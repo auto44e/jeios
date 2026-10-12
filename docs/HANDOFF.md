@@ -57,8 +57,12 @@ hardware detector or supervisor.
 - Initial GitHub run passed core/ELF checks but failed ISO creation because GRUB
   auto-selected extra EFI modules on the runner and attempted to invoke missing
   `mformat`. The Makefile now explicitly selects the BIOS i386-pc module directory
-  via `GRUB_PC_DIR`, matching the documented M0 platform. The follow-up CI run
-  must be observed independently before reporting its result.
+  via `GRUB_PC_DIR`, matching the documented M0 platform.
+- Follow-up GitHub CI: PASS for code commit
+  `23900ff6dd408205064b4ec0cacd66de64ff18e3`. Core/ELF, ordinary QEMU boot,
+  and NX-absent legacy-profile checks all completed successfully. Evidence:
+  https://github.com/auto44e/jeios/actions/runs/38313541117
+  This handoff-only evidence update changes no tested code or build recipe.
 - No real-machine, AArch64, GPU, security, compatibility ABI, or mobile tests.
 
 ## Build and layout
