@@ -54,6 +54,11 @@ hardware detector or supervisor.
 - Legacy-path check: PASS with `tools/smoke.py build/jeios.iso --cpu qemu64,-nx
   --expect-nx absent`; the NX-absent line and successful halt were observed.
   Both CPU profiles are configured in CI.
+- Initial GitHub run passed core/ELF checks but failed ISO creation because GRUB
+  auto-selected extra EFI modules on the runner and attempted to invoke missing
+  `mformat`. The Makefile now explicitly selects the BIOS i386-pc module directory
+  via `GRUB_PC_DIR`, matching the documented M0 platform. The follow-up CI run
+  must be observed independently before reporting its result.
 - No real-machine, AArch64, GPU, security, compatibility ABI, or mobile tests.
 
 ## Build and layout

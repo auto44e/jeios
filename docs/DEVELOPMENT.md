@@ -38,7 +38,9 @@ make smoke
 ```
 
 `make iso` first requires GRUB to recognize Multiboot2, stages the ELF and GRUB
-config, and builds `build/jeios.iso` with xorriso. `tools/smoke.py` boots QEMU with
+config, and builds `build/jeios.iso` with xorriso. The recipe explicitly selects
+`GRUB_PC_DIR` (default `/usr/lib/grub/i386-pc`) to build the M0 BIOS image;
+extra EFI modules on a development host do not change the image type. `tools/smoke.py` boots QEMU with
 `pc`, `qemu64`, 128 MiB, no NIC and no display; serial goes to the terminal. It
 waits up to 12 seconds, then requires C-entry and successful initialization
 markers with no fatal marker. Intentional halt means a timeout alone is never

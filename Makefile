@@ -1,6 +1,8 @@
 CC = gcc
 LD = ld
 PYTHON ?= python3
+# M0 is a BIOS PC target; do not autodetect EFI modules installed on the host.
+GRUB_PC_DIR ?= /usr/lib/grub/i386-pc
 BUILD := build
 WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
 CPPFLAGS := -Iinclude
@@ -30,7 +32,7 @@ iso: all
 	@mkdir -p $(BUILD)/iso/boot/grub
 	cp $(BUILD)/jeios.elf $(BUILD)/iso/boot/
 	cp boot/grub/grub.cfg $(BUILD)/iso/boot/grub/
-	grub-mkrescue -o $(BUILD)/jeios.iso $(BUILD)/iso
+	grub-mkrescue -d $(GRUB_PC_DIR) -o $(BUILD)/jeios.iso $(BUILD)/iso
 smoke: iso
 	$(PYTHON) tools/smoke.py $(BUILD)/jeios.iso
 clean:
