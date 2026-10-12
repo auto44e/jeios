@@ -51,8 +51,19 @@ PATH, LD_LIBRARY_PATH and QEMU_MODULE_DIR for relocation plus
 `GRUB_PC_DIR=/tmp/jeios-tools/usr/lib/grub/i386-pc`. These transient paths are not
 repository dependencies. Normal installed tools use DEVELOPMENT.md commands.
 
-Remote CI must be checked on the final branch SHA; a local PASS is not evidence
-of a remote result. The final verification record is appended after publication.
+## Published verification evidence
+
+Implementation commit `96d4dee037389e7b30132ad8fd7425c80a90ea1d` passed both
+GitHub push and pull-request CI, including default sanitizer checks, normal and
+NX-absent boots, 16/1536 MiB profiles and every fault-injection case.
+
+- Pull request: https://github.com/auto44e/jeios/pull/1
+- PR verification: https://github.com/auto44e/jeios/actions/runs/38317024232
+- Branch verification: https://github.com/auto44e/jeios/actions/runs/38316970273
+
+This subsequent handoff-only evidence update changes no tested implementation.
+Check the current PR checks when continuing; never substitute a local PASS for
+observed remote execution, or the original M0 checks for these new phase gates.
 
 ## Critical implementation contracts
 
