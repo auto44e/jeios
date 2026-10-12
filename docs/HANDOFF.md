@@ -1,4 +1,9 @@
-# Agent handoff: initial scaffold
+# Agent handoff: M1/M2 development
+
+Current work is on `develop/m1-m2-core`. Read `docs/IMPLEMENTATION.md` for the
+new gate contracts and evidence; the M0 record below is retained as history.
+M1a adds the IDT, TSS/IST exception stacks and real CPU fault-injection tests.
+M1b memory discovery and M2 scheduling are next in this development sequence.
 
 Date: 2026-10-12. Owner project: `auto44e/jeios`. Stage: M0.
 Read AGENTS.md, DESIGN.md and ROADMAP.md before continuing.

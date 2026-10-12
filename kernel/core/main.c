@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <jeios/trap.h>
 #include <jeios/arch.h>
 #include <jeios/module.h>
 static je_status policy_init(void) { return JE_OK; }
@@ -10,6 +11,15 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t boot_info)
     (void)boot_info;
     je_status console = je_arch_console_init();
     if (console == JE_OK) je_arch_console_write("JeiOS M0: entered C kernel\r\n");
+    je_arch_traps_init();
+    je_arch_console_write("M1: traps ready\r\n");
+#if JE_TEST_MODE == 1
+    __asm__ volatile("ud2");
+#elif JE_TEST_MODE == 2
+    __asm__ volatile("movw %0,%%ds" : : "r"((uint16_t)0x28));
+#elif JE_TEST_MODE == 3
+    je_arch_test_double_fault();
+#endif
     if (magic != 0x36d76289u) {
         je_arch_console_write("JeiOS fatal: invalid Multiboot2 magic\r\n");
         je_arch_halt();

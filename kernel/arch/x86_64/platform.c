@@ -40,3 +40,13 @@ _Noreturn void je_arch_halt(void)
 {
     for (;;) __asm__ volatile ("cli; hlt" : : : "memory");
 }
+
+void je_arch_console_hex(uint64_t value)
+{
+    char text[19] = "0x0000000000000000";
+    const char digits[] = "0123456789abcdef";
+    for (unsigned i = 0; i < 16; ++i) {
+        text[17-i] = digits[value & 15]; value >>= 4;
+    }
+    je_arch_console_write(text);
+}

@@ -3,13 +3,14 @@ LD = ld
 PYTHON ?= python3
 # M0 is a BIOS PC target; do not autodetect EFI modules installed on the host.
 GRUB_PC_DIR ?= /usr/lib/grub/i386-pc
-BUILD := build
+TEST_MODE ?= 0
+BUILD := build/$(TEST_MODE)
 WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
-CPPFLAGS := -Iinclude
+CPPFLAGS := -Iinclude -DJE_TEST_MODE=$(TEST_MODE)
 CFLAGS := -std=c11 -O2 -g $(WARN) -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -m64 -march=x86-64 -mno-red-zone -mgeneral-regs-only
 CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c
-SOURCES := $(CORE) kernel/core/main.c kernel/arch/x86_64/platform.c
-OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o
+SOURCES := $(CORE) kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c
+OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o $(BUILD)/kernel/arch/x86_64/trap_entry.o
 .PHONY: all check test iso smoke clean
 all: $(BUILD)/jeios.elf
 $(BUILD)/jeios.elf: $(OBJECTS) kernel/arch/x86_64/linker.ld
@@ -36,5 +37,8 @@ iso: all
 smoke: iso
 	$(PYTHON) tools/smoke.py $(BUILD)/jeios.iso
 clean:
-	rm -rf $(BUILD)
+	rm -rf build
 -include $(OBJECTS:.o=.d)
+.PHONY: integration
+integration:
+	$(PYTHON) tools/integration.py
