@@ -101,7 +101,9 @@ pdpt: .skip 4096
 pd: .skip 4096
 saved_magic: .skip 4
 saved_info: .skip 4
-.balign 16
+.balign 4096
+.global je_boot_guard
+je_boot_guard: .skip 4096
 stack_bottom: .skip 32768
 stack_top:
 .section .note.GNU-stack,"",@progbits

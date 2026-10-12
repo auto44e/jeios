@@ -1313,4 +1313,10 @@ je_isr_table:
     .quad je_isr_253
     .quad je_isr_254
     .quad je_isr_255
+.section .text,"ax"
+.global je_arch_test_stack_overflow
+je_arch_test_stack_overflow:
+    movq %rdi,%rsp
+    pushq $0
+    ud2
 .section .note.GNU-stack,"",@progbits

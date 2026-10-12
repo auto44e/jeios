@@ -8,8 +8,8 @@ BUILD := build/$(TEST_MODE)
 WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
 CPPFLAGS := -Iinclude -DJE_TEST_MODE=$(TEST_MODE)
 CFLAGS := -std=c11 -O2 -g $(WARN) -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -m64 -march=x86-64 -mno-red-zone -mgeneral-regs-only
-CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c
-SOURCES := $(CORE) kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c
+CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c kernel/core/boot.c
+SOURCES := $(CORE) kernel/core/memory.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c
 OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o $(BUILD)/kernel/arch/x86_64/trap_entry.o
 .PHONY: all check test iso smoke clean
 all: $(BUILD)/jeios.elf
@@ -24,8 +24,9 @@ $(BUILD)/%.o: %.S
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core
+test: $(BUILD)/test_core $(BUILD)/test_boot
 	./$(BUILD)/test_core
+	./$(BUILD)/test_boot
 check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
 iso: all
@@ -42,3 +43,6 @@ clean:
 .PHONY: integration
 integration:
 	$(PYTHON) tools/integration.py
+$(BUILD)/test_boot: tests/test_boot.c kernel/core/boot.c include/jeios/boot.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_boot.c kernel/core/boot.c -o $@

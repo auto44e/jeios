@@ -37,3 +37,39 @@ M1a: GCC/ELF checks, hosted core tests, QEMU normal boot and modes 1, 2, 3
 passed before proceeding to M1b. Mode 2 uses GDT selector 0x28, just beyond the
 installed table limit, to deterministically exercise #GP with error code 0x28. Consult HANDOFF.md for final observed
 results after the complete phase sequence.
+
+## M1b: boot data and protected mappings
+
+A portable Multiboot2 parser copies bounded memory-map records and reservation
+intervals. It rejects undersized/truncated tags, bad alignment/strides, unsupported
+map versions, wrapping physical ranges, ambiguous overlapping maps, malformed
+module bounds/strings, missing/duplicate maps and absent terminal tags. Unknown
+memory types are never allocatable. Fixed-capacity overflow returns a failure;
+output remains invalid. The image must be ordinary RAM. Low 1 MiB, the complete
+image (including BSS page tables/stacks), boot block and modules stay reserved.
+The parser retains no loader pointers. The architecture validates the loader
+address against the bootstrap map before reading; it cannot prove faulty firmware
+has provided physically backed memory merely from the mapping. A bad access is a
+fatal diagnosed exception, not recoverable firmware parsing.
+
+Fresh 4 KiB supervisor page tables identity-map complete type-1 RAM pages from
+1 MiB up to a deliberate 1 GiB implementation limit. Holes and reserved firmware
+ranges remain unmapped. Kernel text is read-only/executable, rodata read-only,
+and writable RAM non-executable when NX exists. CR0.WP enforces supervisor writes;
+EFER.NXE is enabled before installing NX entries. There are no writable aliases
+for code. The bootstrap, double-fault and NMI stacks have unmapped leading guards.
+On NX-absent CPUs the same read-only/guard checks apply, but data non-execution is
+explicitly unavailable. This is an early identity-mapped kernel, not KASLR or a
+user/kernel split. Page-table metadata itself remains writable by trusted kernel
+code; no privileged module isolation is claimed.
+
+Validation: 20,000 deterministic parser mutations plus explicit truncation,
+overflow, overlap, module and reservation cases pass ASan/UBSan. Local leak
+checking is disabled (`ASAN_OPTIONS=detect_leaks=0`) because the execution sandbox
+cannot inspect process threads; address and undefined-behavior checks stay active.
+CI keeps default leak checking. CPU fault tests observe code-write #PF (error 3),
+guard read #PF (0), data execute #PF (17), and a real stack exhaustion double fault
+using the emergency IST. NX-absent normal boot also passes.
+
+Source: GNU Multiboot2 specification, Boot information format, memory-map and
+module tags: https://www.gnu.org/software/grub/manual/multiboot2/html_node/Boot-information-format.html
