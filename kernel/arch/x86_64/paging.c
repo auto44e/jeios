@@ -56,3 +56,13 @@ je_status je_arch_page_guard(uintptr_t a)
     __asm__ volatile("invlpg (%0)"::"r"(a):"memory");
     return JE_OK;
 }
+
+je_status je_arch_page_restore(uintptr_t a)
+{
+    if (!active || (a&4095) || a>=JE_PHYSICAL_LIMIT || a<0x100000 ||
+        (a>=(uintptr_t)__kernel_start && a<(uintptr_t)__kernel_end)) return JE_ERR_INVALID;
+    if (pt[a>>21][(a>>12)&511]) return JE_ERR_INVALID;
+    pt[a>>21][(a>>12)&511]=(uint64_t)a|3|nx;
+    __asm__ volatile("invlpg (%0)"::"r"(a):"memory");
+    return JE_OK;
+}

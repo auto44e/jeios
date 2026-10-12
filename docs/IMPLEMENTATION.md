@@ -73,3 +73,105 @@ using the emergency IST. NX-absent normal boot also passes.
 
 Source: GNU Multiboot2 specification, Boot information format, memory-map and
 module tags: https://www.gnu.org/software/grub/manual/multiboot2/html_node/Boot-information-format.html
+
+## M2: physical allocation and a bounded heap
+
+`je_pages` describes only the first GiB with one 16-bit state per 4 KiB page.
+An entry is reserved, free, an exact allocation head/length, or a continuation.
+Initialization derives free pages exclusively from validated type-1 RAM and
+reservations. Allocation searches for a contiguous run, limited to 256 pages.
+Failure does not change accounting; frees validate the complete extent before
+mutation. Interior pointers, wrong lengths, double frees, unaligned addresses and
+reserved pages are rejected. Total free memory does not imply a contiguous run.
+No compaction, buddy allocator, NUMA, high physical memory or reclaim exists yet.
+
+The first heap intentionally uses one contiguous page extent per object rather
+than claiming a slab allocator. It supports 64 live objects, each 1 byte through
+1 MiB, with separate trusted allocation records. This trades memory efficiency
+for simple ownership and rollback. Every successful extent is zeroed, including
+padding, before returning it. A failed mapping returns the pages to the allocator.
+Free identifies an exact returned pointer before dereferencing metadata. Freed
+memory is not scrubbed immediately; it is cleared before its next heap exposure.
+Raw page allocations are not zeroed by the portable allocator; the thread-stack
+consumer explicitly clears its pages before use. Future userspace grants must do
+the same. Stale pointers after address reuse are not detected by this kernel heap.
+
+Portable algorithms require external serialization. `je_kalloc`/`je_kfree`
+disable and restore interrupts around the whole transaction on the BSP. This is
+not an SMP lock. Large zeroing/scans can extend interrupt latency; hard real-time
+claims are not supported. IRQ handlers do not allocate or call these wrappers.
+Page-table guards are changed only while interrupts are disabled; INVLPG updates
+the BSP. There is no remote TLB shootdown or concurrent page-table mutation.
+
+Hosted tests cover exact frees, reserved-page protection, full exhaustion,
+fragmentation despite enough total memory, zero-on-reuse, mapping failure rollback,
+invalid sizes/pointers and heap metadata capacity. The emulator workload performs
+allocations from independently preemptible threads and checks content/accounting.
+
+## M2: execution and scheduling
+
+The legacy dual 8259 PIC is remapped to vectors 32–47. All lines remain masked
+except IRQ0. PIT channel 0 runs mode 2 at approximately 100 Hz. This is a tick
+source, not a calibrated wall clock, real-time deadline guarantee, APIC driver,
+SMP system or arbitrary hardware interrupt framework. Unexpected vectors remain
+fatal; comprehensive spurious IRQ/device recovery is future platform work.
+
+A fixed table has eight slots: bootstrap/idle monitor at 0 and seven worker slots.
+States are EMPTY, RUNNING, READY, SLEEPING and ZOMBIE. The timer handler saves the
+current trap-frame pointer, wakes due sleepers, places a running task back in the
+ready set, and chooses the next ready slot round-robin. It acknowledges IRQ0
+before the frame switch. The assembly epilogue restores another task's registers
+and IRETQ frame. Kernel stacks have 16 KiB usable space plus one unmapped guard.
+Synthetic first frames enter a C trampoline with the AMD64 SysV stack alignment
+and a fallback return address. Thread callbacks return through `je_thread_exit`.
+
+Yield/sleep use kernel-only interrupt vector 0x81. Duration zero yields; positive
+duration records an absolute tick deadline under interrupt exclusion. Overflow
+is rejected before state mutation. The sleeping thread's interrupt return restores
+its disabled state; it reenables interrupts only when the original call had them
+enabled. IRQ handlers never sleep. Exit marks the task ZOMBIE and switches away;
+stacks are reaped only from bootstrap after every worker has exited. Guards are
+remapped before physical pages return to the allocator. Reaping an active set is
+busy. No cancellation, priority classes, general wait queues, mutexes, user
+credentials, cross-CPU migration or SIMD/FPU context management exists yet.
+
+The idle loop tests completion with interrupts disabled, then executes STI/HLT
+as one adjacent instruction pair. This avoids the usual check-then-sleep lost
+wakeup window. All scheduler state changes are serialized on this one CPU;
+creation/init/reap are caller-restricted to interrupt-disabled bootstrap context.
+The completion count uses a C11 atomic. Tick wrap is treated as an invariant
+failure instead of silently breaking absolute wake deadlines.
+
+### Boot workload and success contract
+
+The normal development kernel runs a diagnostic workload then halts:
+
+1. Fill all seven worker slots and reject an eighth without consuming pages.
+2. Each worker allocates zeroed memory and writes a distinct pattern.
+3. An assembly loop holds/checks all 15 ordinary GPRs while waiting for timer tick
+   64. It never yields inside that loop, so progress requires hardware interrupts.
+4. Each worker checks sleep-overflow refusal, yields, sleeps for a distinct delay,
+   verifies the wake time and its retained heap bytes, frees memory and exits.
+5. Bootstrap requires multiple dispatches for every worker and at least 16 timer
+   context switches, reaps all stacks, and compares free pages with the start.
+
+A success marker alone is not used to infer scheduling: it is reached only after
+these checks. Timeout, unexpected fatal marker, incorrect CPU profile, missing
+vector/error pair or accounting mismatch fails the external harness. This workload
+is kernel self-test/demo code; it is not an application manager or isolated tasks.
+
+Primary timer reference: Intel Core M Platform I/O Datasheet, legacy interrupt
+controller initialization and 8254 timer register descriptions:
+https://www.intel.com/content/dam/www/public/us/en/documents/datasheets/core-m-processor-platform-i-o-datasheet.pdf
+
+## Remaining boundaries before M3
+
+M1/M2 complete the scoped BSP foundation gates, not every hardening goal in the
+long-term design. There is no secure entropy service, compiler stack-canary setup,
+heap quarantine, KASLR, stack-clash protection, user-copy recovery, process address
+space, handle generation system or capability enforcement. Fatal kernel corruption
+stops the entire machine. One-page guards do not detect arbitrary stack jumps.
+The low-level physical allocator and page mapping APIs assume trusted callers.
+Before launching untrusted code, establish ring-3 entry, a user/kernel mapping
+split, validated copy primitives, per-process lifetime/authority rules and vetted
+hardening prerequisites. Do not present seven ring-0 threads as sandboxed apps.

@@ -4,6 +4,7 @@
 je_status je_arch_paging_init(const je_boot_context *ctx);
 /* BSP only, interrupts disabled, owned kernel RAM page. No SMP TLB shootdown. */
 je_status je_arch_page_guard(uintptr_t address);
+je_status je_arch_page_restore(uintptr_t address);
 extern unsigned char __kernel_start[], __kernel_end[], __text_end[], __rodata_end[];
 extern unsigned char je_boot_guard[];
 #endif

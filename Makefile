@@ -1,16 +1,16 @@
 CC = gcc
 LD = ld
 PYTHON ?= python3
-# M0 is a BIOS PC target; do not autodetect EFI modules installed on the host.
+# Current kernel is a BIOS PC target; do not autodetect EFI modules installed on the host.
 GRUB_PC_DIR ?= /usr/lib/grub/i386-pc
 TEST_MODE ?= 0
 BUILD := build/$(TEST_MODE)
 WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
 CPPFLAGS := -Iinclude -DJE_TEST_MODE=$(TEST_MODE)
 CFLAGS := -std=c11 -O2 -g $(WARN) -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -m64 -march=x86-64 -mno-red-zone -mgeneral-regs-only
-CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c kernel/core/boot.c
-SOURCES := $(CORE) kernel/core/memory.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c
-OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o $(BUILD)/kernel/arch/x86_64/trap_entry.o
+CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c kernel/core/boot.c kernel/core/alloc.c
+SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c
+OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o $(BUILD)/kernel/arch/x86_64/trap_entry.o $(BUILD)/kernel/arch/x86_64/register_probe.o
 .PHONY: all check test iso smoke clean
 all: $(BUILD)/jeios.elf
 $(BUILD)/jeios.elf: $(OBJECTS) kernel/arch/x86_64/linker.ld
@@ -24,9 +24,10 @@ $(BUILD)/%.o: %.S
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
+	./$(BUILD)/test_alloc
 check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
 iso: all
@@ -43,6 +44,10 @@ clean:
 .PHONY: integration
 integration:
 	$(PYTHON) tools/integration.py
-$(BUILD)/test_boot: tests/test_boot.c kernel/core/boot.c include/jeios/boot.h
+$(BUILD)/test_boot: tests/test_boot.c kernel/core/boot.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_boot.c kernel/core/boot.c -o $@
+
+$(BUILD)/test_alloc: tests/test_alloc.c kernel/core/alloc.c kernel/core/boot.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_alloc.c kernel/core/alloc.c kernel/core/boot.c -o $@

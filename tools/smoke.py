@@ -8,7 +8,9 @@ parser.add_argument("--cpu", default="qemu64")
 parser.add_argument("--memory", default="128M")
 parser.add_argument("--expect-nx", choices=("present", "absent"))
 args = parser.parse_args()
-expected = [b"JeiOS: entered C kernel", b"M1: traps ready", b"M1: boot map validated", b"M1: protected mappings"]
+expected = [b"JeiOS: entered C kernel", b"M1: traps ready", b"M1: boot map validated", b"M1: protected mappings",
+            b"M2: preemption/GPR/sleep/heap checks passed",
+            b"M2: exited threads reaped; page accounting restored"]
 if args.expect_nx:
     expected.append(b"CPU: NX enforced" if args.expect_nx == "present"
                     else b"CPU: legacy profile, NX absent")

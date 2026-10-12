@@ -1,7 +1,9 @@
 # Hardware profiles and feature policy
 
-Status: proposed support policy; M0 implements only the AMD64 entry demonstration,
-a COM1 console, and NX presence reporting. **Reported NX is not enabled NX.**
+Status: M1/M2 implements an AMD64 BIOS/PC foundation, qualified in QEMU only.
+It enables NX where present, read-only supervisor code/data permissions, stack
+guards, a legacy PIC/PIT timer and kernel threads. Physical allocation is limited
+to RAM below 1 GiB. No ARM, GPU or newer extended CPU context is implemented.
 
 ## Meaning of compatibility
 
@@ -14,7 +16,7 @@ K8-era board support remain unverified. UEFI-only machines need a boot-path gate
 
 | Profile | CPU/boot target | Guarantee and fallback | Implementation |
 | --- | --- | --- | --- |
-| M0 emulator | AMD64 long mode, legacy GRUB Multiboot2, COM1 | C entry and intentional halt; no runtime isolation | ELF and QEMU smoke pass; no real-PC qualification |
+| M1/M2 emulator | AMD64, BIOS GRUB, COM1, PIC/PIT | Memory protection and preemptive kernel workload, then halt; no process isolation | NX/no-NX and 16/128/1536 MiB profiles; no real-PC qualification |
 | Legacy PC | Early AMD64; optional NX/IOMMU/modern state | Baseline instruction paths; weaker protections disclosed | Planned; real board matrix required |
 | Hardened PC | NX, validated isolation prerequisites, maintained firmware | W^X, process separation, device containment when qualified | Planned; exact mandatory feature set pending |
 | AArch64 baseline | Armv8-A on named board/emulator | Ordinary MMU process isolation; advanced features optional | No implementation |
@@ -27,7 +29,7 @@ K8-era board support remain unverified. UEFI-only machines need a boot-path gate
 For each feature define stable internal ID, raw report, firmware/platform readiness,
 OS readiness, policy permission, required context state, allowed CPU mask,
 security effect, fallback, test evidence, and errata overrides. Keep **advertised**
-separate from **enabled** and **required**. M0's `je_features_select` is only a
+separate from **enabled** and **required**. The original `je_features_select` is only a
 portable mask helper; it does not populate CPUID records or enable features.
 
 Never execute an optional instruction to see whether it works before traps and

@@ -10,8 +10,8 @@ Read `README.md`, `docs/HANDOFF.md`, `docs/ROADMAP.md`, and the relevant section
    architecture operations. Do not introduce another core language by accident.
 2. Read the implementation before claiming a design feature exists. Update the
    implementation-status table and handoff in the same change as new behavior.
-3. Work on one roadmap gate at a time. Start with M1 exception containment and
-   memory-map validation. A desktop mockup does not advance kernel readiness.
+3. Work on one roadmap gate at a time. Continue with M3a userspace boundaries after reviewing the completed M1/M2
+   implementation ledger. A desktop mockup does not advance kernel readiness.
 4. Document contracts: ownership, lifetime, locking, caller context, bounds,
    privilege, error states, rollback, hardware prerequisites, and tests. Explain
    the reason for subtle register/assembly operations and cite architecture docs.

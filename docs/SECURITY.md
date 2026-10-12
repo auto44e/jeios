@@ -1,9 +1,12 @@
 # Security and privacy design requirements
 
-**M0 is not a hardened OS.** It has no userspace, access controls, secure boot,
-encryption, network stack, randomness service, or recoverable exception handling.
-Its bootstrap pages are writable and executable. The following is a threat model
-and implementation plan, not a security certification.
+**This remains an experimental kernel, not a hardened OS.** M1/M2 provides
+read-only kernel text/rodata, NX data on qualified CPUs, guarded kernel stacks,
+validated boot input and bounded allocation/rollback. Kernel faults stop the
+machine with diagnostics. All threads run at CPL0 in one address space.
+There is no userspace authority boundary, secure boot, encryption, randomness
+service or networking. Early bootstrap maps are temporarily RWX until replaced.
+The following threat model remains a requirement for future implementation.
 
 ## Assets, adversaries, and boundaries
 
@@ -63,7 +66,7 @@ A future owner-configurable trust root is required; no hidden universal vendor
 key. Verified boot, anti-rollback counters, A/B images, signed manifests, and
 recovery must be coordinated. A known-good image can still be vulnerable; signed
 recovery policy must distinguish authorized rollback from downgrade attacks.
-Private signing keys never enter the repo. M0 GRUB has no trust-chain enforcement.
+Private signing keys never enter the repo. The GRUB prototype has no trust-chain enforcement.
 
 Use vetted cryptography. Design key derivation/storage/unlock, memory lifetime,
 physical access, recovery and backup before adding an 'encrypted' UI label. Mobile

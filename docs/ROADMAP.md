@@ -21,20 +21,30 @@ M0 stubs do not count as completing future modules.
 | E1 | Mobile | Named board/device, power/touch/display/modem separation and update path | P1, M7-M9 plus device drivers |
 | E2 | 64-bit MMU IoT | Headless profile, scoped management, offline recovery, power loss tolerance | Relevant M4-M9 mechanisms |
 
-## Immediate bounded next task
+## Current gate status and next task
 
-Implement M1a: install an x86-64 IDT and dedicated fault path before enabling
-interrupts. Define trap-frame layout and C entry alignment; avoid compiler
-floating-point/SIMD state. Demonstrate an intentional fault in QEMU producing a
-specific serial record rather than a triple fault. The production/default M0
-smoke marker must still pass when no fault is injected. Use a build/test option
-for fault injection, not an unconditional crash.
+M0, M1a, M1b and the scoped M2 BSP foundation are implemented on
+`develop/m1-m2-core`; see IMPLEMENTATION.md and HANDOFF.md for exact evidence.
+M1 has validated maps/reservations, fatal exceptions and hardware permission tests.
+M2 has bounded page/heap allocation, timer preemption, guarded kernel threads,
+yield/sleep/exit and deferred stack reclamation. This is not a general scheduler,
+SMP implementation, userspace sandbox, or complete hardening milestone.
 
-Then M1b: validate/copy the Multiboot2 memory map and reserve bootstrap ranges.
-Only after this may M2 allocate RAM. Add host parser fuzz/boundary tests and
-emulator scenarios. Trap containment must precede touching unchecked firmware
-pointers. Do not add disk writes, external networking, or GPU command submission
-as a shortcut to visible progress.
+Next is M3, split into independently reviewable subgates:
+
+- **M3a:** private user address spaces, ring-3 entry/return, user-copy fault
+  containment and a bounded user program loader. Prove two actual CPL3 tasks
+  cannot access each other's memory or kernel state. A task fault must be local.
+- **M3b:** typed handles with generation counters, rights attenuation, explicit
+  object lifetime and checked syscall layouts. Test stale/forged handles and
+  denied operations without side effects.
+- **M3c:** bounded capability-aware IPC, waiting/cancellation semantics and init
+  process startup, with race/timeout/lifetime tests.
+
+Before calling M3 hardened, resolve entropy/canary strategy, general wait queues
+and synchronization, spurious IRQ handling and a security review of the user/kernel
+transition. Broader hardening remains a separate acceptance claim. Do not expand
+storage, network, GPU or desktop scope as a substitute for these boundaries.
 
 ## Decision gates
 

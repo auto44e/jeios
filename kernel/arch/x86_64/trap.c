@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <jeios/arch.h>
 #include <jeios/trap.h>
+#include <jeios/sched.h>
 /* Intel SDM Vol.3A: 64-bit interrupt handling, IST and TSS; Vol.2: LIDT/LTR.
  * Source references and ABI rationale are in docs/IMPLEMENTATION.md. */
 struct __attribute__((packed)) gate {
@@ -50,6 +51,10 @@ void je_arch_traps_init(void)
 static volatile unsigned panicking;
 je_trap_frame *je_trap_dispatch(je_trap_frame *f)
 {
+    if (f->vector==32) {
+        je_arch_timer_eoi(); return je_sched_interrupt(f,true);
+    }
+    if (f->vector==0x81) return je_sched_interrupt(f,false);
     if (panicking++) je_arch_halt();
     uint64_t cr2 = 0;
     if (f->vector == 14) __asm__ volatile("mov %%cr2,%0" : "=r"(cr2));
