@@ -86,3 +86,10 @@ Before production use, establish a tested private disclosure channel, triage
 owners, patch distribution, supported-version policy, and a recovery process.
 Do not use a public issue to post sensitive exploit details or credentials. No
 private disclosure address is configured by this scaffold; do not invent one.
+
+## Detailed encryption requirements
+
+See [ENCRYPTION.md](ENCRYPTION.md) for the RAM threat model, PQ key agreement
+and authentication requirements, key lifecycle and nearby sharing. Filesystem
+checksums do not provide cryptographic authentication; encrypted storage does
+not keep plaintext secret from an authorized live-memory reader.

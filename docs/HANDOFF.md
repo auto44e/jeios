@@ -122,3 +122,22 @@ calling M3 hardened. Do not jump straight to desktop, GPU or phone support.
 Owner distribution license; hardened hardware baseline; actual old-PC support;
 stable native ABI; toolkit/compositor strategy; service placement measurements;
 and vendor GPU/phone targets. No external kernel source has been imported.
+
+## Requirements addendum: 2026-10-13
+
+Owner requested configurable init, PQ end-to-end encryption with honest RAM
+protection, nearby device sharing and a filesystem recommendation. Added INIT.md,
+ENCRYPTION.md and STORAGE.md; linked DESIGN.md, SECURITY.md, ROADMAP.md and README.
+All are proposed contracts. Kernel implementation and next gate M3a are unchanged.
+Ext4 is the first persistent candidate, not a completed driver or final production
+default. Btrfs/OpenZFS remain evaluation options. No external source was imported.
+
+Outstanding decisions: project license; exact crypto protocol/library and entropy
+source; hardware memory-protection qualification; init schema and numeric limits;
+ext4 feature profile and writable-backend feasibility; storage encryption format.
+Do not mistake illustrative service manifests for an implemented interface.
+
+Validation for this docs-only change: `ASAN_OPTIONS=detect_leaks=0 make check`,
+relative Markdown link validation and `git diff --check` passed locally. No boot
+code changed, so emulator tests were not repeated locally. Prior kernel execution
+evidence remains scoped to the earlier code; check the current PR for remote CI.

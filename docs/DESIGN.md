@@ -458,6 +458,9 @@ bypass capability validation or expose stale cross-domain buffers.
 
 ## 12. Storage, filesystems, and transactional operation
 
+See [STORAGE.md](STORAGE.md) for the staged ext4 recommendation, alternatives,
+format qualification and VFS/durability contracts. No production default is frozen.
+
 Begin with an in-memory filesystem and read-only init image. Next add a simple
 block device and a proven on-disk format with explicit recovery tests. A VFS
 contract defines identity, permissions, handles, mount namespaces, locking,
@@ -553,6 +556,9 @@ arbitrary kernel corruption. Crash dumps, supervisors, watchdogs and recoverable
 userspace processes remain future milestones.
 
 ## 16. Executive services and configuration
+
+See [INIT.md](INIT.md) for the proposed small supervisor, declarative configuration,
+replaceability, dependency semantics and recovery gates. No userspace init exists yet.
 
 System services expose the same typed operations to GUI, CLI, and automation.
 Configuration is schema-versioned, validated, auditable, exportable, and applied
@@ -706,3 +712,11 @@ to stubs claiming entire subsystems.
 
 These decisions should be resolved with evidence and the owner's product intent,
 not assumptions buried in code. Record changes in ADRs and handoff notes.
+
+## 23. Encryption and ecosystem security requirements
+
+[ENCRYPTION.md](ENCRYPTION.md) distinguishes post-quantum device-to-device
+protection, storage encryption and hardware-dependent memory protection. It also
+defines consent-based nearby sharing and key-lifecycle acceptance gates. These
+are planned requirements; neither encryption nor confidential execution exists
+in the current kernel. Legacy compatibility cannot imply unavailable guarantees.

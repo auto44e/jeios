@@ -53,3 +53,16 @@ Before stable ABI: specify native wire layout, rights/lifetime and concurrency.
 Before hardened profile: define exact minimum hardware and firmware/update policy.
 Before accelerated desktop: select native toolkit/compositor strategy in an ADR.
 Before foreign compatibility: scope exact ABI/application set and security mapping.
+
+## Additional owner requirements (2026-10-13)
+
+These design additions do not change the next implementation gate, M3a.
+
+- M3c/M4: [INIT.md](INIT.md), configurable supervisor with good defaults,
+  generation-safe readiness, bounded restarts, recovery and explicit authority.
+- M5a-c: [STORAGE.md](STORAGE.md), initfs/RAM filesystem, read-only ext4 candidate,
+  then independently qualified writable storage. Production default remains open.
+- M5/M6/M9/P2: [ENCRYPTION.md](ENCRYPTION.md), key lifecycle before format freeze,
+  optional nearby sharing, reviewed PQ protection, qualified memory encryption
+  and separate confidential-execution gates. No new crypto code is authorized
+  for production use merely by this design; library/protocol review is required.
