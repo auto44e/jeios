@@ -1,5 +1,9 @@
 # Implementation ledger: M1 and M2
 
+Coding-agent continuation: [AGENT_START.md](AGENT_START.md) maps owner requirements,
+current baseline and linked issue dependencies. Future designs remain unimplemented.
+
+
 This file records current contracts and execution evidence as gates are built.
 DESIGN.md describes the broader target architecture. No entry below implies
 userspace isolation, SMP safety, driver containment or production readiness.
@@ -175,3 +179,4 @@ The low-level physical allocator and page mapping APIs assume trusted callers.
 Before launching untrusted code, establish ring-3 entry, a user/kernel mapping
 split, validated copy primitives, per-process lifetime/authority rules and vetted
 hardening prerequisites. Do not present seven ring-0 threads as sandboxed apps.
+

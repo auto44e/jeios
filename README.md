@@ -16,6 +16,9 @@ dynamic module loader or ARM implementation. This is not a daily-use or hardened
 
 ## Start here
 
+Coding agents: begin with [the starting guide](docs/AGENT_START.md) for the current
+baseline, all owner requirements, issue dependencies and checkpoint rules.
+
 - [Detailed design](docs/DESIGN.md): full product architecture and future contracts.
 - [M3a implementation proposal](docs/M3A.md): proposed boundaries and M3b/M3c contracts.
 - [Accelerators and media](docs/ACCELERATORS.md): open standards, conservative offloading,

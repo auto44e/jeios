@@ -1,5 +1,9 @@
 # Gated roadmap
 
+Coding-agent continuation: [AGENT_START.md](AGENT_START.md) maps owner requirements,
+current baseline and linked issue dependencies. Future designs remain unimplemented.
+
+
 No milestone has a calendar deadline. Each gate requires code, failure tests,
 implementation-status updates, and a handoff with observed evidence. Existing
 M0 stubs do not count as completing future modules.

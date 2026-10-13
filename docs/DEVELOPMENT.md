@@ -1,5 +1,9 @@
 # Build, fault injection and verification
 
+Coding-agent continuation: [AGENT_START.md](AGENT_START.md) maps owner requirements,
+current baseline and linked issue dependencies. Future designs remain unimplemented.
+
+
 ## Host and dependencies
 
 Use an x86-64 Linux host with GNU GCC/binutils, make and Python 3. This is not yet
@@ -111,3 +115,4 @@ CI dependencies/runner images are not a pinned reproducible supply chain yet.
 Successful tests do not prove secure boot, process isolation, arbitrary hardware
 compatibility, or complete memory safety. See IMPLEMENTATION.md for exact caller,
 lifetime, interrupt and memory limits.
+

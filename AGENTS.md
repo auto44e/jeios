@@ -1,7 +1,8 @@
 # JeiOS contributor and AI agent instructions
 
 Read `README.md`, `docs/HANDOFF.md`, `docs/ROADMAP.md`, and the relevant sections of
-`docs/DESIGN.md` before editing. This file governs the whole repository.
+`docs/DESIGN.md` before editing. Also read `docs/AGENT_START.md` for the consolidated
+owner requirements and task sequence. This file governs the whole repository.
 
 ## Required discipline
 

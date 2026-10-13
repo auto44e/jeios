@@ -1,7 +1,9 @@
 # Agent handoff: M1/M2 kernel foundation
 
-Date: 2026-10-12. Project `auto44e/jeios`; branch `develop/m1-m2-core`.
+Updated: 2026-10-13. Project `auto44e/jeios`; branch `develop/m1-m2-core`.
 Read AGENTS.md, IMPLEMENTATION.md, ROADMAP.md and the relevant DESIGN.md sections.
+Start with [AGENT_START.md](AGENT_START.md) for the consolidated requirements and
+linked work queue. Foundation PR #1 must be checked before choosing main as a base.
 The previous M0 state is preserved in git history; this file describes the latest
 branch implementation. Do not infer future capabilities from design prose.
 
@@ -102,7 +104,8 @@ kernel threads in one address space. Never call them isolated processes/apps.
 
 ## Next bounded work: M3a userspace boundary
 
-Start a new branch after reviewing/merging this work. Specify user/kernel address
+Start a new implementation branch from the latest PR head, or updated main after
+merge; do not assume main already contains this work. Specify user/kernel address
 layout, user code/data/stack mapping rights, private kernel stacks, TSS RSP0,
 entry/return state, and copy-in/copy-out fault semantics before adding syscalls.
 Keep CPU feature exposure restricted to state the scheduler preserves. Add a
@@ -206,3 +209,20 @@ allocator and ELF checks; address/undefined-behavior checks remained enabled.
 Relative Markdown links and `git diff --check` passed. Source changes are license
 comments only; emulator tests were not rerun locally. New remote CI is separate
 from this local evidence and must be checked on the published head.
+
+## Consolidated coding-agent handoff: 2026-10-13
+
+Added AGENT_START.md with the complete requirements map, issues #2–#9, dependency
+order, proposed-versus-decided distinctions and sustained checkpoint rules.
+Updated AGENTS, README, ROADMAP, DEVELOPMENT and IMPLEMENTATION entry points.
+No runtime changes or new subsystem implementations. M3a remains next.
+
+Observed remote evidence: Apache/design commit
+`0e46993e480c075f2396015174d69d59dc6e7b37` passed PR CI run
+https://github.com/auto44e/jeios/actions/runs/38390326429 .
+This is prior-head evidence, not a claim about the subsequent docs-only head.
+
+Local verification for this handoff: `ASAN_OPTIONS=detect_leaks=0 make check`,
+relative Markdown links and `git diff --check` passed. No boot behavior changed,
+so emulator tests were not repeated locally. Verify new remote CI separately.
+Project-ready issues exist; board membership requires a separate verified action.
