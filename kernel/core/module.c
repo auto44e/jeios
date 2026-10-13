@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <jeios/module.h>
 je_status je_modules_start(const je_module *m, size_t n, size_t *failed)
 {
@@ -22,3 +23,4 @@ je_status je_modules_start(const je_module *m, size_t n, size_t *failed)
     }
     return JE_OK;
 }
+

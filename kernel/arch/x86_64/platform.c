@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <stdint.h>
 #include <jeios/arch.h>
 static inline void out8(uint16_t port, uint8_t value)
@@ -40,3 +41,39 @@ _Noreturn void je_arch_halt(void)
 {
     for (;;) __asm__ volatile ("cli; hlt" : : : "memory");
 }
+
+void je_arch_console_hex(uint64_t value)
+{
+    char text[19] = "0x0000000000000000";
+    const char digits[] = "0123456789abcdef";
+    for (unsigned i = 0; i < 16; ++i) {
+        text[17-i] = digits[value & 15]; value >>= 4;
+    }
+    je_arch_console_write(text);
+}
+
+uint64_t je_arch_irq_save(void)
+{
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0; cli":"=r"(flags)::"memory");
+    return flags;
+}
+void je_arch_irq_restore(uint64_t flags)
+{
+    if (flags & (UINT64_C(1)<<9)) __asm__ volatile("sti":::"memory");
+}
+static void io_wait(void) { out8(0x80,0); }
+void je_arch_timer_init(void)
+{
+    /* BSP legacy PC only: PIC ICW sequence, all IRQs masked except IRQ0.
+     * PIT channel 0 mode 2, divisor 11932 (~100 Hz), not a precise clock. */
+    out8(0x21,0xff);out8(0xa1,0xff);
+    out8(0x20,0x11);io_wait();out8(0xa0,0x11);io_wait();
+    out8(0x21,0x20);io_wait();out8(0xa1,0x28);io_wait();
+    out8(0x21,4);io_wait();out8(0xa1,2);io_wait();
+    out8(0x21,1);io_wait();out8(0xa1,1);io_wait();
+    out8(0xa1,0xff);out8(0x21,0xfe);
+    out8(0x43,0x34);out8(0x40,(uint8_t)(11932&255));out8(0x40,(uint8_t)(11932>>8));
+}
+void je_arch_timer_eoi(void) { out8(0x20,0x20); }
+

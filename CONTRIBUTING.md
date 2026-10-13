@@ -9,6 +9,10 @@ Run `make check`; run `make smoke` for boot changes when tools are available.
 Update HANDOFF with actual evidence, not expected CI. Never add private keys,
 credentials, personal logs, generated binaries or imported source without review.
 
-Project licensing is pending owner selection. External contributions and imported
-code should wait until licensing/contributor terms are settled; report defects
-and discuss architecture without assuming a distribution license.
+Original project contributions use Apache-2.0; see LICENSE and ADR 0005. Submit
+only work you have authority to contribute under those terms. Preserve accurate
+authorship and third-party notices; document provenance, dependency versions and
+license compatibility before imports. Use SPDX-License-Identifier: Apache-2.0
+for original source files. Third-party code keeps its own license and must not
+receive an inaccurate Apache identifier. No separate CLA is introduced here.
+

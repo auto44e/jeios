@@ -1,9 +1,12 @@
 # Security and privacy design requirements
 
-**M0 is not a hardened OS.** It has no userspace, access controls, secure boot,
-encryption, network stack, randomness service, or recoverable exception handling.
-Its bootstrap pages are writable and executable. The following is a threat model
-and implementation plan, not a security certification.
+**This remains an experimental kernel, not a hardened OS.** M1/M2 provides
+read-only kernel text/rodata, NX data on qualified CPUs, guarded kernel stacks,
+validated boot input and bounded allocation/rollback. Kernel faults stop the
+machine with diagnostics. All threads run at CPL0 in one address space.
+There is no userspace authority boundary, secure boot, encryption, randomness
+service or networking. Early bootstrap maps are temporarily RWX until replaced.
+The following threat model remains a requirement for future implementation.
 
 ## Assets, adversaries, and boundaries
 
@@ -63,7 +66,7 @@ A future owner-configurable trust root is required; no hidden universal vendor
 key. Verified boot, anti-rollback counters, A/B images, signed manifests, and
 recovery must be coordinated. A known-good image can still be vulnerable; signed
 recovery policy must distinguish authorized rollback from downgrade attacks.
-Private signing keys never enter the repo. M0 GRUB has no trust-chain enforcement.
+Private signing keys never enter the repo. The GRUB prototype has no trust-chain enforcement.
 
 Use vetted cryptography. Design key derivation/storage/unlock, memory lifetime,
 physical access, recovery and backup before adding an 'encrypted' UI label. Mobile
@@ -83,3 +86,31 @@ Before production use, establish a tested private disclosure channel, triage
 owners, patch distribution, supported-version policy, and a recovery process.
 Do not use a public issue to post sensitive exploit details or credentials. No
 private disclosure address is configured by this scaffold; do not invent one.
+
+## Detailed encryption requirements
+
+See [ENCRYPTION.md](ENCRYPTION.md) for the RAM threat model, PQ key agreement
+and authentication requirements, key lifecycle and nearby sharing. Filesystem
+checksums do not provide cryptographic authentication; encrypted storage does
+not keep plaintext secret from an authorized live-memory reader.
+
+## Identity, management and raw storage authority
+
+See [IDENTITY.md](IDENTITY.md) for account/device/session separation, E2E group
+membership, recovery and explicit family/enterprise visibility. Administering a
+service does not automatically make its operator a personal-data key recipient.
+Management of a privileged OS nevertheless changes endpoint trust and must be
+visible at enrollment. Offline revocation and remote wipe are not instantaneous.
+
+[STORAGE.md](STORAGE.md) requires separately authorized range-bound raw I/O,
+exclusive write leases and no automatic formatting of unknown media. Ordinary
+file access does not authorize bypassing filesystem or encryption boundaries.
+
+## Accelerator and media boundaries (planned)
+
+[ACCELERATORS.md](ACCELERATORS.md) requires scoped device/buffer/fence authority,
+qualified DMA isolation, bounded submissions and parser/compiler workers, and
+explicit reset/quiescence before memory reuse. Offload policy cannot expand
+permissions. No silent precision downgrade or cloud transfer. Unsupported
+required containment fails closed. Codecs/SDKs remain userspace components;
+no GPU/NPU/media isolation is implemented by this document.

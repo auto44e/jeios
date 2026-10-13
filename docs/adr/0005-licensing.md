@@ -1,14 +1,25 @@
-# ADR 0005: License selection pending
+# ADR 0005: Apache License 2.0
 
-Status: pending owner decision, 2026-10-12.
+Status: accepted by owner, 2026-10-13; supersedes the 2026-10-12 pending decision.
 
-The owner requested a fresh project but did not choose a distribution license.
-Do not silently choose GPL, BSD, MIT or another license. A public GitHub repository
-is not by itself a general permission grant to redistribute modified source.
-No third-party code or assets were imported in the scaffold.
+Use Apache License, Version 2.0 for original JeiOS project code. The unmodified
+license text is in ../../LICENSE. Source files use the Apache-2.0 SPDX identifier.
+This records the owner's explicit choice, not a license inferred from GitHub
+visibility. Existing third-party work is never relicensed by this decision.
 
-Before accepting external contributions/imports, the owner should choose the
-project license and contributor policy. Record per-component provenance and
-terms. Linux GPL code, permissive BSD code, ReactOS components, userspace
-libraries, GPU firmware and proprietary driver interfaces require specific
-review; architectural resemblance does not determine license compatibility.
+Contributors must have authority to submit their work under these terms and
+preserve accurate notices. No copyright assignment or separate CLA is introduced.
+Maintain per-component provenance, exact license/build versions and required
+notices/source distribution. Preserve applicable NOTICE material when importing
+components; do not fabricate attribution or claim ownership of upstream work.
+
+Apache-2.0 provides copyright and contributor patent grants subject to its terms.
+It does not confer unrelated codec patent, firmware or proprietary SDK rights.
+Review dependencies and actual linking/distribution arrangements individually.
+Separate processes are an architectural boundary, not an automatic legal ruling.
+
+FFmpeg, HandBrake and Blackmagic RAW integration remains planned; each keeps
+its applicable upstream terms. See ../ACCELERATORS.md. No external kernel source,
+codec or SDK is imported by this change.
+
+Primary source: https://www.apache.org/licenses/LICENSE-2.0

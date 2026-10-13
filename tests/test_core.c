@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -39,3 +40,4 @@ int main(void)
     puts("core tests: PASS (feature prerequisites, fail-closed selection, reverse rollback)");
     return 0;
 }
+

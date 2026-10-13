@@ -1,111 +1,228 @@
-# Agent handoff: initial scaffold
+# Agent handoff: M1/M2 kernel foundation
 
-Date: 2026-10-12. Owner project: `auto44e/jeios`. Stage: M0.
-Read AGENTS.md, DESIGN.md and ROADMAP.md before continuing.
+Updated: 2026-10-13. Project `auto44e/jeios`; branch `develop/m1-m2-core`.
+Read AGENTS.md, IMPLEMENTATION.md, ROADMAP.md and the relevant DESIGN.md sections.
+Start with [AGENT_START.md](AGENT_START.md) for the consolidated requirements and
+linked work queue. Foundation PR #1 must be checked before choosing main as a base.
+The previous M0 state is preserved in git history; this file describes the latest
+branch implementation. Do not infer future capabilities from design prose.
 
-## Owner intent to preserve
+## Owner intent
 
-Fresh C kernel and OS core. Modular construction, qualified modern CPU/GPU
-support with an early 64-bit compatibility goal, graceful failures, privacy and
-security inspired by GrapheneOS/CalyxOS, future mobile/IoT profiles, verbose
-continuation documentation. Earlier product intent: NT-inspired service/object
-organization; macOS-inspired coherence; native framework with Linux-style ricing;
-per-area complexity independent of authority. No existing kernel source fusion.
+Fresh C kernel/core; modularity; modern hardware with an early AMD64 compatibility
+path; graceful failures; GrapheneOS/CalyxOS-inspired security/privacy; eventual
+mobile/IoT; NT-inspired object/service organization; macOS-inspired coherence;
+Linux-style ricing and independent per-area UI complexity. Keep detailed records
+for future agents. No existing kernel-source fusion. Owner explicitly selected Apache-2.0 on 2026-10-13.
 
-## Actual implementation
+## Implemented and tested
 
-| Component | State | Evidence / limitations |
+| Gate / component | Actual behavior | Boundary |
 | --- | --- | --- |
-| AMD64 Multiboot2 entry | Implemented | Assembly enters C in long mode; first GiB temporary identity map |
-| Kernel console | Implemented | COM1, bounded polling; missing UART is optional |
-| CPU feature helper | Implemented and host-tested | Intersects hardware/OS/policy; does not enable registers |
-| NX | Detection only | CPUID presence printed; page-table enforcement not implemented |
-| Static module init | Implemented and host-tested | Prevalidation and reverse rollback; no dynamic loading/isolation |
-| Status contract | Implemented and host-tested | Distinct failures; no stable external ABI yet |
-| ELF validation | Implemented and tested | Header, target, entry/load bounds, no runtime unresolved symbols |
-| QEMU smoke | Executed and passed | C entry, NX presence line, successful initialization and intentional halt observed |
-| CI | Configured | Same checks plus QEMU; remote execution must be observed separately |
-| Kernel/runtime isolation | Absent | No IDT, scheduler, allocator, process, handle table, IPC, DMA isolation |
-| Devices / UI / other ISAs | Absent | No storage, network, GPU, desktop, ARM port, mobile or IoT implementation |
+| M1a exceptions | 256 IDT gates, normalized frames, TSS/IST for DF/NMI, bounded fatal diagnostics | Kernel faults halt; no user recovery |
+| M1b boot context | Bounded Multiboot2 memory/module parser, reserved ranges, no retained loader pointers | Rejects overlapping maps; 128 records, 40 reservations |
+| M1b page protection | New 4 KiB mappings, CR0.WP, NX where present, code/rodata read-only, guard pages | Early bootstrap still temporary RWX; later mappings are supervisor-only |
+| M2 physical pages | First-fit contiguous extents, exact free validation and reservation exclusion | First GiB only; <=256-page allocation; caller serialization |
+| M2 heap | 64 allocation records, <=1 MiB/object, zero-on-allocation and failure rollback | Page-granular; no slab/quarantine/generation safety |
+| M2 execution | PIC/PIT IRQ0, eight slots including idle, seven guarded kernel workers | One CPU, CPL0, round-robin; no SIMD context or priorities |
+| M2 lifecycle | Yield, tick sleep, exit and safe stack reclamation from bootstrap | No general wait queues, cancellation or SMP locks |
+| Runtime checks | All GPRs, timer preemption, sleeps, retained heap bytes and page accounting | Self-test workload then halt, no application manager |
 
-The `policy-placeholder` module has no security behavior. Do not infer any
-protection from its name. Modules are caller-owned static descriptors with no
-runtime state tracking; they are intended to start once, not provide restart or
-reentrancy semantics. C helpers are reusable policy mechanics, not a complete
-hardware detector or supervisor.
+## Verification performed locally
 
-## Verification record
+- `ASAN_OPTIONS=detect_leaks=0 make check`: PASS with GCC 13.3.0 and binutils 2.42.
+  Leak inspection is unavailable in this managed environment; ASan/UBSan remain
+  active. Parser includes 20,000 mutations and truncated heap buffers. Allocation
+  tests include exhaustion, fragmentation, exact frees, zeroing and rollback.
+- Normal QEMU boot: PASS with NX, 128 MiB, all seven workers completing/reaped.
+- NX-absent boot: PASS, including explicit weaker profile reporting.
+- Low-memory (16 MiB, NX absent) and large-memory (1536 MiB, first-GiB clipping)
+  profiles: PASS locally; both run the full seven-worker workload and are
+  included in CI.
+- `make integration`: seven real CPU fault cases pass with exact vector/error
+  pairs, including stack exhaustion -> double fault on the emergency IST.
+- ELF checks validate AMD64, Multiboot2, entry/load limits, separate segment flags
+  and no unresolved runtime dependencies. Hardware permission tests are separate.
+- GCC `-fanalyzer` with warnings as errors over every kernel C source: PASS.
+- Python syntax, relative documentation links and `git diff --check`: PASS.
+- No real-machine, ARM, GPU, userspace security or application ABI testing.
 
-- Host: x86-64 Linux; GCC 13.3.0; GNU binutils ld 2.42.
-- `make check`: PASS, freestanding kernel linked; core tests executed with UB
-  sanitizer; ELF structural checks passed.
-- `python3 -m py_compile tools/*.py`: PASS.
-- `git diff --cached --check`: PASS during initial review.
-- Boot: PASS using QEMU 8.2.2, GRUB 2.12 and xorriso 1.5.6. The ISO was built
-  with the repository recipe; `tools/smoke.py build/jeios.iso` observed both C-entry
-  and initialization markers plus NX-present reporting, with no fatal marker.
-  Emulator halt was intentional. This is execution evidence, not just an ELF build.
-- Local environment note: system package installation was unavailable. Packages
-  were downloaded and extracted outside the repository; PATH/library/module/data
-  overrides selected those tools. Initial QEMU attempts lacked its relocated
-  module/BIOS paths; correcting the tool paths produced the successful smoke test.
-  These environment overrides are not project source dependencies or committed
-  binaries. A normally installed toolchain uses `make smoke` directly.
-- Legacy-path check: PASS with `tools/smoke.py build/jeios.iso --cpu qemu64,-nx
-  --expect-nx absent`; the NX-absent line and successful halt were observed.
-  Both CPU profiles are configured in CI.
-- Initial GitHub run passed core/ELF checks but failed ISO creation because GRUB
-  auto-selected extra EFI modules on the runner and attempted to invoke missing
-  `mformat`. The Makefile now explicitly selects the BIOS i386-pc module directory
-  via `GRUB_PC_DIR`, matching the documented M0 platform.
-- Follow-up GitHub CI: PASS for code commit
-  `23900ff6dd408205064b4ec0cacd66de64ff18e3`. Core/ELF, ordinary QEMU boot,
-  and NX-absent legacy-profile checks all completed successfully. Evidence:
-  https://github.com/auto44e/jeios/actions/runs/38313541117
-  This handoff-only evidence update changes no tested code or build recipe.
-- No real-machine, AArch64, GPU, security, compatibility ABI, or mobile tests.
+Emulation tools are the previous extracted QEMU 8.2.2 / GRUB 2.12 / xorriso 1.5.6
+under `/tmp/jeios-tools`, with wrappers in `/tmp/jeios-bin`. Local commands use
+PATH, LD_LIBRARY_PATH and QEMU_MODULE_DIR for relocation plus
+`GRUB_PC_DIR=/tmp/jeios-tools/usr/lib/grub/i386-pc`. These transient paths are not
+repository dependencies. Normal installed tools use DEVELOPMENT.md commands.
 
-## Build and layout
+## Published verification evidence
 
-`make check`; `make smoke` with GRUB/xorriso/QEMU dependencies. See DEVELOPMENT.md.
-Do not use host-specific baseline compiler flags. Outputs stay in ignored build/.
-Entry is 32-bit code in an ELF64 image; linker keeps the header within the first
-32 KiB and below the mapped range. GRUB supplies protected mode/A20 and loads
-segments including zero-initialized BSS. Bootstrap stack top is 16-byte aligned;
-C call follows the AMD64 SysV ABI. SIMD use is disabled until state management.
+Implementation commit `96d4dee037389e7b30132ad8fd7425c80a90ea1d` passed both
+GitHub push and pull-request CI, including default sanitizer checks, normal and
+NX-absent boots, 16/1536 MiB profiles and every fault-injection case.
 
-## Known hazards
+- Pull request: https://github.com/auto44e/jeios/pull/1
+- PR verification: https://github.com/auto44e/jeios/actions/runs/38317024232
+- Branch verification: https://github.com/auto44e/jeios/actions/runs/38316970273
 
-1. No IDT: unexpected exceptions can triple fault. Interrupts stay disabled.
-2. First GiB map is RWX supervisor memory, not a validated RAM ownership map.
-3. NX is never enabled; ELF segment flags do not establish runtime W^X.
-4. No boot information parsing. Pointer is intentionally not dereferenced.
-5. No allocation or device probing beyond development COM1/CPUID.
-6. Serial polling count is bounded but is not a time-based deadline.
-7. No current recovery from kernel faults, signing, trust chain or cryptography.
-8. Licensing remains owner-pending. Do not import external kernel/driver code.
-9. CI configuration is not observed CI evidence; runner dependencies are unpinned.
+This subsequent handoff-only evidence update changes no tested implementation.
+Check the current PR checks when continuing; never substitute a local PASS for
+observed remote execution, or the original M0 checks for these new phase gates.
 
-## Next task: M1a exceptions
+## Critical implementation contracts
 
-Implement IDT/trap stubs and a bounded diagnostic path. Specify the trap frame,
-register preservation, stack alignment, privilege transition fields and error
-code distinctions. Keep interrupts disabled until handlers and controller setup
-are ready. Include a dedicated stack for double-fault handling when its TSS setup
-is correct. Distinguish safe deliberate test faults from arbitrary corruption.
+- Boot/main context has interrupts disabled through map/allocator/thread creation.
+  IRQ0 is unmasked/programmed only after scheduler state and stacks are ready.
+- Handler entry preserves 15 GPRs; IRETQ restores the full 64-bit hardware frame.
+  Never use SSE/AVX/FPU in this kernel before context management exists.
+- Page tables describe only known complete RAM pages above 1 MiB and below 1 GiB.
+  Boot, image, modules and low memory remain reserved by the allocator. Loader
+  tables are copied before paging changes, and never dereferenced afterward.
+- `je_pages`/`je_heap` portable functions are not internally thread-safe. Kernel
+  wrappers use interrupt exclusion on the BSP. IRQ handlers must not allocate.
+- Thread stacks are zeroed before guarding. An exited thread must never free its
+  own live stack. Bootstrap remaps guards and frees only zombie stacks after all
+  workers are done. Never free a stack still referenced by a scheduler frame.
+- Sleep sets state under interrupt exclusion before the software scheduling
+  interrupt. Idle checks readiness with interrupts off before adjacent STI/HLT.
+- A fault kernel uses its own `build/N/` tree. Do not accidentally boot it as the
+  normal image, and do not treat any timeout as proof of successful containment.
 
-Pass criteria: ordinary `make smoke` still observes both success markers;
-a separate fault-injection build/test observes the expected exception and halt
-rather than reset/triple fault; trap-frame fields match architecture semantics.
-Run emulator tests; hosted tests cannot validate CPU trap entry.
+## Known limitations and hazards
 
-Then M1b: validated Multiboot2 memory-map parsing and reserved-range tracking.
-Use mapped-range/length checks before memory reads. Add malformed-tag, overflow,
-stride, overlap and truncated-input tests. Only then implement M2 allocation.
+No process boundary, handle/capability enforcement, secure boot, cryptography,
+secure entropy, stack canaries, heap quarantine, KASLR, userspace copy recovery,
+SMP, APIC, IOMMU, device lifecycle, filesystem, networking, GPU or desktop. The
+remaining protection goals in DESIGN.md are future requirements. Heap pointers
+can become stale after address reuse; no temporal safety is promised. One-page
+stack guards do not catch arbitrary stack jumps. Large allocator scans/zeroing
+occur with interrupts disabled and have no hard real-time latency guarantee.
 
-## Unresolved decisions
+Legacy PIC/PIT support is qualified only in the tested PC emulator profiles.
+Unexpected IRQs/NMIs are fatal; broader spurious IRQ and platform fault handling
+remain future work. The memory map is conservatively rejected if ranges overlap.
+No RAM above 1 GiB is used even on larger systems. All seven workers are trusted
+kernel threads in one address space. Never call them isolated processes/apps.
 
-Owner distribution license, exact hardened hardware minimum, actual old-PC
-minimum RAM/support list, native ABI layouts, service placement benchmarking,
-UI toolkit/compositor strategy, and phone/GPU vendor targets. These are documented
-questions, not blockers to M1a. Record future decisions in ADRs.
+## Next bounded work: M3a userspace boundary
+
+Start a new implementation branch from the latest PR head, or updated main after
+merge; do not assume main already contains this work. Specify user/kernel address
+layout, user code/data/stack mapping rights, private kernel stacks, TSS RSP0,
+entry/return state, and copy-in/copy-out fault semantics before adding syscalls.
+Keep CPU feature exposure restricted to state the scheduler preserves. Add a
+small checked ELF loader or a deliberately bounded built-in user image, not a
+large application compatibility layer at the same time.
+
+Acceptance: two actual CPL3 tasks with distinct page tables run; a user task's
+illegal access terminates only that task; kernel/other-task memory stays protected;
+malformed syscall pointers cannot panic the kernel; argument lengths/overflows
+are tested; no raw kernel pointer ABI. Add explicit handle rights, generation
+and lifetime contracts in M3b, then bounded IPC in M3c. General wait queues/locks,
+stack-canary/entropy planning and spurious interrupt handling need review before
+calling M3 hardened. Do not jump straight to desktop, GPU or phone support.
+
+## Open decisions
+
+Hardened hardware baseline; actual old-PC support;
+stable native ABI; toolkit/compositor strategy; service placement measurements;
+and vendor GPU/phone targets. No external kernel source has been imported.
+
+## Requirements addendum: 2026-10-13
+
+Owner requested configurable init, PQ end-to-end encryption with honest RAM
+protection, nearby device sharing and a filesystem recommendation. Added INIT.md,
+ENCRYPTION.md and STORAGE.md; linked DESIGN.md, SECURITY.md, ROADMAP.md and README.
+All are proposed contracts. Kernel implementation and next gate M3a are unchanged.
+Ext4 is the first persistent candidate, not a completed driver or final production
+default. Btrfs/OpenZFS remain evaluation options. No external source was imported.
+
+Outstanding decisions at that point (license since resolved by ADR 0005): exact crypto protocol/library and entropy
+source; hardware memory-protection qualification; init schema and numeric limits;
+ext4 feature profile and writable-backend feasibility; storage encryption format.
+Do not mistake illustrative service manifests for an implemented interface.
+
+Validation for this docs-only change: `ASAN_OPTIONS=detect_leaks=0 make check`,
+relative Markdown link validation and `git diff --check` passed locally. No boot
+code changed, so emulator tests were not repeated locally. Prior kernel execution
+evidence remains scoped to the earlier code; check the current PR for remote CI.
+
+## Identity and storage expansion: 2026-10-13
+
+Owner added local-to-fleet user/device management, E2E sync, multiple pairing
+methods, family/multi-user isolation, raw disk access without formatting and
+broad filesystem interoperability. Ext4 is now owner-approved as the provisional
+starting OS filesystem default, still unimplemented and not production-qualified.
+
+Added IDENTITY.md and expanded STORAGE.md. Updated DESIGN, ENCRYPTION, INIT,
+SECURITY, ROADMAP and README links/contracts. No kernel behavior changed; next
+bounded implementation task remains M3a. Management authority does not imply a
+personal-data key grant, but privileged endpoint control remains a trust limit.
+Persistent file-like raw-disk views require metadata in RAM, a sidecar or an
+explicitly initialized region; never silently format or write unknown media.
+
+New open decisions: principal/session ABI, recovery and PQ group protocol,
+membership consistency, enrollment/federation profiles, fleet policy precedence,
+raw block lease/alias tracking and sidecar format, exact supported filesystem
+versions/features. Future agents must qualify each format's writes separately.
+Validation: `ASAN_OPTIONS=detect_leaks=0 make check`, relative Markdown link
+validation and `git diff --check` passed locally. No boot code changed; emulator
+tests were not repeated. Remote checks must be observed separately on the PR.
+
+## Explicit domain and Group Policy requirements: 2026-10-13
+
+Added DOMAINS.md and links from README, IDENTITY, DESIGN and ROADMAP. Native
+domain services and Microsoft AD DS interoperability are distinct targets.
+The design covers join/leave/recovery, policy inheritance and precedence,
+delegation, effective-policy reporting, offline expiry and compatibility gates.
+No runtime implementation or outside directory modification occurred. Open ADRs:
+policy composition/order, directory consistency, enrollment trust and exact AD/GPO
+compatibility matrix. Next bounded kernel task remains M3a.
+
+Local validation: `ASAN_OPTIONS=detect_leaks=0 make check`, Markdown relative-link
+validation and `git diff --check` passed. Docs-only; no new boot tests required.
+Remote CI status must be observed independently on the PR.
+
+Owner clarification in the same work session: domain interoperability includes
+macOS and Linux. Expanded DOMAINS.md with provider/endpoint directionality,
+Samba AD and FreeIPA/LDAP/Kerberos evaluation, platform adapters and a tested
+feature matrix requirement. No automatic cross-platform GPO compatibility claim.
+Repeated local checks and documentation validation passed for this clarification.
+
+## Apache-2.0 and accelerator/media requirements: 2026-10-13
+
+Implemented documentation/license change: owner selected Apache-2.0. Added the
+official LICENSE, original-source SPDX notices, updated ADR 0005, contributor
+instructions and previously pending-license references, including STORAGE.md.
+Added M3A.md (proposal only) and ACCELERATORS.md; linked README, DESIGN, ROADMAP,
+HARDWARE and SECURITY. No executable behavior, codec, driver or SDK was added.
+
+Planned: open-standards-first GPU/NPU APIs across qualified platforms; configurable
+conservative offload policy; userspace FFmpeg, HandBrake and BRAW integration.
+Blocked pending later prerequisites: native drivers/runtime, buffer/DMA isolation,
+CPU extended-state support, vendor SDK feasibility and component license review.
+Next bounded kernel gate remains M3a; see M3A.md for proposed pass/fail criteria.
+Its API/layout/profile choices remain recommendations, not owner-approved ABI.
+
+Validation observed locally: plain `make check` built successfully and passed core
+tests, then LeakSanitizer failed because process/thread inspection is unavailable.
+`ASAN_OPTIONS=detect_leaks=0 make check` passed core, boot-parser mutation corpus,
+allocator and ELF checks; address/undefined-behavior checks remained enabled.
+Relative Markdown links and `git diff --check` passed. Source changes are license
+comments only; emulator tests were not rerun locally. New remote CI is separate
+from this local evidence and must be checked on the published head.
+
+## Consolidated coding-agent handoff: 2026-10-13
+
+Added AGENT_START.md with the complete requirements map, issues #2–#9, dependency
+order, proposed-versus-decided distinctions and sustained checkpoint rules.
+Updated AGENTS, README, ROADMAP, DEVELOPMENT and IMPLEMENTATION entry points.
+No runtime changes or new subsystem implementations. M3a remains next.
+
+Observed remote evidence: Apache/design commit
+`0e46993e480c075f2396015174d69d59dc6e7b37` passed PR CI run
+https://github.com/auto44e/jeios/actions/runs/38390326429 .
+This is prior-head evidence, not a claim about the subsequent docs-only head.
+
+Local verification for this handoff: `ASAN_OPTIONS=detect_leaks=0 make check`,
+relative Markdown links and `git diff --check` passed. No boot behavior changed,
+so emulator tests were not repeated locally. Verify new remote CI separately.
+Project-ready issues exist; board membership requires a separate verified action.

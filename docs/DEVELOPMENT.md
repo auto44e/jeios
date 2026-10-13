@@ -1,95 +1,118 @@
-# Build and verification
+# Build, fault injection and verification
 
-## Host requirements
+Coding-agent continuation: [AGENT_START.md](AGENT_START.md) maps owner requirements,
+current baseline and linked issue dependencies. Future designs remain unimplemented.
 
-Use an x86-64 Linux development host. Current Makefile invokes GNU GCC and GNU ld;
-it is not a cross-platform or cross-ISA build system yet. C11, binutils (`ld`,
-`nm`), make, and Python 3 are required. Hosted tests link the GCC UB sanitizer.
-No third-party source dependency is downloaded by the Makefile.
 
-On Ubuntu/Debian with authorized local package administration:
+## Host and dependencies
+
+Use an x86-64 Linux host with GNU GCC/binutils, make and Python 3. This is not yet
+a cross-ISA toolchain. Hosted parser/allocator tests require GCC ASan and UBSan.
+No third-party source is downloaded by the Makefile.
 
 ```sh
 sudo apt-get update
 sudo apt-get install gcc binutils make python3 grub-pc-bin grub-common xorriso qemu-system-x86
-```
-
-## Core checks
-
-```sh
 make check
+make smoke integration
 ```
 
-This builds `build/jeios.elf`, executes portable core tests with undefined-behavior
-checks, and verifies ELF64 AMD64 metadata, the Multiboot2 header/checksum/end tag,
-entry placement, load flags and absence of unresolved symbols. Baseline flags
-exclude SIMD register use and the red zone. Debug information is enabled.
+`make check` builds the normal ELF, runs core policy/module tests, parser tests
+(including 20,000 deterministic mutations), allocator tests and ELF structural
+checks. `make smoke` makes a BIOS ISO and observes the normal kernel workload.
+`make integration` builds independent fault kernels and requires exact CPU vector/
+error evidence. Failure or timeout does not count as passing.
 
-Hosted tests exercise feature prerequisites and no partial enablement on failure,
-reverse-order cleanup, failed-init ownership, empty/invalid module lists,
-prevalidation before side effects, and stable status naming. They do not prove
-correctness of privileged instructions or exception isolation. The ELF check is
-structural, not boot evidence or runtime W^X enforcement.
+The ISO recipe explicitly selects `GRUB_PC_DIR` (default
+`/usr/lib/grub/i386-pc`); installed EFI modules cannot silently change its type.
+A relocated GRUB toolchain can override that variable. No EFI boot promise is made.
 
-## Actual boot test
+## Build outputs and normal execution
 
-```sh
-make smoke
-```
+Normal artifacts: `build/0/jeios.elf`, `build/0/jeios.iso`. Test mode N uses
+`build/N/`, preventing stale injected-fault objects from entering a normal build.
+Run `make clean` when changing compiler/target flags. Baseline objects use
+`-march=x86-64`, no red zone and no SIMD/FPU register generation.
 
-`make iso` first requires GRUB to recognize Multiboot2, stages the ELF and GRUB
-config, and builds `build/jeios.iso` with xorriso. The recipe explicitly selects
-`GRUB_PC_DIR` (default `/usr/lib/grub/i386-pc`) to build the M0 BIOS image;
-extra EFI modules on a development host do not change the image type. `tools/smoke.py` boots QEMU with
-`pc`, `qemu64`, 128 MiB, no NIC and no display; serial goes to the terminal. It
-waits up to 12 seconds, then requires C-entry and successful initialization
-markers with no fatal marker. Intentional halt means a timeout alone is never
-success. QEMU can be terminated after the success marker; the harness bounds it.
-
-Expected serial output includes:
+The successful normal workload prints these milestones (addresses/counts vary):
 
 ```text
-JeiOS M0: entered C kernel
-CPU: NX present (not enabled in M0)
-JeiOS M0: initialization complete; halted
+JeiOS: entered C kernel
+M1: traps ready
+M1: boot map validated; reservations ready
+CPU: NX enforced
+M1: protected mappings and stack guards ready
+M2: allocator ready; free pages=...
+M2: seven guarded threads ready; enabling PIT
+M2: preemption/GPR/sleep/heap checks passed; ticks=...
+M2: exited threads reaped; page accounting restored
+JeiOS: initialization complete; halted
 ```
 
-NX-absent CPUs have the explicit legacy line. This is presence reporting only.
-To reproduce the legacy-path check after building the ISO:
+`CPU: legacy profile, NX absent` replaces the NX line on the legacy profile.
+The harness terminates QEMU after verified terminal evidence. The kernel normally
+halts itself with interrupts disabled; there is no shell or persistent runtime.
+
+## Platform profiles
+
+After `make iso`:
 
 ```sh
-python3 tools/smoke.py build/jeios.iso --cpu qemu64,-nx --expect-nx absent
+python3 tools/smoke.py build/0/jeios.iso --expect-nx present
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --expect-nx absent
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M --expect-nx absent
+python3 tools/smoke.py build/0/jeios.iso --memory 1536M --expect-nx present
 ```
-The smoke test uses emulation, not KVM, so it does not require host virtualization.
-It does not validate BIOS/UEFI diversity, actual old PCs, ARM, drivers or sandboxing.
 
-## Manual inspection and debugging
+The large-memory profile tests clipping: the implementation manages only RAM below
+1 GiB. The 16 MiB profile is emulator evidence, not a certified minimum real-PC
+specification. QEMU uses one CPU, emulation rather than KVM, no NIC, no display
+and serial stdout. The harness allows 15 seconds for terminal evidence and bounds
+emulator cleanup separately. A stalled PIT fails via the harness; no kernel
+watchdog exists yet.
+
+## Fault matrix
+
+| Mode | Injection | Required vector/error | Mechanism exercised |
+| --- | --- | --- | --- |
+| 1 | UD2 | #UD 6 / 0 | No-error-code exception frame |
+| 2 | Out-of-table GDT selector 0x28 | #GP 13 / 0x28 | CPU error-code frame |
+| 3 | #PF with absent #PF gate | #DF 8 / 0 | TSS emergency stack before new mappings |
+| 4 | Write kernel code | #PF 14 / 3 | Read-only supervisor mapping and CR0.WP |
+| 5 | Read bootstrap guard | #PF 14 / 0 | Absent guard mapping |
+| 6 | Execute writable data | #PF 14 / 17 | NX instruction-fetch protection |
+| 7 | Push through exhausted bootstrap stack | #DF 8 / 0 | Emergency stack after guard enforcement |
+
+For a single diagnostic build: `make iso TEST_MODE=7`. The normal smoke script
+expects successful initialization and intentionally rejects a fault image; use
+`tools/integration.py` or the `boot()` helper in `tools/emulator.py` with the
+appropriate expected terminal/vector. Mode 6 requires NX-capable emulation.
+
+## Debugging
 
 ```sh
-readelf -h -l build/jeios.elf
-nm -u build/jeios.elf
-objdump -d build/jeios.elf
-qemu-system-x86_64 -cdrom build/jeios.iso -m 128M -display none -serial stdio -monitor none -no-reboot -no-shutdown -nic none -s -S
+readelf -h -l build/0/jeios.elf
+nm -u build/0/jeios.elf
+objdump -d build/0/jeios.elf
+qemu-system-x86_64 -cdrom build/0/jeios.iso -m 128M -display none -serial stdio -monitor none -no-reboot -no-shutdown -nic none -s -S
 ```
 
-The last command starts paused with a development GDB stub. Attach locally with
-`gdb build/jeios.elf`, then `target remote localhost:1234`. Do not expose the GDB
-port remotely. Before long-mode entry the machine is executing 32-bit code in an
-ELF64 image; debugger disassembly mode must match the current execution state.
+Attach locally with `gdb build/0/jeios.elf` and `target remote localhost:1234`.
+The entry bridge initially executes 32-bit instructions in an ELF64 image;
+disassembler mode must match the current execution state. Do not expose the
+unauthenticated development debugger remotely.
 
-## CI
+## Sanitizers and CI
 
-`.github/workflows/ci.yml` runs the same core/ELF and QEMU smoke checks on Ubuntu
-24.04. Its job installs tools and does not upload binaries, publish releases, or
-hold signing keys. Dependency installation and the hosted runner image are not
-pinned reproducible build inputs. Pin toolchain and action revisions before a
-production supply-chain claim. See HANDOFF for checks actually observed this turn.
+CI runs full default sanitizer settings, builds/boots both CPU profiles, low/large
+memory profiles, and all seven fault modes. Local managed environments which deny
+LeakSanitizer thread inspection may use `ASAN_OPTIONS=detect_leaks=0 make check`.
+This disables only leak scanning; ASan memory-access and UBSan checks remain.
+Such a local exception must be recorded in the handoff. Never globally suppress
+sanitizer errors to get a passing check.
 
-## Known bootstrap limitations
+CI dependencies/runner images are not a pinned reproducible supply chain yet.
+Successful tests do not prove secure boot, process isolation, arbitrary hardware
+compatibility, or complete memory safety. See IMPLEMENTATION.md for exact caller,
+lifetime, interrupt and memory limits.
 
-Identity-map first GiB; no validated RAM map; no allocator; no IDT; interrupts
-masked; only BSP; no SMP; ring 0 only; temporary RWX mappings; development COM1
-only; no framebuffer, UEFI-specific entry, disks, network, secure boot, dynamic
-module loader or AArch64 path. Unexpected faults can triple fault. A serial
-iteration limit is not a monotonic time deadline. Do not expand device support
-before trap/memory milestones.

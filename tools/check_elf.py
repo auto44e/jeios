@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Validate bootstrap metadata, ELF target, and absence of runtime dependencies.
 This is a structural check, not evidence that the CPU can boot this image.
 """
@@ -18,7 +19,7 @@ h = struct.unpack_from("<4I", data, off)
 assert h[1] == 0 and h[2] == 24 and sum(h) % (1 << 32) == 0, "bad header"
 assert data[off+16:off+24] == struct.pack("<HHI", 0, 0, 8), "bad end tag"
 assert not subprocess.check_output(["nm", "-u", str(p)]).strip(), "undefined symbols"
-# Program headers carry separate RW/RX flags; M0 page tables still map RWX.
+# Segment flags are checked here; QEMU fault tests verify hardware enforcement.
 phoff = struct.unpack_from("<Q", data, 32)[0]
 phsize, phnum = struct.unpack_from("<HH", data, 54)
 entry = struct.unpack_from("<Q", data, 24)[0]
@@ -32,3 +33,4 @@ for i in range(phnum):
         executable_entry |= bool(flags & 1 and vaddr <= entry < vaddr + memsz)
 assert executable_entry, "entry must be in executable load segment"
 print("ELF checks: PASS (AMD64, Multiboot2, entry, segments, no undefined symbols)")
+

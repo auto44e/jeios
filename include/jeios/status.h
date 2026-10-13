@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef JEIOS_STATUS_H
 #define JEIOS_STATUS_H
 /* Internal status values, not yet a stable userspace ABI. Never discard errors. */
@@ -7,3 +8,4 @@ typedef enum {
 } je_status;
 const char *je_status_name(je_status status);
 #endif
+

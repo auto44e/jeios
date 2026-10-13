@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /* Multiboot2 enters 32-bit protected mode. This small assembly bridge is
  * necessary even though the OS core is C. Bootstrap identity maps the first
  * GiB with 2 MiB RWX supervisor pages. Replace these mappings in milestone M1.
@@ -101,7 +102,10 @@ pdpt: .skip 4096
 pd: .skip 4096
 saved_magic: .skip 4
 saved_info: .skip 4
-.balign 16
+.balign 4096
+.global je_boot_guard
+je_boot_guard: .skip 4096
 stack_bottom: .skip 32768
 stack_top:
 .section .note.GNU-stack,"",@progbits
+

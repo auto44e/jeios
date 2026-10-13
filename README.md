@@ -3,53 +3,61 @@
 JeiOS is an experimental operating system with a fresh C kernel. Its design
 combines Unix interoperability, an NT-inspired object/service model, and an
 integrated, deeply customizable desktop. Privacy, explicit authority, recoverable
-operations, and hardware feature negotiation are foundational goals.
+operations and qualified hardware support are long-term goals.
 
-**Current stage: M0 scaffold.** The source builds an AMD64 Multiboot2 ELF with a
-32-bit-to-64-bit entry bridge, development serial output, static initialization
-rollback, and pure capability selection helpers. It is not a usable or secure OS.
-There are no processes, interrupts, allocator, filesystem, graphics, dynamic
-modules, Linux/BSD/Windows compatibility, or ARM implementation yet.
+**Current stage: M1/M2 single-CPU kernel foundation.** The AMD64 BIOS prototype
+boots, handles fatal CPU exceptions, validates Multiboot2 memory information,
+enforces read-only/NX mappings where supported, allocates RAM, and preemptively
+runs seven guarded kernel threads. Its diagnostic workload verifies registers,
+sleep/wakeup, heap contents and resource reclamation, then halts.
+
+There is no userspace, application sandbox, SMP, filesystem, graphics, networking,
+dynamic module loader or ARM implementation. This is not a daily-use or hardened OS.
 
 ## Start here
 
-- [Detailed design](docs/DESIGN.md): architecture, contracts, alternatives, and acceptance criteria.
-- [Hardware policy](docs/HARDWARE.md): baseline versus optional hardware features.
-- [Security and privacy](docs/SECURITY.md): threat boundaries, degraded operation, and limitations.
-- [Development](docs/DEVELOPMENT.md): exact build, emulation, and verification commands.
+Coding agents: begin with [the starting guide](docs/AGENT_START.md) for the current
+baseline, all owner requirements, issue dependencies and checkpoint rules.
+
+- [Detailed design](docs/DESIGN.md): full product architecture and future contracts.
+- [M3a implementation proposal](docs/M3A.md): proposed boundaries and M3b/M3c contracts.
+- [Accelerators and media](docs/ACCELERATORS.md): open standards, conservative offloading,
+  and planned FFmpeg/HandBrake/Blackmagic RAW integration; no runtime support yet.
+- [Init/service design](docs/INIT.md), [encryption and nearby sharing](docs/ENCRYPTION.md),
+  and [filesystem recommendation](docs/STORAGE.md): planned contracts and acceptance gates.
+- [Identity and device management](docs/IDENTITY.md): local login, E2E sync, family and fleet contracts.
+- [Domains and centralized policy](docs/DOMAINS.md): native joining and separate AD/GPO compatibility targets.
+- [Implementation ledger](docs/IMPLEMENTATION.md): current M1/M2 mechanisms, evidence and limits.
+- [Hardware policy](docs/HARDWARE.md) and [security model](docs/SECURITY.md).
+- [Development](docs/DEVELOPMENT.md): build, emulator tests and fault modes.
 - [Roadmap](docs/ROADMAP.md): gated milestones and dependency order.
 - [Agent handoff](docs/HANDOFF.md) and [AGENTS.md](AGENTS.md): continuation instructions.
-- [References](docs/REFERENCES.md): primary sources and limits of borrowed concepts.
+- [References](docs/REFERENCES.md): primary architecture sources.
 
-## Build
+## Build and verify
 
-On an x86-64 Linux host with GCC, binutils, make, and Python 3:
+On x86-64 Linux with GCC, binutils, make and Python 3:
 
 ```sh
 make check
 ```
 
-With GRUB PC utilities, xorriso, and QEMU installed:
+With GRUB PC utilities, xorriso and QEMU installed:
 
 ```sh
-make smoke
+make smoke integration
 ```
 
-Outputs are under `build/`. See DEVELOPMENT.md for dependencies and what these
-checks do and do not prove. Early page tables are deliberately temporary RWX
-supervisor mappings. Do not install this image on a machine holding valuable data.
+Normal outputs are in `build/0/`; each fault mode uses a separate directory.
+See DEVELOPMENT.md for sanitizer requirements, CPU/memory profiles and limitations.
 
-## Project decisions
+The OS core uses C11 with small architecture-specific assembly bridges. Early
+AMD64 is the first compatibility target; AArch64 requires a separate port.
+Modern features are enabled only after their OS prerequisites are implemented.
+The desktop, native SDK, privacy controls and mobile/IoT ecosystem remain planned.
 
-The kernel and OS core use C11 with small architecture-specific assembly bridges.
-The initial PC target is early AMD64, not every historical 64-bit ISA. AArch64 and
-later RV64 need independent ports and platform drivers. Modern acceleration is
-optional and advertised only when the OS can safely enable and preserve it.
+Original JeiOS code is licensed under [Apache License 2.0](LICENSE), selected by
+the owner on 2026-10-13. Third-party components retain their own licenses and
+require provenance/compatibility review. No external kernel source has been
+imported. See [the licensing decision](docs/adr/0005-licensing.md).
 
-The native desktop will have consistent interaction and accessibility contracts,
-public theming/composition APIs, replaceable shells, and per-area complexity
-settings independent of administrative permissions. These are planned features.
-
-Licensing is **pending owner selection**. No external kernel code has been
-imported and no permissive or copyleft license is implicitly selected. See
-`docs/adr/0005-licensing.md` before accepting third-party contributions.

@@ -25,3 +25,7 @@ and revision dates in their ADRs or code comments. The broad manuals above are
 reference entry points, not evidence that every planned detail was researched
 or validated against every CPU stepping. Recheck features and platform support
 before implementing any optional extension.
+
+Implementation-specific references for M1/M2 are in IMPLEMENTATION.md, including
+Intel's 64-bit interrupt/TSS/IRET contracts and legacy PIC/PIT registers, plus the
+GNU Multiboot2 memory-map/module format. No reference implementation was copied.

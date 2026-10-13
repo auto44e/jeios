@@ -1,10 +1,25 @@
 # JeiOS system design
 
-Version: 0.1, 2026-10-12. Status: architecture proposal plus M0 C scaffold.
+Version: 0.2, 2026-10-12. Status: long-term architecture plus M1/M2 BSP implementation.
 Audience: the project owner, kernel contributors, system developers, and future
 AI agents. This is the primary design document; implementation evidence lives in
 HANDOFF.md. Requirements use **must**, **should**, and **may** deliberately. A
 requirement here is not a claim that the source currently implements it.
+
+## 0. Current implementation versus target design
+
+M1 exception entry, validated boot-memory discovery and protected mappings are
+implemented. M2 adds bounded page/heap allocation, PIC/PIT interrupts, seven
+preemptible guarded kernel workers, sleep/wakeup and exit/reaping. These are
+single-CPU AMD64 mechanisms; there is no userspace or sandbox yet. The runtime
+self-test checks registers, memory and resource accounting before halting.
+
+Read [IMPLEMENTATION.md](IMPLEMENTATION.md) for exact limits and current contracts,
+and [HANDOFF.md](HANDOFF.md) for observed tests. Historical mentions of M0 describe
+the original scaffold. All other subsystem designs below remain requirements or
+proposals until the implementation ledger says otherwise. In particular the first
+heap is page-granular, not a slab allocator; general wait queues, canary/entropy
+setup, SMP and hardened application boundaries remain future work.
 
 ## 1. Product intent and constraints
 
@@ -150,10 +165,10 @@ partial initialization state, not arbitrary invalid memory.
 
 ### 4.1 Hardening sequence
 
-M0 disables compiler stack protection only because there is no canary setup or
-failure handler. M1-M2 must add early canary initialization, guarded stacks,
-validated mappings, zero-initialized allocations, and non-executable data where
-hardware supports it. Later add control-flow protections supported by the
+Compiler stack protection remains disabled pending canary initialization and
+a validated failure/entropy strategy; this must be resolved before claiming a
+hardened userspace boundary. M1/M2 now provide guarded stacks, validated mappings,
+zero-initialized heap/stack allocations, and non-executable data where supported. Later add control-flow protections supported by the
 compiler, hardened heap metadata, delayed reuse or quarantine where useful,
 randomized layouts, and verified entropy before claiming cryptographic security.
 
@@ -179,14 +194,16 @@ experimental entry path, not the final boot trust architecture. The ELF lives
 at 1 MiB, enters in 32-bit protected mode, establishes a three-level path into
 four-level paging, identity maps the first GiB using 2 MiB pages, loads a GDT,
 sets EFER.LME, and enters 64-bit C with an aligned stack. The BSP alone runs.
-Interrupts remain disabled. CPUID checks long mode before using the long-mode
-MSR. M0 does not read the boot information block or allocate memory.
+Interrupts remain disabled during early setup. CPUID checks long mode before
+using the long-mode MSR. M1 validates and copies loader data; M2 enables IRQ0 only
+after memory and thread state are initialized.
 
 The assembly and linker enforce placement within the bootstrap map. ELF segments
-are RX, R, and RW, but the initial page tables are RWX; segment flags are not
-hardware enforcement. There is no IDT, so an exception may cause a triple fault.
-These are explicit temporary limitations to remove before running untrusted
-code, enabling interrupts, or attempting device expansion.
+are RX, R, and RW, but the initial page tables are temporarily RWX; segment flags
+alone are not hardware enforcement. M1 installs an IDT/TSS and then replaces
+those maps with read-only code/rodata, guarded stacks and NX data where available.
+Unexpected kernel faults produce a fatal diagnostic. Userspace recovery and
+process separation are still required before running untrusted code.
 
 ### 5.1 M1 boot information contract
 
@@ -305,8 +322,8 @@ rights across CPUs and devices.
 
 ### 7.1 Allocation and pressure
 
-Begin with a bounded boot allocator, then a physical page allocator and a small
-slab/size-class heap. Account memory by security domain, including pinned device
+M2 uses reserved static bootstrap metadata, a physical page allocator and a
+bounded page-granular heap. A slab/size-class heap is a later efficiency step. Account memory by security domain, including pinned device
 buffers and driver metadata. No unbounded allocation in interrupt context. Use
 preallocated pools for critical completions and diagnostics. Exhaustion returns
 an explicit status or invokes a documented pressure policy.
@@ -409,6 +426,11 @@ Maintain first-party simple drivers before adapting complex foreign frameworks.
 
 ## 11. GPU, display, media, and accelerator architecture
 
+See [ACCELERATORS.md](ACCELERATORS.md) for owner requirements covering all planned
+platforms, open standards by default, configurable conservative offloading and
+FFmpeg/HandBrake/Blackmagic RAW integration. All remain future implementation.
+
+
 GPU support is layered: firmware framebuffer -> software rendering -> modeset
 and display -> device-specific acceleration -> compute/media. A working CPU and
 PCIe enumeration are not GPU support. New CPU compatibility does not imply a new
@@ -440,6 +462,9 @@ and power tradeoffs. Old hardware fallback must remain tested. Fast paths cannot
 bypass capability validation or expose stale cross-domain buffers.
 
 ## 12. Storage, filesystems, and transactional operation
+
+See [STORAGE.md](STORAGE.md) for the staged ext4 recommendation, alternatives,
+format qualification and VFS/durability contracts. No production default is frozen.
 
 Begin with an in-memory filesystem and read-only init image. Next add a simple
 block device and a proven on-disk format with explicit recovery tests. A VFS
@@ -530,12 +555,15 @@ unbounded locks. Recursive faults use an even smaller last-resort path. Watchdog
 and restart policies must distinguish liveness failures from intentional idle.
 No automatic upload. Sensitive memory dumps require explicit local consent.
 
-M0 only has bounded serial polling, status returns, initialization rollback, and
-halt-on-explicit-failure. It has no exception handling, crash dump, supervisor,
-watchdog, or recoverable runtime process. That absence is the first development
-priority, not something the design document can fix on its own.
+M1/M2 provide bounded fatal exception reporting, protected mappings, allocation
+failures/rollback, and basic kernel-thread lifecycle checks. They do not recover
+arbitrary kernel corruption. Crash dumps, supervisors, watchdogs and recoverable
+userspace processes remain future milestones.
 
 ## 16. Executive services and configuration
+
+See [INIT.md](INIT.md) for the proposed small supervisor, declarative configuration,
+replaceability, dependency semantics and recovery gates. No userspace init exists yet.
 
 System services expose the same typed operations to GUI, CLI, and automation.
 Configuration is schema-versioned, validated, auditable, exportable, and applied
@@ -672,7 +700,8 @@ to stubs claiming entire subsystems.
 
 ## 22. Open decisions and risks
 
-- Owner license selection is pending; imported code cannot proceed without it.
+- Apache-2.0 is selected for original code; dependency provenance, license
+  compatibility and distribution obligations remain per-component review gates.
 - Exact hardened x86 baseline and minimum RAM are not yet selected; old AMD64 is
   a compatibility ambition, not a security-certification guarantee.
 - Userspace-versus-kernel placement of networking/filesystems needs measurements.
@@ -689,3 +718,32 @@ to stubs claiming entire subsystems.
 
 These decisions should be resolved with evidence and the owner's product intent,
 not assumptions buried in code. Record changes in ADRs and handoff notes.
+
+## 23. Encryption and ecosystem security requirements
+
+[ENCRYPTION.md](ENCRYPTION.md) distinguishes post-quantum device-to-device
+protection, storage encryption and hardware-dependent memory protection. It also
+defines consent-based nearby sharing and key-lifecycle acceptance gates. These
+are planned requirements; neither encryption nor confidential execution exists
+in the current kernel. Legacy compatibility cannot imply unavailable guarantees.
+
+## 24. Identity and device-management continuum
+
+[IDENTITY.md](IDENTITY.md) specifies optional progression from local-only login to
+one identity across devices, separate family users, shared machines and managed
+fleets. Identity, device trust, session authority and data decryption remain
+separate. It defines multiple pairing methods, E2E collection membership/recovery,
+explicit administrator visibility and measured fleet-scale acceptance gates.
+
+The owner accepts ext4 as the provisional starting OS filesystem default.
+[STORAGE.md](STORAGE.md) now also specifies raw block I/O without formatting,
+RAM/sidecar virtual views, exclusive write leases and a broad filesystem backlog
+with per-format read/write qualification. No filesystem or account code exists yet.
+
+## 25. Domains and policy inheritance
+
+[DOMAINS.md](DOMAINS.md) specifies native domain join/leave, user and device
+policy, inheritance, delegated exceptions, effective-policy inspection and offline
+behavior. Microsoft AD DS joining and selected GPO mappings form a separate
+compatibility workstream. Neither is implemented; next kernel gate remains M3a.
+

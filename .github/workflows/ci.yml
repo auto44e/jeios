@@ -1,4 +1,4 @@
-name: scaffold checks
+name: kernel checks
 on: [push, pull_request]
 permissions:
   contents: read
@@ -14,4 +14,10 @@ jobs:
       - name: Boot smoke
         run: make smoke
       - name: Legacy CPU profile without NX
-        run: python3 tools/smoke.py build/jeios.iso --cpu qemu64,-nx --expect-nx absent
+        run: python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --expect-nx absent
+      - name: Low-memory legacy profile
+        run: python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M --expect-nx absent
+      - name: Large-memory clipping profile
+        run: python3 tools/smoke.py build/0/jeios.iso --memory 1536M --expect-nx present
+      - name: CPU exception and protection faults
+        run: make integration
