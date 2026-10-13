@@ -1,11 +1,13 @@
 # Agent handoff: M1/M2 kernel foundation
 
-Updated: 2026-10-13. Project `auto44e/jeios`; branch `develop/m1-m2-core`.
+Updated: 2026-10-13. Project `auto44e/jeios`; current documentation branch
+`docs/mobile-ecosystem` (PR #11). M1/M2 foundation PR #1 is merged into main.
 Read AGENTS.md, IMPLEMENTATION.md, ROADMAP.md and the relevant DESIGN.md sections.
 Start with [AGENT_START.md](AGENT_START.md) for the consolidated requirements and
-linked work queue. Foundation PR #1 must be checked before choosing main as a base.
-The previous M0 state is preserved in git history; this file describes the latest
-branch implementation. Do not infer future capabilities from design prose.
+linked work queue. Multitouch/security-key PR #10 is merged into main at
+`5f290b3`; this branch incorporates that merge and preserves both feature plans.
+The previous M0 state is preserved in git history; this file describes the M1/M2
+implementation and subsequent documentation checkpoints. Do not infer future capabilities from design prose.
 
 ## Owner intent
 
@@ -104,8 +106,8 @@ kernel threads in one address space. Never call them isolated processes/apps.
 
 ## Next bounded work: M3a userspace boundary
 
-Start a new implementation branch from the latest PR head, or updated main after
-merge; do not assume main already contains this work. Specify user/kernel address
+Start a new implementation branch from updated main for M1/M2. Read mobile PR #11
+while it remains open, or its merged docs once available on main. Specify user/kernel address
 layout, user code/data/stack mapping rights, private kernel stacks, TSS RSP0,
 entry/return state, and copy-in/copy-out fault semantics before adding syscalls.
 Keep CPU feature exposure restricted to state the scheduler preserves. Add a
@@ -227,6 +229,20 @@ relative Markdown links and `git diff --check` passed. No boot behavior changed,
 so emulator tests were not repeated locally. Verify new remote CI separately.
 Project-ready issues exist; board membership requires a separate verified action.
 
+## Multitouch and hardware MFA requirements: 2026-10-13
+
+PR #1 is merged; this documentation branch starts from main merge commit
+`03aa2f380d8e49262abd1720a3b8db37517cbb31`. Added INPUT.md and SECURITY_KEYS.md;
+updated README, DESIGN, IDENTITY, ROADMAP and the AGENT_START requirements map.
+Owner requires OS-wide touchscreen/trackpad multitouch and built-in hardware MFA
+keys. No runtime behavior changed; M3a remains next. Open ADRs include input event
+ABI/gesture arbitration, authenticator broker/RP identity, recovery and numeric
+limits. Do not claim pointer fallback is native app multitouch or FIDO is PQ.
+
+Validation: `ASAN_OPTIONS=detect_leaks=0 make check`, Markdown relative links and
+`git diff --check` passed locally. Docs-only; no boot tests repeated. New PR CI
+must be observed separately. No hardware input/key tests have run.
+
 ## Fresh-kernel mobile repository: 2026-10-13
 
 Owner superseded the initial AOSP/Linux host proposal: mobile uses the fresh C
@@ -242,3 +258,22 @@ M3a remains next. Mobile issues #1-#5 track contracts, execution, Pixel, Android
 and parity. Validation: core make check (ASAN_OPTIONS=detect_leaks=0), relative
 links and git diff --check; mobile manifest/negative tests separately passed.
 No device action occurred. Project membership is verified separately in the UI.
+
+## PR #11 conflict resolution: 2026-10-13
+
+Merged main `5f290b351181d8fa23b17ac5f493ff66ae9415b8` into the mobile
+planning branch after PR #10 landed. Resolved five overlapping documentation
+additions by retaining both multitouch/hardware-MFA and fresh-kernel mobile
+requirements; DESIGN sections 26 and 27 remain distinct. Updated stale foundation
+branch guidance. No kernel, build, test or security invariant changed.
+
+Observed local validation: `ASAN_OPTIONS=detect_leaks=0 make check` passed core,
+boot-parser, allocator and ELF checks; Markdown relative links, conflict-marker
+scan and `git diff --check` passed. Leak inspection remains disabled for the
+managed environment; address/undefined-behavior sanitizers remain enabled.
+Mobile main `55505743500809b5714a725cb23e155a569791b1` passed
+`python3 tools/validate.py` and all four `unittest` tests. Its immutable core pin
+remains the tested M1/M2 foundation; documentation merges do not require moving
+that implementation pin. Boot tests were not repeated locally for docs-only
+changes. Check remote CI on the new PR head before merging. M3a and mobile MP0
+remain the next bounded tasks; no ARM64/Pixel/Android execution is implemented.

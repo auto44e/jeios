@@ -7,15 +7,10 @@ and continuation order; it does not claim later milestones are implemented.
 ## Establish the correct baseline
 
 Foundation PR: https://github.com/auto44e/jeios/pull/1
-Development branch: `develop/m1-m2-core`. Latest verified pre-handoff commit:
-`0e46993e480c075f2396015174d69d59dc6e7b37`.
-Its PR CI passed: https://github.com/auto44e/jeios/actions/runs/38390326429
-
-Check current PR/branch state before starting. Until PR #1 is merged, main remains
-an older scaffold. For implementation, create a new branch from the latest PR
-head, or updated main after merge. Preserve unrelated changes. Do not mistake a
-review approval for a merge or bypass branch protection. This guide changes no
-runtime code; verify CI for whichever exact commit you use.
+PR #1 merged into main at `03aa2f380d8e49262abd1720a3b8db37517cbb31`.
+Start new implementation branches from updated main; check for newer concurrent
+work before editing. The additional multitouch/security-key requirements are
+proposed documentation only. Verify CI for the exact implementation head used.
 
 Implemented: M1 exceptions, validated memory discovery/protected mappings, and M2
 bounded allocation plus seven trusted preemptible kernel workers on one AMD64 CPU.
@@ -51,6 +46,8 @@ Resolve these in the first ADR. Keep M3a/M3b/M3c distinct and reviewable.
 | --- | --- | --- |
 | Fresh C11 core, modular services, Unix interoperability/NT-style object model | [DESIGN](DESIGN.md), ADR 0001/0002 | No foreign kernel-source fusion; ring 0 is trusted |
 | Privacy, explicit authority, graceful failures; customization with good defaults | [SECURITY](SECURITY.md), [DESIGN](DESIGN.md) | UI complexity never grants rights; no telemetry/cloud-login requirement |
+| OS-wide touchscreen/trackpad multitouch | [INPUT](INPUT.md), M4/M7/E1 | Qualified transports, secure routing, native toolkit/accessibility; foreign apps may use pointer fallback |
+| Built-in hardware MFA security keys | [SECURITY_KEYS](SECURITY_KEYS.md), M4-M9 | CTAP/FIDO2 broker, native/WebAuthn boundaries, recovery; preboot/PQ capabilities qualified separately |
 | Fresh-kernel mobile and ecosystem Android app support | [MOBILE](MOBILE.md), dedicated auto44e/jeios-mobile | Owner chose native C kernel; QEMU ARM64 first, Pixel candidates unqualified; AOSP is reference/future app layer |
 | Native configurable init and supervision | [INIT](INIT.md), M3c/M4 | Minimal fixed-plan init first, full supervisor later |
 | Single-device local login through multi-device/family/multi-user/fleet management | [IDENTITY](IDENTITY.md), M3 onward | Separate principal/device/session/tenant and management vs data-key authority |

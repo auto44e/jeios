@@ -250,3 +250,9 @@ cloud enrollment and native policy do not imply AD/GPO compatibility.
 Domain interoperability includes mixed Windows/macOS/Linux endpoints, Microsoft
 and Samba AD providers, and separately qualified FreeIPA/LDAP/Kerberos adapters.
 See DOMAINS.md for directionality and per-platform policy enforcement limits.
+
+## Hardware authenticators
+
+[SECURITY_KEYS.md](SECURITY_KEYS.md) makes hardware-key enrollment, MFA,
+reauthentication and recovery first-class native services. User presence alone
+is not user verification; account authentication alone does not recover data keys.

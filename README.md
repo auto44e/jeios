@@ -27,6 +27,7 @@ baseline, all owner requirements, issue dependencies and checkpoint rules.
   and [filesystem recommendation](docs/STORAGE.md): planned contracts and acceptance gates.
 - [Identity and device management](docs/IDENTITY.md): local login, E2E sync, family and fleet contracts.
 - [Domains and centralized policy](docs/DOMAINS.md): native joining and separate AD/GPO compatibility targets.
+- [Multitouch input](docs/INPUT.md) and [hardware security keys](docs/SECURITY_KEYS.md): planned OS-wide integration.
 - [Fresh-kernel mobile project](docs/MOBILE.md): shared core, capability parity and future Android app layer.
 - [Implementation ledger](docs/IMPLEMENTATION.md): current M1/M2 mechanisms, evidence and limits.
 - [Hardware policy](docs/HARDWARE.md) and [security model](docs/SECURITY.md).

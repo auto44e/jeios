@@ -102,6 +102,14 @@ ports with qualified CPU state; M7 adds desktop integration; M8 qualifies GPU/NP
 backends and measured automatic offloading. FFmpeg, HandBrake and Blackmagic RAW
 are userspace integration targets, not current codecs or kernel features.
 
+## Multitouch and security keys (2026-10-13)
+
+[INPUT.md](INPUT.md): M4 input transports/lifecycle, M7 compositor/toolkit/secure
+UI and accessibility, E1 touch device qualification. [SECURITY_KEYS.md](SECURITY_KEYS.md):
+M4 authenticator transports, M5/M6 credential broker/storage, M7 enrollment UI,
+M9 authentication/recovery qualification. Preboot support is a separate gate.
+These requirements extend the later backlog; M3a remains the next kernel task.
+
 ## Fresh-kernel mobile track
 
 [MOBILE.md](MOBILE.md) links auto44e/jeios-mobile: MP0 ARM64 contract, MP1-MP3

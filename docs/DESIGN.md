@@ -748,6 +748,14 @@ behavior. Microsoft AD DS joining and selected GPO mappings form a separate
 compatibility workstream. Neither is implemented; next kernel gate remains M3a.
 
 
+## 26. Multitouch and hardware authentication
+
+[INPUT.md](INPUT.md) requires end-to-end multitouch for touchscreens and trackpads,
+including native applications, login, secure prompts and accessibility.
+[SECURITY_KEYS.md](SECURITY_KEYS.md) defines built-in FIDO2/CTAP credential support,
+MFA policy, recovery and separately qualified preboot/domain integration. Both
+are future requirements; no input or authentication subsystem exists yet.
+
 ## 27. Fresh-kernel mobile and Android compatibility
 
 [MOBILE.md](MOBILE.md) records the dedicated mobile repo and owner decision:
