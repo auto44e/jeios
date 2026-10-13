@@ -109,3 +109,10 @@ UI and accessibility, E1 touch device qualification. [SECURITY_KEYS.md](SECURITY
 M4 authenticator transports, M5/M6 credential broker/storage, M7 enrollment UI,
 M9 authentication/recovery qualification. Preboot support is a separate gate.
 These requirements extend the later backlog; M3a remains the next kernel task.
+
+## Fresh-kernel mobile track
+
+[MOBILE.md](MOBILE.md) links auto44e/jeios-mobile: MP0 ARM64 contract, MP1-MP3
+native virtual execution/isolation, MP4 Pixel feasibility, MP5-MP6 physical mobile
+bring-up/services, AC0-AC2 future Android compatibility. Fresh C kernel remains
+shared; no AOSP/Linux host or lunch target. Core M3a remains next.
