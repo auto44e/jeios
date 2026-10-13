@@ -226,3 +226,17 @@ Local verification for this handoff: `ASAN_OPTIONS=detect_leaks=0 make check`,
 relative Markdown links and `git diff --check` passed. No boot behavior changed,
 so emulator tests were not repeated locally. Verify new remote CI separately.
 Project-ready issues exist; board membership requires a separate verified action.
+
+## Multitouch and hardware MFA requirements: 2026-10-13
+
+PR #1 is merged; this documentation branch starts from main merge commit
+`03aa2f380d8e49262abd1720a3b8db37517cbb31`. Added INPUT.md and SECURITY_KEYS.md;
+updated README, DESIGN, IDENTITY, ROADMAP and the AGENT_START requirements map.
+Owner requires OS-wide touchscreen/trackpad multitouch and built-in hardware MFA
+keys. No runtime behavior changed; M3a remains next. Open ADRs include input event
+ABI/gesture arbitration, authenticator broker/RP identity, recovery and numeric
+limits. Do not claim pointer fallback is native app multitouch or FIDO is PQ.
+
+Validation: `ASAN_OPTIONS=detect_leaks=0 make check`, Markdown relative links and
+`git diff --check` passed locally. Docs-only; no boot tests repeated. New PR CI
+must be observed separately. No hardware input/key tests have run.
