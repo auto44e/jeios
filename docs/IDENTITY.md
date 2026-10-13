@@ -239,3 +239,10 @@ Reviewed 2026-10-13 as protocol design inputs, not implementation claims:
 - [OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0-errata2.html): federated authentication and claims.
 - [SCIM RFC 7644](https://www.rfc-editor.org/info/rfc7644/): identity provisioning protocol; review updates/errata when selecting an adapter.
 - [MLS RFC 9420](https://www.rfc-editor.org/info/rfc9420/): group key management reference; PQ qualification is separate.
+
+## Domain membership and centralized policy
+
+[DOMAINS.md](DOMAINS.md) makes native domain joining, directory identities,
+organizational hierarchy and Group Policy-style management explicit. Joining
+Microsoft AD DS is a separately qualified interoperability target; OIDC login,
+cloud enrollment and native policy do not imply AD/GPO compatibility.

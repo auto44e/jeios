@@ -733,3 +733,10 @@ The owner accepts ext4 as the provisional starting OS filesystem default.
 [STORAGE.md](STORAGE.md) now also specifies raw block I/O without formatting,
 RAM/sidecar virtual views, exclusive write leases and a broad filesystem backlog
 with per-format read/write qualification. No filesystem or account code exists yet.
+
+## 25. Domains and policy inheritance
+
+[DOMAINS.md](DOMAINS.md) specifies native domain join/leave, user and device
+policy, inheritance, delegated exceptions, effective-policy inspection and offline
+behavior. Microsoft AD DS joining and selected GPO mappings form a separate
+compatibility workstream. Neither is implemented; next kernel gate remains M3a.

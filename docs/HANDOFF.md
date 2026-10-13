@@ -163,3 +163,17 @@ versions/features. Future agents must qualify each format's writes separately.
 Validation: `ASAN_OPTIONS=detect_leaks=0 make check`, relative Markdown link
 validation and `git diff --check` passed locally. No boot code changed; emulator
 tests were not repeated. Remote checks must be observed separately on the PR.
+
+## Explicit domain and Group Policy requirements: 2026-10-13
+
+Added DOMAINS.md and links from README, IDENTITY, DESIGN and ROADMAP. Native
+domain services and Microsoft AD DS interoperability are distinct targets.
+The design covers join/leave/recovery, policy inheritance and precedence,
+delegation, effective-policy reporting, offline expiry and compatibility gates.
+No runtime implementation or outside directory modification occurred. Open ADRs:
+policy composition/order, directory consistency, enrollment trust and exact AD/GPO
+compatibility matrix. Next bounded kernel task remains M3a.
+
+Local validation: `ASAN_OPTIONS=detect_leaks=0 make check`, Markdown relative-link
+validation and `git diff --check` passed. Docs-only; no new boot tests required.
+Remote CI status must be observed independently on the PR.
