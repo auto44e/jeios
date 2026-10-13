@@ -748,8 +748,8 @@ behavior. Microsoft AD DS joining and selected GPO mappings form a separate
 compatibility workstream. Neither is implemented; next kernel gate remains M3a.
 
 
-## 27. Adjacent AOSP mobile project
+## 27. Fresh-kernel mobile and Android compatibility
 
-[MOBILE.md](MOBILE.md) records the mobile scaffold and cross-device capability
-parity goal. AOSP/Linux bring-up is separate from the fresh C kernel; protocol
-semantics are shared before kernel/application ABI convergence.
+[MOBILE.md](MOBILE.md) records the dedicated mobile repo and owner decision:
+use the same fresh C kernel from the start. AOSP informs a future Android app
+layer across the ecosystem; the earlier AOSP/Linux host proposal is superseded.

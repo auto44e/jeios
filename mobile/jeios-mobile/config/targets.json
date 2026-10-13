@@ -1,8 +1,0 @@
-{
-  "schema": 1,
-  "targets": [
-    {"id": "cuttlefish", "role": "first-virtual", "codename": null, "status": "candidate", "source_revision": null, "lunch": null, "blockers": ["Pin upstream source and product/release definitions", "Build and boot unchanged upstream"]},
-    {"id": "pixel9", "role": "first-physical", "codename": "tokay", "status": "candidate", "source_revision": null, "lunch": null, "blockers": ["Qualify maintained device tree and kernel/vendor pairing", "Record provenance, recovery and variant", "Verify product and release configuration"]},
-    {"id": "pixel10", "role": "next-physical", "codename": "frankel", "status": "candidate", "source_revision": null, "lunch": null, "blockers": ["Verify source/vendor build feasibility independently", "Qualify device-specific boot, recovery and firmware"]}
-  ]
-}

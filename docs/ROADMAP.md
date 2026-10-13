@@ -102,9 +102,9 @@ ports with qualified CPU state; M7 adds desktop integration; M8 qualifies GPU/NP
 backends and measured automatic offloading. FFmpeg, HandBrake and Blackmagic RAW
 are userspace integration targets, not current codecs or kernel features.
 
-## Adjacent mobile track
+## Fresh-kernel mobile track
 
-[MOBILE.md](MOBILE.md): MB0 source/provenance/product qualification, MB1 unchanged
-Cuttlefish build/boot, MB2 ecosystem adapters, MB3 Pixel 9 hardware qualification,
-MB4 update/security/parity evidence. Pixel 10 is a separate candidate. No verified
-lunch target yet; this track does not advance core M3a or replace the C kernel.
+[MOBILE.md](MOBILE.md) links auto44e/jeios-mobile: MP0 ARM64 contract, MP1-MP3
+native virtual execution/isolation, MP4 Pixel feasibility, MP5-MP6 physical mobile
+bring-up/services, AC0-AC2 future Android compatibility. Fresh C kernel remains
+shared; no AOSP/Linux host or lunch target. Core M3a remains next.
