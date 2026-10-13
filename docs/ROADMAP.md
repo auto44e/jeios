@@ -101,3 +101,10 @@ boundaries; M5/M6 supplies application/storage prerequisites and software media
 ports with qualified CPU state; M7 adds desktop integration; M8 qualifies GPU/NPU
 backends and measured automatic offloading. FFmpeg, HandBrake and Blackmagic RAW
 are userspace integration targets, not current codecs or kernel features.
+
+## Adjacent mobile track
+
+[MOBILE.md](MOBILE.md): MB0 source/provenance/product qualification, MB1 unchanged
+Cuttlefish build/boot, MB2 ecosystem adapters, MB3 Pixel 9 hardware qualification,
+MB4 update/security/parity evidence. Pixel 10 is a separate candidate. No verified
+lunch target yet; this track does not advance core M3a or replace the C kernel.

@@ -51,6 +51,7 @@ Resolve these in the first ADR. Keep M3a/M3b/M3c distinct and reviewable.
 | --- | --- | --- |
 | Fresh C11 core, modular services, Unix interoperability/NT-style object model | [DESIGN](DESIGN.md), ADR 0001/0002 | No foreign kernel-source fusion; ring 0 is trusted |
 | Privacy, explicit authority, graceful failures; customization with good defaults | [SECURITY](SECURITY.md), [DESIGN](DESIGN.md) | UI complexity never grants rights; no telemetry/cloud-login requirement |
+| Adjacent AOSP mobile and cross-device capability parity | [MOBILE](MOBILE.md), mobile MB0-MB4 | Proposed AOSP/Linux bring-up; core remains fresh C; Pixel candidates not build-qualified |
 | Native configurable init and supervision | [INIT](INIT.md), M3c/M4 | Minimal fixed-plan init first, full supervisor later |
 | Single-device local login through multi-device/family/multi-user/fleet management | [IDENTITY](IDENTITY.md), M3 onward | Separate principal/device/session/tenant and management vs data-key authority |
 | E2E protection built into identity/sync design; several pairing methods | [IDENTITY](IDENTITY.md), [ENCRYPTION](ENCRYPTION.md) | Qualified key lifecycle, entropy and reviewed protocols; no ad hoc crypto |

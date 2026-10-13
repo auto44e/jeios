@@ -226,3 +226,14 @@ Local verification for this handoff: `ASAN_OPTIONS=detect_leaks=0 make check`,
 relative Markdown links and `git diff --check` passed. No boot behavior changed,
 so emulator tests were not repeated locally. Verify new remote CI separately.
 Project-ready issues exist; board membership requires a separate verified action.
+
+## AOSP mobile seed: 2026-10-13
+
+Prepared mobile/jeios-mobile as an exportable Apache-2.0 repository seed with
+docs, target registry and read-only inspector. MOBILE.md maps it to the core
+ecosystem. Separate repo creation is blocked by connector capability; browser
+fallback requires approval. No AOSP source/build/blob/flash operation occurred.
+Pixel 9 tokay is the first physical candidate, Pixel 10 frankel the next; neither
+is build-qualified. Cuttlefish/source qualification MB0 precedes mobile changes.
+Core next gate remains M3a. Tested inspector, Python syntax, relative links,
+`ASAN_OPTIONS=detect_leaks=0 make check` and `git diff --check` locally.

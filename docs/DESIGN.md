@@ -747,3 +747,9 @@ policy, inheritance, delegated exceptions, effective-policy inspection and offli
 behavior. Microsoft AD DS joining and selected GPO mappings form a separate
 compatibility workstream. Neither is implemented; next kernel gate remains M3a.
 
+
+## 27. Adjacent AOSP mobile project
+
+[MOBILE.md](MOBILE.md) records the mobile scaffold and cross-device capability
+parity goal. AOSP/Linux bring-up is separate from the fresh C kernel; protocol
+semantics are shared before kernel/application ABI convergence.
