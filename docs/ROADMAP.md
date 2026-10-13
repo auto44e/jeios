@@ -79,3 +79,7 @@ These design additions do not change the next implementation gate, M3a.
 - Enterprise follow-on after M3-M6/M9 prerequisites: [DOMAINS.md](DOMAINS.md),
   native directory/join lifecycle and centralized policy gates, followed by
   independently qualified AD DS client and selected GPO mapping gates.
+
+  The interoperability matrix includes Windows/macOS/Linux endpoints, Microsoft
+  and Samba AD providers, and separately scoped FreeIPA/LDAP/Kerberos integration.
+  Qualify cross-platform agents and policy mappings individually.

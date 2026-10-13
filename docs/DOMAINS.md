@@ -4,16 +4,21 @@ Status: proposed requirements, 2026-10-13. No directory, domain client, policy
 engine or Microsoft interoperability exists yet. This extends
 [IDENTITY.md](IDENTITY.md); M3a remains the next implementation gate.
 
-## Two distinct deliverables
+## Distinct deliverables in a mixed-platform ecosystem
 
 1. A native, optionally self-hosted JeiOS directory/domain service: users, groups,
    devices, organizational containers, delegated administration, authentication
    and centralized device/user policy. Local-only operation remains supported.
-2. An optional interoperability client for joining existing Microsoft Active
-   Directory Domain Services environments. Qualify authentication, directory
+2. An optional interoperability client for joining existing AD-compatible
+   environments, including Microsoft AD DS and independently tested Samba AD. Qualify authentication, directory
    lookup, machine trust and selected policy mappings independently. Native
    domain support does not imply AD wire compatibility, and AD login does not
    imply full Windows Group Policy or application compatibility.
+
+3. Cross-platform identity and management integration for Windows, macOS and
+   Linux endpoints in the same organization. Evaluate FreeIPA and LDAP/Kerberos
+   realms separately from AD-compatible providers. Provide native management
+   agents or supported platform adapters where needed; no blanket GPO parity.
 
 Microsoft Entra ID/cloud enrollment, AD DS membership, generic OIDC login and
 SCIM provisioning are separate integrations. Do not label them interchangeable.
@@ -173,3 +178,53 @@ when implementing, rather than importing broad compatibility claims:
 - [Microsoft Group Policy scope](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/group-policy/group-policy-scope).
 - [MS-GPOL processing order](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpol/41d4bdd2-352b-46bc-a8a8-5eba011bab52).
 - [Microsoft domain join workflow](https://techcommunity.microsoft.com/blog/askds/domain-join-and-basic-troubleshooting/4405860/).
+
+## Mixed-platform compatibility matrix and directionality
+
+Owner clarification: interoperability must include macOS and Linux, not just
+Microsoft implementations. Treat directory provider, endpoint OS, login/SSO,
+resource authorization and policy enforcement as separate matrix axes.
+
+| Direction / environment | Planned goal | Independent qualification |
+| --- | --- | --- |
+| JeiOS client -> Microsoft AD DS or Samba AD | Domain identity, machine trust, SSO and selected policy mappings | Test each provider/version and supported protocol behavior independently |
+| JeiOS client -> FreeIPA or LDAP/Kerberos realm | Directory identities and scoped authentication/resource access | FreeIPA is not an AD clone; schema, trust and ID mapping need separate adapters |
+| Windows/macOS/Linux clients -> shared existing directory | Coexist with JeiOS under common organizational identities | Test platform login, group mapping, SSO, password/key rotation and offline behavior |
+| Windows/macOS/Linux clients -> native JeiOS services | Access supported identity, sync and fleet services through standards or explicit agents | Native services do not become AD-compatible controllers merely by exposing a directory |
+| JeiOS fleet console -> mixed endpoint fleet | Common policy intent, inventory, deployment and health reporting | Per-platform enforcement adapters, enrollment requirements and explicit unsupported settings |
+
+Platform-specific work includes Windows policy/management interfaces, macOS
+supported SSO and device-management/configuration interfaces, and Linux directory
+clients and distribution-specific enforcement. Existing SSSD/realmd or Samba
+components are integration candidates for Linux, not dependencies assumed to run
+inside the JeiOS kernel. Apple management eligibility and enrollment constraints
+must be checked before claiming that an operation is available. Keep platform
+agents narrowly scoped, signed and independently updated.
+
+A portable policy expresses intent such as screen-lock timeout or allowed login
+groups. Each adapter reports supported, semantically equivalent, partially mapped,
+unsupported or failed, with actual enforcement evidence. A server must not count
+an unsupported control as compliant. A Windows registry/GPO setting cannot simply
+be replayed on macOS/Linux. Directory login alone does not apply cross-platform
+management policy. Conversely, managing inventory does not require adopting one
+shared user password or granting the console every user's data keys.
+
+Map immutable issuer-qualified identities to platform SID/UID/GID and native
+principals without collisions or automatic administrator promotion. Test group
+nesting, ACL translation and service identities as well as interactive login.
+Cross-realm trust has explicit direction and scope; transitive privilege is never
+assumed. Preserve personal/work separation and E2E recipient boundaries across
+adapters. Devices that cannot meet a PQ protocol minimum must report incompatibility
+or use a separately approved, visibly weaker interoperability profile.
+
+Acceptance expands to a versioned provider x endpoint x feature matrix, with
+mixed-platform login/SSO, revocation, offline use, shared-resource authorization,
+policy enforcement and enrollment/leave tests. Exact Windows/macOS releases and
+Linux distributions remain open until selected and exercised in a disposable lab.
+This adds architectural scope, not implemented support or live enrollment.
+
+Additional primary references reviewed 2026-10-13:
+
+- [Apple AD integration](https://support.apple.com/guide/deployment/integrate-mac-computers-with-active-directory-depd1a7cad1f/web).
+- [Samba overview](https://devel.samba.org/samba/what_is_samba.html).
+- [FreeIPA trust architecture](https://www.freeipa.org/page/Trusts).

@@ -246,3 +246,7 @@ Reviewed 2026-10-13 as protocol design inputs, not implementation claims:
 organizational hierarchy and Group Policy-style management explicit. Joining
 Microsoft AD DS is a separately qualified interoperability target; OIDC login,
 cloud enrollment and native policy do not imply AD/GPO compatibility.
+
+Domain interoperability includes mixed Windows/macOS/Linux endpoints, Microsoft
+and Samba AD providers, and separately qualified FreeIPA/LDAP/Kerberos adapters.
+See DOMAINS.md for directionality and per-platform policy enforcement limits.

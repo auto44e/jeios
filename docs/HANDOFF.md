@@ -177,3 +177,9 @@ compatibility matrix. Next bounded kernel task remains M3a.
 Local validation: `ASAN_OPTIONS=detect_leaks=0 make check`, Markdown relative-link
 validation and `git diff --check` passed. Docs-only; no new boot tests required.
 Remote CI status must be observed independently on the PR.
+
+Owner clarification in the same work session: domain interoperability includes
+macOS and Linux. Expanded DOMAINS.md with provider/endpoint directionality,
+Samba AD and FreeIPA/LDAP/Kerberos evaluation, platform adapters and a tested
+feature matrix requirement. No automatic cross-platform GPO compatibility claim.
+Repeated local checks and documentation validation passed for this clarification.
