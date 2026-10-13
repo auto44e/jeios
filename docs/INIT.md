@@ -128,3 +128,13 @@ configuration interruption and shutdown timeouts. Prove CLI/GUI authorization
 parity later in M7. Measure launch latency and memory on a low-resource profile
 before choosing defaults. Configuration format and compatibility policy need an
 ADR before becoming stable; this sketch must not accidentally become the ABI.
+
+## Identity-aware service lifecycle
+
+[IDENTITY.md](IDENTITY.md) defines local principals, sessions and enrollment.
+Per-user services bind a session/principal and cannot inherit another logged-in
+user's capabilities. Session logout drains or cancels work and revokes its grants;
+a separately authorized background-sync service has an explicit key-residency
+policy. Device-wide enrollment policy cannot silently expand per-user service
+rights. A controller outage must not prevent permitted local login or service
+startup; enterprise offline policy is a separately visible configuration.

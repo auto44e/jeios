@@ -141,3 +141,25 @@ Validation for this docs-only change: `ASAN_OPTIONS=detect_leaks=0 make check`,
 relative Markdown link validation and `git diff --check` passed locally. No boot
 code changed, so emulator tests were not repeated locally. Prior kernel execution
 evidence remains scoped to the earlier code; check the current PR for remote CI.
+
+## Identity and storage expansion: 2026-10-13
+
+Owner added local-to-fleet user/device management, E2E sync, multiple pairing
+methods, family/multi-user isolation, raw disk access without formatting and
+broad filesystem interoperability. Ext4 is now owner-approved as the provisional
+starting OS filesystem default, still unimplemented and not production-qualified.
+
+Added IDENTITY.md and expanded STORAGE.md. Updated DESIGN, ENCRYPTION, INIT,
+SECURITY, ROADMAP and README links/contracts. No kernel behavior changed; next
+bounded implementation task remains M3a. Management authority does not imply a
+personal-data key grant, but privileged endpoint control remains a trust limit.
+Persistent file-like raw-disk views require metadata in RAM, a sidecar or an
+explicitly initialized region; never silently format or write unknown media.
+
+New open decisions: principal/session ABI, recovery and PQ group protocol,
+membership consistency, enrollment/federation profiles, fleet policy precedence,
+raw block lease/alias tracking and sidecar format, exact supported filesystem
+versions/features. Future agents must qualify each format's writes separately.
+Validation: `ASAN_OPTIONS=detect_leaks=0 make check`, relative Markdown link
+validation and `git diff --check` passed locally. No boot code changed; emulator
+tests were not repeated. Remote checks must be observed separately on the PR.

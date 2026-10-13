@@ -720,3 +720,16 @@ protection, storage encryption and hardware-dependent memory protection. It also
 defines consent-based nearby sharing and key-lifecycle acceptance gates. These
 are planned requirements; neither encryption nor confidential execution exists
 in the current kernel. Legacy compatibility cannot imply unavailable guarantees.
+
+## 24. Identity and device-management continuum
+
+[IDENTITY.md](IDENTITY.md) specifies optional progression from local-only login to
+one identity across devices, separate family users, shared machines and managed
+fleets. Identity, device trust, session authority and data decryption remain
+separate. It defines multiple pairing methods, E2E collection membership/recovery,
+explicit administrator visibility and measured fleet-scale acceptance gates.
+
+The owner accepts ext4 as the provisional starting OS filesystem default.
+[STORAGE.md](STORAGE.md) now also specifies raw block I/O without formatting,
+RAM/sidecar virtual views, exclusive write leases and a broad filesystem backlog
+with per-format read/write qualification. No filesystem or account code exists yet.

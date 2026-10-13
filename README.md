@@ -19,6 +19,7 @@ dynamic module loader or ARM implementation. This is not a daily-use or hardened
 - [Detailed design](docs/DESIGN.md): full product architecture and future contracts.
 - [Init/service design](docs/INIT.md), [encryption and nearby sharing](docs/ENCRYPTION.md),
   and [filesystem recommendation](docs/STORAGE.md): planned contracts and acceptance gates.
+- [Identity and device management](docs/IDENTITY.md): local login, E2E sync, family and fleet contracts.
 - [Implementation ledger](docs/IMPLEMENTATION.md): current M1/M2 mechanisms, evidence and limits.
 - [Hardware policy](docs/HARDWARE.md) and [security model](docs/SECURITY.md).
 - [Development](docs/DEVELOPMENT.md): build, emulator tests and fault modes.

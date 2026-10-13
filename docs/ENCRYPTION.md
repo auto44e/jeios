@@ -125,3 +125,13 @@ No production claim until independent review and named platform evidence exist.
 
 References reviewed 2026-10-13; standards errata and platform advisories must be
 rechecked when an implementation and supported hardware are selected.
+
+## Identity, group sync and managed endpoints
+
+[IDENTITY.md](IDENTITY.md) extends pairing to local and remote device enrollment,
+family/organization membership, collection key epochs and recovery. Authentication
+reset does not automatically recover encrypted data. Personal sync relays do not
+receive content keys; organization recovery recipients and management telemetry
+collectors are explicitly named endpoints for their respective data. A privileged
+managed OS can inspect ordinary active sessions, so E2E is not a promise against
+every device administrator. Revocation cannot erase previously delivered plaintext.

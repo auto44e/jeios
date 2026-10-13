@@ -66,3 +66,12 @@ These design additions do not change the next implementation gate, M3a.
   optional nearby sharing, reviewed PQ protection, qualified memory encryption
   and separate confidential-execution gates. No new crypto code is authorized
   for production use merely by this design; library/protocol review is required.
+
+- M3/M4 through M9: [IDENTITY.md](IDENTITY.md), local principals/sessions first,
+  then durable identity records, multi-method pairing and E2E sync qualification.
+  Family/tenant membership and fleet scale require additional acceptance evidence;
+  no cloud account is required for unmanaged local login.
+- M5 and later format gates: owner-approved provisional ext4 default, raw block
+  I/O with exclusive range leases, temporary/sidecar views without reformatting,
+  and a qualified filesystem interoperability matrix. Additional formats are
+  planned individually; no blanket current read/write support is implied.

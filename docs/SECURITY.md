@@ -93,3 +93,15 @@ See [ENCRYPTION.md](ENCRYPTION.md) for the RAM threat model, PQ key agreement
 and authentication requirements, key lifecycle and nearby sharing. Filesystem
 checksums do not provide cryptographic authentication; encrypted storage does
 not keep plaintext secret from an authorized live-memory reader.
+
+## Identity, management and raw storage authority
+
+See [IDENTITY.md](IDENTITY.md) for account/device/session separation, E2E group
+membership, recovery and explicit family/enterprise visibility. Administering a
+service does not automatically make its operator a personal-data key recipient.
+Management of a privileged OS nevertheless changes endpoint trust and must be
+visible at enrollment. Offline revocation and remote wipe are not instantaneous.
+
+[STORAGE.md](STORAGE.md) requires separately authorized range-bound raw I/O,
+exclusive write leases and no automatic formatting of unknown media. Ordinary
+file access does not authorize bypassing filesystem or encryption boundaries.
