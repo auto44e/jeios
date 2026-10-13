@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef JEIOS_SCHED_H
 #define JEIOS_SCHED_H
 #include <stdbool.h>
@@ -20,3 +21,4 @@ uint64_t je_sched_min_dispatches(void);
 extern volatile uint64_t je_timer_ticks;
 int je_arch_register_probe(void);
 #endif
+

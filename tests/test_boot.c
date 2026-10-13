@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -73,3 +74,4 @@ int main(void)
     }
     puts("boot parser: PASS (truncation, overflow, overlaps, modules, mutation corpus)");
 }
+

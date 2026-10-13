@@ -11,7 +11,7 @@ Fresh C kernel/core; modularity; modern hardware with an early AMD64 compatibili
 path; graceful failures; GrapheneOS/CalyxOS-inspired security/privacy; eventual
 mobile/IoT; NT-inspired object/service organization; macOS-inspired coherence;
 Linux-style ricing and independent per-area UI complexity. Keep detailed records
-for future agents. No existing kernel-source fusion or implied license choice.
+for future agents. No existing kernel-source fusion. Owner explicitly selected Apache-2.0 on 2026-10-13.
 
 ## Implemented and tested
 
@@ -119,7 +119,7 @@ calling M3 hardened. Do not jump straight to desktop, GPU or phone support.
 
 ## Open decisions
 
-Owner distribution license; hardened hardware baseline; actual old-PC support;
+Hardened hardware baseline; actual old-PC support;
 stable native ABI; toolkit/compositor strategy; service placement measurements;
 and vendor GPU/phone targets. No external kernel source has been imported.
 
@@ -132,7 +132,7 @@ All are proposed contracts. Kernel implementation and next gate M3a are unchange
 Ext4 is the first persistent candidate, not a completed driver or final production
 default. Btrfs/OpenZFS remain evaluation options. No external source was imported.
 
-Outstanding decisions: project license; exact crypto protocol/library and entropy
+Outstanding decisions at that point (license since resolved by ADR 0005): exact crypto protocol/library and entropy
 source; hardware memory-protection qualification; init schema and numeric limits;
 ext4 feature profile and writable-backend feasibility; storage encryption format.
 Do not mistake illustrative service manifests for an implemented interface.
@@ -183,3 +183,26 @@ macOS and Linux. Expanded DOMAINS.md with provider/endpoint directionality,
 Samba AD and FreeIPA/LDAP/Kerberos evaluation, platform adapters and a tested
 feature matrix requirement. No automatic cross-platform GPO compatibility claim.
 Repeated local checks and documentation validation passed for this clarification.
+
+## Apache-2.0 and accelerator/media requirements: 2026-10-13
+
+Implemented documentation/license change: owner selected Apache-2.0. Added the
+official LICENSE, original-source SPDX notices, updated ADR 0005, contributor
+instructions and previously pending-license references, including STORAGE.md.
+Added M3A.md (proposal only) and ACCELERATORS.md; linked README, DESIGN, ROADMAP,
+HARDWARE and SECURITY. No executable behavior, codec, driver or SDK was added.
+
+Planned: open-standards-first GPU/NPU APIs across qualified platforms; configurable
+conservative offload policy; userspace FFmpeg, HandBrake and BRAW integration.
+Blocked pending later prerequisites: native drivers/runtime, buffer/DMA isolation,
+CPU extended-state support, vendor SDK feasibility and component license review.
+Next bounded kernel gate remains M3a; see M3A.md for proposed pass/fail criteria.
+Its API/layout/profile choices remain recommendations, not owner-approved ABI.
+
+Validation observed locally: plain `make check` built successfully and passed core
+tests, then LeakSanitizer failed because process/thread inspection is unavailable.
+`ASAN_OPTIONS=detect_leaks=0 make check` passed core, boot-parser mutation corpus,
+allocator and ELF checks; address/undefined-behavior checks remained enabled.
+Relative Markdown links and `git diff --check` passed. Source changes are license
+comments only; emulator tests were not rerun locally. New remote CI is separate
+from this local evidence and must be checked on the published head.

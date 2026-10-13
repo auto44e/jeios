@@ -2,7 +2,7 @@
 
 Status: recommendation and future implementation plan, 2026-10-13. No VFS,
 block driver or filesystem exists in JeiOS today. The final production default
-remains open pending evidence, license selection and porting feasibility.
+remains open pending evidence, dependency license review and porting feasibility.
 
 ## Provisional default
 
@@ -31,7 +31,7 @@ separate when media behavior or resource budgets justify it.
 | New native format | Complete freedom over semantics | Recovery tools, compatibility and crash correctness all become our responsibility | Defer unless measured requirements defeat existing formats |
 
 This recommendation does not authorize importing any implementation. The project
-license remains pending. Linux implementation licensing and OpenZFS's CDDL must
+uses Apache-2.0 for original code. Linux implementation licensing and OpenZFS's CDDL must
 be reviewed separately from reading a public format specification. Record source
 provenance and selected component licenses before any port.
 
@@ -204,3 +204,4 @@ Persistent overlays and additional formats follow their own reviewable gates;
 network mounts depend on M6 and identity controls. Before release, choose and
 publish a finite supported subset. Broad compatibility does not justify delaying
 process isolation or importing unreviewed foreign kernel code.
+

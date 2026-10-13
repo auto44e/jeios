@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <stdint.h>
 #include <stdatomic.h>
 #include <jeios/kheap.h>
@@ -98,3 +99,4 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
     je_arch_console_write("JeiOS: initialization complete; halted\r\n");
     je_arch_halt();
 }
+

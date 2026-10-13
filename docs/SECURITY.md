@@ -105,3 +105,12 @@ visible at enrollment. Offline revocation and remote wipe are not instantaneous.
 [STORAGE.md](STORAGE.md) requires separately authorized range-bound raw I/O,
 exclusive write leases and no automatic formatting of unknown media. Ordinary
 file access does not authorize bypassing filesystem or encryption boundaries.
+
+## Accelerator and media boundaries (planned)
+
+[ACCELERATORS.md](ACCELERATORS.md) requires scoped device/buffer/fence authority,
+qualified DMA isolation, bounded submissions and parser/compiler workers, and
+explicit reset/quiescence before memory reuse. Offload policy cannot expand
+permissions. No silent precision downgrade or cloud transfer. Unsupported
+required containment fails closed. Codecs/SDKs remain userspace components;
+no GPU/NPU/media isolation is implemented by this document.

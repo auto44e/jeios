@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 CC = gcc
 LD = ld
 PYTHON ?= python3
@@ -51,3 +52,4 @@ $(BUILD)/test_boot: tests/test_boot.c kernel/core/boot.c $(wildcard include/jeio
 $(BUILD)/test_alloc: tests/test_alloc.c kernel/core/alloc.c kernel/core/boot.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_alloc.c kernel/core/alloc.c kernel/core/boot.c -o $@
+

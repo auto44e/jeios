@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef JEIOS_BOOT_H
 #define JEIOS_BOOT_H
 #include <stddef.h>
@@ -28,3 +29,4 @@ je_status je_boot_parse(const void *data, size_t accessible, uint64_t physical,
 bool je_boot_ram_page(const je_boot_context *ctx, uint64_t address);
 bool je_boot_free_page(const je_boot_context *ctx, uint64_t address);
 #endif
+

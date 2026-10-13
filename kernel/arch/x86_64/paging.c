@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <jeios/arch.h>
 #include <jeios/paging.h>
 #include <jeios/trap.h>
@@ -66,3 +67,4 @@ je_status je_arch_page_restore(uintptr_t a)
     __asm__ volatile("invlpg (%0)"::"r"(a):"memory");
     return JE_OK;
 }
+

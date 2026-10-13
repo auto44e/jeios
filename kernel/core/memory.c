@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /* Compiler-emitted freestanding runtime operations. No allocation or locking. */
 #include <stddef.h>
 void *memset(void *destination, int value, size_t count)
@@ -12,3 +13,4 @@ void *memcpy(void *destination, const void *source, size_t count)
     for (size_t i=0;i<count;++i) d[i]=s[i];
     return destination;
 }
+

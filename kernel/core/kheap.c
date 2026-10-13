@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <jeios/arch.h>
 #include <jeios/kheap.h>
 je_pages je_kernel_pages;
@@ -26,3 +27,4 @@ je_status je_kfree(void *p)
     je_status s=je_heap_free(&heap,p);
     je_arch_irq_restore(flags);return s;
 }
+

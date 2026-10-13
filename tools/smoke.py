@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Boot the normal kernel; validate profile and actual serial progress."""
 import argparse
 from emulator import boot
@@ -16,3 +17,4 @@ if args.expect_nx:
                     else b"CPU: legacy profile, NX absent")
 print(boot(args.image, cpu=args.cpu, memory=args.memory, expected=expected))
 print("QEMU smoke: PASS")
+

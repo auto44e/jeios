@@ -75,3 +75,12 @@ call them all 'thread sandboxing' or use their names interchangeably.
 Support records must name commit, CPU, motherboard/SoC, firmware, device IDs,
 configuration, test commands, results, and known failures. Emulator evidence and
 real hardware evidence must remain separate.
+
+## Cross-platform accelerator qualification (planned)
+
+See [ACCELERATORS.md](ACCELERATORS.md). GPU/NPU APIs should span AMD64, AArch64
+and future ports; hardware support is earned separately for each device, driver,
+firmware and operation profile. Test precision, memory/fences, DMA isolation,
+reset, foreground latency and transfer-inclusive performance. Open APIs do not
+provide missing native drivers. Retain explicit CPU fallback or unsupported
+results; there is currently no accelerated backend.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef JEIOS_ARCH_H
 #define JEIOS_ARCH_H
 #include <stdint.h>
@@ -13,3 +14,4 @@ void je_arch_timer_eoi(void);
 /* Bootstrap detection only; not a scheduler capability record. */
 int je_arch_has_nx(void);
 #endif
+

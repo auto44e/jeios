@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef JEIOS_MODULE_H
 #define JEIOS_MODULE_H
 #include <stddef.h>
@@ -13,3 +14,4 @@ typedef struct {
 je_status je_modules_start(const je_module *modules, size_t count,
                            size_t *failed_index);
 #endif
+

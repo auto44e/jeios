@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <jeios/alloc.h>
 #define RESERVED UINT16_MAX
 #define TAIL (UINT16_MAX-1u)
@@ -86,3 +87,4 @@ je_status je_heap_free(je_heap *h,void *p)
     }
     return JE_ERR_INVALID;
 }
+

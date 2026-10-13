@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Validate bootstrap metadata, ELF target, and absence of runtime dependencies.
 This is a structural check, not evidence that the CPU can boot this image.
 """
@@ -32,3 +33,4 @@ for i in range(phnum):
         executable_entry |= bool(flags & 1 and vaddr <= entry < vaddr + memsz)
 assert executable_entry, "entry must be in executable load segment"
 print("ELF checks: PASS (AMD64, Multiboot2, entry, segments, no undefined symbols)")
+

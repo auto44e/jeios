@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <jeios/status.h>
 const char *je_status_name(je_status s)
 {
@@ -13,3 +14,4 @@ const char *je_status_name(je_status s)
     default: return "unknown-status";
     }
 }
+

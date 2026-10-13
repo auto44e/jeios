@@ -48,7 +48,8 @@ storage, network, GPU or desktop scope as a substitute for these boundaries.
 
 ## Decision gates
 
-Before imports: owner chooses license and contributors record provenance.
+Before imports: record provenance and review compatibility with the selected
+Apache-2.0 project license; preserve each dependency's terms.
 Before stable ABI: specify native wire layout, rights/lifetime and concurrency.
 Before hardened profile: define exact minimum hardware and firmware/update policy.
 Before accelerated desktop: select native toolkit/compositor strategy in an ADR.
@@ -83,3 +84,16 @@ These design additions do not change the next implementation gate, M3a.
   The interoperability matrix includes Windows/macOS/Linux endpoints, Microsoft
   and Samba AD providers, and separately scoped FreeIPA/LDAP/Kerberos integration.
   Qualify cross-platform agents and policy mappings individually.
+
+## Accelerator/media requirements and license decision (2026-10-13)
+
+Apache-2.0 is selected for original project code; see ADR 0005.
+[M3A.md](M3A.md) supplies a proposed implementation sequence, not a completed gate.
+M3a remains next, followed by M3b handles and M3c IPC/init.
+
+[ACCELERATORS.md](ACCELERATORS.md) defines open-standards-first GPU/NPU support
+across planned platforms, qualified per device. M4 supplies device/buffer/DMA
+boundaries; M5/M6 supplies application/storage prerequisites and software media
+ports with qualified CPU state; M7 adds desktop integration; M8 qualifies GPU/NPU
+backends and measured automatic offloading. FFmpeg, HandBrake and Blackmagic RAW
+are userspace integration targets, not current codecs or kernel features.

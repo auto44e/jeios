@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <jeios/features.h>
 je_status je_features_select(je_feature_inputs in, uint64_t required,
                              uint64_t *enabled)
@@ -9,3 +10,4 @@ je_status je_features_select(je_feature_inputs in, uint64_t required,
     *enabled = usable;
     return JE_OK;
 }
+

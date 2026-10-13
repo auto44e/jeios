@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /* Intel IA-32e frames are normalized to [vector,error,RIP,CS,RFLAGS,RSP,SS].
  * A CPU error code is already present only for the listed architectural vectors.
  * Software yield uses vector 0x81, never an error-code exception vector. */
@@ -74,3 +75,4 @@ je_arch_test_stack_overflow:
     pushq $0
     ud2
 .section .note.GNU-stack,"",@progbits
+

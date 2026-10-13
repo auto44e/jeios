@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Build and execute independent fault-injection kernels (never contaminate normal build)."""
 import subprocess
 from pathlib import Path
@@ -20,3 +21,4 @@ for mode, vector, error in [(1, 6, 0), (2, 13, 0x28), (3, 8, 0), (4, 14, 3), (5,
     output = boot(Path(f"build/{mode}/jeios.iso"), terminal=b"JeiOS fatal: exception; halted",
                   expected=expected)
     print(f"fault mode {mode}: PASS\n{output}")
+

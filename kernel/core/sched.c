@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <jeios/arch.h>
 #include <jeios/kheap.h>
 #include <jeios/paging.h>
@@ -124,3 +125,4 @@ uint64_t je_sched_min_dispatches(void)
         if (threads[i].state!=EMPTY && threads[i].dispatches<min) min=threads[i].dispatches;
     return min;
 }
+

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Bounded serial-driven QEMU harness. A timeout without markers always fails."""
 import os
 import selectors
@@ -38,3 +39,4 @@ def boot(image, *, cpu="qemu64", memory="128M", terminal=b"initialization comple
     if b"fatal" not in terminal:
         assert b"JeiOS fatal:" not in output, text
     return text
+

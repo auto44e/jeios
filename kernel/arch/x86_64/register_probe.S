@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /* GPR preservation stress: busy until PIT tick 64, no cooperative yield. */
 .section .text,"ax"
 .global je_arch_register_probe
@@ -72,3 +73,4 @@ je_arch_register_probe:
     popq %rbx
     ret
 .section .note.GNU-stack,"",@progbits
+

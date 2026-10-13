@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef JEIOS_FEATURES_H
 #define JEIOS_FEATURES_H
 #include <stdint.h>
@@ -12,3 +13,4 @@ typedef struct {
 je_status je_features_select(je_feature_inputs in, uint64_t required,
                              uint64_t *enabled);
 #endif
+

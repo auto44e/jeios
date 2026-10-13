@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <stdint.h>
 #include <jeios/arch.h>
 static inline void out8(uint16_t port, uint8_t value)
@@ -75,3 +76,4 @@ void je_arch_timer_init(void)
     out8(0x43,0x34);out8(0x40,(uint8_t)(11932&255));out8(0x40,(uint8_t)(11932>>8));
 }
 void je_arch_timer_eoi(void) { out8(0x20,0x20); }
+

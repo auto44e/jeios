@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <stddef.h>
 #include <stdint.h>
 #include <jeios/arch.h>
@@ -72,3 +73,4 @@ void je_arch_test_double_fault(void)
     idt[14].attributes = 0;
     __asm__ volatile("movq (%%rax),%%rax" : : "a"(UINT64_C(0x40000000)) : "memory");
 }
+

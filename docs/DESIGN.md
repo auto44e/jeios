@@ -426,6 +426,11 @@ Maintain first-party simple drivers before adapting complex foreign frameworks.
 
 ## 11. GPU, display, media, and accelerator architecture
 
+See [ACCELERATORS.md](ACCELERATORS.md) for owner requirements covering all planned
+platforms, open standards by default, configurable conservative offloading and
+FFmpeg/HandBrake/Blackmagic RAW integration. All remain future implementation.
+
+
 GPU support is layered: firmware framebuffer -> software rendering -> modeset
 and display -> device-specific acceleration -> compute/media. A working CPU and
 PCIe enumeration are not GPU support. New CPU compatibility does not imply a new
@@ -695,7 +700,8 @@ to stubs claiming entire subsystems.
 
 ## 22. Open decisions and risks
 
-- Owner license selection is pending; imported code cannot proceed without it.
+- Apache-2.0 is selected for original code; dependency provenance, license
+  compatibility and distribution obligations remain per-component review gates.
 - Exact hardened x86 baseline and minimum RAM are not yet selected; old AMD64 is
   a compatibility ambition, not a security-certification guarantee.
 - Userspace-versus-kernel placement of networking/filesystems needs measurements.
@@ -740,3 +746,4 @@ with per-format read/write qualification. No filesystem or account code exists y
 policy, inheritance, delegated exceptions, effective-policy inspection and offline
 behavior. Microsoft AD DS joining and selected GPO mappings form a separate
 compatibility workstream. Neither is implemented; next kernel gate remains M3a.
+

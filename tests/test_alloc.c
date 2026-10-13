@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,3 +63,4 @@ int main(void)
     free(arena);
     puts("allocator: PASS (reservations, exact frees, exhaustion, fragmentation, zeroing, rollback)");
 }
+

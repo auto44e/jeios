@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <jeios/boot.h>
 static uint32_t u32(const unsigned char *p)
 { return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); }
@@ -97,3 +98,4 @@ bool je_boot_free_page(const je_boot_context *c, uint64_t a)
         if (overlap(a,a+JE_PAGE_SIZE,c->reserved[i].begin,c->reserved[i].end)) return false;
     return true;
 }
+

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 ENTRY(_start)
 PHDRS {
   text PT_LOAD FLAGS(5);
@@ -18,3 +19,4 @@ SECTIONS {
   ASSERT(. < 0x40000000, "kernel exceeds bootstrap identity mapping")
   /DISCARD/ : { *(.eh_frame*) *(.comment*) *(.note*) }
 }
+

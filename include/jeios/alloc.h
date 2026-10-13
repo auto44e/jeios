@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef JEIOS_ALLOC_H
 #define JEIOS_ALLOC_H
 #include <jeios/boot.h>
@@ -30,3 +31,4 @@ je_status je_heap_init(je_heap *heap, je_pages *pages, je_map_ram map, void *con
 je_status je_heap_alloc(je_heap *heap, size_t bytes, void **result);
 je_status je_heap_free(je_heap *heap, void *pointer);
 #endif
+

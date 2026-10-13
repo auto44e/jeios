@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef JEIOS_PAGING_H
 #define JEIOS_PAGING_H
 #include <jeios/boot.h>
@@ -8,3 +9,4 @@ je_status je_arch_page_restore(uintptr_t address);
 extern unsigned char __kernel_start[], __kernel_end[], __text_end[], __rodata_end[];
 extern unsigned char je_boot_guard[];
 #endif
+

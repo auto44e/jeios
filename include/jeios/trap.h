@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #ifndef JEIOS_TRAP_H
 #define JEIOS_TRAP_H
 #include <stdint.h>
@@ -14,3 +15,4 @@ void je_arch_test_double_fault(void);
 _Noreturn void je_arch_test_stack_overflow(uintptr_t guard_end);
 extern unsigned char je_df_stack[], je_nmi_stack[];
 #endif
+

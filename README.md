@@ -17,6 +17,9 @@ dynamic module loader or ARM implementation. This is not a daily-use or hardened
 ## Start here
 
 - [Detailed design](docs/DESIGN.md): full product architecture and future contracts.
+- [M3a implementation proposal](docs/M3A.md): proposed boundaries and M3b/M3c contracts.
+- [Accelerators and media](docs/ACCELERATORS.md): open standards, conservative offloading,
+  and planned FFmpeg/HandBrake/Blackmagic RAW integration; no runtime support yet.
 - [Init/service design](docs/INIT.md), [encryption and nearby sharing](docs/ENCRYPTION.md),
   and [filesystem recommendation](docs/STORAGE.md): planned contracts and acceptance gates.
 - [Identity and device management](docs/IDENTITY.md): local login, E2E sync, family and fleet contracts.
@@ -50,6 +53,8 @@ AMD64 is the first compatibility target; AArch64 requires a separate port.
 Modern features are enabled only after their OS prerequisites are implemented.
 The desktop, native SDK, privacy controls and mobile/IoT ecosystem remain planned.
 
-Licensing is **pending owner selection**. No external kernel source has been
-imported. See [the licensing decision](docs/adr/0005-licensing.md) before importing
-third-party components or accepting external contributions.
+Original JeiOS code is licensed under [Apache License 2.0](LICENSE), selected by
+the owner on 2026-10-13. Third-party components retain their own licenses and
+require provenance/compatibility review. No external kernel source has been
+imported. See [the licensing decision](docs/adr/0005-licensing.md).
+
