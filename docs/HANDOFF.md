@@ -1,5 +1,21 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Latest requirements clarification — 2026-10-14T19:55:55-04:00
+
+Owner requires seamless everyday security plus granular power-user/developer and
+company policy control, spanning deliberate permissive experimentation through
+highly restricted deployments. The shared zero-trust proposal now distinguishes
+UI complexity, security policy and hardware assurance; defines proposed profiles,
+scoped exceptions, GUI/CLI/API parity, visible managed policy and honest restoration
+limits. Profile names/settings are proposals. No runtime enforcement was added.
+M3a and mobile MP0 remain next. This clarification updates existing documentation
+PRs (core #12, mobile #6); no merge is performed by this update.
+
+Validation: new Markdown structure, whitespace and conflict-marker checks passed.
+No new links were introduced. Build/emulator tests were not rerun for this
+documentation-only clarification; prior evidence remains at its recorded commits.
+
+
 ## Current status — observed 2026-10-14T23:50:13.156Z
 
 Repository main baseline: `e897e02f9038e164efbb590cfc0229e8300bff54`. GitHub was read at this
