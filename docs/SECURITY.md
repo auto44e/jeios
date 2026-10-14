@@ -114,3 +114,10 @@ explicit reset/quiescence before memory reuse. Offload policy cannot expand
 permissions. No silent precision downgrade or cloud transfer. Unsupported
 required containment fails closed. Codecs/SDKs remain userspace components;
 no GPU/NPU/media isolation is implemented by this document.
+
+## Ecosystem-wide zero trust — owner requirement 2026-10-14
+
+[ZERO_TRUST.md](ZERO_TRUST.md) defines explicit per-resource authority, least
+privilege, identity provenance, revocation, offline rules and cross-device gates.
+This applies throughout the OS and ecosystem. It adds no current enforcement;
+M3a isolation remains the next implementation dependency.
