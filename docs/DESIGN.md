@@ -761,3 +761,10 @@ are future requirements; no input or authentication subsystem exists yet.
 [MOBILE.md](MOBILE.md) records the dedicated mobile repo and owner decision:
 use the same fresh C kernel from the start. AOSP informs a future Android app
 layer across the ecosystem; the earlier AOSP/Linux host proposal is superseded.
+
+## 28. Ecosystem-wide zero trust
+
+Owner decision 2026-10-14: [ZERO_TRUST.md](ZERO_TRUST.md) makes explicit authority,
+least privilege, bounded delegation, revocation and honest offline trust limits
+cross-cutting requirements for all OS/device/service/runtime profiles. Enforcement
+is staged through existing gates; no zero-trust runtime is implemented yet.
