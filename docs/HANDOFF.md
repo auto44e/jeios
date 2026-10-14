@@ -1,5 +1,21 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Latest scope clarification — 2026-10-14T19:59:09-04:00
+
+The approachable-defaults/deep-control philosophy applies to the entire OS and
+ecosystem, not just security. DESIGN.md now records it as the overall product
+vision across UI, apps, hardware, storage/networking, media, performance/power,
+services, identity/sync, updates and developer workflows. Per-area presets and
+expert controls are composable; UI detail, functionality, permissions and hardware
+support stay distinct. Security is one application of this broader philosophy.
+Earlier security-specific notes remain valid within that scope.
+
+Documentation only; core M3a and mobile MP0 remain next. No runtime capabilities
+or new test execution are claimed. This updates the existing review branches;
+no merge is performed. Added prose checked for whitespace/conflict markers;
+no new links or executable changes.
+
+
 ## Latest requirements clarification — 2026-10-14T19:55:55-04:00
 
 Owner requires seamless everyday security plus granular power-user/developer and
