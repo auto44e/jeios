@@ -1,5 +1,63 @@
 # JeiOS system design
 
+## Overall product vision: approachable defaults, deep owner control
+
+Owner clarification: 2026-10-14T19:59:09-04:00. This philosophy governs the
+entire JeiOS OS/ecosystem, not only security. Everyday users should have a coherent,
+seamless and intuitive experience without needing to understand implementation
+details. Power users, developers and organizations should be able to progressively
+inspect, customize, automate, replace and administer supported components in depth.
+
+Apply this to installation/onboarding, desktop and mobile interaction, themes and
+window management, accessibility, apps and compatibility, files/storage, networking,
+identity/sync, privacy/security, hardware/drivers, audio/media, CPU/GPU/NPU resource
+policy, power/performance, init/services, updates/recovery and developer tools.
+Good defaults must be complete useful workflows, not a deliberately limited edition.
+Advanced controls must be discoverable, documented and supported interfaces rather
+than requiring undocumented patches for ordinary customization.
+
+Presets are starting points, not rigid user classes or one global slider.
+Allow per-area complexity and configuration: expert audio with simple networking,
+a custom shell with stock updates, or deep developer tools with hardened security.
+Separate presentation detail, functional configuration, administrative authority,
+security policy and hardware capability. Changing one must not silently change
+the others. Explicit authorized policy changes remain available to owners within
+the device/workspace's disclosed management boundaries.
+
+Provide simple task-oriented UI with progressive disclosure, searchable settings,
+plain explanations and accessible input. Expose appropriate advanced configuration
+through GUI, CLI and documented APIs with equivalent policy enforcement; not every
+low-level operation needs a prominent everyday screen. Versioned configuration,
+validation, dry runs where useful, export/import, automation and effective-setting
+inspection should make complex setups reproducible. Explain dependencies and
+tradeoffs instead of silently ignoring unsupported settings.
+
+Support a spectrum from stock, mostly automatic experiences to deeply customized,
+experimental ("YOLO"), finely tuned and tightly controlled deployments. These are
+composable choices, not a ranking where more restriction or more complexity is
+always better. The authorized owner chooses the balance; organizations can define
+and disclose policy for the devices/workspaces they manage.
+
+Prefer scoped changes, previews and reversible transactions where feasible.
+Clearly identify destructive, irreversible or system-wide effects. Recovery should
+offer a known-good usable environment without needlessly discarding customization.
+A reset-to-defaults action must identify affected data/settings and cannot promise
+to undo prior data loss or compromise. Do not mistake customizability for a promise
+that every component is hot-swappable or every hardware feature exists.
+
+Carry coherent concepts, configuration semantics and workflows across desktop,
+mobile, IoT and future device types, adapting interaction to screen, input, power
+and hardware. Aim for functional parity where practical; publish explicit support
+differences and fallbacks. Cloud accounts and vendor services must not be mandatory
+merely to access ordinary local use or expert controls.
+
+Acceptance must cover both audiences: ordinary end-to-end tasks with sensible
+defaults and little friction, and documented advanced workflows with predictable
+results, configuration portability, accessible explanations and tested recovery.
+Qualify each subsystem as it is implemented. This is an accepted product direction,
+not evidence that any future UI, service, API or parity target already exists.
+
+
 Version: 0.2, 2026-10-12. Status: long-term architecture plus M1/M2 BSP implementation.
 Audience: the project owner, kernel contributors, system developers, and future
 AI agents. This is the primary design document; implementation evidence lives in
