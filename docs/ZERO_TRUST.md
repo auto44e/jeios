@@ -117,6 +117,90 @@ Each gate records exact implementation commit, platform/configuration, commands,
 observed positive and negative results, remaining trusted components and limits.
 No gate is complete because a design, API stub, signed binary or dashboard exists.
 
+## Usability and owner-controlled security spectrum
+
+Owner clarification: 2026-10-14T19:55:55-04:00. Security throughout the OS and
+ecosystem must be seamless and intuitive for everyday users while exposing
+granular, customizable controls to power users, developers and organizations.
+Support a spectrum from deliberately permissive experimentation ("YOLO") through
+secure everyday operation to tightly restricted, high-assurance deployments.
+The spectrum is an accepted product goal; names and exact settings below are
+proposals, not an implemented UI or approved security certification.
+
+### Independent controls
+
+Keep three dimensions distinct: interface detail, actual security policy, and
+hardware/boot assurance. A simple interface can operate a strict device; an expert
+interface can inspect a secure system without weakening it. Security profiles
+intentionally change policy only through an authorized operation, never as a side
+effect of showing more settings. Hardware guarantees cannot be created by a preset.
+
+| Proposed profile | Intended behavior |
+| --- | --- |
+| Everyday (default) | Strong practical defaults, automatic routine protections, understandable consent at meaningful boundaries, easy permission review |
+| Developer | Scoped debugging, local builds, test identities and per-workload exceptions; retain unrelated protections |
+| Permissive / experimental ("YOLO") | Owner-authorized broad grants and selected disabled protections, including development boot/kernel policy where supported; explicit loss of assurance |
+| Hardened | Tighter application/device admission, shorter grants and stronger authentication/recovery policy appropriate to the threat model |
+| Restricted / organization-defined | Custom policy beyond stock presets, potentially allowlisted apps/peripherals, offline operation, restricted networking and dual-control administration |
+
+These are starting configurations, not a single universal security score or a
+claim that every setting forms a total ordering. Allow per-app, service, device,
+user, workspace and resource overrides where the implementation can enforce them.
+For example, keep personal keys and normal apps protected while opening a test
+workspace for development. Where changing kernel/boot trust affects the whole
+machine, explicitly report that isolation cannot preserve the previous assurance.
+
+### Everyday experience and expert tools
+
+Use plain-language descriptions of what an app wants, why and for how long.
+Prefer scoped pickers and brokered actions over broad grants. Avoid repeated
+prompts for already authorized routine work; prompt when authority meaningfully
+expands or sensitive policy requires reauthentication. Do not make dismissing
+security dialogs the normal workflow. Support accessible touch, keyboard and
+assistive interfaces, with concise defaults and expandable technical details.
+
+Experts need equivalent documented GUI, CLI and policy API control, searchable
+settings, versioned policy export/import, dry-run validation, effective-policy
+inspection and explanations of denied operations. Report the source of each
+restriction and how an authorized operator can change it. Policy imports are
+privileged changes and must be validated; an app cannot self-select a permissive
+profile. Keep policy schema and numeric defaults in reviewed ADRs before freezing.
+
+### Deliberate weakening and restoration
+
+An authorized personal-device owner may deliberately relax supported protections.
+Record the exact scope, affected guarantees, duration and restart/reboot needs.
+Offer temporary exceptions and a reliable return path; persistent exceptions are
+allowed when explicitly selected. Confirmation should be proportional to impact,
+not a blanket extra prompt on every action. Show persistent, unobtrusive status
+when assurance is reduced, with details available on demand.
+
+Permissive policy can grant broad authority, but does not mean accepting malformed
+kernel pointers, memory corruption or broken lifetime rules. Mechanism correctness
+remains required. Disabling a boundary removes the corresponding security claim;
+do not continue advertising zero-trust enforcement for that boundary. A permissive
+peer never automatically weakens another device or inherits its credentials.
+
+Returning to a hardened preset does not undo prior compromise, data disclosure,
+key exposure or rollback. Where required, restoration must include trusted boot,
+reinstallation, re-enrollment or credential rotation before assurance is restored.
+Define these transitions per profile and device, including recovery from lockout.
+
+### Managed ownership and qualification
+
+On an unmanaged personal device, the owner controls supported profiles. On managed
+devices/workspaces, identify who controls each policy and show enrollment terms,
+locked settings and effective policy. An ordinary user cannot override an
+organization's authorized policy floor. Personal versus corporate ownership,
+unenrollment, emergency access and destructive reset implications need explicit
+contracts; no hidden administrator authority or universal bypass.
+
+Test both usability and enforcement: everyday tasks without prompt storms,
+accessible explanations, GUI/CLI/API equivalence, scoped exceptions, policy
+precedence, denied unauthorized changes, profile transitions, offline recovery,
+cross-device mismatch and inability to claim unavailable hardware assurance.
+No preset is "absolutely secure"; qualify actual controls and residual risks.
+
 ## Related designs
 
 [Security](SECURITY.md), [M3 proposal](M3A.md), [Identity](IDENTITY.md),
