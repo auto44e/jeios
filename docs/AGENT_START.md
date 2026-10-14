@@ -1,8 +1,11 @@
 # Coding-agent starting guide
 
-Updated 2026-10-13. Read this with ../AGENTS.md, HANDOFF.md and IMPLEMENTATION.md.
+Updated 2026-10-14. Read this with ../AGENTS.md, HANDOFF.md and IMPLEMENTATION.md.
 Owner requested a sustained coding-agent handoff. This guide records requirements
 and continuation order; it does not claim later milestones are implemented.
+
+Current status and timestamped history: [HANDOFF.md](HANDOFF.md). Ecosystem-wide
+[zero trust](ZERO_TRUST.md) is an owner requirement; enforcement remains planned.
 
 ## Establish the correct baseline
 
