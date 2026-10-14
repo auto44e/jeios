@@ -52,3 +52,18 @@ State: implemented / tested / planned / blocked. List files and commands. Identi
 next bounded task and its pass/fail criteria. Record what is NOT enforced yet;
 security claims must map to actual checks at a trust boundary.
 
+
+## Status refresh and historical records
+
+Owner preference recorded 2026-10-14: retain detailed timestamped history alongside
+a clearly labeled current status. Every refresher must record an ISO-8601
+observation time with timezone, repository/branch and exact inspected commit,
+implemented/tested/planned/blocked states, PR/issue state, evidence and next task.
+Separate an event's timestamp from the time it was verified. If an old record has
+only a date, preserve that precision; never invent a time. Keep superseded plans
+and previous failures as labeled history with links to their replacements.
+
+Current status takes precedence over historical branch names or open/closed
+wording. Preserve previous test results at their original commit and environment;
+do not present them as rerun or current-head CI. State unverified items explicitly.
+Use enough detail for an agent to resume without reconstructing the conversation.
