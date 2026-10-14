@@ -1,13 +1,47 @@
 # Agent handoff: M1/M2 kernel foundation
 
-Updated: 2026-10-13. Project `auto44e/jeios`; current documentation branch
-`docs/mobile-ecosystem` (PR #11). M1/M2 foundation PR #1 is merged into main.
-Read AGENTS.md, IMPLEMENTATION.md, ROADMAP.md and the relevant DESIGN.md sections.
-Start with [AGENT_START.md](AGENT_START.md) for the consolidated requirements and
-linked work queue. Multitouch/security-key PR #10 is merged into main at
-`5f290b3`; this branch incorporates that merge and preserves both feature plans.
-The previous M0 state is preserved in git history; this file describes the M1/M2
-implementation and subsequent documentation checkpoints. Do not infer future capabilities from design prose.
+## Current status — observed 2026-10-14T23:50:13.156Z
+
+Repository main baseline: `e897e02f9038e164efbb590cfc0229e8300bff54`. GitHub was read at this
+checkpoint: PRs #1, #10 and #11 are merged; no pre-existing open core or mobile PR
+was returned. This documentation update will have its own reviewable PRs and is
+not merged by this snapshot. M1/M2 remains the documented implementation baseline;
+M3a is next, then M3b/M3c. Mobile remains planning/scaffold; MP0 is next.
+No runtime implementation or test rerun is claimed by this refresh.
+
+Owner added ecosystem-wide [zero trust](ZERO_TRUST.md) on 2026-10-14.
+It is a planned cross-cutting framework; current CPL0 workers are not isolated.
+The previously recorded build/emulator/CI evidence below remains historical and
+scoped to its original commits; current-head CI has not been checked in this refresh.
+
+### Verified merge history
+
+| Event | GitHub event time (UTC) | Merge commit |
+| --- | --- | --- |
+| PR #1 | 2026-10-13T20:33:01Z | `03aa2f380d8e49262abd1720a3b8db37517cbb31` |
+| PR #10 | 2026-10-13T23:05:02Z | `5f290b351181d8fa23b17ac5f493ff66ae9415b8` |
+| PR #11 | 2026-10-13T23:10:59Z | `e897e02f9038e164efbb590cfc0229e8300bff54` |
+
+Earlier date-only checkpoints below retain their original precision. Their
+branch names, open-PR statements and test outcomes describe those past sessions.
+The current baseline above supersedes historical continuation instructions.
+
+Read AGENTS.md, IMPLEMENTATION.md, ROADMAP.md and [AGENT_START.md](AGENT_START.md).
+
+## Status refresh and historical records
+
+Owner preference recorded 2026-10-14: retain detailed timestamped history alongside
+a clearly labeled current status. Every refresher must record an ISO-8601
+observation time with timezone, repository/branch and exact inspected commit,
+implemented/tested/planned/blocked states, PR/issue state, evidence and next task.
+Separate an event's timestamp from the time it was verified. If an old record has
+only a date, preserve that precision; never invent a time. Keep superseded plans
+and previous failures as labeled history with links to their replacements.
+
+Current status takes precedence over historical branch names or open/closed
+wording. Preserve previous test results at their original commit and environment;
+do not present them as rerun or current-head CI. State unverified items explicitly.
+Use enough detail for an agent to resume without reconstructing the conversation.
 
 ## Owner intent
 
@@ -106,8 +140,8 @@ kernel threads in one address space. Never call them isolated processes/apps.
 
 ## Next bounded work: M3a userspace boundary
 
-Start a new implementation branch from updated main for M1/M2. Read mobile PR #11
-while it remains open, or its merged docs once available on main. Specify user/kernel address
+Start a new implementation branch from updated main. PR #11 is merged; read
+its mobile design documents on main. Specify user/kernel address
 layout, user code/data/stack mapping rights, private kernel stacks, TSS RSP0,
 entry/return state, and copy-in/copy-out fault semantics before adding syscalls.
 Keep CPU feature exposure restricted to state the scheduler preserves. Add a
@@ -277,3 +311,15 @@ remains the tested M1/M2 foundation; documentation merges do not require moving
 that implementation pin. Boot tests were not repeated locally for docs-only
 changes. Check remote CI on the new PR head before merging. M3a and mobile MP0
 remain the next bounded tasks; no ARM64/Pixel/Android execution is implemented.
+
+## Historical handoff header — 2026-10-13 (superseded)
+
+Updated: 2026-10-13. Project `auto44e/jeios`; current documentation branch
+`docs/mobile-ecosystem` (PR #11). M1/M2 foundation PR #1 is merged into main.
+Read AGENTS.md, IMPLEMENTATION.md, ROADMAP.md and the relevant DESIGN.md sections.
+Start with [AGENT_START.md](AGENT_START.md) for the consolidated requirements and
+linked work queue. Multitouch/security-key PR #10 is merged into main at
+`5f290b3`; this branch incorporates that merge and preserves both feature plans.
+The previous M0 state is preserved in git history; this file describes the M1/M2
+implementation and subsequent documentation checkpoints. Do not infer future capabilities from design prose.
+
