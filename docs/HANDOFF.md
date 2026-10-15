@@ -1,5 +1,19 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Latest native-app requirement — 2026-10-14T20:12:45-04:00
+
+Owner requires native JeiOS apps to gracefully handle cryptographic relock/unlock.
+The shared ENCRYPTION.md now makes this an SDK/toolkit/application conformance
+contract: protected drafts/checkpoints, bounded lifecycle events, OS-enforced
+revocation, process reconstruction and fresh authority after unlock. Apps cannot
+veto locking, and callback acknowledgement alone does not prove memory cleanup.
+Interrupted external operations require reconciliation, not automatic replay.
+
+Planned only; no API/runtime implementation added. Core M3a and mobile MP0 remain
+next. Documentation structure/whitespace checked; no executable tests rerun.
+This update stays on existing PR branches, with no merge performed.
+
+
 ## Latest requirement — 2026-10-14T20:08:17-04:00
 
 Owner wants ordinary device/session locking to support cryptographic relock:
