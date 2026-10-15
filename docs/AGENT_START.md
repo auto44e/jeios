@@ -108,3 +108,12 @@ resource/accounting invariants and next step. Do not merge/release, assign revie
 change credentials, contact vendors or import restricted source without applicable
 authorization. The owner asked to approve PR #1; that is not an instruction to
 invent an independent reviewer or silently bypass self-review restrictions.
+
+## Cryptographic relock requirement — 2026-10-14
+
+ENCRYPTION.md now requires a configurable ordinary-lock path to withdraw protected
+user-domain keys and plaintext access without a power cycle. Include process/cache/
+DMA cleanup, credential-gated reopening, background exceptions and truthful failure
+status. Screen lock alone is insufficient; reboot equivalence is not assumed.
+Key-domain and lifecycle design precede storage/identity format freeze; runtime
+qualification remains a later gate. No implementation was added.
