@@ -1,10 +1,11 @@
 # Filesystem recommendation and storage contracts
 
 Status: recommendation and future implementation plan, 2026-10-13. No VFS,
-block driver or filesystem exists in JeiOS today. The final production default
-remains open pending evidence, dependency license review and porting feasibility.
+block driver or filesystem exists in JeiOS today. The long-term policy is multiple profile-selected defaults (owner decision
+2026-10-14, detailed below). Exact production profiles remain subject to evidence,
+dependency license review and porting feasibility.
 
-## Provisional default
+## Initial bring-up default
 
 Build a filesystem-independent VFS. Start M5 with a bounded read-only init image
 and RAM filesystem, then qualify an explicitly limited ext4 format profile as
@@ -99,7 +100,7 @@ encryption when used, with bounded decompression. Disable cross-user deduplicati
 by default. Define discard/TRIM leakage, snapshots retaining deleted content,
 key erasure and backups before promising secure deletion, particularly on SSDs.
 
-## Evidence required before selecting the production default
+## Evidence required before qualifying production defaults
 
 Compare low-memory idle/cache behavior, recovery time, boot/update reliability,
 small-file latency, sustained writes, SSD write amplification and storage failures.
@@ -328,3 +329,87 @@ power loss at activation/migration, failed health checks, credential/key changes
 and forward-after-rollback. Verify user files survive OS rollback and unauthorized
 apps cannot disable protection or choose a different trusted boot version.
 No runtime implementation or completed gate is implied by this decision.
+
+## Owner decision: multiple first-class default backends and owner replacements
+
+Decision: 2026-10-14T20:40:22-04:00. The long-term core storage offering should
+include Btrfs, OpenZFS and an appropriate mobile filesystem as first-class default
+choices, with a seamless native JeiOS experience above them. Owners may substitute
+their own filesystem as the system default within documented technical and policy
+limits. This supersedes the earlier framing of selecting one universal production
+default; it does not certify any backend or authorize unreviewed source imports.
+
+Proposed profile mapping: Btrfs for general desktops/laptops; OpenZFS for
+storage-focused workstation/server profiles; F2FS as the mobile flash candidate.
+These mappings and F2FS selection require measurements and qualification, rather
+than restricting advanced owners to a device category. ext4 remains the initial
+bounded bring-up target and a possible supported alternative. No filesystem is
+implemented yet; do not expand the next gate beyond M3a to deliver these in parallel.
+
+### Common experience and capability contracts
+
+Core default means a maintained, integrated and tested choice for named profiles,
+not all filesystems simultaneously managing the same block ranges. Default
+installation chooses a qualified profile without asking ordinary users to compare
+filesystem internals. Advanced installation and administration expose supported
+choices, constraints and tradeoffs. Multiple backend volumes may coexist with
+separate ownership, mounts and resource accounting.
+
+Native applications use JeiOS file/storage, identity, encryption-domain, lifecycle
+and version-management APIs. Keep snapshots, datasets, subvolumes and backend
+commands out of ordinary workflows. Native namespaces and permissions must retain
+their intended semantics across backends; unsupported operations return explicit
+capability errors. Publish a backend/version/feature matrix and negotiate actual
+capabilities rather than pretending every backend has identical native features.
+
+The OS deployment manager supplies version history and recovery even without
+native filesystem snapshots, using qualified A/B or versioned-image mechanisms.
+Per-user cryptographic relock requires separately qualified encryption/key-domain
+and cache-revocation integration; a common API is not evidence of equal protection.
+Filesystem encryption, external encryption layers and OS protection domains need
+explicit backend-specific implementations and threat models.
+
+Use baseline contracts for durability, atomic namespace operations, ownership,
+bounds, quotas/accounting, locking, cancellation, key availability and failure.
+Map optional checksums, compression, snapshots, cloning and replication separately.
+Equivalent UX may use different implementations; do not silently simulate guarantees
+such as durable commits, authentication or instant atomic snapshots.
+
+### Owner-provided system-default filesystem
+
+Provide a documented, versioned backend interface and conformance tooling.
+Distinguish an ordinary data-volume adapter from a system/root-capable backend.
+System-default qualification additionally requires early boot/init integration,
+update staging/activation, recovery tools, crash consistency, locked-volume behavior,
+and a way to recover when the backend cannot mount. Drivers belong behind isolated
+service boundaries where feasible; early trusted components need explicit review.
+A plugin interface does not grant arbitrary kernel privilege or bypass boot policy.
+
+Allow owners to build, register, select and package a custom backend and recovery
+implementation. Offer an explicitly experimental profile for unqualified owner
+builds with clear lost guarantees; do not advertise production support or a hardened
+profile when required invariants are absent. Managed systems may restrict selection
+under disclosed policy. A safe recovery environment should not depend solely on
+the experimental filesystem it is meant to repair.
+
+Changing the configured default generally affects new installs/volumes/deployments.
+Existing on-disk data does not change format by flipping a setting. Migration needs
+a separately designed copy/export/import or specifically qualified conversion path,
+sufficient storage, verification, backup/recovery and explicit destructive-write
+authorization. Never silently reformat media, assume universal in-place conversion,
+or let two backends concurrently own the same writable ranges.
+
+### Qualification and maintenance
+
+Qualify each backend independently for read-only, read/write, system boot,
+protected/mutable deployments, version navigation, crypto relock, quotas and
+multi-user boundaries. Test power loss, ENOSPC, corruption, concurrent operations,
+device loss, memory budgets, sustained latency, flash write amplification,
+checkpoint compatibility and independent-tool recovery. Keep exact feature flags
+and versions pinned; a successful desktop port does not qualify mobile.
+
+Maintaining several defaults multiplies integration and recovery work. Stage
+delivery rather than making every backend a prerequisite to the first usable
+system. Upstream formats and implementations retain their own licenses and
+provenance requirements. Any custom or imported backend must have an explicit
+maintenance owner and supported-profile declaration before production promotion.
