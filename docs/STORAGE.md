@@ -205,3 +205,126 @@ network mounts depend on M6 and identity controls. Before release, choose and
 publish a finite supported subset. Broad compatibility does not justify delaying
 process isolation or importing unreviewed foreign kernel code.
 
+
+## Owner decision: protected defaults and independent version management
+
+Decision: 2026-10-14T20:30:05-04:00. Implement protected, versioned system
+deployments as the seamless default for ordinary users. Native JeiOS apps and
+components must integrate naturally with this model. Keep it fully configurable,
+including an authorized owner-controlled off switch for system immutability.
+Provide intuitive forward updates and rollback for the OS and built-in apps
+independently of whether system immutability is enabled.
+
+This is an accepted product requirement and future implementation direction,
+not implemented storage/update behavior. Existing M3a and mobile MP0 sequencing
+is unchanged; design deployment/data contracts before M5 formats freeze and
+qualify trusted update/recovery at M9. Provisional ext4 remains compatible with
+the direction; snapshots or a particular filesystem are not mandatory.
+
+### Separate mechanisms and controls
+
+Treat these as independent concepts:
+- System write protection: whether active OS-managed files can be modified in place.
+- Version/deployment management: retaining, preparing and selecting coherent versions.
+- Trust policy: which publishers, owner builds and system modifications are authorized.
+- Data protection: encryption, relock domains and mutable-data migration/backup rules.
+
+Turning off system write protection does not disable version history, the update
+manager, authorization, encryption or recovery. Nor does it automatically disable
+verified boot or allow unsigned code: settings can interact and those dependencies
+must be explained. If direct changes invalidate a verified image, report its
+changed trust state and offer a qualified owner-build/reseal/development path.
+Managed devices may enforce disclosed policy; an unauthorized user cannot bypass
+that policy via the off switch.
+
+The proposed UX is a simple protected-system control plus an independent version
+history with actions such as update, return to previous version and reapply a
+retained compatible version. Exact wording/interaction is not frozen. Everyday
+users should not need to understand images, overlays, package graphs or partitions.
+Expert GUI/CLI/APIs expose manifests, diffs, dependencies, retention, trust state
+and custom compositions with the same permission checks.
+
+### Native OS and app update contracts
+
+Maintain a version manifest covering OS components and built-in apps, their
+dependencies/ABI ranges, provenance and data-schema requirements. Applications
+should update independently when qualified compatibility permits; components
+requiring a coordinated OS/app set move together. Built-in status does not imply
+blanket privileges. Avoid forcing a whole OS reboot for an app-only update where
+safe replacement is supported; show when an actual restart/reboot is required.
+
+Use a shared native lifecycle contract for update preparation, bounded quiescence,
+protected state saving, resource release and restoration. Reuse crypto-relock
+primitives where appropriate, but update and relock are distinct events with
+different key availability and state transitions. Apps must survive termination
+without a final callback and validate versioned saved state on restart.
+
+Stage and validate an update before activation. Require a crash-safe activation
+record and dependency-consistent deployment selection. Health checks determine
+whether to retain the new deployment or return to an authorized compatible one.
+Keep a recovery path independent of a broken desktop, app manager or writable
+development deployment. Define bounded retries, ENOSPC behavior, incomplete
+downloads and power-loss recovery; never delete the last recovery candidate
+merely to free space for an update.
+
+### Mutable mode with version history
+
+When write protection is off, allow authorized direct modifications. Preserve
+managed version manifests and recoverable prior deployments independently.
+Before replacing a modified deployment, identify its divergence and offer an
+explicit preserve/checkpoint, rebase/merge, discard or abort path as applicable.
+Do not silently overwrite local changes or represent an altered deployment as
+byte-identical to its original release. Never blindly replay old modifications
+over new privileged binaries.
+
+Native managed updates should retain transactional behavior in mutable mode.
+Arbitrary out-of-band writes cannot automatically be promised atomic or recoverable.
+Specify what is checkpointed, when, and which writes bypass tracking. A complete
+recoverable system checkpoint must capture a coherent state and account for
+concurrent writers; an arbitrary folder copy is not sufficient. Atomic deployment
+switching may require staging another generation even if the current one is writable.
+
+Reenabling protection validates/recomposes the chosen system version and reports
+remaining trust limitations. Making modified files read-only does not restore
+their integrity or undo prior compromise. Keep the off switch practical and
+documented without claiming protections that have been disabled.
+
+### Forward/back navigation and data compatibility
+
+The user-facing history should offer a simple way to move between retained,
+compatible versions of the OS and built-in apps, in either protection mode.
+Prepare a reversible plan where possible and explain any migration, restart,
+missing dependency, blocked version or data consequence before activation.
+Retained releases remain subject to owner/organization trust and anti-rollback
+policy: do not silently boot a revoked vulnerable version to satisfy a rollback.
+
+Executable rollback is separate from user-data rollback. Native apps must declare
+schema/checkpoint compatibility and migration behavior. Prefer backward-compatible
+changes; where needed retain protected recovery copies or use a separately reviewed
+transactional migration. Non-reversible migrations require an explicit data recovery
+choice or a blocked downgrade, not a falsely successful rollback. Documents created
+since the older OS version must not disappear merely because OS code was reverted.
+
+Forward navigation after rollback is conditional on validated manifests and data
+compatibility, not guaranteed replay of an old session. Never replay external
+messages, purchases or remote actions. Retention/garbage collection must preserve
+referenced recovery data and respect storage quotas, encryption domains and key
+lifecycle. History is not a substitute for independent backups; retained copies
+may retain deleted secrets and must be reflected in deletion/privacy controls.
+
+### Acceptance and implementation gates
+
+At M5 specify version manifests, configuration/data separation, immutable versus
+mutable ownership and crash-safe deployment selection. At M7 qualify accessible
+everyday history/recovery UX and advanced controls. At M9 qualify signatures,
+owner trust roots, anti-rollback policy and recovery. Shared native SDK and built-in
+apps must pass lifecycle/migration tests; mobile qualifies its own boot/storage
+constraints rather than inheriting desktop guarantees.
+
+Test protected and mutable modes, owner-built deployments, direct modification
+conflicts, switching protection on/off, independent and coordinated app updates,
+old/new schemas, crypto-relock checkpoints, low disk space, corrupt manifests,
+power loss at activation/migration, failed health checks, credential/key changes
+and forward-after-rollback. Verify user files survive OS rollback and unauthorized
+apps cannot disable protection or choose a different trusted boot version.
+No runtime implementation or completed gate is implied by this decision.
