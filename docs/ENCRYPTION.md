@@ -295,3 +295,18 @@ Native app qualification must distinguish supported recovery from best effort.
 Foreign applications use compatibility lifecycle adapters with separately tested
 limits; they must never weaken the native relock boundary. This is a planned
 SDK/platform requirement; no lifecycle APIs or runtime enforcement exist yet.
+
+## Android compatibility adaptation — 2026-10-14T20:15:24-04:00
+
+The owner explicitly assigns additional relock/unlock lifecycle work to the future
+AOSP-derived compatibility layer. Its framework/runtime adapters coordinate
+foreign app persistence, process teardown/reconstruction, Binder and native broker
+resource lifetimes, protected caches and background exceptions. Host policy and
+key eviction remain authoritative. Neither pausing ART nor Android lifecycle
+callbacks alone establish cryptographic relock.
+
+jeios-mobile/docs/ANDROID.md records the AC0-AC2 responsibility and test matrix.
+Shared core/runtime work supports all device types. Prefer framework/app-supported
+restoration; encrypted checkpoints require separate qualification. Publish honest
+per-app recovery limits where state was never saved or external operations cannot
+be replayed safely. No silent lock-policy downgrade for compatibility.
