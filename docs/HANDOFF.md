@@ -1,5 +1,21 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Latest requirement — 2026-10-14T20:08:17-04:00
+
+Owner wants ordinary device/session locking to support cryptographic relock:
+withdraw protected user-domain keys and plaintext access to regain a defined
+pre-first-unlock-like state without reboot. Shared core ENCRYPTION.md specifies
+proposed lock profiles, key/lifecycle/DMA cleanup, strong-credential reopening,
+background-service exceptions, failure handling and acceptance gates.
+This is an ecosystem-wide requirement, including mobile and compatibility apps.
+No universal reboot equivalence or implemented encryption is claimed.
+
+Planning only; core M3a and mobile MP0 remain next. Added prose was checked for
+whitespace/conflict markers; reference URLs came from retrieved official Apple/AOSP
+documentation. No kernel/build/emulator tests were rerun. Existing documentation
+PR branches are updated; no merge is performed.
+
+
 ## Latest scope clarification — 2026-10-14T19:59:09-04:00
 
 The approachable-defaults/deep-control philosophy applies to the entire OS and
