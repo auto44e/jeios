@@ -235,3 +235,63 @@ Reference models reviewed 2026-10-15 UTC:
 - Android credential-encrypted versus device-encrypted storage:
   https://source.android.com/docs/security/features/encryption/file-based
 
+
+## Native application contract: graceful cryptographic relock/unlock
+
+Owner clarification: 2026-10-14T20:12:45-04:00. Graceful cryptographic relock and
+unlock is a first-class native JeiOS application requirement across device types.
+Design the SDK, toolkit, storage and task APIs around this lifecycle from the
+start. It must be a normal supported transition, not exceptional behavior that
+every developer has to invent. Native app conformance requires lifecycle tests;
+being compiled for JeiOS alone does not prove correct handling.
+
+The desired experience is to lock normally and resume the app's meaningful state
+after unlock, including recoverable unsaved drafts, navigation and task progress.
+Applications do not need to preserve the same process or keep plaintext resident.
+Toolkit/session restoration can reconstruct a terminated process from a protected
+checkpoint. Persistent state must have explicit retention and deletion semantics;
+do not turn every transient secret into a saved draft.
+
+### Proposed SDK and OS responsibilities
+
+- Provide domain-aware protected storage, durable drafts, transactional checkpoints,
+  cancellable asynchronous I/O and restartable tasks through standard APIs. Use
+  toolkit defaults to preserve ordinary UI state without copying sensitive content
+  into boot-available storage. SDK helpers never expose raw storage keys.
+- Define a bounded prepare-for-relock event, protected-resource-unavailable results
+  and an authenticated domain-available/restoration event. Exact ABI/names, callback
+  context, deadline and event ordering remain ADR decisions. An app cannot veto
+  lock or extend the grace period indefinitely.
+- Immediately protect the screen and freeze new authority at relock initiation.
+  A policy-bounded preparation phase may allow existing authorized operations to
+  commit protected state; the UI must not report cryptographic completion during
+  that phase. Strict profiles may require immediate revocation and rely on prior
+  durable checkpoints. Apps must tolerate having no final callback.
+- At the deadline, the OS enforces revocation, closes/invalidate grants, clears
+  protected memory and quiesces device access. Terminate affected processes when
+  their plaintext cannot otherwise be reliably removed. An app acknowledgement
+  is not evidence that all copies are gone. Pausing a process is not sufficient.
+- On authorized unlock, restore using versioned, validated, bounded checkpoints.
+  Reissue fresh resource handles; never deserialize pointers, keys or stale
+  capabilities as restored authority. Reevaluate current permissions and policy.
+  Unlock does not automatically authorize a sensitive external action.
+- Define task-specific resume semantics: interrupted reads can restart; writes
+  need transaction/recovery rules; external side effects need operation identifiers
+  and reconciliation. Never blindly replay payments, messages or remote commands.
+  Media/network/accelerator work must use broker cancellation and reinitialization.
+- In multi-domain apps, isolate protected workers or restart the whole process
+  when necessary. A less-protected UI/background worker must not retain a locked
+  domain's plaintext. Background exceptions use explicit separate authority.
+
+Provide reference applications, developer diagnostics without secret-bearing logs,
+and a conformance suite. Test relock during editing, save, download, rendering,
+GPU/NPU work, network loss and remote operations; repeated lock/unlock; process kill
+before callbacks; expired permissions; corrupt/old checkpoints; low memory/storage;
+multiple users/domains and power loss. Verify both protection and useful restoration.
+
+Graceful recovery is the required design target, not a promise of zero data loss
+under arbitrary failure. Clearly surface unrecoverable work and checkpoint failures.
+Native app qualification must distinguish supported recovery from best effort.
+Foreign applications use compatibility lifecycle adapters with separately tested
+limits; they must never weaken the native relock boundary. This is a planned
+SDK/platform requirement; no lifecycle APIs or runtime enforcement exist yet.
