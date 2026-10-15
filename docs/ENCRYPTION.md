@@ -135,3 +135,103 @@ receive content keys; organization recovery recipients and management telemetry
 collectors are explicitly named endpoints for their respective data. A privileged
 managed OS can inspect ordinary active sessions, so E2E is not a promise against
 every device administrator. Revocation cannot erase previously delivered plaintext.
+
+## Cryptographic relock on ordinary device lock
+
+Owner requirement: 2026-10-14T20:08:17-04:00. A normal lock action should be able
+to restore pre-first-unlock-like protection for selected user data without requiring
+a power cycle. Applies across device types and to manual lock, idle timeout,
+lid-close, remote authorized lock and other configured session-lock triggers.
+Exact triggers/defaults and platform feasibility require ADRs and tests.
+
+Data remains encrypted at rest while unlocked; the change is withdrawal of usable
+keys and plaintext access, not re-encrypting the entire disk each time. Distinguish
+screen/UI lock, cryptographic relock of a declared protection domain, and a real
+reboot. Relock cannot reset every privileged component, undo compromise or provide
+universal forensic equivalence to powered-off or freshly booted hardware.
+
+### Proposed lock policies
+
+- Ordinary session lock: hides interaction; explicitly identify any keys/data still
+  accessible to background services. Do not label this cryptographic relock.
+- Cryptographic relock: ordinary lock also evicts the selected domain's usable
+  keys and clears or seals its plaintext state, restoring a defined credential-gated
+  state. Offer this as an integrated everyday lock option, not a special reboot.
+- Strict credential relock: same protection with fresh PIN/passphrase or a separately
+  qualified strong credential required; disable biometric-only and trusted-device
+  auto-unlock paths for this profile. A convenience biometric option, if qualified,
+  has a separately stated key-release policy and must not imply identical guarantees.
+
+Default selection must balance usable workflows with demonstrated protection.
+Keep configuration understandable: explain background functionality lost and data
+still available. Power users and organizations can scope profiles per user/workspace
+where real key/process isolation permits. A session holding another user's data
+must not retain it across that user's relock merely because its own session is open.
+
+### Transition contract before implementation
+
+Define states unlocked -> relocking -> cryptographically locked -> unlocking.
+Immediately secure the UI and block new domain grants. In bounded time, revoke
+access, stop/quiesce affected workloads and device submissions, durably commit
+approved writes, then remove keys from every usable key slot/cache and clear
+plaintext across apps, brokers, filesystem/page caches, shared mappings, clipboard,
+previews, swap/dumps, IPC and GPU/NPU/device memory. Invalidate old handles and
+pending completions so races cannot reopen the domain.
+
+Suspending a process with readable plaintext in RAM is insufficient. Terminate it
+or checkpoint it using an independently reviewed encrypted format whose decrypting
+key is unavailable until the next authorized unlock. Resumption and application
+state restoration are goals requiring tested implementations, not assumed free
+side effects. Noncooperative apps must not indefinitely prevent lock; define bounded
+termination, unsaved-work policy and clear recovery behavior without silently
+discarding data or leaving the domain accessible.
+
+Only report successful cryptographic relock after the declared postconditions hold.
+If writes, DMA quiescence, memory sanitization or key eviction fail, keep the UI
+locked, report protection as incomplete and follow an explicit tested fallback.
+Where shutdown/reboot is needed, say so; never certify success based on a screen
+animation. The exact durability/fallback policy must be resolved before release.
+
+Key hierarchy must separate boot-available services from credential-gated user
+domains. No resident master/wrapping key, recovery agent or cached authentication
+token may silently reconstruct a supposedly evicted domain key. Credential attempts
+require reviewed rate limiting and hardware protection where qualified; short PIN
+security cannot be assumed on platforms lacking those protections.
+
+### Background work and practical limits
+
+Alarms, emergency functions, calls and minimal notifications may need distinct
+boot-available services/data. Specify their narrow data classes, keys and metadata
+exposure. Sensitive notification previews, sync, search, media playback, downloads
+and remote workloads pause unless a user-authorized exception explicitly retains
+the required data in a separate domain. Exceptions reduce coverage; display them.
+An app cannot silently copy protected content into a weaker class for convenience.
+
+Remote peers, already delivered plaintext, peripheral firmware and historical memory
+copies cannot be erased by local relock. Powered RAM remanence, firmware, secure
+hardware, storage/controller caches and compromised kernel behavior require an
+honest platform-specific threat model. An unlocked hostile kernel may already
+have retained secrets. Encryption at rest alone does not solve this.
+
+### Dependencies and acceptance
+
+Design key classes, protected domains, app lifecycle and lock ABI before storage,
+identity and session formats freeze. Implement only after M3 isolation/handles/IPC,
+M4 device quiescence and M5 storage/lifecycle foundations; M9 cryptographic and
+platform qualification is required for a security claim. Mobile qualifies equivalent
+behavior independently, including Android compatibility apps and suspend/resume.
+
+Test every trigger, concurrent reads/writes and key requests, noncooperative apps,
+shared mappings, in-flight DMA, process death, multiple users, background exceptions,
+power loss during relock, hibernation, stale authentication tokens, wrong credentials,
+offline unlock and failure recovery. Verify no usable domain key or protected
+plaintext remains accessible through the specified software/hardware interfaces.
+No whole-device BFU-equivalence claim without a separately defined threat model
+and independent evidence. All behavior in this section remains planned.
+
+Reference models reviewed 2026-10-15 UTC:
+- Apple Data Protection classes:
+  https://support.apple.com/en-ie/guide/security/secb010e978a/web
+- Android credential-encrypted versus device-encrypted storage:
+  https://source.android.com/docs/security/features/encryption/file-based
+
