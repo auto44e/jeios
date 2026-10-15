@@ -117,3 +117,14 @@ DMA cleanup, credential-gated reopening, background exceptions and truthful fail
 status. Screen lock alone is insufficient; reboot equivalence is not assumed.
 Key-domain and lifecycle design precede storage/identity format freeze; runtime
 qualification remains a later gate. No implementation was added.
+
+## Protected system and version management — owner decision 2026-10-14
+
+STORAGE.md records seamless protected/versioned system deployments by default,
+full owner customization including an immutability off switch, and independent
+intuitive OS/built-in-app update/rollback in both protected and mutable modes.
+Native apps must participate through lifecycle and schema compatibility contracts.
+Write protection, deployment history, trust policy and data encryption are distinct.
+Mutable-mode direct edits require explicit conflict/checkpoint handling; rollback
+must not silently revert user documents or bypass data/anti-rollback constraints.
+Accepted direction, not implemented behavior; M3a remains next.
