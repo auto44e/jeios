@@ -1,5 +1,20 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Latest compatibility requirement — 2026-10-14T20:15:24-04:00
+
+Owner expects the future AOSP-derived Android layer to carry additional crypto
+relock/unlock adaptation for existing apps. Mobile ANDROID.md now specifies
+framework/ART/Binder/JNI and native-resource coordination, bounded state saving,
+domain teardown/restoration and app-specific qualification. Core ENCRYPTION.md
+records host ownership of keys/policy and the compatibility boundary.
+No hidden key retention or weaker host policy to keep a foreign app running.
+Graceful restoration is a target; unsupported unsaved-state recovery is disclosed.
+
+Planned only; no Android runtime or relock implementation added. Core M3a/mobile
+MP0 remain next. No executable tests rerun for these documentation additions.
+Changes remain on existing PR branches; no merge performed.
+
+
 ## Latest native-app requirement — 2026-10-14T20:12:45-04:00
 
 Owner requires native JeiOS apps to gracefully handle cryptographic relock/unlock.
