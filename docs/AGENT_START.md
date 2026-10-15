@@ -128,3 +128,13 @@ Write protection, deployment history, trust policy and data encryption are disti
 Mutable-mode direct edits require explicit conflict/checkpoint handling; rollback
 must not silently revert user documents or bypass data/anti-rollback constraints.
 Accepted direction, not implemented behavior; M3a remains next.
+
+## Multiple default filesystems — owner decision 2026-10-14
+
+STORAGE.md now records Btrfs, OpenZFS and a mobile backend as first-class long-term
+default choices selected by qualified device profiles. F2FS is the proposed mobile
+candidate. Owners can select a conforming custom backend, including as system
+default with additional boot/recovery qualification, or use a visibly experimental
+profile. Native APIs keep workflows coherent without claiming identical features.
+ext4 stays the initial bring-up target. No automatic reformat/conversion or new
+implementation is implied. M3a remains next.
