@@ -28,7 +28,7 @@ M0 stubs do not count as completing future modules.
 ## Current gate status and next task
 
 M0, M1a, M1b and the scoped M2 BSP foundation are implemented on
-`develop/m1-m2-core`; see IMPLEMENTATION.md and HANDOFF.md for exact evidence.
+main (foundation PR #1 merged 2026-10-13); see IMPLEMENTATION.md and HANDOFF.md for exact evidence.
 M1 has validated maps/reservations, fatal exceptions and hardware permission tests.
 M2 has bounded page/heap allocation, timer preemption, guarded kernel threads,
 yield/sleep/exit and deferred stack reclamation. This is not a general scheduler,
@@ -116,3 +116,10 @@ These requirements extend the later backlog; M3a remains the next kernel task.
 native virtual execution/isolation, MP4 Pixel feasibility, MP5-MP6 physical mobile
 bring-up/services, AC0-AC2 future Android compatibility. Fresh C kernel remains
 shared; no AOSP/Linux host or lunch target. Core M3a remains next.
+
+## Zero trust throughout the ecosystem — 2026-10-14
+
+[ZERO_TRUST.md](ZERO_TRUST.md) maps enforcement to M3a isolation, M3b rights,
+M3c IPC, M4-M6 brokers/network/storage, M7-M9 consent/identity/recovery and mobile
+qualification. Treat this as a requirement across gates, not a completed feature
+or a reason to skip M3a. See HANDOFF.md for dated current status and history.

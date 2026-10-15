@@ -1,8 +1,21 @@
 # Coding-agent starting guide
 
-Updated 2026-10-13. Read this with ../AGENTS.md, HANDOFF.md and IMPLEMENTATION.md.
+Updated 2026-10-14. Read this with ../AGENTS.md, HANDOFF.md and IMPLEMENTATION.md.
 Owner requested a sustained coding-agent handoff. This guide records requirements
 and continuation order; it does not claim later milestones are implemented.
+
+Current status and timestamped history: [HANDOFF.md](HANDOFF.md). Ecosystem-wide
+[zero trust](ZERO_TRUST.md) is an owner requirement; enforcement remains planned.
+
+## Product philosophy across every subsystem
+
+Owner clarification 2026-10-14: seamless everyday defaults plus granular,
+customizable power-user/developer/organization control govern the whole OS and
+ecosystem. Read the overall product vision near the start of DESIGN.md.
+Security profiles are one application; apply the same progressive disclosure,
+per-area customization, automation, coherent cross-device behavior and honest
+recovery principles to all subsystem work. These are requirements, not implemented
+features. Keep interface complexity separate from actual authority and capability.
 
 ## Establish the correct baseline
 
@@ -95,3 +108,54 @@ resource/accounting invariants and next step. Do not merge/release, assign revie
 change credentials, contact vendors or import restricted source without applicable
 authorization. The owner asked to approve PR #1; that is not an instruction to
 invent an independent reviewer or silently bypass self-review restrictions.
+
+## Cryptographic relock requirement — 2026-10-14
+
+ENCRYPTION.md now requires a configurable ordinary-lock path to withdraw protected
+user-domain keys and plaintext access without a power cycle. Include process/cache/
+DMA cleanup, credential-gated reopening, background exceptions and truthful failure
+status. Screen lock alone is insufficient; reboot equivalence is not assumed.
+Key-domain and lifecycle design precede storage/identity format freeze; runtime
+qualification remains a later gate. No implementation was added.
+
+## Protected system and version management — owner decision 2026-10-14
+
+STORAGE.md records seamless protected/versioned system deployments by default,
+full owner customization including an immutability off switch, and independent
+intuitive OS/built-in-app update/rollback in both protected and mutable modes.
+Native apps must participate through lifecycle and schema compatibility contracts.
+Write protection, deployment history, trust policy and data encryption are distinct.
+Mutable-mode direct edits require explicit conflict/checkpoint handling; rollback
+must not silently revert user documents or bypass data/anti-rollback constraints.
+Accepted direction, not implemented behavior; M3a remains next.
+
+## Multiple default filesystems — owner decision 2026-10-14
+
+STORAGE.md now records Btrfs, OpenZFS and a mobile backend as first-class long-term
+default choices selected by qualified device profiles. F2FS is the proposed mobile
+candidate. Owners can select a conforming custom backend, including as system
+default with additional boot/recovery qualification, or use a visibly experimental
+profile. Native APIs keep workflows coherent without claiming identical features.
+ext4 stays the initial bring-up target. No automatic reformat/conversion or new
+implementation is implied. M3a remains next.
+
+## F2FS approval and agent tasks — 2026-10-14T20:43:47-04:00
+
+Owner approved F2FS as the provisional mobile default, subject to actual JeiOS
+qualification. This supersedes earlier candidate-only wording; device support,
+feature flags and production readiness are not implied. Btrfs/OpenZFS remain
+long-term default targets; ext4 remains the initial core bring-up backend.
+
+Ready-to-start bounded work:
+- [Core #13](https://github.com/auto44e/jeios/issues/13): backend contract ADR,
+  hosted fake-block-device and conformance harness.
+- [Core #14](https://github.com/auto44e/jeios/issues/14): F2FS format/provenance
+  review and bounded read-only hosted metadata probe with negative tests.
+- [Mobile #7](https://github.com/auto44e/jeios-mobile/issues/7): mobile F2FS
+  workload/qualification profile and shared-backend integration plan.
+
+These issues are open/unassigned at creation; no coding agent has been launched
+by creating them and project-board membership has not been verified. Hosted
+prototypes can proceed independently while runtime integration waits for M3/M4/M5
+and relevant mobile execution/driver gates. No writes to real user media.
+M3a remains the next core kernel gate; MP0 remains the mobile architecture gate.

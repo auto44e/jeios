@@ -1,13 +1,177 @@
 # Agent handoff: M1/M2 kernel foundation
 
-Updated: 2026-10-13. Project `auto44e/jeios`; current documentation branch
-`docs/mobile-ecosystem` (PR #11). M1/M2 foundation PR #1 is merged into main.
-Read AGENTS.md, IMPLEMENTATION.md, ROADMAP.md and the relevant DESIGN.md sections.
-Start with [AGENT_START.md](AGENT_START.md) for the consolidated requirements and
-linked work queue. Multitouch/security-key PR #10 is merged into main at
-`5f290b3`; this branch incorporates that merge and preserves both feature plans.
-The previous M0 state is preserved in git history; this file describes the M1/M2
-implementation and subsequent documentation checkpoints. Do not infer future capabilities from design prose.
+## F2FS approval and agent tasks — 2026-10-14T20:43:47-04:00
+
+Owner approved F2FS as the provisional mobile default, subject to actual JeiOS
+qualification. This supersedes earlier candidate-only wording; device support,
+feature flags and production readiness are not implied. Btrfs/OpenZFS remain
+long-term default targets; ext4 remains the initial core bring-up backend.
+
+Ready-to-start bounded work:
+- [Core #13](https://github.com/auto44e/jeios/issues/13): backend contract ADR,
+  hosted fake-block-device and conformance harness.
+- [Core #14](https://github.com/auto44e/jeios/issues/14): F2FS format/provenance
+  review and bounded read-only hosted metadata probe with negative tests.
+- [Mobile #7](https://github.com/auto44e/jeios-mobile/issues/7): mobile F2FS
+  workload/qualification profile and shared-backend integration plan.
+
+These issues are open/unassigned at creation; no coding agent has been launched
+by creating them and project-board membership has not been verified. Hosted
+prototypes can proceed independently while runtime integration waits for M3/M4/M5
+and relevant mobile execution/driver gates. No writes to real user media.
+M3a remains the next core kernel gate; MP0 remains the mobile architecture gate.
+
+
+## Latest storage decision — 2026-10-14T20:40:22-04:00
+
+Owner selected multiple first-class long-term default backends: Btrfs, OpenZFS
+and a suitable mobile filesystem. F2FS is the proposed mobile candidate; suggested
+profile assignments remain subject to qualification. Native APIs provide coherent
+workflows, with backend-specific capabilities and tested guarantees. Owner-provided
+system defaults are supported through explicit interfaces, boot/recovery contracts
+and honest experimental profiles. Changing defaults is not an in-place conversion.
+
+Shared STORAGE.md records scope and staged gates. ext4 remains initial bring-up;
+core M3a/mobile MP0 remain next. Documentation-only decision; no filesystem,
+migration tool or plugin runtime was added. New text checked for whitespace and
+conflict markers; no executable tests rerun. No merge performed.
+
+
+## Latest owner decision — 2026-10-14T20:30:05-04:00
+
+Protected/versioned system deployments are the seamless default, with full
+customization and an authorized immutability off switch. OS and built-in-app
+forward updates/rollback must remain intuitive and available independently of
+write protection. Shared STORAGE.md specifies native lifecycle/schema contracts,
+mutable-mode change handling, retained versions, coherent activation and recovery.
+Data migration and trust/anti-rollback limits remain explicit; no promise that
+arbitrary direct edits or external effects can be automatically reversed.
+
+Planning only; no update manager, filesystem or native app runtime was added.
+Core M3a/mobile MP0 remain next; reserve storage/update contracts before M5 format
+freeze. Documentation whitespace/conflict-marker checks only; runtime tests
+not rerun. Existing PR branches updated; no merge performed.
+
+
+## Latest compatibility requirement — 2026-10-14T20:15:24-04:00
+
+Owner expects the future AOSP-derived Android layer to carry additional crypto
+relock/unlock adaptation for existing apps. Mobile ANDROID.md now specifies
+framework/ART/Binder/JNI and native-resource coordination, bounded state saving,
+domain teardown/restoration and app-specific qualification. Core ENCRYPTION.md
+records host ownership of keys/policy and the compatibility boundary.
+No hidden key retention or weaker host policy to keep a foreign app running.
+Graceful restoration is a target; unsupported unsaved-state recovery is disclosed.
+
+Planned only; no Android runtime or relock implementation added. Core M3a/mobile
+MP0 remain next. No executable tests rerun for these documentation additions.
+Changes remain on existing PR branches; no merge performed.
+
+
+## Latest native-app requirement — 2026-10-14T20:12:45-04:00
+
+Owner requires native JeiOS apps to gracefully handle cryptographic relock/unlock.
+The shared ENCRYPTION.md now makes this an SDK/toolkit/application conformance
+contract: protected drafts/checkpoints, bounded lifecycle events, OS-enforced
+revocation, process reconstruction and fresh authority after unlock. Apps cannot
+veto locking, and callback acknowledgement alone does not prove memory cleanup.
+Interrupted external operations require reconciliation, not automatic replay.
+
+Planned only; no API/runtime implementation added. Core M3a and mobile MP0 remain
+next. Documentation structure/whitespace checked; no executable tests rerun.
+This update stays on existing PR branches, with no merge performed.
+
+
+## Latest requirement — 2026-10-14T20:08:17-04:00
+
+Owner wants ordinary device/session locking to support cryptographic relock:
+withdraw protected user-domain keys and plaintext access to regain a defined
+pre-first-unlock-like state without reboot. Shared core ENCRYPTION.md specifies
+proposed lock profiles, key/lifecycle/DMA cleanup, strong-credential reopening,
+background-service exceptions, failure handling and acceptance gates.
+This is an ecosystem-wide requirement, including mobile and compatibility apps.
+No universal reboot equivalence or implemented encryption is claimed.
+
+Planning only; core M3a and mobile MP0 remain next. Added prose was checked for
+whitespace/conflict markers; reference URLs came from retrieved official Apple/AOSP
+documentation. No kernel/build/emulator tests were rerun. Existing documentation
+PR branches are updated; no merge is performed.
+
+
+## Latest scope clarification — 2026-10-14T19:59:09-04:00
+
+The approachable-defaults/deep-control philosophy applies to the entire OS and
+ecosystem, not just security. DESIGN.md now records it as the overall product
+vision across UI, apps, hardware, storage/networking, media, performance/power,
+services, identity/sync, updates and developer workflows. Per-area presets and
+expert controls are composable; UI detail, functionality, permissions and hardware
+support stay distinct. Security is one application of this broader philosophy.
+Earlier security-specific notes remain valid within that scope.
+
+Documentation only; core M3a and mobile MP0 remain next. No runtime capabilities
+or new test execution are claimed. This updates the existing review branches;
+no merge is performed. Added prose checked for whitespace/conflict markers;
+no new links or executable changes.
+
+
+## Latest requirements clarification — 2026-10-14T19:55:55-04:00
+
+Owner requires seamless everyday security plus granular power-user/developer and
+company policy control, spanning deliberate permissive experimentation through
+highly restricted deployments. The shared zero-trust proposal now distinguishes
+UI complexity, security policy and hardware assurance; defines proposed profiles,
+scoped exceptions, GUI/CLI/API parity, visible managed policy and honest restoration
+limits. Profile names/settings are proposals. No runtime enforcement was added.
+M3a and mobile MP0 remain next. This clarification updates existing documentation
+PRs (core #12, mobile #6); no merge is performed by this update.
+
+Validation: new Markdown structure, whitespace and conflict-marker checks passed.
+No new links were introduced. Build/emulator tests were not rerun for this
+documentation-only clarification; prior evidence remains at its recorded commits.
+
+
+## Current status — observed 2026-10-14T23:50:13.156Z
+
+Repository main baseline: `e897e02f9038e164efbb590cfc0229e8300bff54`. GitHub was read at this
+checkpoint: PRs #1, #10 and #11 are merged; no pre-existing open core or mobile PR
+was returned. This documentation update will have its own reviewable PRs and is
+not merged by this snapshot. M1/M2 remains the documented implementation baseline;
+M3a is next, then M3b/M3c. Mobile remains planning/scaffold; MP0 is next.
+No runtime implementation or test rerun is claimed by this refresh.
+
+Owner added ecosystem-wide [zero trust](ZERO_TRUST.md) on 2026-10-14.
+It is a planned cross-cutting framework; current CPL0 workers are not isolated.
+The previously recorded build/emulator/CI evidence below remains historical and
+scoped to its original commits; current-head CI has not been checked in this refresh.
+
+### Verified merge history
+
+| Event | GitHub event time (UTC) | Merge commit |
+| --- | --- | --- |
+| PR #1 | 2026-10-13T20:33:01Z | `03aa2f380d8e49262abd1720a3b8db37517cbb31` |
+| PR #10 | 2026-10-13T23:05:02Z | `5f290b351181d8fa23b17ac5f493ff66ae9415b8` |
+| PR #11 | 2026-10-13T23:10:59Z | `e897e02f9038e164efbb590cfc0229e8300bff54` |
+
+Earlier date-only checkpoints below retain their original precision. Their
+branch names, open-PR statements and test outcomes describe those past sessions.
+The current baseline above supersedes historical continuation instructions.
+
+Read AGENTS.md, IMPLEMENTATION.md, ROADMAP.md and [AGENT_START.md](AGENT_START.md).
+
+## Status refresh and historical records
+
+Owner preference recorded 2026-10-14: retain detailed timestamped history alongside
+a clearly labeled current status. Every refresher must record an ISO-8601
+observation time with timezone, repository/branch and exact inspected commit,
+implemented/tested/planned/blocked states, PR/issue state, evidence and next task.
+Separate an event's timestamp from the time it was verified. If an old record has
+only a date, preserve that precision; never invent a time. Keep superseded plans
+and previous failures as labeled history with links to their replacements.
+
+Current status takes precedence over historical branch names or open/closed
+wording. Preserve previous test results at their original commit and environment;
+do not present them as rerun or current-head CI. State unverified items explicitly.
+Use enough detail for an agent to resume without reconstructing the conversation.
 
 ## Owner intent
 
@@ -106,8 +270,8 @@ kernel threads in one address space. Never call them isolated processes/apps.
 
 ## Next bounded work: M3a userspace boundary
 
-Start a new implementation branch from updated main for M1/M2. Read mobile PR #11
-while it remains open, or its merged docs once available on main. Specify user/kernel address
+Start a new implementation branch from updated main. PR #11 is merged; read
+its mobile design documents on main. Specify user/kernel address
 layout, user code/data/stack mapping rights, private kernel stacks, TSS RSP0,
 entry/return state, and copy-in/copy-out fault semantics before adding syscalls.
 Keep CPU feature exposure restricted to state the scheduler preserves. Add a
@@ -277,3 +441,15 @@ remains the tested M1/M2 foundation; documentation merges do not require moving
 that implementation pin. Boot tests were not repeated locally for docs-only
 changes. Check remote CI on the new PR head before merging. M3a and mobile MP0
 remain the next bounded tasks; no ARM64/Pixel/Android execution is implemented.
+
+## Historical handoff header — 2026-10-13 (superseded)
+
+Updated: 2026-10-13. Project `auto44e/jeios`; current documentation branch
+`docs/mobile-ecosystem` (PR #11). M1/M2 foundation PR #1 is merged into main.
+Read AGENTS.md, IMPLEMENTATION.md, ROADMAP.md and the relevant DESIGN.md sections.
+Start with [AGENT_START.md](AGENT_START.md) for the consolidated requirements and
+linked work queue. Multitouch/security-key PR #10 is merged into main at
+`5f290b3`; this branch incorporates that merge and preserves both feature plans.
+The previous M0 state is preserved in git history; this file describes the M1/M2
+implementation and subsequent documentation checkpoints. Do not infer future capabilities from design prose.
+

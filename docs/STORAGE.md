@@ -1,10 +1,11 @@
 # Filesystem recommendation and storage contracts
 
 Status: recommendation and future implementation plan, 2026-10-13. No VFS,
-block driver or filesystem exists in JeiOS today. The final production default
-remains open pending evidence, dependency license review and porting feasibility.
+block driver or filesystem exists in JeiOS today. The long-term policy is multiple profile-selected defaults (owner decision
+2026-10-14, detailed below). Exact production profiles remain subject to evidence,
+dependency license review and porting feasibility.
 
-## Provisional default
+## Initial bring-up default
 
 Build a filesystem-independent VFS. Start M5 with a bounded read-only init image
 and RAM filesystem, then qualify an explicitly limited ext4 format profile as
@@ -99,7 +100,7 @@ encryption when used, with bounded decompression. Disable cross-user deduplicati
 by default. Define discard/TRIM leakage, snapshots retaining deleted content,
 key erasure and backups before promising secure deletion, particularly on SSDs.
 
-## Evidence required before selecting the production default
+## Evidence required before qualifying production defaults
 
 Compare low-memory idle/cache behavior, recovery time, boot/update reliability,
 small-file latency, sustained writes, SSD write amplification and storage failures.
@@ -205,3 +206,231 @@ network mounts depend on M6 and identity controls. Before release, choose and
 publish a finite supported subset. Broad compatibility does not justify delaying
 process isolation or importing unreviewed foreign kernel code.
 
+
+## Owner decision: protected defaults and independent version management
+
+Decision: 2026-10-14T20:30:05-04:00. Implement protected, versioned system
+deployments as the seamless default for ordinary users. Native JeiOS apps and
+components must integrate naturally with this model. Keep it fully configurable,
+including an authorized owner-controlled off switch for system immutability.
+Provide intuitive forward updates and rollback for the OS and built-in apps
+independently of whether system immutability is enabled.
+
+This is an accepted product requirement and future implementation direction,
+not implemented storage/update behavior. Existing M3a and mobile MP0 sequencing
+is unchanged; design deployment/data contracts before M5 formats freeze and
+qualify trusted update/recovery at M9. Provisional ext4 remains compatible with
+the direction; snapshots or a particular filesystem are not mandatory.
+
+### Separate mechanisms and controls
+
+Treat these as independent concepts:
+- System write protection: whether active OS-managed files can be modified in place.
+- Version/deployment management: retaining, preparing and selecting coherent versions.
+- Trust policy: which publishers, owner builds and system modifications are authorized.
+- Data protection: encryption, relock domains and mutable-data migration/backup rules.
+
+Turning off system write protection does not disable version history, the update
+manager, authorization, encryption or recovery. Nor does it automatically disable
+verified boot or allow unsigned code: settings can interact and those dependencies
+must be explained. If direct changes invalidate a verified image, report its
+changed trust state and offer a qualified owner-build/reseal/development path.
+Managed devices may enforce disclosed policy; an unauthorized user cannot bypass
+that policy via the off switch.
+
+The proposed UX is a simple protected-system control plus an independent version
+history with actions such as update, return to previous version and reapply a
+retained compatible version. Exact wording/interaction is not frozen. Everyday
+users should not need to understand images, overlays, package graphs or partitions.
+Expert GUI/CLI/APIs expose manifests, diffs, dependencies, retention, trust state
+and custom compositions with the same permission checks.
+
+### Native OS and app update contracts
+
+Maintain a version manifest covering OS components and built-in apps, their
+dependencies/ABI ranges, provenance and data-schema requirements. Applications
+should update independently when qualified compatibility permits; components
+requiring a coordinated OS/app set move together. Built-in status does not imply
+blanket privileges. Avoid forcing a whole OS reboot for an app-only update where
+safe replacement is supported; show when an actual restart/reboot is required.
+
+Use a shared native lifecycle contract for update preparation, bounded quiescence,
+protected state saving, resource release and restoration. Reuse crypto-relock
+primitives where appropriate, but update and relock are distinct events with
+different key availability and state transitions. Apps must survive termination
+without a final callback and validate versioned saved state on restart.
+
+Stage and validate an update before activation. Require a crash-safe activation
+record and dependency-consistent deployment selection. Health checks determine
+whether to retain the new deployment or return to an authorized compatible one.
+Keep a recovery path independent of a broken desktop, app manager or writable
+development deployment. Define bounded retries, ENOSPC behavior, incomplete
+downloads and power-loss recovery; never delete the last recovery candidate
+merely to free space for an update.
+
+### Mutable mode with version history
+
+When write protection is off, allow authorized direct modifications. Preserve
+managed version manifests and recoverable prior deployments independently.
+Before replacing a modified deployment, identify its divergence and offer an
+explicit preserve/checkpoint, rebase/merge, discard or abort path as applicable.
+Do not silently overwrite local changes or represent an altered deployment as
+byte-identical to its original release. Never blindly replay old modifications
+over new privileged binaries.
+
+Native managed updates should retain transactional behavior in mutable mode.
+Arbitrary out-of-band writes cannot automatically be promised atomic or recoverable.
+Specify what is checkpointed, when, and which writes bypass tracking. A complete
+recoverable system checkpoint must capture a coherent state and account for
+concurrent writers; an arbitrary folder copy is not sufficient. Atomic deployment
+switching may require staging another generation even if the current one is writable.
+
+Reenabling protection validates/recomposes the chosen system version and reports
+remaining trust limitations. Making modified files read-only does not restore
+their integrity or undo prior compromise. Keep the off switch practical and
+documented without claiming protections that have been disabled.
+
+### Forward/back navigation and data compatibility
+
+The user-facing history should offer a simple way to move between retained,
+compatible versions of the OS and built-in apps, in either protection mode.
+Prepare a reversible plan where possible and explain any migration, restart,
+missing dependency, blocked version or data consequence before activation.
+Retained releases remain subject to owner/organization trust and anti-rollback
+policy: do not silently boot a revoked vulnerable version to satisfy a rollback.
+
+Executable rollback is separate from user-data rollback. Native apps must declare
+schema/checkpoint compatibility and migration behavior. Prefer backward-compatible
+changes; where needed retain protected recovery copies or use a separately reviewed
+transactional migration. Non-reversible migrations require an explicit data recovery
+choice or a blocked downgrade, not a falsely successful rollback. Documents created
+since the older OS version must not disappear merely because OS code was reverted.
+
+Forward navigation after rollback is conditional on validated manifests and data
+compatibility, not guaranteed replay of an old session. Never replay external
+messages, purchases or remote actions. Retention/garbage collection must preserve
+referenced recovery data and respect storage quotas, encryption domains and key
+lifecycle. History is not a substitute for independent backups; retained copies
+may retain deleted secrets and must be reflected in deletion/privacy controls.
+
+### Acceptance and implementation gates
+
+At M5 specify version manifests, configuration/data separation, immutable versus
+mutable ownership and crash-safe deployment selection. At M7 qualify accessible
+everyday history/recovery UX and advanced controls. At M9 qualify signatures,
+owner trust roots, anti-rollback policy and recovery. Shared native SDK and built-in
+apps must pass lifecycle/migration tests; mobile qualifies its own boot/storage
+constraints rather than inheriting desktop guarantees.
+
+Test protected and mutable modes, owner-built deployments, direct modification
+conflicts, switching protection on/off, independent and coordinated app updates,
+old/new schemas, crypto-relock checkpoints, low disk space, corrupt manifests,
+power loss at activation/migration, failed health checks, credential/key changes
+and forward-after-rollback. Verify user files survive OS rollback and unauthorized
+apps cannot disable protection or choose a different trusted boot version.
+No runtime implementation or completed gate is implied by this decision.
+
+## Owner decision: multiple first-class default backends and owner replacements
+
+Decision: 2026-10-14T20:40:22-04:00. The long-term core storage offering should
+include Btrfs, OpenZFS and an appropriate mobile filesystem as first-class default
+choices, with a seamless native JeiOS experience above them. Owners may substitute
+their own filesystem as the system default within documented technical and policy
+limits. This supersedes the earlier framing of selecting one universal production
+default; it does not certify any backend or authorize unreviewed source imports.
+
+Proposed profile mapping: Btrfs for general desktops/laptops; OpenZFS for
+storage-focused workstation/server profiles; F2FS as the mobile flash candidate.
+These mappings and F2FS selection require measurements and qualification, rather
+than restricting advanced owners to a device category. ext4 remains the initial
+bounded bring-up target and a possible supported alternative. No filesystem is
+implemented yet; do not expand the next gate beyond M3a to deliver these in parallel.
+
+### Common experience and capability contracts
+
+Core default means a maintained, integrated and tested choice for named profiles,
+not all filesystems simultaneously managing the same block ranges. Default
+installation chooses a qualified profile without asking ordinary users to compare
+filesystem internals. Advanced installation and administration expose supported
+choices, constraints and tradeoffs. Multiple backend volumes may coexist with
+separate ownership, mounts and resource accounting.
+
+Native applications use JeiOS file/storage, identity, encryption-domain, lifecycle
+and version-management APIs. Keep snapshots, datasets, subvolumes and backend
+commands out of ordinary workflows. Native namespaces and permissions must retain
+their intended semantics across backends; unsupported operations return explicit
+capability errors. Publish a backend/version/feature matrix and negotiate actual
+capabilities rather than pretending every backend has identical native features.
+
+The OS deployment manager supplies version history and recovery even without
+native filesystem snapshots, using qualified A/B or versioned-image mechanisms.
+Per-user cryptographic relock requires separately qualified encryption/key-domain
+and cache-revocation integration; a common API is not evidence of equal protection.
+Filesystem encryption, external encryption layers and OS protection domains need
+explicit backend-specific implementations and threat models.
+
+Use baseline contracts for durability, atomic namespace operations, ownership,
+bounds, quotas/accounting, locking, cancellation, key availability and failure.
+Map optional checksums, compression, snapshots, cloning and replication separately.
+Equivalent UX may use different implementations; do not silently simulate guarantees
+such as durable commits, authentication or instant atomic snapshots.
+
+### Owner-provided system-default filesystem
+
+Provide a documented, versioned backend interface and conformance tooling.
+Distinguish an ordinary data-volume adapter from a system/root-capable backend.
+System-default qualification additionally requires early boot/init integration,
+update staging/activation, recovery tools, crash consistency, locked-volume behavior,
+and a way to recover when the backend cannot mount. Drivers belong behind isolated
+service boundaries where feasible; early trusted components need explicit review.
+A plugin interface does not grant arbitrary kernel privilege or bypass boot policy.
+
+Allow owners to build, register, select and package a custom backend and recovery
+implementation. Offer an explicitly experimental profile for unqualified owner
+builds with clear lost guarantees; do not advertise production support or a hardened
+profile when required invariants are absent. Managed systems may restrict selection
+under disclosed policy. A safe recovery environment should not depend solely on
+the experimental filesystem it is meant to repair.
+
+Changing the configured default generally affects new installs/volumes/deployments.
+Existing on-disk data does not change format by flipping a setting. Migration needs
+a separately designed copy/export/import or specifically qualified conversion path,
+sufficient storage, verification, backup/recovery and explicit destructive-write
+authorization. Never silently reformat media, assume universal in-place conversion,
+or let two backends concurrently own the same writable ranges.
+
+### Qualification and maintenance
+
+Qualify each backend independently for read-only, read/write, system boot,
+protected/mutable deployments, version navigation, crypto relock, quotas and
+multi-user boundaries. Test power loss, ENOSPC, corruption, concurrent operations,
+device loss, memory budgets, sustained latency, flash write amplification,
+checkpoint compatibility and independent-tool recovery. Keep exact feature flags
+and versions pinned; a successful desktop port does not qualify mobile.
+
+Maintaining several defaults multiplies integration and recovery work. Stage
+delivery rather than making every backend a prerequisite to the first usable
+system. Upstream formats and implementations retain their own licenses and
+provenance requirements. Any custom or imported backend must have an explicit
+maintenance owner and supported-profile declaration before production promotion.
+
+## F2FS approval and agent tasks — 2026-10-14T20:43:47-04:00
+
+Owner approved F2FS as the provisional mobile default, subject to actual JeiOS
+qualification. This supersedes earlier candidate-only wording; device support,
+feature flags and production readiness are not implied. Btrfs/OpenZFS remain
+long-term default targets; ext4 remains the initial core bring-up backend.
+
+Ready-to-start bounded work:
+- [Core #13](https://github.com/auto44e/jeios/issues/13): backend contract ADR,
+  hosted fake-block-device and conformance harness.
+- [Core #14](https://github.com/auto44e/jeios/issues/14): F2FS format/provenance
+  review and bounded read-only hosted metadata probe with negative tests.
+- [Mobile #7](https://github.com/auto44e/jeios-mobile/issues/7): mobile F2FS
+  workload/qualification profile and shared-backend integration plan.
+
+These issues are open/unassigned at creation; no coding agent has been launched
+by creating them and project-board membership has not been verified. Hosted
+prototypes can proceed independently while runtime integration waits for M3/M4/M5
+and relevant mobile execution/driver gates. No writes to real user media.
+M3a remains the next core kernel gate; MP0 remains the mobile architecture gate.
