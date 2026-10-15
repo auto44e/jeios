@@ -138,3 +138,24 @@ default with additional boot/recovery qualification, or use a visibly experiment
 profile. Native APIs keep workflows coherent without claiming identical features.
 ext4 stays the initial bring-up target. No automatic reformat/conversion or new
 implementation is implied. M3a remains next.
+
+## F2FS approval and agent tasks — 2026-10-14T20:43:47-04:00
+
+Owner approved F2FS as the provisional mobile default, subject to actual JeiOS
+qualification. This supersedes earlier candidate-only wording; device support,
+feature flags and production readiness are not implied. Btrfs/OpenZFS remain
+long-term default targets; ext4 remains the initial core bring-up backend.
+
+Ready-to-start bounded work:
+- [Core #13](https://github.com/auto44e/jeios/issues/13): backend contract ADR,
+  hosted fake-block-device and conformance harness.
+- [Core #14](https://github.com/auto44e/jeios/issues/14): F2FS format/provenance
+  review and bounded read-only hosted metadata probe with negative tests.
+- [Mobile #7](https://github.com/auto44e/jeios-mobile/issues/7): mobile F2FS
+  workload/qualification profile and shared-backend integration plan.
+
+These issues are open/unassigned at creation; no coding agent has been launched
+by creating them and project-board membership has not been verified. Hosted
+prototypes can proceed independently while runtime integration waits for M3/M4/M5
+and relevant mobile execution/driver gates. No writes to real user media.
+M3a remains the next core kernel gate; MP0 remains the mobile architecture gate.
