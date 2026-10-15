@@ -1,5 +1,20 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Latest storage decision — 2026-10-14T20:40:22-04:00
+
+Owner selected multiple first-class long-term default backends: Btrfs, OpenZFS
+and a suitable mobile filesystem. F2FS is the proposed mobile candidate; suggested
+profile assignments remain subject to qualification. Native APIs provide coherent
+workflows, with backend-specific capabilities and tested guarantees. Owner-provided
+system defaults are supported through explicit interfaces, boot/recovery contracts
+and honest experimental profiles. Changing defaults is not an in-place conversion.
+
+Shared STORAGE.md records scope and staged gates. ext4 remains initial bring-up;
+core M3a/mobile MP0 remain next. Documentation-only decision; no filesystem,
+migration tool or plugin runtime was added. New text checked for whitespace and
+conflict markers; no executable tests rerun. No merge performed.
+
+
 ## Latest owner decision — 2026-10-14T20:30:05-04:00
 
 Protected/versioned system deployments are the seamless default, with full
