@@ -1,5 +1,21 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Latest owner decision — 2026-10-14T20:30:05-04:00
+
+Protected/versioned system deployments are the seamless default, with full
+customization and an authorized immutability off switch. OS and built-in-app
+forward updates/rollback must remain intuitive and available independently of
+write protection. Shared STORAGE.md specifies native lifecycle/schema contracts,
+mutable-mode change handling, retained versions, coherent activation and recovery.
+Data migration and trust/anti-rollback limits remain explicit; no promise that
+arbitrary direct edits or external effects can be automatically reversed.
+
+Planning only; no update manager, filesystem or native app runtime was added.
+Core M3a/mobile MP0 remain next; reserve storage/update contracts before M5 format
+freeze. Documentation whitespace/conflict-marker checks only; runtime tests
+not rerun. Existing PR branches updated; no merge performed.
+
+
 ## Latest compatibility requirement — 2026-10-14T20:15:24-04:00
 
 Owner expects the future AOSP-derived Android layer to carry additional crypto
