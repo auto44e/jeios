@@ -7,6 +7,16 @@ and continuation order; it does not claim later milestones are implemented.
 Current status and timestamped history: [HANDOFF.md](HANDOFF.md). Ecosystem-wide
 [zero trust](ZERO_TRUST.md) is an owner requirement; enforcement remains planned.
 
+## Product philosophy across every subsystem
+
+Owner clarification 2026-10-14: seamless everyday defaults plus granular,
+customizable power-user/developer/organization control govern the whole OS and
+ecosystem. Read the overall product vision near the start of DESIGN.md.
+Security profiles are one application; apply the same progressive disclosure,
+per-area customization, automation, coherent cross-device behavior and honest
+recovery principles to all subsystem work. These are requirements, not implemented
+features. Keep interface complexity separate from actual authority and capability.
+
 ## Establish the correct baseline
 
 Foundation PR: https://github.com/auto44e/jeios/pull/1
