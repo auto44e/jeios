@@ -123,3 +123,13 @@ shared; no AOSP/Linux host or lunch target. Core M3a remains next.
 M3c IPC, M4-M6 brokers/network/storage, M7-M9 consent/identity/recovery and mobile
 qualification. Treat this as a requirement across gates, not a completed feature
 or a reason to skip M3a. See HANDOFF.md for dated current status and history.
+
+## Core standards commitment — 2026-10-16
+
+[STANDARDS.md](STANDARDS.md): target POSIX.1-2024 as a core application environment;
+M6 remains an initial tested subset followed by complete-profile qualification.
+Built-in LDAPv3 provider/identity integration is also core, with optional enrollment.
+M3-M6 and security prerequisites still apply; M3a remains next.
+Track [POSIX #15](https://github.com/auto44e/jeios/issues/15) and
+[LDAP #16](https://github.com/auto44e/jeios/issues/16). Certification, AD DS/GPO and
+cloud enrollment are separate goals, not implied completion.

@@ -1,5 +1,36 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Current refresh — observed 2026-10-16T23:08:34+00:00
+
+Inspected `auto44e/jeios` main at `416fb2b20923f3bddd47d26d3ed8f7efa249635d`.
+Core #12 merged 2026-10-15T00:47:05Z; #1/#10/#11 also merged.
+No open PRs existed in either repository at initial inspection. This update uses
+`docs/posix-ldap-20261016` and will be submitted as an unmerged review PR.
+Core #2-#9 and #13-#16 open; #15/#16 created by this refresh.
+
+Implemented: core M1/M2 AMD64 foundation; mobile planning/manifest scaffold only.
+Planned: POSIX.1-2024 and built-in LDAPv3 are now core requirements, owner decision
+2026-10-16T19:04:18-04:00. Organizational enrollment remains optional.
+Blocked: native POSIX/directory runtime awaits isolation, services, storage,
+networking and security prerequisites; mobile also awaits ARM64 qualification.
+Next bounded tasks remain core M3a (#2 contracts first) and mobile MP0 (#1).
+New standards ADR/qualification planning can proceed without claiming runtime work.
+
+Preserve all historical decisions below, including immutability/off switch,
+versioned updates independent of immutability, F2FS selection, crypto relock,
+zero trust, customization, Android planning, multitouch and hardware MFA.
+Earlier references to then-open PRs or candidate-only LDAP are historical.
+Core `make check` built and passed core tests but failed at LeakSanitizer
+process inspection (`/proc/.../task` unavailable). Rerun
+`ASAN_OPTIONS=detect_leaks=0 make check` passed core, boot-parser mutation corpus,
+allocator and ELF checks; ASan/UBSan remained active.
+Relative Markdown targets, whitespace and conflict-marker checks passed.
+GitHub CI for the new PR head is separate from local results.
+Project board verified: new core #15 and #16 are present as Todo; prior merged
+PRs are Done. Refreshed stale core #2-#9 baseline guidance and mobile #5 parity.
+No boot behavior changes; no emulator/device tests or POSIX/LDAP runtime tests claimed.
+
+
 ## F2FS approval and agent tasks — 2026-10-14T20:43:47-04:00
 
 Owner approved F2FS as the provisional mobile default, subject to actual JeiOS
@@ -130,7 +161,7 @@ No new links were introduced. Build/emulator tests were not rerun for this
 documentation-only clarification; prior evidence remains at its recorded commits.
 
 
-## Current status — observed 2026-10-14T23:50:13.156Z
+## Historical status — observed 2026-10-14T23:50:13.156Z
 
 Repository main baseline: `e897e02f9038e164efbb590cfc0229e8300bff54`. GitHub was read at this
 checkpoint: PRs #1, #10 and #11 are merged; no pre-existing open core or mobile PR

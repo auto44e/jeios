@@ -1,6 +1,6 @@
 # Coding-agent starting guide
 
-Updated 2026-10-14. Read this with ../AGENTS.md, HANDOFF.md and IMPLEMENTATION.md.
+Updated 2026-10-16. Read this with ../AGENTS.md, HANDOFF.md and IMPLEMENTATION.md.
 Owner requested a sustained coding-agent handoff. This guide records requirements
 and continuation order; it does not claim later milestones are implemented.
 
@@ -159,3 +159,13 @@ by creating them and project-board membership has not been verified. Hosted
 prototypes can proceed independently while runtime integration waits for M3/M4/M5
 and relevant mobile execution/driver gates. No writes to real user media.
 M3a remains the next core kernel gate; MP0 remains the mobile architecture gate.
+
+## Core standards workstreams — 2026-10-16
+
+Read [STANDARDS.md](STANDARDS.md). POSIX.1-2024 and built-in LDAPv3 are accepted
+core commitments; staged runtime implementation remains blocked on native gates.
+[POSIX #15](https://github.com/auto44e/jeios/issues/15) defines the profile and
+conformance roadmap; [LDAP #16](https://github.com/auto44e/jeios/issues/16) defines
+the isolated provider and identity-broker contract. Begin bounded design work
+without displacing M3a. Mobile parity reuses these contracts and implementations.
+Historical wording that treats generic LDAP as only a candidate is superseded.
