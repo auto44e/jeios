@@ -1,5 +1,26 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## CI planning refresh — observed 2026-10-16T23:57:44+00:00
+
+Owner request: 2026-10-16T19:55:53-04:00. Inspected core PR #17 head
+`507c06ab397add3d42ba2440670ace7af04ddeab` and mobile PR #8 head
+`b2ab0f0a75cc6e8902408eb222474de592adfdc5`; both remain open/unmerged.
+This follow-up updates core branch `docs/posix-ldap-20261016` in PR #17.
+
+Added [CI_STRATEGY.md](CI_STRATEGY.md), near/long-term stages, replayable failure
+injection, outcome/flake reporting and source references. Core #18 is open as the
+first implementation task; no coding agent launched or board membership claimed.
+Existing CI already tests hosted code and AMD64 QEMU; new jobs/fuzz infrastructure,
+ARM64 tests and broader recovery qualification remain planned. No workflow or
+kernel behavior changes. M3a and mobile MP0 remain next; all prior requirements
+remain preserved. Current-head CI for this new commit must be observed separately.
+
+Validation: `ASAN_OPTIONS=detect_leaks=0 make check` passed core, parser, allocator
+and ELF checks. Leak scanning remains unavailable locally; ASan/UBSan active.
+Relative Markdown targets, conflict markers and `git diff --check` passed.
+No local emulator rerun for this documentation-only follow-up. Prior evidence retains
+its original commit and timestamp; this header supersedes then-current PR wording.
+
 ## Current refresh — observed 2026-10-16T23:08:34+00:00
 
 Inspected `auto44e/jeios` main at `416fb2b20923f3bddd47d26d3ed8f7efa249635d`.

@@ -169,3 +169,12 @@ conformance roadmap; [LDAP #16](https://github.com/auto44e/jeios/issues/16) defi
 the isolated provider and identity-broker contract. Begin bounded design work
 without displacing M3a. Mobile parity reuses these contracts and implementations.
 Historical wording that treats generic LDAP as only a candidate is superseded.
+
+## Curl-inspired CI direction — 2026-10-16
+
+[CI_STRATEGY.md](CI_STRATEGY.md) records the owner's short/long-term testing goal:
+portable regressions, compiler diversity, sanitizers/static analysis, replayable
+failure injection and fuzzing, supplemented by native kernel execution and storage
+crash-recovery qualification. [Core #18](https://github.com/auto44e/jeios/issues/18)
+is the first bounded CI implementation task. Existing gates remain mandatory;
+M3a and mobile MP0 remain next. This update adds planning only, not workflow jobs.
