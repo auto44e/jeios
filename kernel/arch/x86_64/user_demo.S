@@ -253,4 +253,129 @@ je_user_badrsp_start:
 4:
     jmp 4b                     /* loop; next timer dispatch validates+terminates */
 je_user_badrsp_end:
+
+/* M3b second PR: exercise the handle syscalls (self=5, close=6, query=7) and
+ * record each result at a fixed data-page offset for the kernel to assert. SELF
+ * is this process's identity capability (type JE_ABI_OBJ_SELF=1). Layout of the
+ * recorded words (data page at 0x40001000):
+ *   +0x20 self#1 status     +0x28 self#1 handle
+ *   +0x30 query(live) status +0x38 query(live) type
+ *   +0x40 close(live) status
+ *   +0x48 query(closed) status   +0x50 close(closed) status
+ *   +0x58 close(handle 0) status
+ *   +0x60 query(bound index) status
+ *   +0x68 query(wrong gen, live slot) status
+ *   +0x70 close(wide handle) status
+ *   +0x78 self#2 handle (slot reuse; must differ from self#1)
+ *   +0x80 quota status (after filling the quota)
+ * then a heartbeat loop. r11 holds self#1's handle across the sequence. */
+.globl je_user_handle_start
+.globl je_user_handle_end
+je_user_handle_start:
+    /* self#1 -> status@+0x20, handle(RDX)@+0x28 */
+    movq $5, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001020
+    movq %rdx, 0x40001028
+    movq %rdx, %r11             /* keep self#1 handle */
+    /* query(live, h=self#1) -> status@+0x30, type(RDX)@+0x38 */
+    movq $7, %rax
+    movq %r11, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001030
+    movq %rdx, 0x40001038
+    /* close(live, h=self#1) -> status@+0x40 */
+    movq $6, %rax
+    movq %r11, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001040
+    /* query(closed, h=self#1) -> status@+0x48 (expect STALE) */
+    movq $7, %rax
+    movq %r11, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001048
+    /* close(closed, h=self#1) -> status@+0x50 (expect STALE) */
+    movq $6, %rax
+    movq %r11, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001050
+    /* close(handle 0) -> status@+0x58 (expect BADINDEX) */
+    movq $6, %rax
+    xorq %rdi,%rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001058
+    /* query(index == capacity 16, gen 1) -> status@+0x60 (expect BADINDEX).
+     * encode(16,1) = (1<<16)|16 = 0x10010. */
+    movq $7, %rax
+    movq $0x10010, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001060
+    /* self#2 (slot 0 reused at gen 2) -> status@+0x88, handle@+0x78, kept in r10 */
+    movq $5, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001088      /* self#2 status (expect OK) */
+    movq %rdx, 0x40001078      /* self#2 handle */
+    movq %rdx, %r10            /* self#2 handle */
+    /* RE-STALE PROOF: now that slot 0 is LIVE again at gen 2, present the OLD
+     * self#1 handle (r11, gen 1) again -> status@+0x90 (expect STALE). This is
+     * the real proof that reuse re-stales, not merely that the new handle differs. */
+    movq $7, %rax
+    movq %r11, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001090
+    movq 0x40001078, %r10      /* restore self#2 handle into r10 */
+    /* query(wrong gen on the now-LIVE slot 0): encode(0,99)=99<<16=0x630000
+     * -> status@+0x68 (expect STALE, since slot 0 is at gen 2 not 99). */
+    movq $7, %rax
+    movq $0x630000, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001068
+    /* close(wide handle: bit 32 set) -> status@+0x70 (expect INVALID).
+     * Reload self#2 from memory and set bit 32, so it names a real slot but is
+     * rejected pre-narrow on the high bits. */
+    movq $6, %rax
+    movq 0x40001078, %rdi       /* self#2 handle */
+    movq $0x100000000, %rcx
+    orq %rcx, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001070
+    /* quota: self#2 holds 1 live; quota = CAP-1 = 15, so exactly 14 more mints
+     * succeed and the 15th acquisition returns QUOTA. Count the SUCCESSES (r12)
+     * so the kernel can assert exactly 14 — proving QUOTA (not NOSLOTS) ends the
+     * loop at CAP-1. r13 bounds the loop so a bug can't spin forever. */
+    xorq %r12, %r12            /* success counter */
+    movq $64, %r13             /* loop bound > quota */
+9:
+    movq $5, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001080      /* last self status */
+    cmpq $7, %rax              /* JE_ABI_H_QUOTA == 7 */
+    je 10f
+    cmpq $0, %rax              /* JE_ABI_OK == 0 */
+    jne 10f                    /* any other status: stop (unexpected) */
+    incq %r12                  /* a successful mint */
+    decq %r13
+    jnz 9b
+10:
+    movq %r12, 0x40001098      /* count of successful mints after self#2 */
+    /* done; heartbeat loop */
+11:
+    incq 0x40001000
+    jmp 11b
+je_user_handle_end:
 .section .note.GNU-stack,"",@progbits

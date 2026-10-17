@@ -11,7 +11,12 @@ typedef enum {
     JE_SYSCALL_RETURN = 0,  /* resume the caller with status in RAX, result in RDX */
     JE_SYSCALL_YIELD  = 1,  /* write OK into the caller frame, then reschedule */
     JE_SYSCALL_EXIT   = 2,  /* terminate the caller; *out_result is the exit code */
-    JE_SYSCALL_COPY_PROBE = 3  /* glue performs je_copy_probe with the frame args */
+    JE_SYSCALL_COPY_PROBE = 3,  /* glue performs je_copy_probe with the frame args */
+    /* M3b: handle ops. Decode validates reserved args and returns these; the glue
+     * resolves the current user process and calls the per-process handle table. */
+    JE_SYSCALL_HANDLE_SELF  = 5,
+    JE_SYSCALL_HANDLE_CLOSE = 6,
+    JE_SYSCALL_HANDLE_QUERY = 7
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYSCALL_COPY_FIXUP_INJECT = 4  /* glue raw-copies an unmapped page (fixup test) */
 #endif

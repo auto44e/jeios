@@ -446,6 +446,68 @@ the `table_init` rejection-path tests. Deferred per ADR 0008 to later PRs: typed
 rights checking on use, attenuation + references, and the owner-gated process-death
 teardown wiring. AI-assisted review only; not independent human qualification.
 
+## M3b second PR — handle table wired + first handle syscalls — 2026-10-17
+
+Wires the (unchanged) M3b handle table into the live kernel and adds the first
+three handle syscalls: `handle_self` (op 5), `handle_close` (op 6), `handle_query`
+(op 7). The per-process table is now inline in `je_vm_process` (`JE_VM_HANDLE_CAP`
+= 16 slots, quota 15), initialized in `je_vm_build` just before the process is
+published READY. **This supersedes the first-PR "no syscalls / no kernel wiring"
+status for the wiring itself** (the pure table in `handle.c` is unchanged).
+
+The only nameable object in M3b is **SELF**: a kernel-minted, immortal,
+resource-free process-identity capability (`JE_ABI_OBJ_SELF`), carrying no
+dereferenceable pointer. `handle_self` mints a SELF handle in the caller's own
+table; `handle_close` closes one; `handle_query` returns the object type.
+
+ABI (ADR 0008 D2, settled here): distinct `JE_ABI_H_*` statuses (STALE=3,
+BADINDEX=4, WRONGTYPE=5, DENIED=6, QUOTA=7, NOSLOTS=8) are appended to `abi.h`
+and pinned with `_Static_assert`; an exhaustive mapper from the internal
+`JE_HANDLE_*` lives in the syscall glue, so `abi.h` stays independent of both
+`status.h` **and** `handle.h` (the `make check` isolation grep now enforces both).
+A wide handle (RDI bits 63:32 set) is a **malformed call → `JE_ABI_INVALID`** at
+decode, distinct from a well-formed-but-bad handle → BADINDEX (ADR 0008 D2 amended
+to say so). The process is resolved ONLY via `je_sched_current_user`, never from a
+syscall argument; a non-user caller gets INVALID.
+
+Reclamation needs **no fault-death-path edit**: the table lives in the struct the
+existing `je_vm_destroy`/build-unwind already zero (`*p = {0}`), and a zeroed table
+has capacity 0 so every lookup fails BADINDEX and every alloc fails QUOTA — fail
+-safe even if init never ran. `je_vm_build` re-inits before READY, so a reused
+process slot cannot carry a stale LIVE handle. SELF owns no external resource, so a
+faulted-but-not-yet-destroyed process holding one is inert.
+
+Verified in this env: `make check` PASS (hosted `test_syscall` now covers the
+self/close/query decode incl. the wide-handle INVALID and reserved-arg rules;
+`test_vm` links `handle.c`; both handle hosted tests pass). `make smoke` PASS with
+a new `M3b-s1` marker from a ring-3 stub that mints SELF, queries it (type==SELF),
+closes it, and asserts the full matrix: query/close-closed → STALE; handle 0 and
+index==capacity → BADINDEX; wrong generation → STALE; wide handle → INVALID; slot
+reuse mints a new handle AND the OLD handle re-queries as STALE (the real
+reuse-invalidation proof); and the mint loop ends at QUOTA after **exactly 14**
+further mints (quota 15 minus the live self#2) — a measured count, not just "ended
+at QUOTA". 11 integration modes, M2's 4 markers, and all 3 CI smoke profiles
+unchanged.
+
+Scope honesty: the `M3b-s1` run exercises ONE process's table; it does not by
+itself prove tables are *per-process* (that holds by construction + the hosted
+vm/table tests), and the marker/comments say so rather than overclaiming.
+
+REVISIT (owner-approved for this PR, recorded here): (1) `je_vm_process` grew by
+an inline handle table — watch the struct-size budget as object kinds and the
+handle count grow. (2) `handle_query` returns **type only**; rights are carried
+internally but **NOT enforced and NOT exposed** in M3b — exposing a frozen rights
+layout waits until a real rights-enforcing operation exists. (3) `NOSLOTS` is
+reachable from ring 3 only via generation saturation of every slot (a bounded
+self-DoS of the caller's own table over ~1M syscalls), not truly "unreachable";
+it is covered exhaustively by the reduced-width hosted test.
+
+Peer cross-review (two independent reads) found no identity / slot-reuse / ABI-
+mapping / decode defect, and drove the evidence hardening applied here (the
+re-stale-after-reuse assertion, the measured quota count, the softened per-process
+wording, the ADR wide-handle amendment, and the pinned ABI static-asserts).
+AI-assisted review only; not independent human qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

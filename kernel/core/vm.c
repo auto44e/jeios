@@ -359,6 +359,19 @@ je_status je_vm_build(je_vm *vm, const je_vm_image *image, const void *blob,
         if (s != JE_OK) { unwind(vm, idx); return s; }
     }
 
+    /* M3b: initialize the per-process handle table over the inline slot storage
+     * before publishing READY (ADR 0008). Capacity is JE_VM_HANDLE_CAP; quota is
+     * kept BELOW capacity so a handle_self loop hits QUOTA (not NOSLOTS) — the
+     * two are reported distinctly. Compile-time-sized, so init cannot fail here;
+     * the teardown/unwind zeroing (which sets capacity 0 -> every lookup
+     * BADINDEX) reclaims it, and re-init on slot reuse prevents a stale LIVE
+     * entry from surviving into a reused process slot. */
+    if (!je_handle_table_init(&p->htable, p->hslots, JE_VM_HANDLE_CAP,
+                              JE_VM_HANDLE_CAP - 1u)) {
+        unwind(vm, idx);
+        return JE_ERR_INVALID;   /* unreachable: capacity/quota are compile-time */
+    }
+
     /* publish. */
     p->entry = image->entry_offset;
     p->state = JE_VM_READY;

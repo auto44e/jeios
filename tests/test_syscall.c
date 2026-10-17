@@ -49,9 +49,31 @@ int main(void)
     assert(dec(0xdeadbeef, 1,2,3,4,5,6,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
     /* Full 64-bit op decode: 0x1_0000_0000 must NOT alias op 0 (abi_query). */
     assert(dec(UINT64_C(0x100000000), 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
-    /* op 4 and up are unknown in step (b): UNSUPPORTED, no success. */
+    /* op 4 is the dev-only copy_fixup_inject, guarded out of this hosted build:
+     * UNSUPPORTED here, no success. */
     assert(dec(4, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
 
-    printf("syscall: PASS (abi_query, yield, exit, reserved-arg, full-width op, unsupported)\n");
+    /* M3b handle ops (5/6/7). The pure decoder validates reserved args and the
+     * wide-handle rule; the glue does the table work. */
+    /* handle_self(): clean -> SELF action, OK. */
+    assert(dec(JE_SYS_HANDLE_SELF, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_SELF && st==JE_ABI_OK);
+    /* handle_self() with ANY nonzero arg (it takes none) -> INVALID, not an action. */
+    assert(dec(JE_SYS_HANDLE_SELF, 1,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    assert(dec(JE_SYS_HANDLE_SELF, 0,0,0,0,0,9,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    /* handle_close(h=RDI): clean -> CLOSE action, OK. */
+    assert(dec(JE_SYS_HANDLE_CLOSE, 0x00010000,0,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_CLOSE && st==JE_ABI_OK);
+    /* handle_close with a reserved arg -> INVALID. */
+    assert(dec(JE_SYS_HANDLE_CLOSE, 0x00010000,1,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    /* handle_close with a WIDE handle (bits 63:32 set) -> INVALID before narrowing. */
+    assert(dec(JE_SYS_HANDLE_CLOSE, UINT64_C(0x100000000),0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    /* handle_query(h=RDI): clean -> QUERY action; reserved + wide-handle rejected. */
+    assert(dec(JE_SYS_HANDLE_QUERY, 0x00010000,0,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_QUERY && st==JE_ABI_OK);
+    assert(dec(JE_SYS_HANDLE_QUERY, 0x00010000,0,1,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    assert(dec(JE_SYS_HANDLE_QUERY, UINT64_C(0x500000000),0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    /* op 8 and up unknown. */
+    assert(dec(8, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
+
+    printf("syscall: PASS (abi_query, yield, exit, copy_probe, handle self/close/query, "
+           "reserved-arg, wide-handle, full-width op, unsupported)\n");
     return 0;
 }

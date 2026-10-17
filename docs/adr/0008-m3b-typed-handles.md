@@ -99,7 +99,15 @@ later:
   that is `0`, is rejected at lookup with a defined error and no object access.
 - **Register width:** a handle passed as a syscall argument occupies the low 32
   bits of its 64-bit argument register; the **upper 32 bits MUST be zero** (the
-  ADR 0007 "reserved bits are zero" rule), checked before decode, else `BADINDEX`.
+  ADR 0007 "reserved bits are zero" rule). A nonzero upper half is a **malformed
+  syscall call**, not a malformed handle: it is rejected at the syscall decode as
+  `JE_ABI_INVALID` **before** the value is narrowed to a `je_handle` and before the
+  table is consulted — exactly as any other reserved-argument violation. (This is
+  distinct from a well-formed 32-bit handle that is simply wrong, e.g. handle 0 or
+  an out-of-range index, which reaches the table and returns `BADINDEX`.) Amended
+  2026-10-17 at the first handle-syscall PR: the earlier wording "checked before
+  decode, else BADINDEX" is superseded — the wide-handle rejection is the ABI's
+  INVALID, keeping "malformed call" and "bad handle" as separate, honest signals.
 - **Status namespace (latent ABI, frozen here):** the `JE_HANDLE_*` statuses are
   part of the **v0 ABI status namespace** and MUST NOT leak internal `je_status`
   numbering (ADR 0007 D11). Their external numeric values are assigned in the v0

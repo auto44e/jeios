@@ -23,22 +23,56 @@
 typedef enum {
     JE_ABI_OK          = 0,
     JE_ABI_UNSUPPORTED = 1,
-    JE_ABI_INVALID     = 2
+    JE_ABI_INVALID     = 2,
+    /* M3b handle statuses (ADR 0008 D2): appended, DISTINCT values exposed to
+     * ring 3 (not collapsed to INVALID). These are the v0 ABI mapping of the
+     * internal JE_HANDLE_* results; abi.h stays independent of handle.h (the
+     * glue maps between them). Information leak is not a concern: a handle names
+     * only the caller's own process-local table. */
+    JE_ABI_H_STALE     = 3,  /* slot FREE/RETIRED or generation mismatch */
+    JE_ABI_H_BADINDEX  = 4,  /* handle 0, or index >= table capacity */
+    JE_ABI_H_WRONGTYPE = 5,  /* live slot, wrong object type (hosted-only in M3b) */
+    JE_ABI_H_DENIED    = 6,  /* live slot, insufficient rights (hosted-only in M3b) */
+    JE_ABI_H_QUOTA     = 7,  /* allocate: live-slot count at the process quota */
+    JE_ABI_H_NOSLOTS   = 8   /* allocate: no FREE slot remains */
 } je_abi_status;
 _Static_assert(JE_ABI_OK == 0, "abi ok");
 _Static_assert(JE_ABI_UNSUPPORTED == 1, "abi unsupported");
 _Static_assert(JE_ABI_INVALID == 2, "abi invalid");
+/* M3b handle statuses are ABI too — pin their numbering so a careless reorder
+ * can't silently renumber a status ring 3 already depends on. */
+_Static_assert(JE_ABI_H_STALE == 3, "abi h_stale");
+_Static_assert(JE_ABI_H_BADINDEX == 4, "abi h_badindex");
+_Static_assert(JE_ABI_H_WRONGTYPE == 5, "abi h_wrongtype");
+_Static_assert(JE_ABI_H_DENIED == 6, "abi h_denied");
+_Static_assert(JE_ABI_H_QUOTA == 7, "abi h_quota");
+_Static_assert(JE_ABI_H_NOSLOTS == 8, "abi h_noslots");
 
 /* Operation numbers (full 64-bit RAX; any value not listed is UNSUPPORTED). */
 typedef enum {
     JE_SYS_ABI_QUERY = 0,  /* abi_query(which): RDI 0=version,1=profile -> RDX */
     JE_SYS_YIELD     = 1,  /* yield(): reschedule caller; no authority grant */
     JE_SYS_EXIT      = 2,  /* exit(code): RDI=code; terminate process, no return */
-    JE_SYS_COPY_PROBE = 3  /* dev-only copy_probe(src=RDI, dst=RSI, len=RDX), <=256 */
+    JE_SYS_COPY_PROBE = 3, /* dev-only copy_probe(src=RDI, dst=RSI, len=RDX), <=256 */
+    /* M3b handle ops (ADR 0008). (vm,index) is resolved ONLY via the current
+     * user process; a non-user caller gets JE_ABI_INVALID. */
+    JE_SYS_HANDLE_SELF  = 5, /* handle_self(): mint a handle to this process's
+                              * SELF object -> handle in RDX, status in RAX */
+    JE_SYS_HANDLE_CLOSE = 6, /* handle_close(h=RDI): close; status in RAX */
+    JE_SYS_HANDLE_QUERY = 7  /* handle_query(h=RDI): -> RDX = object type (rights
+                              * NOT exposed in M3b; reserved out bits zero) */
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYS_COPY_FIXUP_INJECT = 4  /* dev-only: raw-copy an unmapped page to test the fixup */
 #endif
 } je_abi_op;
+
+/* M3b handle object types (RDX from handle_query). Only SELF exists in M3b: a
+ * kernel-minted, immortal, resource-free process-identity capability. Type 0 is
+ * reserved/invalid so a zeroed slot never reads as a valid type. */
+#define JE_ABI_OBJ_SELF 1u
+_Static_assert(JE_SYS_HANDLE_SELF == 5, "abi op handle_self");
+_Static_assert(JE_SYS_HANDLE_CLOSE == 6, "abi op handle_close");
+_Static_assert(JE_SYS_HANDLE_QUERY == 7, "abi op handle_query");
 
 /* abi_query selectors (RDI). */
 #define JE_ABI_QUERY_VERSION 0u
