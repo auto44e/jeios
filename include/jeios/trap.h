@@ -3,7 +3,8 @@
 #define JEIOS_TRAP_H
 #include <stdint.h>
 /* Exact assembly push order; IA-32e always saves SS:RSP, including CPL0.
- * No user transitions, SIMD, swapgs, nesting/recovery or SMP supported yet. */
+ * Ring-3 entry/return via IRETQ with per-task CR3 + TSS.RSP0 (M3a #4). No
+ * swapgs, SIMD-save, nesting/recovery or SMP supported yet. */
 typedef struct {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rdi, rsi, rbp, rdx, rcx, rbx, rax;

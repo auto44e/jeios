@@ -254,6 +254,41 @@ QEMU there. CPL0 cannot prove U/S ring-3 enforcement, user-mode NX fetch, or
 scheduler address-space switching; this step does not assert them. AI-assisted
 peer review only; not independent human qualification.
 
+## M3a #4 step 3 — CPL3 entry/return (real ring-3 execution) — 2026-10-17
+
+The scheduler now enters ring 3. `sched.c` gains a thread kind (kernel/user); a
+user thread binds a vm process's CR3 and a per-process TSS.RSP0.
+`je_thread_create_user` synthesizes the initial ring-3 trap frame (GPRs zero,
+cs=0x33, ss=0x2b, rip=arena+entry, rsp=arena top, rflags forced safe) on the
+process's held kernel stack and guards that stack's first page. `je_sched_interrupt`
+validates the incoming frame by thread kind, and for a user next-thread runs the
+pure validator `je_uframe_check` (`kernel/core/uframe.c`, hostable + unit-tested)
+to re-validate+**sanitize** RFLAGS every dispatch (force IF=1/IOPL=0, clear
+NT/TF/RF/VM/AC/ID/DF), then sets TSS.RSP0 and loads the process CR3 before the
+one shared IRETQ. Kernel next-threads get RSP0=0 (fail-closed) + the kernel root.
+`je_sched_reap` excludes user threads (their kstack is vm-owned, freed by
+`je_vm_destroy` — avoids a double-free); `je_sched_drop_user` detaches a user
+thread and restores its kstack guard before teardown. D7 (`je_arch_cpu_policy_init`)
+sets CR0.EM/MP/TS and clears CR4.OSFXSR/OSXMMEXCPT/OSXSAVE/FSGSBASE before any
+user thread, and normalizes DS/ES/FS/GS to null (no-TLS, ADR D6). Gates stay DPL0
+(the D6 `int 0x80` gate lands in step 4 per the amendment).
+
+Verified in QEMU (this env): `make check` PASS (adds `test_uframe`:
+bounds/selectors/canonical/rflags-sanitize), `make smoke` PASS — a built-in
+ring-3 program (`incq [heartbeat]; jmp`, assembled in `user_demo.S`) reached CPL3,
+survived >=16 timer preemptions and advanced its heartbeat ~9-17M times across
+runs, then was torn down with restored page accounting. `make integration` PASS —
+10 fault modes; new mode 10 launches a user task that executes `xorps` at CPL3 and
+observes `#UD` (vector 6) from a `cs=0x33` frame, proving D7 denies SIMD to ring
+3 by **hardware**, not a compiler flag. All three CI smoke profiles pass locally
+(no-NX cleanly skips step 3 per D2); M2 markers unchanged (owner sign-off
+condition).
+
+SCOPE / not claimed here: ONE built-in trusted task, timer-only. NOT claimed:
+inter-process isolation, fault-local offender death (a user fault still PANICs
+until step 4), the `int 0x80` gate, syscalls, kernel-unreachable-from-ring3 as a
+positive claim, SMEP/SMAP, SMP, remote CI, independent human qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

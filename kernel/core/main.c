@@ -77,6 +77,53 @@ static uint32_t vm_s2_build(uint64_t *out_root)
     *out_root = vm_s2.procs[idx].root;
     return idx;
 }
+
+/* ---- M3a #4 step 3: ring-3 entry proof ------------------------------------ */
+extern unsigned char je_user_demo_start[], je_user_demo_end[];
+extern unsigned char je_user_fp_start[], je_user_fp_end[];
+static je_vm vm_s3;
+static unsigned char vm_blob_s3[256];
+/* Build a user process whose code page holds a demo loop and whose data page is
+ * a heartbeat. With fp!=0 the code is the hostile-SSE stub (for the D7 proof);
+ * otherwise the heartbeat-increment loop. Returns the process index; fails hard. */
+static uint32_t vm_s3_build(int fp)
+{
+    unsigned char *start = fp ? je_user_fp_start : je_user_demo_start;
+    unsigned char *end   = fp ? je_user_fp_end   : je_user_demo_end;
+    size_t code_len=(size_t)(end-start);
+    if (code_len==0 || code_len>sizeof(vm_blob_s3)) fail("JeiOS fatal: s3 demo size\r\n");
+    for (size_t i=0;i<sizeof(vm_blob_s3);++i) vm_blob_s3[i]=0;
+    for (size_t i=0;i<code_len;++i) vm_blob_s3[i]=start[i];
+    je_vm_image img={0};
+    img.version=JE_VM_IMAGE_VERSION;
+    img.segment_count=2u;
+    img.entry_offset=0u;
+    img.segments[0]=(je_vm_segment){ 0u, code_len, 0u, JE_PAGE_SIZE, JE_VM_R|JE_VM_X, 0u };
+    img.segments[1]=(je_vm_segment){ 0u, 0u, JE_PAGE_SIZE, JE_PAGE_SIZE, JE_VM_R|JE_VM_W, 0u };
+    int nx=je_arch_has_nx();
+    const je_vm_ops *ops=je_arch_vm_ops(&je_kernel_pages, nx);
+    if (je_vm_init(&vm_s3, ops, &je_kernel_pages, 0)!=JE_OK) fail("JeiOS fatal: s3 vm_init\r\n");
+    if (je_vm_image_validate(&img, sizeof vm_blob_s3)!=JE_OK) fail("JeiOS fatal: s3 image\r\n");
+    uint32_t idx;
+    if (je_vm_build(&vm_s3, &img, vm_blob_s3, sizeof vm_blob_s3, nx, &idx)!=JE_OK)
+        fail("JeiOS fatal: s3 build\r\n");
+    if (je_vm_audit(&vm_s3, idx)!=JE_OK) fail("JeiOS fatal: s3 audit\r\n");
+    return idx;
+}
+/* Read the heartbeat word by switching to the process root, reading the arena
+ * data page at CPL0, and switching back. Interrupts must be disabled so the
+ * timer cannot dispatch while we are on the process root from kernel context. */
+static uint64_t vm_s3_heartbeat(uint32_t idx)
+{
+    uint64_t flags=je_arch_irq_save();
+    uint64_t kroot=je_arch_kernel_root_phys();
+    je_arch_cr3_load(vm_s3.procs[idx].root);
+    volatile uint64_t *hb=(volatile uint64_t *)(uintptr_t)(JE_VM_ARENA_BASE+JE_PAGE_SIZE);
+    uint64_t v=*hb;
+    je_arch_cr3_load(kroot);
+    je_arch_irq_restore(flags);
+    return v;
+}
 _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
 {
     (void)je_arch_console_init();
@@ -106,6 +153,9 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
     je_arch_console_write(je_arch_has_nx() ? "CPU: NX enforced\r\n" :
                                             "CPU: legacy profile, NX absent\r\n");
     je_arch_console_write("M1: protected mappings and stack guards ready\r\n");
+    /* M3a #4 step 3 (ADR 0007 D7): deny x87/MMX/SSE/AVX before any user thread
+     * can exist, so hostile ring-3 FP/SIMD traps rather than executes/leaks. */
+    je_arch_cpu_policy_init();
 #if JE_TEST_MODE == 4
     __asm__ volatile("movq $1,(%%rax)"::"a"((uintptr_t)__kernel_start):"memory");
 #elif JE_TEST_MODE == 5
@@ -185,6 +235,64 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
         if (je_vm_destroy(&vm_s2, vm_idx)!=JE_OK) fail("JeiOS fatal: s2 destroy\r\n");
         if (je_kernel_pages.free_count!=vm_free_before) fail("JeiOS fatal: s2 page leak\r\n");
         je_arch_console_write("M3a-s2: process destroyed; page accounting restored\r\n");
+    }
+
+    /* M3a #4 step 3: real CPL3 execution under timer preemption (one user task,
+     * no fault-locality yet). Gated on NX (D2). Proves: D7 policy took; a user
+     * thread entered ring 3 (cs&3==3 frames observed); it survived preemption;
+     * its heartbeat strictly increased (real ring-3 progress). */
+    if (!je_arch_has_nx()) {
+        je_arch_console_write("M3a-s3: skipped; D2 requires NX (legacy CPU profile)\r\n");
+    } else {
+        /* D7 readback: EM(2)=1, MP(1)=1, TS(3)=1 in CR0; OSFXSR(9)=OSXMMEXCPT(10)
+         * =OSXSAVE(18)=FSGSBASE(16)=0 in CR4. Mode 10 additionally proves denial
+         * by executing SSE at CPL3 and observing #UD. */
+        uint64_t cr0=je_arch_cpu_policy_cr0(), cr4=je_arch_cpu_policy_cr4();
+        if (!(cr0&(1u<<2)) || !(cr0&(1u<<1)) || !(cr0&(1u<<3)) ||
+            (cr4&(1u<<9)) || (cr4&(1u<<10)) || (cr4&(1u<<18)) || (cr4&(1u<<16)))
+            fail("JeiOS fatal: s3 D7 policy not enforced\r\n");
+        je_arch_console_write("M3a-s3: D7 FPU/SIMD denial enforced (CR0.EM/MP/TS, CR4 clear)\r\n");
+
+        size_t s3_free_before=je_kernel_pages.free_count;
+        (void)s3_free_before;
+#if JE_TEST_MODE == 10
+        /* D7 enforcement proof: launch a user task that executes SSE at CPL3.
+         * With CR0.EM=1 the CPU raises #UD (vector 6) from a cs=0x33 frame,
+         * proving hardware denial (not just a compiler flag). The fault reaches
+         * the fatal PANIC path (fault-locality is step 4). */
+        uint32_t fpidx=vm_s3_build(1);
+        if (je_thread_create_user(&vm_s3, fpidx)!=JE_OK) fail("JeiOS fatal: s3 fp user thread\r\n");
+        je_arch_console_write("M3a-s3: hostile-FP user thread created; entering ring 3\r\n");
+        for (;;) { (void)je_arch_irq_save(); __asm__ volatile("sti; hlt":::"memory"); }
+#endif
+        uint32_t uidx=vm_s3_build(0);
+        uint64_t before_disp=je_sched_user_cpl3_dispatches();
+        if (je_thread_create_user(&vm_s3, uidx)!=JE_OK) fail("JeiOS fatal: s3 user thread\r\n");
+        je_arch_console_write("M3a-s3: user thread created; entering ring 3 via timer\r\n");
+        uint64_t hb0=vm_s3_heartbeat(uidx);
+        /* Run until we have observed enough CPL3 dispatches, then confirm
+         * progress. The PIT is already live from M2; bootstrap (slot 0) cannot
+         * sleep, so it hlt-loops and the timer preempts into the user thread. */
+        uint64_t spins=0;
+        for (;;) {
+            (void)je_arch_irq_save();
+            uint64_t disp=je_sched_user_cpl3_dispatches()-before_disp;
+            if (disp>=JE_THREAD_MAX*2) break;
+            if (++spins>100000000ull) fail("JeiOS fatal: s3 no CPL3 progress\r\n");
+            __asm__ volatile("sti; hlt":::"memory");
+        }
+        uint64_t hb1=vm_s3_heartbeat(uidx);
+        if (hb1<=hb0) fail("JeiOS fatal: s3 heartbeat did not advance\r\n");
+        je_arch_console_write("M3a-s3: CPL3 reached; survived preemption; heartbeat advanced ticks=");
+        je_arch_console_hex(hb1);je_arch_console_write("\r\n");
+        /* Tear down: the user thread never exits (infinite loop), so mark its
+         * slot and destroy the process (frees its held kstack). We stop the task
+         * by clearing it from scheduling first. */
+        (void)je_arch_irq_save(); /* keep interrupts off through teardown */
+        if (je_sched_drop_user(&vm_s3, uidx)!=JE_OK) fail("JeiOS fatal: s3 drop_user\r\n");
+        if (je_vm_destroy(&vm_s3, uidx)!=JE_OK) fail("JeiOS fatal: s3 destroy\r\n");
+        if (je_kernel_pages.free_count!=s3_free_before) fail("JeiOS fatal: s3 page leak\r\n");
+        je_arch_console_write("M3a-s3: user process torn down; page accounting restored\r\n");
     }
 
     je_arch_console_write("JeiOS: initialization complete; halted\r\n");

@@ -57,6 +57,45 @@ void je_arch_traps_init(void)
     __asm__ volatile("lidt %0" : : "m"(ip) : "memory");
 }
 static volatile unsigned panicking;
+/* M3a #4 step 3: TSS.RSP0 is the kernel stack the CPU loads on a CPL3->CPL0
+ * trap. The scheduler sets it to the next user thread's per-process kernel stack
+ * top before returning that thread's frame; a kernel thread sets 0 (never
+ * consulted for CPL0->CPL0, fail-closed if ever wrongly used). */
+void je_arch_tss_set_rsp0(uint64_t rsp0) { tss.rsp[0] = rsp0; }
+uint64_t je_arch_tss_get_rsp0(void) { return tss.rsp[0]; }
+
+/* M3a #4 step 3 (ADR 0007 D7): architectural denial of x87/MMX/SSE/AVX and
+ * extended state, so hostile ring-3 FP/SIMD traps (#NM/#UD) instead of executing
+ * or leaking register state. CR0.EM=1 (no x87, SSE #UDs), MP=1, TS=1 (FP use
+ * #NMs); CR4.OSFXSR/OSXMMEXCPT/OSXSAVE=0 (SSE not OS-enabled). The kernel is
+ * built -mgeneral-regs-only and emits no FP/SIMD, so this is safe for kernel
+ * code. Called once after paging init, before any user thread exists. */
+void je_arch_cpu_policy_init(void)
+{
+    uintptr_t cr0, cr4;
+    __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
+    cr0 |= (uintptr_t)1 << 2;   /* EM */
+    cr0 |= (uintptr_t)1 << 1;   /* MP */
+    cr0 |= (uintptr_t)1 << 3;   /* TS */
+    __asm__ volatile("mov %0,%%cr0" : : "r"(cr0) : "memory");
+    __asm__ volatile("mov %%cr4,%0" : "=r"(cr4));
+    cr4 &= ~((uintptr_t)1 << 9);   /* OSFXSR */
+    cr4 &= ~((uintptr_t)1 << 10);  /* OSXMMEXCPT */
+    cr4 &= ~((uintptr_t)1 << 18);  /* OSXSAVE */
+    cr4 &= ~((uintptr_t)1 << 16);  /* FSGSBASE: no user FS/GS-base API (ADR D6 no-TLS) */
+    __asm__ volatile("mov %0,%%cr4" : : "r"(cr4) : "memory");
+    /* Normalize data selectors for the no-TLS profile (ADR 0007 D6): IRETQ to
+     * CPL3 loads SS from the frame but leaves DS/ES/FS/GS at their current
+     * values, so clear them to the null selector now. The kernel never reads
+     * through these in 64-bit mode (flat model); a user process gets no inherited
+     * kernel data selector. */
+    __asm__ volatile("mov %0,%%ds; mov %0,%%es; mov %0,%%fs; mov %0,%%gs"
+                     : : "r"((uint16_t)0) : "memory");
+}
+/* Test-only readback so the step-3 boot check can prove the policy took. */
+uint64_t je_arch_cpu_policy_cr0(void) { uintptr_t v; __asm__ volatile("mov %%cr0,%0":"=r"(v)); return v; }
+uint64_t je_arch_cpu_policy_cr4(void) { uintptr_t v; __asm__ volatile("mov %%cr4,%0":"=r"(v)); return v; }
+
 je_trap_frame *je_trap_dispatch(je_trap_frame *f)
 {
     if (f->vector==32) {
@@ -69,6 +108,7 @@ je_trap_frame *je_trap_dispatch(je_trap_frame *f)
     je_arch_console_write("PANIC vector="); je_arch_console_hex(f->vector);
     je_arch_console_write(" error="); je_arch_console_hex(f->error);
     je_arch_console_write(" rip="); je_arch_console_hex(f->rip);
+    je_arch_console_write(" cs="); je_arch_console_hex(f->cs);
     je_arch_console_write(" cr2="); je_arch_console_hex(cr2);
     je_arch_console_write("\r\nJeiOS fatal: exception; halted\r\n");
     je_arch_halt();
