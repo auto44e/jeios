@@ -144,8 +144,12 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
 
     /* M3a #4 step 2: real per-process page tables + real CR3, exercised at CPL0
      * only (no ring-3, no sched CR3 switch). The happy path runs every boot so
-     * `make smoke` covers it; modes 8/9 provoke the single-shot fault probes. */
-    {
+     * `make smoke` covers it; modes 8/9 provoke the single-shot fault probes.
+     * ADR 0007 D2 gates user launch on NX: with NX absent je_vm_build refuses
+     * (JE_ERR_UNSUPPORTED), so this check is skipped on the legacy CPU profile. */
+    if (!je_arch_has_nx()) {
+        je_arch_console_write("M3a-s2: skipped; D2 requires NX (legacy CPU profile)\r\n");
+    } else {
         size_t vm_free_before=je_kernel_pages.free_count;
         uint64_t proc_root=0;
         uint32_t vm_idx=vm_s2_build(&proc_root);
