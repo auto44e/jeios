@@ -1,5 +1,28 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Boot toolchain verified in this environment — observed 2026-10-17T08:08:00+00:00
+
+The QEMU/GRUB boot toolchain is installed and working on the current build
+machine (Ubuntu 24.04 "noble"), so the serial-marker boot evidence that gates
+M3a #4 and later runtime claims can be produced here:
+
+- `qemu-system-x86_64` 8.2.2 (`qemu-system-x86`), SeaBIOS present
+  (`/usr/share/seabios/bios.bin`). The kernel is a BIOS/legacy-PC target; OVMF
+  (UEFI) is NOT required and its absence is irrelevant.
+- `grub-pc-bin` (i386-pc modules at `/usr/lib/grub/i386-pc`), plus
+  `grub-mkrescue`/`xorriso`, so `make iso` builds a bootable multiboot2 image.
+  Note: the kernel is multiboot2-only (header magic `0xe85250d6`), so QEMU
+  `-kernel` (multiboot1) CANNOT load it directly — GRUB is required.
+
+Verified now at `main`: `make smoke` PASS (normal boot prints the ordered markers
+through "initialization complete; halted", NX enforced) and `make integration`
+PASS (all seven CPU-fault-injection cases, including the double-fault/IST path).
+This supersedes the earlier note that emulation tools lived only in transient
+`/tmp/jeios-tools` wrappers; a working toolchain is now present via system
+packages. A fresh environment still needs `qemu-system-x86` and `grub-pc-bin`
+installed before boot evidence can be produced. Documentation only; no code or
+kernel behavior changed.
+
 ## M3a #3 hosted VM/loader implemented — observed 2026-10-17T06:30:00+00:00
 
 Inspected `auto44e/jeios` branch `feat/m3a-3-vm-loader` from `main`
