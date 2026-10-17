@@ -63,3 +63,8 @@ the owner on 2026-10-13. Third-party components retain their own licenses and
 require provenance/compatibility review. No external kernel source has been
 imported. See [the licensing decision](docs/adr/0005-licensing.md).
 
+## Core standards direction
+
+[POSIX.1-2024 and LDAPv3](docs/STANDARDS.md) are accepted core requirements,
+implemented in stages across desktop/mobile. Both remain planned; neither current
+conformance nor directory login is claimed. Organizational enrollment is optional.

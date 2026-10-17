@@ -123,3 +123,29 @@ shared; no AOSP/Linux host or lunch target. Core M3a remains next.
 M3c IPC, M4-M6 brokers/network/storage, M7-M9 consent/identity/recovery and mobile
 qualification. Treat this as a requirement across gates, not a completed feature
 or a reason to skip M3a. See HANDOFF.md for dated current status and history.
+
+## Core standards commitment — 2026-10-16
+
+[STANDARDS.md](STANDARDS.md): target POSIX.1-2024 as a core application environment;
+M6 remains an initial tested subset followed by complete-profile qualification.
+Built-in LDAPv3 provider/identity integration is also core, with optional enrollment.
+M3-M6 and security prerequisites still apply; M3a remains next.
+Track [POSIX #15](https://github.com/auto44e/jeios/issues/15) and
+[LDAP #16](https://github.com/auto44e/jeios/issues/16). Certification, AD DS/GPO and
+cloud enrollment are separate goals, not implied completion.
+
+## Curl-inspired CI direction — 2026-10-16
+
+[CI_STRATEGY.md](CI_STRATEGY.md) records the owner's short/long-term testing goal:
+portable regressions, compiler diversity, sanitizers/static analysis, replayable
+failure injection and fuzzing, supplemented by native kernel execution and storage
+crash-recovery qualification. [Core #18](https://github.com/auto44e/jeios/issues/18)
+is the first bounded CI implementation task. Existing gates remain mandatory;
+M3a and mobile MP0 remain next. This update adds planning only, not workflow jobs.
+
+## Ecosystem coding discipline — 2026-10-16
+
+[CODING_STANDARD.md](CODING_STANDARD.md) applies NASA/JPL-inspired rules with
+stricter critical-component profiles. [Core #19](https://github.com/auto44e/jeios/issues/19)
+tracks audit and enforcement with CI #18. Incremental adoption supports each gate;
+it does not replace M3a or establish NASA certification.

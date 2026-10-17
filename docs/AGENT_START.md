@@ -1,6 +1,6 @@
 # Coding-agent starting guide
 
-Updated 2026-10-14. Read this with ../AGENTS.md, HANDOFF.md and IMPLEMENTATION.md.
+Updated 2026-10-16. Read this with ../AGENTS.md, HANDOFF.md and IMPLEMENTATION.md.
 Owner requested a sustained coding-agent handoff. This guide records requirements
 and continuation order; it does not claim later milestones are implemented.
 
@@ -159,3 +159,29 @@ by creating them and project-board membership has not been verified. Hosted
 prototypes can proceed independently while runtime integration waits for M3/M4/M5
 and relevant mobile execution/driver gates. No writes to real user media.
 M3a remains the next core kernel gate; MP0 remains the mobile architecture gate.
+
+## Core standards workstreams — 2026-10-16
+
+Read [STANDARDS.md](STANDARDS.md). POSIX.1-2024 and built-in LDAPv3 are accepted
+core commitments; staged runtime implementation remains blocked on native gates.
+[POSIX #15](https://github.com/auto44e/jeios/issues/15) defines the profile and
+conformance roadmap; [LDAP #16](https://github.com/auto44e/jeios/issues/16) defines
+the isolated provider and identity-broker contract. Begin bounded design work
+without displacing M3a. Mobile parity reuses these contracts and implementations.
+Historical wording that treats generic LDAP as only a candidate is superseded.
+
+## Curl-inspired CI direction — 2026-10-16
+
+[CI_STRATEGY.md](CI_STRATEGY.md) records the owner's short/long-term testing goal:
+portable regressions, compiler diversity, sanitizers/static analysis, replayable
+failure injection and fuzzing, supplemented by native kernel execution and storage
+crash-recovery qualification. [Core #18](https://github.com/auto44e/jeios/issues/18)
+is the first bounded CI implementation task. Existing gates remain mandatory;
+M3a and mobile MP0 remain next. This update adds planning only, not workflow jobs.
+
+## Ecosystem assurance direction — 2026-10-16
+
+[CODING_STANDARD.md](CODING_STANDARD.md) defines NASA/JPL-inspired risk profiles
+and ten project rules. Core #19 tracks baseline audit and enforcement, alongside
+CI #18. Apply across core, services, apps, tooling and mobile; no compliance audit
+or new CI checks are claimed. M3a remains next.

@@ -67,3 +67,10 @@ Current status takes precedence over historical branch names or open/closed
 wording. Preserve previous test results at their original commit and environment;
 do not present them as rerun or current-head CI. State unverified items explicitly.
 Use enough detail for an agent to resume without reconstructing the conversation.
+
+## Ecosystem coding policy
+
+Read [docs/CODING_STANDARD.md](docs/CODING_STANDARD.md) for NASA/JPL-inspired
+risk profiles and JCS-01 through JCS-10. Apply applicable rules to new/materially
+changed code, identify evidence and deviations, and never claim unaudited existing
+code conforms. Automation rollout is core #19 with CI #18.

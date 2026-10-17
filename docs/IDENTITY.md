@@ -256,3 +256,11 @@ See DOMAINS.md for directionality and per-platform policy enforcement limits.
 [SECURITY_KEYS.md](SECURITY_KEYS.md) makes hardware-key enrollment, MFA,
 reauthentication and recovery first-class native services. User presence alone
 is not user verification; account authentication alone does not recover data keys.
+
+## Core LDAP commitment — 2026-10-16
+
+[STANDARDS.md](STANDARDS.md) promotes built-in LDAPv3 integration from an
+interoperability candidate to a core requirement. Enrollment remains optional;
+local accounts remain independent. LDAP directory access, authentication, native
+rights mapping, AD DS membership, Kerberos SSO and cloud identity retain separate
+contracts. No runtime integration is implemented. See core issue #16.

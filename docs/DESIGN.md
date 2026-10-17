@@ -681,8 +681,11 @@ extensions. Recovery must also offer CLI/serial diagnostics where available.
 
 ## 18. Compatibility strategy
 
-Native APIs come first, then a POSIX environment sufficient to build standard
-portable tooling. POSIX source compatibility, Linux syscall/binary compatibility,
+POSIX.1-2024 compatibility is a core requirement alongside native APIs; staged
+portable-tool support is an initial checkpoint, not the final scope. Built-in
+LDAPv3 directory integration is also a core requirement with optional enrollment.
+See [STANDARDS.md](STANDARDS.md) for shared desktop/mobile contracts and gates.
+POSIX source compatibility, Linux syscall/binary compatibility,
 FreeBSD ABI compatibility, Windows user APIs, macOS frameworks, and foreign kernel
 drivers are different scopes with separate acceptance suites.
 

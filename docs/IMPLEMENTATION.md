@@ -180,3 +180,12 @@ Before launching untrusted code, establish ring-3 entry, a user/kernel mapping
 split, validated copy primitives, per-process lifetime/authority rules and vetted
 hardening prerequisites. Do not present seven ring-0 threads as sandboxed apps.
 
+## Standards status — 2026-10-16
+
+| Capability | Status | Next evidence |
+| --- | --- | --- |
+| POSIX.1-2024 environment | Planned core requirement; no runtime conformance | Issue #15 profile/ADR, then native staged tests |
+| LDAPv3 directory integration | Planned core requirement; no provider/login | Issue #16 contract/lab plan, then qualified native broker |
+
+See [STANDARDS.md](STANDARDS.md). This documentation update changes no executable
+behavior; M1/M2 remains the implemented baseline.

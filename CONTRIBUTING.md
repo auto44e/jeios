@@ -16,3 +16,7 @@ license compatibility before imports. Use SPDX-License-Identifier: Apache-2.0
 for original source files. Third-party code keeps its own license and must not
 receive an inaccurate Apache identifier. No separate CLA is introduced here.
 
+
+Follow [the ecosystem coding policy](docs/CODING_STANDARD.md). In each code PR,
+identify risk profile, applicable rules, changed invariants, verification evidence
+and deviations. Human and AI contributions have the same obligations.
