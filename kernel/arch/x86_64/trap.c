@@ -4,6 +4,7 @@
 #include <jeios/arch.h>
 #include <jeios/trap.h>
 #include <jeios/sched.h>
+#include <jeios/syscall.h>
 /* Intel SDM Vol.3A: 64-bit interrupt handling, IST and TSS; Vol.2: LIDT/LTR.
  * Source references and ABI rationale are in docs/IMPLEMENTATION.md. */
 struct __attribute__((packed)) gate {
@@ -125,12 +126,16 @@ je_trap_frame *je_trap_dispatch(je_trap_frame *f)
     if (f->vector==0x81) return je_sched_interrupt(f,false);
     uint64_t cr2 = 0;
     if (f->vector == 14) __asm__ volatile("mov %%cr2,%0" : "=r"(cr2));
-    /* Fault-local death: a synchronous fault from ring 3, or a user int 0x80
-     * (the DPL3 gate; no syscall handler yet), terminates ONLY that process.
-     * User origin requires the saved CS to be the user selector — a kernel-origin
-     * fault on any of these vectors stays fatal. je_sched_fault_terminate adds
-     * the kind/stack-location cross-checks. */
-    if ((f->cs & 3) == 3 && (f->vector==0x80 || user_terminable_vector(f->vector)))
+    /* M3a #5: a user-origin int 0x80 is a SYSCALL (dispatch on RAX), not a fault.
+     * Route it before the fault-termination path. A kernel-origin int 0x80 is
+     * never issued by the kernel and stays fatal (falls through to PANIC). */
+    if ((f->cs & 3) == 3 && f->vector == 0x80)
+        return je_syscall_dispatch(f);
+    /* Fault-local death: a synchronous fault from ring 3 terminates ONLY that
+     * process. User origin requires the saved CS to be the user selector — a
+     * kernel-origin fault on any of these vectors stays fatal.
+     * je_sched_fault_terminate adds the kind/stack-location cross-checks. */
+    if ((f->cs & 3) == 3 && user_terminable_vector(f->vector))
         return je_sched_fault_terminate(f, cr2);
     if (panicking++) je_arch_halt();
     je_arch_console_write("PANIC vector="); je_arch_console_hex(f->vector);

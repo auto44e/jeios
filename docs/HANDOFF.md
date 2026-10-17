@@ -1,5 +1,42 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M3a #5 step (a): v0 syscall dispatcher — observed 2026-10-17T17:40:00+00:00
+
+Branch `feat/m3a-5a-syscall-dispatch`. The DPL3 `int 0x80` gate now dispatches a
+real experimental v0 syscall (previously it routed straight to death). New
+`kernel/core/syscall.c` (`je_syscall_decode` pure + unit-tested; `je_syscall_dispatch`
+glue), `include/jeios/abi.h` (separate, explicitly-numbered ABI status/ops,
+never the internal `status.h`). trap.c routes user-origin `int 0x80` to the
+dispatcher before the fault path; kernel-origin 0x80 stays fatal.
+
+Ops: `abi_query(which)` (version/profile in RDX), `yield()` (reschedule via the
+kind-aware path, RAX=OK written before switching), `exit(code)` (DEATH_EXIT +
+code). Unknown op → UNSUPPORTED (full 64-bit decode); recognized op with a
+nonzero reserved arg → INVALID, no side effect. Every non-switching return goes
+through `je_sched_return_to_user` → re-validates+sanitizes the frame, terminating
+(DEATH_BAD_RETURN) rather than IRETQ a bad frame.
+
+Owner-approved tested-code touch (kept M2+step4 green): the step-4 death record
+gained `reason {FAULT,EXIT,BAD_RETURN}` + `exit_code` (the `0xbad` magic vector
+removed); a sibling `je_sched_exit_current` was added rather than renaming the
+tested `je_sched_fault_terminate`.
+
+Peer: pre-write design vote (both agents) caught the direct-return-skips-validation
+gap (fixed by `je_sched_return_to_user`). Codex cross-review found no
+escape/UAF/ABI-leak and drove three closures: test asserts RDX=0 on INVALID/
+UNSUPPORTED; a new QEMU stub proves BAD_RETURN *through the syscall return path*;
+and these doc updates.
+
+Tested in QEMU (this env): `make check` PASS (+`test_syscall` + abi.h isolation
+grep), `make smoke` PASS — boot proves exit(42)→clean EXIT, abi_query/yield
+return results to ring 3, unknown op→UNSUPPORTED+survives, bad-frame-on-return→
+BAD_RETURN death, all with peer B live and page accounting restored.
+`make integration` PASS (10 modes). All three CI smoke profiles pass locally;
+M2's 4 markers unchanged. Next: step (b) — copy_from/to_user + copy_probe +
+exception-fixup copy sites (the only genuinely tricky remaining piece). NOT yet
+claimed: any user-copy/pointer handling, a stable ABI. AI-assisted review only;
+not independent human qualification.
+
 ## M3a #4 step 4: fault-local process death + D6 int 0x80 gate + H1 fix — observed 2026-10-17T15:30:00+00:00
 
 Branch `feat/m3a-4-step4-fault-local`. #4's core acceptance: a synchronous USER

@@ -8,6 +8,7 @@
 #include <jeios/boot.h>
 #include <jeios/paging.h>
 #include <jeios/vm.h>
+#include <jeios/abi.h>
 static je_boot_context boot;
 static _Noreturn void fail(const char *message)
 {
@@ -82,11 +83,15 @@ static uint32_t vm_s2_build(uint64_t *out_root)
 extern unsigned char je_user_demo_start[], je_user_demo_end[];
 extern unsigned char je_user_fp_start[], je_user_fp_end[];
 extern unsigned char je_user_fault_start[], je_user_fault_end[];
-extern unsigned char je_user_int80_start[], je_user_int80_end[];
+extern unsigned char je_user_exit_start[], je_user_exit_end[];
+extern unsigned char je_user_syscall_start[], je_user_syscall_end[];
+extern unsigned char je_user_unknownop_start[], je_user_unknownop_end[];
+extern unsigned char je_user_badret_start[], je_user_badret_end[];
 extern unsigned char je_user_badrsp_start[], je_user_badrsp_end[];
 static je_vm vm_s3;
 static unsigned char vm_blob_s3[256];
-typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_INT80=3, PROG_BADRSP=4 } user_prog;
+typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_EXIT=3,
+               PROG_SYSCALL=4, PROG_UNKNOWNOP=5, PROG_BADRSP=6, PROG_BADRET=7 } user_prog;
 static int vm_s3_inited;
 /* Initialize the shared step-3/4 vm once (it holds up to JE_VM_MAX_PROCESSES
  * processes — A and B share it, matching the 2-process admission quota). */
@@ -104,11 +109,14 @@ static uint32_t vm_s3_build(user_prog prog)
     vm_s3_init_once();
     unsigned char *start, *end;
     switch (prog) {
-    case PROG_FP:     start=je_user_fp_start;     end=je_user_fp_end;     break;
-    case PROG_FAULT:  start=je_user_fault_start;  end=je_user_fault_end;  break;
-    case PROG_INT80:  start=je_user_int80_start;  end=je_user_int80_end;  break;
-    case PROG_BADRSP: start=je_user_badrsp_start; end=je_user_badrsp_end; break;
-    default:          start=je_user_demo_start;   end=je_user_demo_end;   break;
+    case PROG_FP:        start=je_user_fp_start;        end=je_user_fp_end;        break;
+    case PROG_FAULT:     start=je_user_fault_start;     end=je_user_fault_end;     break;
+    case PROG_EXIT:      start=je_user_exit_start;      end=je_user_exit_end;      break;
+    case PROG_SYSCALL:   start=je_user_syscall_start;   end=je_user_syscall_end;   break;
+    case PROG_UNKNOWNOP: start=je_user_unknownop_start; end=je_user_unknownop_end; break;
+    case PROG_BADRSP:    start=je_user_badrsp_start;    end=je_user_badrsp_end;    break;
+    case PROG_BADRET:    start=je_user_badret_start;    end=je_user_badret_end;    break;
+    default:             start=je_user_demo_start;      end=je_user_demo_end;      break;
     }
     size_t code_len=(size_t)(end-start);
     if (code_len==0 || code_len>sizeof(vm_blob_s3)) fail("JeiOS fatal: s3 demo size\r\n");
@@ -136,6 +144,19 @@ static uint64_t vm_s3_heartbeat(uint32_t idx)
     je_arch_cr3_load(vm_s3.procs[idx].root);
     volatile uint64_t *hb=(volatile uint64_t *)(uintptr_t)(JE_VM_ARENA_BASE+JE_PAGE_SIZE);
     uint64_t v=*hb;
+    je_arch_cr3_load(kroot);
+    je_arch_irq_restore(flags);
+    return v;
+}
+/* Read a u64 at arena offset `off` under process idx's root (CPL0). Used to read
+ * back syscall results the user stub stored in its data page. */
+static uint64_t vm_s3_scratch(uint32_t idx, uint64_t off)
+{
+    uint64_t flags=je_arch_irq_save();
+    uint64_t kroot=je_arch_kernel_root_phys();
+    je_arch_cr3_load(vm_s3.procs[idx].root);
+    volatile uint64_t *p=(volatile uint64_t *)(uintptr_t)(JE_VM_ARENA_BASE+off);
+    uint64_t v=*p;
     je_arch_cr3_load(kroot);
     je_arch_irq_restore(flags);
     return v;
@@ -351,11 +372,13 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
          * running, reusing the freed second process slot: the D6 int 0x80 gate
          * (unsupported op -> death) and bad-return-state (H1: a user task that
          * corrupts its RSP must be killed at next dispatch, not halt the kernel).
-         * Each expects the faulting process DYING, then reaps it. */
-        static const user_prog variants[2] = { PROG_INT80, PROG_BADRSP };
+         * Each expects the faulting process DYING with the right reason, then
+         * reaps it, all while peer B keeps running. */
+        static const user_prog variants[2] = { PROG_BADRSP, PROG_FP };
+        static const uint64_t vreason[2] = { JE_DEATH_BAD_RETURN, JE_DEATH_FAULT };
         static const char *const vmsg[2] = {
-            "M3a-s4: user int 0x80 (D6 gate) terminated offender; B alive\r\n",
-            "M3a-s4: bad-RSP (H1) user task terminated, not kernel; B alive\r\n" };
+            "M3a-s4: bad-RSP (H1) user task terminated (BAD_RETURN), not kernel; B alive\r\n",
+            "M3a-s4: hostile-FP user task terminated (#UD FAULT); B alive\r\n" };
         for (unsigned vi=0; vi<2; ++vi) {
             uint32_t C=vm_s3_build(variants[vi]);
             uint64_t bdisp=je_sched_dispatches_of(&vm_s3,B);
@@ -365,9 +388,9 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                 if (++sp>100000000ull) fail("JeiOS fatal: s4 variant did not die\r\n");
                 __asm__ volatile("sti; hlt":::"memory");
             }
-            uint64_t cv,ce,cr,cc,ccr2; (void)je_arch_irq_save();
-            if (je_sched_death_record(&vm_s3,C,&cv,&ce,&cr,&cc,&ccr2)!=JE_OK) fail("JeiOS fatal: s4 variant no record\r\n");
-            if (cc!=0x33u) fail("JeiOS fatal: s4 variant not user origin\r\n");
+            uint64_t creason,ccode; (void)je_arch_irq_save();
+            if (je_sched_death_reason(&vm_s3,C,&creason,&ccode)!=JE_OK) fail("JeiOS fatal: s4 variant no record\r\n");
+            if (creason!=vreason[vi]) fail("JeiOS fatal: s4 variant wrong death reason\r\n");
             if (je_sched_reap_dead()<0) fail("JeiOS fatal: s4 variant reap\r\n");
             /* B must still be scheduled (progressed past the pre-variant snapshot). */
             for (uint64_t sp=0; je_sched_dispatches_of(&vm_s3,B)<=bdisp; ) {
@@ -377,7 +400,85 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             }
             je_arch_console_write(vmsg[vi]);
         }
-        /* Tear down B; all step-3/4 pages must be back to the pre-s4 baseline. */
+
+        /* --- step-(a) syscall proof, with B still the live peer --- */
+        /* exit(42) via the int 0x80 gate: a CLEAN controlled termination
+         * (DEATH_EXIT, code 42), distinct from a fault. */
+        {
+            uint32_t E=vm_s3_build(PROG_EXIT);
+            if (je_thread_create_user(&vm_s3, E)!=JE_OK) fail("JeiOS fatal: s5a exit thread\r\n");
+            for (uint64_t sp=0; !je_sched_has_dying(); ) {
+                (void)je_arch_irq_save();
+                if (++sp>100000000ull) fail("JeiOS fatal: s5a exit did not exit\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            uint64_t er,ec; (void)je_arch_irq_save();
+            if (je_sched_death_reason(&vm_s3,E,&er,&ec)!=JE_OK) fail("JeiOS fatal: s5a exit no record\r\n");
+            if (er!=JE_DEATH_EXIT || ec!=42u) fail("JeiOS fatal: s5a exit wrong reason/code\r\n");
+            if (je_sched_reap_dead()<0) fail("JeiOS fatal: s5a exit reap\r\n");
+            je_arch_console_write("M3a-s5a: user exit(42) -> clean EXIT (code 42) via int 0x80; B alive\r\n");
+        }
+        /* abi_query + yield: a returning-syscall task. It records abi_query's
+         * status/version and a yield status into its data page; run it a while,
+         * then read those back and confirm it keeps looping (syscalls returned). */
+        {
+            uint32_t S=vm_s3_build(PROG_SYSCALL);
+            uint64_t sdisp0;
+            if (je_thread_create_user(&vm_s3, S)!=JE_OK) fail("JeiOS fatal: s5a syscall thread\r\n");
+            sdisp0=je_sched_dispatches_of(&vm_s3,S);
+            for (uint64_t sp=0; je_sched_dispatches_of(&vm_s3,S)-sdisp0<JE_THREAD_MAX*2; ) {
+                (void)je_arch_irq_save();
+                if (++sp>100000000ull) fail("JeiOS fatal: s5a syscall no progress\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            uint64_t qstatus=vm_s3_scratch(S,JE_PAGE_SIZE+8);   /* abi_query status */
+            uint64_t qver=vm_s3_scratch(S,JE_PAGE_SIZE+16);     /* abi_query version */
+            uint64_t ystatus=vm_s3_scratch(S,JE_PAGE_SIZE+24);  /* yield status */
+            if (qstatus!=JE_ABI_OK || qver!=JE_ABI_VERSION) fail("JeiOS fatal: s5a abi_query result\r\n");
+            if (ystatus!=JE_ABI_OK) fail("JeiOS fatal: s5a yield result\r\n");
+            (void)je_arch_irq_save();
+            if (je_sched_drop_user(&vm_s3, S)!=JE_OK) fail("JeiOS fatal: s5a syscall drop\r\n");
+            if (je_vm_destroy(&vm_s3, S)!=JE_OK) fail("JeiOS fatal: s5a syscall destroy\r\n");
+            je_arch_console_write("M3a-s5a: abi_query returned OK+version; yield returned OK; B alive\r\n");
+        }
+        /* Unknown op must NOT terminate: the task records UNSUPPORTED and keeps
+         * running. */
+        {
+            uint32_t U=vm_s3_build(PROG_UNKNOWNOP);
+            uint64_t udisp0;
+            if (je_thread_create_user(&vm_s3, U)!=JE_OK) fail("JeiOS fatal: s5a unknown thread\r\n");
+            udisp0=je_sched_dispatches_of(&vm_s3,U);
+            for (uint64_t sp=0; je_sched_dispatches_of(&vm_s3,U)-udisp0<JE_THREAD_MAX*2; ) {
+                (void)je_arch_irq_save();
+                if (++sp>100000000ull) fail("JeiOS fatal: s5a unknown no progress\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            if (je_sched_has_dying()) fail("JeiOS fatal: s5a unknown op terminated the task\r\n");
+            if (vm_s3_scratch(U,JE_PAGE_SIZE+8)!=JE_ABI_UNSUPPORTED) fail("JeiOS fatal: s5a unknown status\r\n");
+            (void)je_arch_irq_save();
+            if (je_sched_drop_user(&vm_s3, U)!=JE_OK) fail("JeiOS fatal: s5a unknown drop\r\n");
+            if (je_vm_destroy(&vm_s3, U)!=JE_OK) fail("JeiOS fatal: s5a unknown destroy\r\n");
+            je_arch_console_write("M3a-s5a: unknown op -> UNSUPPORTED, task survived; B alive\r\n");
+        }
+        /* Bad-return THROUGH the syscall return path: corrupt RSP then make a
+         * returning syscall; je_sched_return_to_user must validate and terminate
+         * (BAD_RETURN) rather than iretq the bad frame. */
+        {
+            uint32_t R=vm_s3_build(PROG_BADRET);
+            if (je_thread_create_user(&vm_s3, R)!=JE_OK) fail("JeiOS fatal: s5a badret thread\r\n");
+            for (uint64_t sp=0; !je_sched_has_dying(); ) {
+                (void)je_arch_irq_save();
+                if (++sp>100000000ull) fail("JeiOS fatal: s5a badret did not die\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            uint64_t rr,rc; (void)je_arch_irq_save();
+            if (je_sched_death_reason(&vm_s3,R,&rr,&rc)!=JE_OK) fail("JeiOS fatal: s5a badret no record\r\n");
+            if (rr!=JE_DEATH_BAD_RETURN) fail("JeiOS fatal: s5a badret wrong reason\r\n");
+            if (je_sched_reap_dead()<0) fail("JeiOS fatal: s5a badret reap\r\n");
+            je_arch_console_write("M3a-s5a: bad frame on syscall return -> BAD_RETURN death (validated); B alive\r\n");
+        }
+
+        /* Tear down B; all step-3/4/5a pages must be back to the pre-s4 baseline. */
         (void)je_arch_irq_save();
         if (je_sched_drop_user(&vm_s3, B)!=JE_OK) fail("JeiOS fatal: s4 drop B\r\n");
         if (je_vm_destroy(&vm_s3, B)!=JE_OK) fail("JeiOS fatal: s4 destroy B\r\n");

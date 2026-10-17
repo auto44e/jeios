@@ -55,16 +55,97 @@ je_user_fault_start:
     jmp 3b                     /* unreached */
 je_user_fault_end:
 
-/* M3a #4 step 4: a user program that invokes the DPL3 int 0x80 gate (no syscall
- * handler yet -> unsupported op -> fault-local termination). Proves the D6 gate
- * is reachable from ring 3 and leads to death, not to kernel entry. */
-.globl je_user_int80_start
-.globl je_user_int80_end
-je_user_int80_start:
-    incq 0x40001000            /* one heartbeat so we can see it ran */
-    int $0x80                  /* DPL3 gate -> terminate (no handler) */
-    jmp je_user_int80_start    /* unreached */
-je_user_int80_end:
+/* M3a #5 step (a): a user program that calls exit(42) via the int 0x80 gate —
+ * a clean, controlled termination through the D6 gate (DEATH_EXIT, code 42),
+ * as opposed to a fault. RAX=JE_SYS_EXIT(2), RDI=42. */
+.globl je_user_exit_start
+.globl je_user_exit_end
+je_user_exit_start:
+    incq 0x40001000            /* one heartbeat so we can see it ran at CPL3 */
+    movq $2, %rax              /* JE_SYS_EXIT */
+    movq $42, %rdi             /* exit code 42 */
+    xorq %rsi, %rsi            /* reserved args zero */
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80                  /* -> je_sched_exit_current; never returns */
+    jmp je_user_exit_start     /* unreached */
+je_user_exit_end:
+
+/* M3a #5 step (a): a user program exercising returning syscalls — abi_query and
+ * yield — then looping on its heartbeat. Proves the dispatcher returns to the
+ * caller with a result (RAX/RDX) and that yield reschedules and resumes with OK.
+ * It stores abi_query's returned version into the heartbeat+8 word so the kernel
+ * can read back that a real syscall result reached ring 3. */
+.globl je_user_syscall_start
+.globl je_user_syscall_end
+je_user_syscall_start:
+    /* abi_query(version): RAX=0 (JE_SYS_ABI_QUERY), RDI=0 (version). */
+    xorq %rax, %rax
+    xorq %rdi, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80                  /* -> RAX=status, RDX=version */
+    movq %rax, 0x40001008      /* record status at heartbeat+8 */
+    movq %rdx, 0x40001010      /* record version at heartbeat+16 */
+5:
+    incq 0x40001000            /* heartbeat */
+    movq $1, %rax              /* JE_SYS_YIELD */
+    xorq %rdi, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80                  /* yield; resumes here with RAX=OK */
+    movq %rax, 0x40001018      /* record yield status at heartbeat+24 */
+    jmp 5b
+je_user_syscall_end:
+
+/* M3a #5: a user program that calls an UNKNOWN syscall op (must return
+ * UNSUPPORTED and keep running), records the status, then loops. Proves an
+ * unknown op does NOT terminate the caller. */
+.globl je_user_unknownop_start
+.globl je_user_unknownop_end
+je_user_unknownop_start:
+    movq $0xdeadbeef, %rax     /* unknown op */
+    xorq %rdi, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80                  /* -> RAX=UNSUPPORTED, returns */
+    movq %rax, 0x40001008      /* record status */
+6:
+    incq 0x40001000            /* heartbeat; keeps running (not terminated) */
+    jmp 6b
+je_user_unknownop_end:
+
+/* M3a #5 step (a): a user program that corrupts its RSP, then immediately makes
+ * a RETURNING syscall (abi_query). The dispatcher's je_sched_return_to_user must
+ * validate the frame on the way back and terminate (DEATH_BAD_RETURN) rather than
+ * IRETQ the bad frame — proving validation happens on the SYSCALL return path
+ * specifically (not only at the next timer dispatch). */
+.globl je_user_badret_start
+.globl je_user_badret_end
+je_user_badret_start:
+    incq 0x40001000            /* one heartbeat */
+    movq $0x1000, %rsp         /* RSP outside the arena; no fault yet */
+    xorq %rax, %rax            /* abi_query (a RETURNING syscall) */
+    xorq %rdi, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80                  /* return path must validate -> BAD_RETURN death */
+    jmp je_user_badret_start   /* unreached */
+je_user_badret_end:
 
 /* M3a #4 step 4: a user program that corrupts its own RSP to an out-of-arena
  * value WITHOUT faulting, then loops. It never traps itself; the scheduler must

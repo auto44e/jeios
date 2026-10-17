@@ -22,10 +22,15 @@ typedef struct {
     uint64_t root, rsp0_top;
     je_vm *vm;
     uint32_t vm_index;
-    /* M3a #4 step 4: death record for a DYING user thread (set by
-     * je_sched_fault_terminate, read by the bootstrap reaper and the proof). */
+    /* M3a #4 step 4 / #5: death record for a DYING user thread. `reason`
+     * distinguishes a synchronous fault, a clean exit(code), and an invalid
+     * return state (read by the bootstrap reaper and the proofs). */
     uint64_t death_vector, death_error, death_rip, death_cs, death_cr2;
+    uint64_t death_reason, exit_code;
 } thread;
+/* Death reasons (M3a #5). FAULT: synchronous user fault. EXIT: clean exit(code).
+ * BAD_RETURN: a user frame failed je_uframe_check (invalid return state). */
+typedef enum { DEATH_FAULT = 0, DEATH_EXIT = 1, DEATH_BAD_RETURN = 2 } death_reason;
 static thread threads[JE_THREAD_MAX];
 static unsigned current;
 static bool ready;
@@ -68,7 +73,7 @@ je_status je_thread_create(void (*entry)(void *),void *arg)
     *(uintptr_t *)rsp=(uintptr_t)je_thread_exit;
     je_trap_frame *f=(void *)(rsp-sizeof(*f));
     *f=(je_trap_frame){.rip=(uintptr_t)trampoline,.cs=8,.rflags=0x202,.rsp=rsp,.ss=16};
-    threads[slot]=(thread){READY,f,entry,arg,base,0,0,THREAD_KERNEL,0,0,0,0,0,0,0,0,0};
+    threads[slot]=(thread){READY,f,entry,arg,base,0,0,THREAD_KERNEL,0,0,0,0,0,0,0,0,0,0,0};
     return JE_OK;
 }
 
@@ -103,17 +108,18 @@ je_status je_thread_create_user(je_vm *vm, uint32_t index)
     f->rip = JE_VM_ARENA_BASE + p->entry;
     f->rsp = JE_VM_ARENA_BASE + JE_VM_ARENA_SIZE;
     f->rflags = 0x202u; /* IF=1, bit1; validator re-sanitizes on every dispatch */
-    threads[slot]=(thread){READY,f,0,0,0,0,0,THREAD_USER,p->root,rsp0_top,vm,index,0,0,0,0,0};
+    threads[slot]=(thread){READY,f,0,0,0,0,0,THREAD_USER,p->root,rsp0_top,vm,index,0,0,0,0,0,0,0};
     return JE_OK;
 }
 /* M3a #4 step 4: mark a user thread DYING with a death record (never requeued;
  * reclaimed later by je_sched_reap_dead from bootstrap). Kernel threads never
  * take this path. */
-static void mark_dying(unsigned slot, uint64_t vec, uint64_t err, uint64_t rip,
-                       uint64_t cs, uint64_t cr2)
+static void mark_dying(unsigned slot, death_reason reason, uint64_t code,
+                       uint64_t vec, uint64_t err, uint64_t rip, uint64_t cs, uint64_t cr2)
 {
     threads[slot].state=DYING;
     threads[slot].frame=0;
+    threads[slot].death_reason=(uint64_t)reason; threads[slot].exit_code=code;
     threads[slot].death_vector=vec; threads[slot].death_error=err;
     threads[slot].death_rip=rip; threads[slot].death_cs=cs; threads[slot].death_cr2=cr2;
 }
@@ -138,7 +144,7 @@ static je_trap_frame *select_and_install_next(void)
             uint64_t sane;
             if (!je_uframe_check(threads[next].frame, JE_VM_ARENA_BASE, JE_VM_ARENA_SIZE, &sane)) {
                 /* Bad saved return state -> terminate THIS task, not the kernel. */
-                mark_dying(next, UINT64_C(0xbad), 0, threads[next].frame->rip,
+                mark_dying(next, DEATH_BAD_RETURN, 0, 0, 0, threads[next].frame->rip,
                            threads[next].frame->cs, 0);
                 continue; /* pick another candidate */
             }
@@ -196,8 +202,42 @@ je_trap_frame *je_sched_fault_terminate(je_trap_frame *f, uint64_t cr2)
     /* Confirm the frame really is the current user task's (defense in depth). */
     if (f->cs != JE_UFRAME_USER_CS || f->ss != JE_UFRAME_USER_SS ||
         (uintptr_t)f != (uintptr_t)(threads[current].rsp0_top - sizeof(*f))) abort_scheduler();
-    mark_dying(current, f->vector, f->error, f->rip, f->cs, cr2);
+    mark_dying(current, DEATH_FAULT, 0, f->vector, f->error, f->rip, f->cs, cr2);
     return select_and_install_next();
+}
+
+/* M3a #5: clean exit(code) — same mechanics as fault_terminate (mark the current
+ * user thread DYING on its own kstack, return a live successor; the reaper frees
+ * it later) but records a DEATH_EXIT reason and the exit code rather than a
+ * fault. Separate from je_sched_fault_terminate (tested step-4 code) by design. */
+je_trap_frame *je_sched_exit_current(je_trap_frame *f, uint64_t code)
+{
+    if (!ready || threads[current].kind!=THREAD_USER) abort_scheduler();
+    if (f->cs != JE_UFRAME_USER_CS || f->ss != JE_UFRAME_USER_SS ||
+        (uintptr_t)f != (uintptr_t)(threads[current].rsp0_top - sizeof(*f))) abort_scheduler();
+    mark_dying(current, DEATH_EXIT, code, 0, 0, f->rip, f->cs, 0);
+    return select_and_install_next();
+}
+
+/* M3a #5: return path for a syscall that resumes the CURRENT user task (no
+ * context switch) — e.g. abi_query, UNSUPPORTED, INVALID. ADR 0007 D6/M3A.md §4
+ * require validating the user frame on EVERY return, so a non-switching syscall
+ * return must NOT skip je_uframe_check (a user can corrupt its own RSP/RFLAGS
+ * before int 0x80). Validate+sanitize here; on failure terminate (BAD_RETURN)
+ * and switch to a live successor instead of iretq'ing a bad frame. The caller
+ * has already written the result registers (rax/rdx) into f. */
+je_trap_frame *je_sched_return_to_user(je_trap_frame *f)
+{
+    if (!ready || threads[current].kind!=THREAD_USER) abort_scheduler();
+    if (f->cs != JE_UFRAME_USER_CS || f->ss != JE_UFRAME_USER_SS ||
+        (uintptr_t)f != (uintptr_t)(threads[current].rsp0_top - sizeof(*f))) abort_scheduler();
+    uint64_t sane;
+    if (!je_uframe_check(f, JE_VM_ARENA_BASE, JE_VM_ARENA_SIZE, &sane)) {
+        mark_dying(current, DEATH_BAD_RETURN, 0, 0, 0, f->rip, f->cs, 0);
+        return select_and_install_next();
+    }
+    f->rflags = sane;
+    return f; /* resume the caller; CR3/RSP0 already correct for the current task */
 }
 je_status je_thread_sleep(uint64_t duration)
 {
@@ -317,6 +357,18 @@ je_status je_sched_death_record(je_vm *vm, uint32_t index, uint64_t *vec, uint64
             if (rip) *rip=threads[i].death_rip;
             if (cs)  *cs=threads[i].death_cs;
             if (cr2) *cr2=threads[i].death_cr2;
+            return JE_OK;
+        }
+    return JE_ERR_INVALID;
+}
+/* M3a #5: the death reason + exit code for a DYING user slot (proof accessor). */
+je_status je_sched_death_reason(je_vm *vm, uint32_t index, uint64_t *reason, uint64_t *code)
+{
+    for (unsigned i=1;i<JE_THREAD_MAX;++i)
+        if (threads[i].kind==THREAD_USER && threads[i].vm==vm && threads[i].vm_index==index &&
+            threads[i].state==DYING) {
+            if (reason) *reason=threads[i].death_reason;
+            if (code)   *code=threads[i].exit_code;
             return JE_OK;
         }
     return JE_ERR_INVALID;
