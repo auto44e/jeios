@@ -322,6 +322,45 @@ two-task isolation qualification, syscalls/ABI, copy-in/out, a process exit path
 general/complete reclamation across all paths, SMP. AI-assisted review only; not
 independent human qualification.
 
+## M3a #5 step (a) — v0 syscall dispatcher — 2026-10-17
+
+The DPL3 `int 0x80` gate (installed in #4) now dispatches a real experimental v0
+syscall instead of terminating. `kernel/core/syscall.c`: `je_syscall_decode` is a
+pure op-decoder (unit-tested) and `je_syscall_dispatch` is the kernel glue.
+`kernel/arch/x86_64/trap.c` routes a user-origin `int 0x80` to the dispatcher
+before the fault-termination path (kernel-origin 0x80 stays fatal). ABI
+(`include/jeios/abi.h`, `<stdint.h>`-only, never `status.h`): RAX=op in /
+`je_abi_status` out {OK=0, UNSUPPORTED=1, INVALID=2}; RDI..R9 args; RDX optional
+scalar result. Ops: `abi_query(which)` → version/profile in RDX; `yield()` →
+reschedule via the existing kind-aware path, writing RAX=OK before switching;
+`exit(code)` → `je_sched_exit_current` (DEATH_EXIT + code). Unknown op →
+UNSUPPORTED (full 64-bit op decode, so `0x1_0000_0000` ≠ op 0); a recognized op
+with a nonzero reserved arg → INVALID with no side effect.
+
+Every non-switching syscall return goes through `je_sched_return_to_user`, which
+re-runs `je_uframe_check` (validate + sanitize RFLAGS) on the current frame and
+terminates (DEATH_BAD_RETURN) rather than IRETQ a bad frame — closing the gap
+where a direct syscall return would skip the "validate on every user return"
+rule. The step-4 death record gained a `reason {FAULT, EXIT, BAD_RETURN}` +
+`exit_code` (owner-approved tested-code touch; the `0xbad` magic vector removed);
+`je_sched_fault_terminate` kept unchanged (reason=FAULT).
+
+Verified in QEMU (this env): `make check` PASS (adds `test_syscall`:
+abi_query/yield/exit/reserved-arg/full-width-op/unsupported, each asserting the
+RDX result, + a `make check` grep enforcing abi.h never includes status.h),
+`make smoke` PASS — the boot proves, with peer B live throughout: `exit(42)` →
+clean DEATH_EXIT code 42 via the gate; `abi_query` returned OK+version and
+`yield` returned OK (read back from the user's data page, so the result reached
+ring 3); an unknown op → UNSUPPORTED and the task **survived**; a bad frame
+presented on the **syscall return path** → BAD_RETURN death (validated there, not
+only at the next timer dispatch). `make integration` PASS — 10 modes. All three
+CI smoke profiles pass locally; M2's 4 markers unchanged.
+
+NOT claimed (step (b)): `copy_from_user`/`copy_to_user`, `copy_probe`, the
+exception-fixup copy sites, or any user-pointer handling — no step-(a) op takes a
+pointer. No stable ABI promise. AI-assisted review only; not independent human
+qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

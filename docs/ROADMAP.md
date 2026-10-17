@@ -52,7 +52,11 @@ Next is M3, split into independently reviewable subgates:
   reclaimed). Steps 1–4 are merged/landing; #4 acceptance ("illegal access kills
   only the offender; peers survive") is met in QEMU. Issue #5 is the integrated
   two-task isolation qualification + the real syscall handler (copy-in/out) behind
-  the already-installed int 0x80 gate.
+  the int 0x80 gate, landing in steps: step (a) — the v0 syscall dispatcher
+  (abi_query/yield/exit, UNSUPPORTED/INVALID, ABI isolated from internal status,
+  validated syscall returns) — is done and QEMU-verified; step (b) (copy_from/to_user,
+  copy_probe, the exception-fixup copy sites) and the adversarial-pointer /
+  fault-recovery qualification remain.
 - **M3b:** typed handles with generation counters, rights attenuation, explicit
   object lifetime and checked syscall layouts. Test stale/forged handles and
   denied operations without side effects.

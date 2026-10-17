@@ -27,12 +27,21 @@ je_trap_frame *je_sched_interrupt(je_trap_frame *frame,bool timer);
  * fault (or user int 0x80); returns a live successor's frame to iretq to. Called
  * from je_trap_dispatch with interrupts disabled. Never requeues the dead task. */
 je_trap_frame *je_sched_fault_terminate(je_trap_frame *frame, uint64_t cr2);
+/* M3a #5: clean exit(code) — terminate the current user process (DEATH_EXIT),
+ * return a live successor. And the validated non-switching syscall return path:
+ * validate+sanitize the current user frame (ADR "validate on every user return")
+ * and resume it, or terminate (DEATH_BAD_RETURN) if the frame is invalid. */
+je_trap_frame *je_sched_exit_current(je_trap_frame *frame, uint64_t code);
+je_trap_frame *je_sched_return_to_user(je_trap_frame *frame);
+/* Public death-reason numbering (matches the scheduler's internal record). */
+enum { JE_DEATH_FAULT = 0, JE_DEATH_EXIT = 1, JE_DEATH_BAD_RETURN = 2 };
 /* M3a #4 step 4: reap DYING user processes from bootstrap (slot 0, irq off)
  * while peers run. Returns count reaped, or a negative je_status on violation. */
 int je_sched_reap_dead(void);
 bool je_sched_has_dying(void);
 je_status je_sched_death_record(je_vm *vm, uint32_t index, uint64_t *vec, uint64_t *err,
                                 uint64_t *rip, uint64_t *cs, uint64_t *cr2);
+je_status je_sched_death_reason(je_vm *vm, uint32_t index, uint64_t *reason, uint64_t *code);
 uint64_t je_sched_dispatches_of(je_vm *vm, uint32_t index);
 bool je_sched_finished(void);
 je_status je_sched_reap(void);
