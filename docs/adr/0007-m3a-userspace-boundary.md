@@ -47,18 +47,62 @@ Per-process virtual layout for M3a:
 | `0x40000000`–`0x401fffff` | per-process 2 MiB user arena; only declared pages mapped |
 | all other addresses | unmapped in M3a |
 
-Each process owns a PML4, PDPT, user PD and user PT. Kernel PD/PT topology may be
-shared read-only; leaf edits remain serialized kernel operations. Effective
-permissions are checked at **every** level — a leaf U bit does not override an
-ancestor. User mappings are never global; PCID stays disabled and CR3 is reloaded
-on address-space switch. Code is RX, constants R/NX, data/BSS/stack RW/NX; W+X is
-never mapped. Every new user page and page-table page is zeroed before
-installation. Image bytes are copied through supervisor mappings, then the
-identity alias of executable frames is made read-only/NX — no writable physical
-alias survives publication. An explicit per-process owned-extents list (independent
-of virtual address) is the only source permitted to populate user PTEs; MMIO,
-reserved pages, page tables and another owner's frames are rejected. No user
+Each process owns a PML4, PDPT, user PD and user PT (exactly four private table
+pages). Kernel PD/PT topology may be shared, but the kernel branch must remain
+supervisor-only (U=0) at every level **from PDPT[0] downward**; PML4[0] is shared
+by both branches and therefore carries U=1 (the arena needs it), so isolation of
+the first GiB depends on the kernel's PDPT[0] carrying U=0, never on a leaf bit
+alone. The arena path is PML4[0] → PDPT[1] → user PD[0] → user PT, where PDPT[0]
+(the kernel branch of each process's own PDPT) carries U=0. Effective permissions are
+checked at **every** level — a leaf U bit does not override an ancestor, and an
+ancestor must carry the most permissive bits the arena needs (P|U|W, no NX on
+PML4[0]/PDPT[1]) with restriction expressed at the leaf. User mappings are never
+global; PCID stays disabled and CR3 is reloaded on address-space switch. Code is
+RX, constants R/NX, data/BSS/stack RW/NX; W+X is never mapped.
+
+Every new user page **and every page-table page (PML4, PDPT, user PD, user PT)**
+is zeroed before it is installed or linked in. Publication order (corrected
+2026-10-17; supersedes the earlier "publish RX then
+demote alias" wording): for each frame — allocate → zero → copy image bytes
+through a supervisor-writable alias. For an **executable** (`USER_CODE`) frame
+only: unmap and flush any temporary loader alias, then **demote the frame's
+identity alias to RO/NX via `je_user_alias_set`** → flush →
+**then install the user RX leaf
+PTE**, so a user-X mapping and a writable alias never coexist. (After this, the
+identity alias is the only remaining alias of an executable frame.) For a
+`USER_DATA` (including stack) frame: flush → install the RW/NX user leaf PTE (its
+identity alias stays writable; the frame is never user-executable, so no W+X
+arises). Teardown is the exact reverse: clear the user PTE → flush → for an
+executable frame only, restore its identity alias to RW via `je_user_alias_set` →
+free. An executable frame must have its alias back to RW before
+`je_pages_free`, because the allocator/heap zeroes through the identity alias; if
+the alias restore fails, panic rather than free (freeing a RO frame would fault a
+later zeroing in CPL0).
+
+Alias protection uses two disjoint per-frame paths. The **user path** operates
+only on `USER_CODE` frames in the caller process's owned extents and moves them
+`RW ↔ RO_NX` through a single named operation, `je_user_alias_set`, which does a
+compare-and-set against the exact expected old PTE value and never falls back to
+`je_arch_page_restore`; it refuses `USER_DATA`, `TABLE`, frames outside the
+caller's extents and the kernel image. The **kernel-stack path** is the
+pre-existing `RW ↔ GUARD` guard-page handling for kernel stacks (not an owned
+extent, not a user frame) and uses `je_arch_page_restore`, which unconditionally
+rewrites `present|write|nx`; it is never used on a user-frame alias. An explicit
+per-process owned-extents list (independent of virtual address), with a frame
+*kind* (`USER_CODE`, `USER_DATA`, `TABLE`) and owner, is the only source
+permitted to populate user PTEs. Stack frames are classified as `USER_DATA`
+(there is no separate `STACK` kind). The PTE-install
+operation takes an owned-frame reference `(extent, page index)`, never a raw
+physical address, and **rejects `kind == TABLE`**; `USER_CODE` installs only as
+RX, `USER_DATA` only as RW/NX. MMIO, reserved pages, page-table frames and
+another owner's frames therefore cannot be expressed as a user mapping. No user
 operation accepts a physical address.
+
+Demotion scope is deliberate: only **executable** (`USER_CODE`) user frames have
+their writable alias removed (demoted to RO/NX). `USER_DATA` frames (including stack)
+keep a writable identity alias — that is how the kernel scrubs and recycles them — and
+are never user-executable, so no W+X exists anywhere. The Consequences section's
+"no writable alias for executable user frames" is the precise claim.
 
 ### D4. Admission bounds (M3a fixtures)
 At most 2 user processes; 1 user thread each; ≤64 user pages/process (incl. a
@@ -67,6 +111,19 @@ Maximum 73 allocated pages/process excluding preallocated process metadata. Chec
 this admission budget against actual free pages at boot, keep a kernel reserve,
 and reject insufficient memory atomically. An unmapped page sits below the user
 stack; segment edges are unmapped where feasible.
+
+Amendment 2026-10-17 (allocation vs reservation): the 73-page budget is the
+admission *quota*; it is not all allocated by issue #3. Issue #3 allocates only
+the 4 table pages and the declared user pages (image + 4-page stack, ≤64). It
+additionally *holds* the 5 kernel-stack pages as a reservation against free
+memory at admission time — counting them in the atomic admission check and
+keeping them out of other allocations — even though issue #4 (ring-3 entry and
+the per-thread kernel stack loaded into the per-CPU TSS.RSP0) performs the actual
+kernel-stack allocation. Without that held reservation, #4 could fail after #3's admission succeeded, breaking the
+"reject atomically" rule. Admission arithmetic and the 2-process limit are
+enforced in #3. The kernel reserve is a fixed minimum of free pages that
+admission must leave untouched; its exact value is set when #3 lands and recorded
+in IMPLEMENTATION.md, so the atomic-reject test has a concrete threshold.
 
 ### D5. Lifecycle
 `BUILDING → READY/RUNNING → DYING → REAPABLE → FREE`. A fault or exit first
@@ -108,6 +165,24 @@ must be zero. First operations: `abi_query`, `yield`, `exit(code)`, and a
 development-only `copy_probe(src,dst,len)` (≤256 bytes, validates both spans,
 stages through kernel scratch, no persistent effect). The experimental ABI is kept
 separate from the internal `status.h` enum numbering.
+
+Amendment 2026-10-17 (image-descriptor precision). The user arena is the
+half-open range `[0x40000000, 0x40200000)` (2 MiB). Descriptor fields are
+fixed-width little-endian with an explicit on-wire layout; validation never runs
+against a padded host struct. Segment `target_offset` and `memory_size` must be
+page-aligned, so no two segments share a page. Because segments are page-aligned,
+any shared page is invalid outright; "overlap" is tested at **page granule**
+(byte-granule sharing cannot arise). A segment with `memory_size == 0` is
+rejected. `entry_offset` is arena-relative and must lie inside the initialized
+(source) bytes of an executable segment — not in BSS and not in a non-executable
+segment. The 4-page user stack occupies the top of the arena with one unmapped
+guard page below it; image segments must not overlap the stack or that guard
+page. All bound checks are subtraction-based on `uint64_t`
+(`src_size <= blob_len - src_off`, `mem_size <= ARENA - tgt_off`,
+`src_size <= mem_size`) and are applied *before* any page rounding, so rounding
+cannot wrap. Segment count is bounded and checked before indexing; permissions
+reject unknown bits, `perm == 0`, W|X, and X-or-W without R. The page budget sums
+per-segment pages plus the 4-page stack and must be ≤64 user pages.
 
 ### D9. User-copy discipline
 `copy_from_user`/`copy_to_user` take numeric user addresses + bounded lengths;
@@ -160,6 +235,30 @@ not a user ABI and must not leak their numbering.
 Decided: the contract above. Not implemented: any M3a kernel code. Not claimed:
 remote CI for any new head, independent review, hardened qualification, or FPU/SMP/
 userspace runtime. This ADR changes documentation only.
+
+Issue split (clarified 2026-10-17). Issue #3 is proven **hosted-only**: a VM /
+loader model plus a transactional rollback proof (an alias ledger and a
+reverse-order unwind journal whose undo steps are infallible — an undo failure is
+a panic, not a silent leak). #3 does NOT claim real CR3 switching, TLB behavior,
+`invlpg`/CR3 ordering, CPL3 execution, U/S or NX hardware enforcement, GDT/IDT or
+TSS.RSP0 changes, syscalls, copy-fixup assembly or no-FPU enforcement; those are
+issue #4 and later, verified in QEMU. The hosted model verifies modeled PTE
+flags, the alias state machine, zero-before-exposure, ownership, admission
+arithmetic and exact rollback after failure injected at every allocation / map /
+alias-protection step.
+
+## Amendment history
+
+- 2026-10-17: corrected D3 publication order (demote writable aliases to RO/NX
+  before installing the user RX PTE, not after); added the per-frame alias state
+  machine and the owned-frame-reference PTE-install rule; pinned D4 allocation-vs-
+  reservation and the kernel reserve; pinned D8 arena half-openness, page-aligned
+  segments, page-granule overlap and arena-relative entry. Prompted by an
+  external multi-agent design review (three AI coding agents) against commit
+  `88e3f00`; the reviews converged on the D3 ordering hazard and the alias-ledger
+  requirement. This is AI-assisted review, not the independent human
+  qualification the critical profile requires (see Status of claims). This is a
+  contract correction before any #3 code; it does not change the M3a scope.
 
 ## References
 
