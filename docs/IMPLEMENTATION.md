@@ -508,6 +508,57 @@ re-stale-after-reuse assertion, the measured quota count, the softened per-proce
 wording, the ADR wide-handle amendment, and the pinned ABI static-asserts).
 AI-assisted review only; not independent human qualification.
 
+## MP1 step 1 — ARM64 entry + bounded console (QEMU virt-8.2) — 2026-10-17
+
+First *executable* ARM64 work (ADR 0002, jeios-mobile). The shared kernel core
+stays in this repo per ADR 0001; this adds a second architecture under
+`kernel/arch/aarch64/` (`boot.S`, `main.c`, `linker.ld`), built by a separate
+`mk/aarch64.mk` (targets `make aarch64`, `make smoke-aarch64`) that leaves the
+x86-64 build/check/smoke/integration flow completely untouched. Scope is entry
+only: **no VBAR/vectors, no DTB parse, no MMU** (those are later MP PRs).
+
+On the QEMU-validated `virt-8.2` / `cortex-a72` target (direct `-kernel`, no
+firmware), `boot.S`: parks x0(DTB) in x19, masks DAIF, asserts **EL1** (FATAL
+marker + halt otherwise), **self-checks the load address == link address**
+(text_offset=0x80000 → 0x40080000; FATAL if QEMU placed us elsewhere, so a future
+absolute reference can't silently be wrong), selects SP_EL1, writes **TCR_EL1 =
+0x80000000** (RES1 bit31 set for cortex-a72, TBI0=0 interim per ADR 0002 D5 — a
+field init, NOT a tag-rejection claim), clears BSS with aligned stores (no DC
+ZVA/atomics — pre-MMU Device-nGnRnE memory), stashes the DTB pointer into `.data`,
+and enters C. `main.c` drives a bounded PL011 (DR-write + bounded TXFF poll, no
+init — a documented virt-8.2 support-tier assumption) and emits ordered markers.
+
+Built `-mstrict-align -mgeneral-regs-only -ffreestanding -fno-builtin` so the
+compiler emits neither unaligned nor FP/SIMD code (a stray SIMD op would trap
+into absent vectors and hang). Image header: text_offset 0x80000, flags **0x1**
+(4 KiB pages, LE), magic, `__image_size` from the linker. Linker asserts keep the
+stack+BSS 16-byte aligned, after the file-backed image, within `__image_size`,
+non-overlapping; `--orphan-handling=error` forbids any unplaced section landing
+in the image.
+
+Verified in this env: `make aarch64` + `make smoke-aarch64` PASS with the ordered
+markers — `entry EL1` / `stack ready sp=0x400844e0` (in the linked range, proving
+load==link) / `tcr_el1 initialized (tbi0=0) tcr=0x80000000` / `bss range [...]` +
+`bss cleared` / `dtb pointer recorded dtb=0x48000000` / `initialization complete;
+halted`. The `ARM_BSS_CHECK=1` build (separate build dir) pattern-fills BSS before
+the production clear and prints **`bss clear verified`**, so the clear is proven
+to zero rather than relying on QEMU's already-zero RAM. The smoke harness
+(`tools/smoke_arm.py`) captures serial to a FILE (stdout races the timeout kill),
+asserts exact ordered markers, rejects `FATAL`, records image SHA-256 + tool
+versions + the exact command, uses `-no-reboot`, and is NOT wired into
+`make check`. The x86-64 side is unchanged — `make check` + smoke + 11 integration
+modes still pass.
+
+Not yet enforced (handoff): the ADR 0002 D5 trap-frame fields (ESR/FAR/ELR/SPSR),
+VBAR exception vectors + the deliberate-fault test, the TBI behavioral (tag
+rejection) test, DTB *validation* (the pointer is recorded, never dereferenced),
+and the MMU. Peer cross-review (two independent reads) found and drove real fixes
+the smoke had passed over: the Image flags (0x2→0x1), TCR_EL1 RES1 (0→0x80000000),
+the load≠link latent hazard (now a boot-time self-check), the vacuous empty-BSS
+marker (now a real probe + range), `_file_end` placement, `--orphan-handling`,
+and the DAIF-by-construction mask. AI-assisted review only; not independent human
+qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

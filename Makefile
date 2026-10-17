@@ -91,3 +91,8 @@ $(BUILD)/test_handle_rw: tests/test_handle.c kernel/core/handle.c $(wildcard inc
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -DJE_HANDLE_TEST_WIDTH -DJE_HANDLE_INDEX_BITS=30u -DJE_HANDLE_GEN_BITS=2u -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_handle.c kernel/core/handle.c -o $@
 
+
+# MP1 (ADR 0002): ARM64 (QEMU virt-8.2) build + smoke, kept fully separate from
+# the x86-64 rules above so the default flow is untouched. Targets: `aarch64`,
+# `smoke-aarch64`.
+include mk/aarch64.mk
