@@ -42,8 +42,17 @@ Next is M3, split into independently reviewable subgates:
   The boundary contract is frozen in [ADR 0007](adr/0007-m3a-userspace-boundary.md)
   (accepted 2026-10-17); issues #3–#6 implement and qualify against it. Issue #3
   (hosted per-process VM builder + bounded image loader) is implemented and
-  hosted-tested — see IMPLEMENTATION.md "M3a #3"; #4 adds real CPL3/CR3/TSS and
-  syscalls in QEMU.
+  hosted-tested — see IMPLEMENTATION.md "M3a #3". Issue #4 is being landed in
+  reviewable, individually QEMU-verified steps: step 1 (ring-3 GDT descriptors),
+  step 2 (real per-process page tables + CR3, CPL0-verified), step 3 (CPL3
+  entry/return — real ring-3 execution under preemption, CR3 + TSS.RSP0, D7
+  enforcement), step 4 (fault-local process death + the D6 int 0x80 gate + the H1
+  kernel-DoS fix — a synchronous user fault / user int 0x80 / bad-return-state
+  kills only the offender, a peer is proven to keep running, the dead process is
+  reclaimed). Steps 1–4 are merged/landing; #4 acceptance ("illegal access kills
+  only the offender; peers survive") is met in QEMU. Issue #5 is the integrated
+  two-task isolation qualification + the real syscall handler (copy-in/out) behind
+  the already-installed int 0x80 gate.
 - **M3b:** typed handles with generation counters, rights attenuation, explicit
   object lifetime and checked syscall layouts. Test stale/forged handles and
   denied operations without side effects.

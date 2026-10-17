@@ -37,4 +37,45 @@ je_user_fp_start:
 2:
     jmp 2b
 je_user_fp_end:
+
+/* M3a #4 step 4: a user program that faults by reading an unmapped arena address
+ * after a short delay, to prove fault-local termination. It increments its
+ * heartbeat a few times (so the kernel can confirm it ran at CPL3) then reads
+ * arena offset 0x3000 — a page that is NOT mapped in its image (image is code
+ * at 0, heartbeat at 0x1000) — raising a user #PF (vector 14). */
+.globl je_user_fault_start
+.globl je_user_fault_end
+je_user_fault_start:
+    movq $8, %rax              /* small spin count so it is seen running first */
+3:
+    incq 0x40001000            /* heartbeat */
+    decq %rax
+    jnz 3b
+    movq 0x40003000, %rax      /* read unmapped arena page -> #PF (vector 14) */
+    jmp 3b                     /* unreached */
+je_user_fault_end:
+
+/* M3a #4 step 4: a user program that invokes the DPL3 int 0x80 gate (no syscall
+ * handler yet -> unsupported op -> fault-local termination). Proves the D6 gate
+ * is reachable from ring 3 and leads to death, not to kernel entry. */
+.globl je_user_int80_start
+.globl je_user_int80_end
+je_user_int80_start:
+    incq 0x40001000            /* one heartbeat so we can see it ran */
+    int $0x80                  /* DPL3 gate -> terminate (no handler) */
+    jmp je_user_int80_start    /* unreached */
+je_user_int80_end:
+
+/* M3a #4 step 4: a user program that corrupts its own RSP to an out-of-arena
+ * value WITHOUT faulting, then loops. It never traps itself; the scheduler must
+ * terminate it at its next dispatch (je_uframe_check fails) instead of halting
+ * the kernel (the H1 hole). Proves bad-return-state is fault-local. */
+.globl je_user_badrsp_start
+.globl je_user_badrsp_end
+je_user_badrsp_start:
+    incq 0x40001000            /* one heartbeat */
+    movq $0x1000, %rsp         /* RSP now outside the arena; no fault yet */
+4:
+    jmp 4b                     /* loop; next timer dispatch validates+terminates */
+je_user_badrsp_end:
 .section .note.GNU-stack,"",@progbits

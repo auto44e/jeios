@@ -78,18 +78,38 @@ static uint32_t vm_s2_build(uint64_t *out_root)
     return idx;
 }
 
-/* ---- M3a #4 step 3: ring-3 entry proof ------------------------------------ */
+/* ---- M3a #4 step 3/4: ring-3 entry + fault-local death proof -------------- */
 extern unsigned char je_user_demo_start[], je_user_demo_end[];
 extern unsigned char je_user_fp_start[], je_user_fp_end[];
+extern unsigned char je_user_fault_start[], je_user_fault_end[];
+extern unsigned char je_user_int80_start[], je_user_int80_end[];
+extern unsigned char je_user_badrsp_start[], je_user_badrsp_end[];
 static je_vm vm_s3;
 static unsigned char vm_blob_s3[256];
-/* Build a user process whose code page holds a demo loop and whose data page is
- * a heartbeat. With fp!=0 the code is the hostile-SSE stub (for the D7 proof);
- * otherwise the heartbeat-increment loop. Returns the process index; fails hard. */
-static uint32_t vm_s3_build(int fp)
+typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_INT80=3, PROG_BADRSP=4 } user_prog;
+static int vm_s3_inited;
+/* Initialize the shared step-3/4 vm once (it holds up to JE_VM_MAX_PROCESSES
+ * processes — A and B share it, matching the 2-process admission quota). */
+static void vm_s3_init_once(void)
 {
-    unsigned char *start = fp ? je_user_fp_start : je_user_demo_start;
-    unsigned char *end   = fp ? je_user_fp_end   : je_user_demo_end;
+    if (vm_s3_inited) return;
+    const je_vm_ops *ops=je_arch_vm_ops(&je_kernel_pages, je_arch_has_nx());
+    if (je_vm_init(&vm_s3, ops, &je_kernel_pages, 0)!=JE_OK) fail("JeiOS fatal: s3 vm_init\r\n");
+    vm_s3_inited=1;
+}
+/* Build one user process into the shared vm from the selected program (code at
+ * arena 0, a heartbeat/scratch data page at 0x1000). Returns its index. */
+static uint32_t vm_s3_build(user_prog prog)
+{
+    vm_s3_init_once();
+    unsigned char *start, *end;
+    switch (prog) {
+    case PROG_FP:     start=je_user_fp_start;     end=je_user_fp_end;     break;
+    case PROG_FAULT:  start=je_user_fault_start;  end=je_user_fault_end;  break;
+    case PROG_INT80:  start=je_user_int80_start;  end=je_user_int80_end;  break;
+    case PROG_BADRSP: start=je_user_badrsp_start; end=je_user_badrsp_end; break;
+    default:          start=je_user_demo_start;   end=je_user_demo_end;   break;
+    }
     size_t code_len=(size_t)(end-start);
     if (code_len==0 || code_len>sizeof(vm_blob_s3)) fail("JeiOS fatal: s3 demo size\r\n");
     for (size_t i=0;i<sizeof(vm_blob_s3);++i) vm_blob_s3[i]=0;
@@ -100,19 +120,15 @@ static uint32_t vm_s3_build(int fp)
     img.entry_offset=0u;
     img.segments[0]=(je_vm_segment){ 0u, code_len, 0u, JE_PAGE_SIZE, JE_VM_R|JE_VM_X, 0u };
     img.segments[1]=(je_vm_segment){ 0u, 0u, JE_PAGE_SIZE, JE_PAGE_SIZE, JE_VM_R|JE_VM_W, 0u };
-    int nx=je_arch_has_nx();
-    const je_vm_ops *ops=je_arch_vm_ops(&je_kernel_pages, nx);
-    if (je_vm_init(&vm_s3, ops, &je_kernel_pages, 0)!=JE_OK) fail("JeiOS fatal: s3 vm_init\r\n");
     if (je_vm_image_validate(&img, sizeof vm_blob_s3)!=JE_OK) fail("JeiOS fatal: s3 image\r\n");
     uint32_t idx;
-    if (je_vm_build(&vm_s3, &img, vm_blob_s3, sizeof vm_blob_s3, nx, &idx)!=JE_OK)
+    if (je_vm_build(&vm_s3, &img, vm_blob_s3, sizeof vm_blob_s3, je_arch_has_nx(), &idx)!=JE_OK)
         fail("JeiOS fatal: s3 build\r\n");
     if (je_vm_audit(&vm_s3, idx)!=JE_OK) fail("JeiOS fatal: s3 audit\r\n");
     return idx;
 }
-/* Read the heartbeat word by switching to the process root, reading the arena
- * data page at CPL0, and switching back. Interrupts must be disabled so the
- * timer cannot dispatch while we are on the process root from kernel context. */
+/* Read the heartbeat word of process idx by switching to its root at CPL0.
+ * Interrupts must be disabled so the timer cannot dispatch mid-switch. */
 static uint64_t vm_s3_heartbeat(uint32_t idx)
 {
     uint64_t flags=je_arch_irq_save();
@@ -254,45 +270,119 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
         je_arch_console_write("M3a-s3: D7 FPU/SIMD denial enforced (CR0.EM/MP/TS, CR4 clear)\r\n");
 
         size_t s3_free_before=je_kernel_pages.free_count;
-        (void)s3_free_before;
 #if JE_TEST_MODE == 10
         /* D7 enforcement proof: launch a user task that executes SSE at CPL3.
-         * With CR0.EM=1 the CPU raises #UD (vector 6) from a cs=0x33 frame,
-         * proving hardware denial (not just a compiler flag). The fault reaches
-         * the fatal PANIC path (fault-locality is step 4). */
-        uint32_t fpidx=vm_s3_build(1);
+         * With CR0.EM=1 the CPU raises #UD (vector 6) from a cs=0x33 frame. In
+         * step 4 this no longer PANICs — it terminates only that process; the
+         * kernel survives and halts normally. */
+        uint32_t fpidx=vm_s3_build(PROG_FP);
         if (je_thread_create_user(&vm_s3, fpidx)!=JE_OK) fail("JeiOS fatal: s3 fp user thread\r\n");
         je_arch_console_write("M3a-s3: hostile-FP user thread created; entering ring 3\r\n");
-        for (;;) { (void)je_arch_irq_save(); __asm__ volatile("sti; hlt":::"memory"); }
+        for (uint64_t sp=0; !je_sched_has_dying(); ) {
+            (void)je_arch_irq_save();
+            if (++sp>100000000ull) fail("JeiOS fatal: s3 fp did not fault\r\n");
+            __asm__ volatile("sti; hlt":::"memory");
+        }
+        { uint64_t v,e,r,c,cr2; (void)je_arch_irq_save();
+          if (je_sched_death_record(&vm_s3,fpidx,&v,&e,&r,&c,&cr2)!=JE_OK) fail("JeiOS fatal: s3 fp no record\r\n");
+          if (v!=6u || c!=0x33u) fail("JeiOS fatal: s3 fp wrong fault\r\n");
+          if (je_sched_reap_dead()<0) fail("JeiOS fatal: s3 fp reap\r\n"); }
+        je_arch_console_write("M3a-s3: hostile-FP task #UD terminated (fault-local); kernel alive\r\n");
+        je_arch_console_write("JeiOS: initialization complete; halted\r\n");
+        je_arch_halt();
 #endif
-        uint32_t uidx=vm_s3_build(0);
+        /* --- step-3 sanity: one task reaches CPL3 and makes progress --- */
+        uint32_t uidx=vm_s3_build(PROG_HEARTBEAT);
         uint64_t before_disp=je_sched_user_cpl3_dispatches();
         if (je_thread_create_user(&vm_s3, uidx)!=JE_OK) fail("JeiOS fatal: s3 user thread\r\n");
         je_arch_console_write("M3a-s3: user thread created; entering ring 3 via timer\r\n");
         uint64_t hb0=vm_s3_heartbeat(uidx);
-        /* Run until we have observed enough CPL3 dispatches, then confirm
-         * progress. The PIT is already live from M2; bootstrap (slot 0) cannot
-         * sleep, so it hlt-loops and the timer preempts into the user thread. */
         uint64_t spins=0;
         for (;;) {
             (void)je_arch_irq_save();
-            uint64_t disp=je_sched_user_cpl3_dispatches()-before_disp;
-            if (disp>=JE_THREAD_MAX*2) break;
+            if (je_sched_user_cpl3_dispatches()-before_disp>=JE_THREAD_MAX*2) break;
             if (++spins>100000000ull) fail("JeiOS fatal: s3 no CPL3 progress\r\n");
             __asm__ volatile("sti; hlt":::"memory");
         }
-        uint64_t hb1=vm_s3_heartbeat(uidx);
-        if (hb1<=hb0) fail("JeiOS fatal: s3 heartbeat did not advance\r\n");
-        je_arch_console_write("M3a-s3: CPL3 reached; survived preemption; heartbeat advanced ticks=");
-        je_arch_console_hex(hb1);je_arch_console_write("\r\n");
-        /* Tear down: the user thread never exits (infinite loop), so mark its
-         * slot and destroy the process (frees its held kstack). We stop the task
-         * by clearing it from scheduling first. */
-        (void)je_arch_irq_save(); /* keep interrupts off through teardown */
+        if (vm_s3_heartbeat(uidx)<=hb0) fail("JeiOS fatal: s3 heartbeat did not advance\r\n");
+        je_arch_console_write("M3a-s3: CPL3 reached; survived preemption; heartbeat advanced\r\n");
+        (void)je_arch_irq_save();
         if (je_sched_drop_user(&vm_s3, uidx)!=JE_OK) fail("JeiOS fatal: s3 drop_user\r\n");
         if (je_vm_destroy(&vm_s3, uidx)!=JE_OK) fail("JeiOS fatal: s3 destroy\r\n");
-        if (je_kernel_pages.free_count!=s3_free_before) fail("JeiOS fatal: s3 page leak\r\n");
-        je_arch_console_write("M3a-s3: user process torn down; page accounting restored\r\n");
+
+        /* --- step-4 acceptance: fault-local death, peer survives --- */
+        /* Build A (faults after a few heartbeats) and B (loops forever). */
+        uint32_t A=vm_s3_build(PROG_FAULT);
+        uint32_t B=vm_s3_build(PROG_HEARTBEAT);
+        if (vm_s3.procs[A].root==vm_s3.procs[B].root) fail("JeiOS fatal: s4 roots not distinct\r\n");
+        if (je_thread_create_user(&vm_s3, A)!=JE_OK) fail("JeiOS fatal: s4 A thread\r\n");
+        if (je_thread_create_user(&vm_s3, B)!=JE_OK) fail("JeiOS fatal: s4 B thread\r\n");
+        je_arch_console_write("M3a-s4: two CPL3 tasks A(fault)+B(loop) created; distinct roots\r\n");
+        /* Run until A has died (its slot is DYING). */
+        for (uint64_t sp=0; !je_sched_has_dying(); ) {
+            (void)je_arch_irq_save();
+            if (++sp>100000000ull) fail("JeiOS fatal: s4 A did not fault\r\n");
+            __asm__ volatile("sti; hlt":::"memory");
+        }
+        /* Observe A's death record (irq off): must be a user #PF on A's arena. */
+        uint64_t Av,Ae,Ar,Ac,Acr2;
+        (void)je_arch_irq_save();
+        if (je_sched_death_record(&vm_s3,A,&Av,&Ae,&Ar,&Ac,&Acr2)!=JE_OK) fail("JeiOS fatal: s4 no A record\r\n");
+        if (Av!=14u || Ac!=0x33u || Acr2!=(JE_VM_ARENA_BASE+3u*JE_PAGE_SIZE))
+            fail("JeiOS fatal: s4 A wrong fault\r\n");
+        uint64_t hbB0=vm_s3_heartbeat(B), dB0=je_sched_dispatches_of(&vm_s3,B), p0=je_sched_preemptions();
+        je_arch_console_write("M3a-s4: A terminated by user #PF (vector 14, cs=0x33); B still scheduled\r\n");
+        /* Prove B progressed AFTER A's death: resume, require B heartbeat +
+         * dispatch + preemption all strictly increased from the post-death snapshot. */
+        for (uint64_t sp=0;;) {
+            (void)je_arch_irq_save();
+            if (je_sched_dispatches_of(&vm_s3,B)-dB0>=4 && je_sched_preemptions()>p0) break;
+            if (++sp>100000000ull) fail("JeiOS fatal: s4 B no post-death progress\r\n");
+            __asm__ volatile("sti; hlt":::"memory");
+        }
+        if (vm_s3_heartbeat(B)<=hbB0) fail("JeiOS fatal: s4 B heartbeat flat after A death\r\n");
+        je_arch_console_write("M3a-s4: B advanced AFTER A's death (heartbeat+dispatch+preempt up)\r\n");
+        /* Reap A from bootstrap while B is still live; A's quota returns. */
+        (void)je_arch_irq_save();
+        if (je_sched_reap_dead()<0) fail("JeiOS fatal: s4 reap A\r\n");
+        je_arch_console_write("M3a-s4: dead process A reaped while peer B runs\r\n");
+
+        /* Additional death causes, each terminated fault-locally while B keeps
+         * running, reusing the freed second process slot: the D6 int 0x80 gate
+         * (unsupported op -> death) and bad-return-state (H1: a user task that
+         * corrupts its RSP must be killed at next dispatch, not halt the kernel).
+         * Each expects the faulting process DYING, then reaps it. */
+        static const user_prog variants[2] = { PROG_INT80, PROG_BADRSP };
+        static const char *const vmsg[2] = {
+            "M3a-s4: user int 0x80 (D6 gate) terminated offender; B alive\r\n",
+            "M3a-s4: bad-RSP (H1) user task terminated, not kernel; B alive\r\n" };
+        for (unsigned vi=0; vi<2; ++vi) {
+            uint32_t C=vm_s3_build(variants[vi]);
+            uint64_t bdisp=je_sched_dispatches_of(&vm_s3,B);
+            if (je_thread_create_user(&vm_s3, C)!=JE_OK) fail("JeiOS fatal: s4 variant thread\r\n");
+            for (uint64_t sp=0; !je_sched_has_dying(); ) {
+                (void)je_arch_irq_save();
+                if (++sp>100000000ull) fail("JeiOS fatal: s4 variant did not die\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            uint64_t cv,ce,cr,cc,ccr2; (void)je_arch_irq_save();
+            if (je_sched_death_record(&vm_s3,C,&cv,&ce,&cr,&cc,&ccr2)!=JE_OK) fail("JeiOS fatal: s4 variant no record\r\n");
+            if (cc!=0x33u) fail("JeiOS fatal: s4 variant not user origin\r\n");
+            if (je_sched_reap_dead()<0) fail("JeiOS fatal: s4 variant reap\r\n");
+            /* B must still be scheduled (progressed past the pre-variant snapshot). */
+            for (uint64_t sp=0; je_sched_dispatches_of(&vm_s3,B)<=bdisp; ) {
+                (void)je_arch_irq_save();
+                if (++sp>100000000ull) fail("JeiOS fatal: s4 B stalled after variant\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            je_arch_console_write(vmsg[vi]);
+        }
+        /* Tear down B; all step-3/4 pages must be back to the pre-s4 baseline. */
+        (void)je_arch_irq_save();
+        if (je_sched_drop_user(&vm_s3, B)!=JE_OK) fail("JeiOS fatal: s4 drop B\r\n");
+        if (je_vm_destroy(&vm_s3, B)!=JE_OK) fail("JeiOS fatal: s4 destroy B\r\n");
+        if (je_kernel_pages.free_count!=s3_free_before) fail("JeiOS fatal: s4 page leak\r\n");
+        je_arch_console_write("M3a-s4: peer B torn down; page accounting restored\r\n");
     }
 
     je_arch_console_write("JeiOS: initialization complete; halted\r\n");

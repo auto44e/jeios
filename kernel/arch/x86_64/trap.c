@@ -53,6 +53,13 @@ void je_arch_traps_init(void)
             (uint8_t)(i == 8 ? 1 : (i == 2 ? 2 : 0)), 0x8e,
             (uint16_t)(address >> 16), (uint32_t)(address >> 32), 0};
     }
+    /* M3a #4 step 4 (ADR 0007 D6): one dedicated DPL3 interrupt gate at vector
+     * 0x80, IST=0, selector 8 — the only user-reachable gate. attributes 0xee =
+     * present, DPL3, 64-bit INTERRUPT gate (clears IF on entry; NOT 0xef/trap).
+     * There is no syscall handler yet, so a user int 0x80 is an unsupported op
+     * routed to fault-local termination; only the DPL differs from every other
+     * gate. Kernel-only yield stays at 0x81 DPL0. */
+    idt[0x80].attributes = 0xee;
     struct table_pointer ip = {(uint16_t)(sizeof(idt)-1), (uintptr_t)idt};
     __asm__ volatile("lidt %0" : : "m"(ip) : "memory");
 }
@@ -96,15 +103,36 @@ void je_arch_cpu_policy_init(void)
 uint64_t je_arch_cpu_policy_cr0(void) { uintptr_t v; __asm__ volatile("mov %%cr0,%0":"=r"(v)); return v; }
 uint64_t je_arch_cpu_policy_cr4(void) { uintptr_t v; __asm__ volatile("mov %%cr4,%0":"=r"(v)); return v; }
 
+/* M3a #4 step 4: synchronous exception vectors that terminate the offending
+ * USER process (fault-local). NMI(2), #DF(8), #MC(18) and reserved vectors are
+ * NOT here — they stay fatal even from ring 3. */
+static int user_terminable_vector(uint64_t v)
+{
+    switch (v) {
+    case 0: case 1: case 3: case 4: case 5: case 6: case 7:
+    case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 19:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 je_trap_frame *je_trap_dispatch(je_trap_frame *f)
 {
     if (f->vector==32) {
         je_arch_timer_eoi(); return je_sched_interrupt(f,true);
     }
     if (f->vector==0x81) return je_sched_interrupt(f,false);
-    if (panicking++) je_arch_halt();
     uint64_t cr2 = 0;
     if (f->vector == 14) __asm__ volatile("mov %%cr2,%0" : "=r"(cr2));
+    /* Fault-local death: a synchronous fault from ring 3, or a user int 0x80
+     * (the DPL3 gate; no syscall handler yet), terminates ONLY that process.
+     * User origin requires the saved CS to be the user selector — a kernel-origin
+     * fault on any of these vectors stays fatal. je_sched_fault_terminate adds
+     * the kind/stack-location cross-checks. */
+    if ((f->cs & 3) == 3 && (f->vector==0x80 || user_terminable_vector(f->vector)))
+        return je_sched_fault_terminate(f, cr2);
+    if (panicking++) je_arch_halt();
     je_arch_console_write("PANIC vector="); je_arch_console_hex(f->vector);
     je_arch_console_write(" error="); je_arch_console_hex(f->error);
     je_arch_console_write(" rip="); je_arch_console_hex(f->rip);
