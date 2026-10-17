@@ -183,9 +183,40 @@ hardening prerequisites. Do not present seven ring-0 threads as sandboxed apps.
 The M3a userspace-boundary contract is now frozen in
 [ADR 0007](adr/0007-m3a-userspace-boundary.md) (accepted 2026-10-17): 2 MiB
 per-process arena, NX-required launch, enforced no-FPU/SIMD policy, experimental
-ABI v0, user-copy fixup discipline and proof-by-test acceptance. That ADR is a
-reviewed decision, not an implementation; no M3a kernel code exists yet. Issues
-#3–#6 implement and qualify against it; CI/enforcement is sequenced with #18/#19.
+ABI v0, user-copy fixup discipline and proof-by-test acceptance.
+
+## M3a #3: hosted per-process VM builder and bounded image loader
+
+Issue #3 implements the address-space builder and bounded built-in image loader
+as a HOSTED-ONLY model behind an injected backend (`je_vm_ops`); see
+`include/jeios/vm.h` and `kernel/core/vm.c`. It proves, in host-compiled tests
+under ASan/UBSan, the ownership/alias/rollback/admission logic the real #4 arch
+backend will drive — it does NOT exercise real paging.
+
+- `je_vm_image_validate`: pure D8 validation — version, per-segment permission
+  bitmask (R|X→code, R→rodata, R|W→data; rejects 0, unknown bits, W|X,
+  X/W-without-R), page-aligned target/size, subtraction-based source/arena bounds
+  (no pre-rounding wrap), page-granule overlap, stack/guard exclusion, an
+  underflow-safe ≤64 user-page budget, and entry inside an RX segment's source.
+- `je_vm_build`: NX gate (D2), 2-process limit, atomic underflow-safe admission
+  (tables + user + the concrete 5-page kstack run + kernel reserve), then a
+  journalled build in D3 publication order (zero → copy → unmap loader alias →
+  demote identity alias RO/NX → flush → install leaf PTE for USER_CODE/RODATA;
+  install RW/NX for USER_DATA). Any failure unwinds the journal in reverse.
+- `je_vm_destroy`: teardown as the exact reverse (clear PTE → flush → restore
+  alias → free), releasing the kstack run.
+- `je_vm_audit`: arena-bounded walk asserting no present leaf outside the arena,
+  no guard-page mapping, each leaf owned by a USER_* extent with a kind-matching
+  perm and the correct identity-alias state (RO_NX for code/rodata, RW for data),
+  completeness and one-to-one mapping, and cross-process root/extent disjointness.
+
+Verification (hosted, at this change): `ASAN_OPTIONS=detect_leaks=0 make check`
+adds `test_vm` PASS — validation, admission, audit, permissions,
+zero-before-expose, the fail-at-every-step rollback proof (exact `je_pages`
+restoration), and teardown. `vm.c` also compiles into the kernel ELF under the
+freestanding flags. Not implemented/claimed here: real CR3/TLB, CPL3 execution,
+U/S or NX hardware enforcement, GDT/TSS/syscalls — all issue #4 in QEMU. No
+independent human qualification; remote CI observed separately.
 
 ## Standards status — 2026-10-16
 

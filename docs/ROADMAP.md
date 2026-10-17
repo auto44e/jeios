@@ -40,7 +40,10 @@ Next is M3, split into independently reviewable subgates:
   containment and a bounded user program loader. Prove two actual CPL3 tasks
   cannot access each other's memory or kernel state. A task fault must be local.
   The boundary contract is frozen in [ADR 0007](adr/0007-m3a-userspace-boundary.md)
-  (accepted 2026-10-17); issues #3–#6 implement and qualify against it.
+  (accepted 2026-10-17); issues #3–#6 implement and qualify against it. Issue #3
+  (hosted per-process VM builder + bounded image loader) is implemented and
+  hosted-tested — see IMPLEMENTATION.md "M3a #3"; #4 adds real CPL3/CR3/TSS and
+  syscalls in QEMU.
 - **M3b:** typed handles with generation counters, rights attenuation, explicit
   object lifetime and checked syscall layouts. Test stale/forged handles and
   denied operations without side effects.

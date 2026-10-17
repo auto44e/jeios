@@ -1,5 +1,45 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M3a #3 hosted VM/loader implemented — observed 2026-10-17T06:30:00+00:00
+
+Inspected `auto44e/jeios` branch `feat/m3a-3-vm-loader` from `main`
+`2c4a90d`. No open PRs at inspection. This change adds the issue #3
+per-process address-space builder and bounded image loader as a HOSTED-ONLY
+model (ADR 0007): `include/jeios/vm.h`, `kernel/core/vm.c`, the hosted fake
+backend `tests/vm_fake.c`, the unit test `tests/test_vm.c`, and the Makefile
+`test_vm` target. `vm.c` is also compiled into the kernel ELF.
+
+Implemented: `je_vm_image_validate` (D8 arithmetic/overlap/stack-guard/entry
+rules), `je_vm_build` (NX gate, 2-process limit, atomic underflow-safe admission
+with the concrete 5-page kstack run, D3 publication order
+zero→copy→unmap→demote→flush→install for USER_CODE/USER_RODATA, RW/NX for
+USER_DATA), a reverse-order build journal with teardown
+clear→flush→restore→free, and `je_vm_audit` (arena-bounded walk; per-leaf
+ownership, kind/perm, alias state, completeness and one-to-one; cross-process
+root/extent disjointness; contiguity of registered extents verified).
+
+Tested (hosted, ASan/UBSan): `make check` adds `test_vm` PASS covering
+validation, admission, audit, permissions, zero-before-expose, the
+fail-at-every-step rollback proof (exact je_pages restoration), and teardown. A
+targeted probe confirms oversized-segment rejection and no pointer-overflow UB.
+Planned: issue #4 (CPL3 entry, real CR3/TSS.RSP0, syscalls) consumes this
+model's contracts and the held kstack run; CI/#18 and coding-policy/#19 alongside.
+Blocked/unverified: NO real paging, CR3/TLB, CPL3 execution or U/S/NX hardware
+enforcement is claimed here — all #4 in QEMU. No independent human qualification;
+remote CI for this head must be observed separately.
+
+Authorship (multi-agent model, AGENTS.md): the lead agent wrote `vm.c` and the
+header; the fake backend `vm_fake.c` was authored by one external coding agent
+and the test `test_vm.c` by another, so implementation and test have distinct
+authors. Two rounds of cross-review (each agent reviewing code it did not write)
+found and fixed a validation quota underflow, a teardown-flush ordering gap, a
+journal rollback hole, NULL-blob/pointer-overflow UB, an extent-id assumption,
+and an over-claiming audit; a third round confirmed the fixes. AI-assisted
+review, NOT the independent human qualification the critical profile requires.
+
+Validation commands: `ASAN_OPTIONS=detect_leaks=0 make check`, `git diff --check`
+passed at this base; local PASS is not remote CI.
+
 ## Multi-agent collaboration model — observed 2026-10-17T06:05:00+00:00
 
 Owner direction 2026-10-17: work may be done by multiple AI coding agents as
