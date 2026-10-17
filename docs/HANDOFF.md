@@ -1,5 +1,38 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M3a #4 step 2: real per-process page tables + CR3 (CPL0) — observed 2026-10-17T11:45:00+00:00
+
+Branch `feat/m3a-4-step2-vm-backend`. The real arch backend
+(`kernel/arch/x86_64/vm_backend.c`) now implements the frozen #3 `je_vm_ops`
+against actual page tables, producing a real per-process CR3. `paging.c` grew a
+small seam: `je_kernel_pd_phys`, `je_user_alias_set/get` (RW↔RO_NX CAS, A/D
+masked), `je_arch_cr3_read/load`, `je_arch_kernel_root_phys`. Topology matches
+the merged #3 audit: `PML4[0] P|U → PDPT[0] P,!U (shared kernel PD) → PDPT[1]
+P|U → PD[0] P|U → PT`. Intermediates also carry W (effective write = AND of W
+across levels under CR0.WP); leaves encode CODE=RX, RODATA=R/NX, DATA=RW/NX.
+
+Owner-approved, done: (1) hardened `je_arch_page_guard`/`restore` to refuse any
+non-exact-RW leaf (fixes a latent bug where the guard path could silently
+un-demote a published RO_NX alias); (2) `_Static_assert(JE_PHYSICAL_LIMIT <=
+JE_VM_ARENA_BASE)` + `<= 4 GiB` pinning the uint32_t root. Two real bugs found
+during bring-up and fixed: guard rejected fresh stack pages until A/D (bits 5,6)
+were masked; CR3 load triple-faulted until all intermediate entries carried W.
+Cross-review (Codex) then found and I fixed three more: OOB on an invalid
+`frame.process` in install/clear_pte, missing alias-enum validation, and
+`read_user_pte` not rejecting a present leaf lacking U.
+
+Tested in QEMU (this env): `make check` PASS, `make smoke` PASS (mode 0 drives
+the full build→audit→CR3 load→arena read→data RW→restore→destroy path with clean
+page accounting), `make integration` PASS — all 9 fault modes, incl. new mode 8
+(read arena under kernel root → `#PF err 0 cr2=0x40000000`) and mode 9 (write
+USER_CODE under process root → `#PF err 3 cr2=0x40000000`).
+
+SCOPE: CPL0 only. NO ring-3, NO `sched.c` CR3 switch, NO TSS.RSP0 — step 3.
+Does not claim U/S ring-3 enforcement or user-mode NX fetch (unprovable at CPL0).
+Next (step 3): scheduler installs CR3 + TSS.RSP0, validates the user return
+frame, IRETQs to ring 3. AI-assisted review only; not independent human
+qualification.
+
 ## M3a #4 step 1: ring-3 GDT descriptors — observed 2026-10-17T11:00:00+00:00
 
 First step of M3a #4 on branch `feat/m3a-4-step1-gdt-user` from `main`
