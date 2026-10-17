@@ -142,3 +142,10 @@ failure injection and fuzzing, supplemented by native kernel execution and stora
 crash-recovery qualification. [Core #18](https://github.com/auto44e/jeios/issues/18)
 is the first bounded CI implementation task. Existing gates remain mandatory;
 M3a and mobile MP0 remain next. This update adds planning only, not workflow jobs.
+
+## Ecosystem coding discipline — 2026-10-16
+
+[CODING_STANDARD.md](CODING_STANDARD.md) applies NASA/JPL-inspired rules with
+stricter critical-component profiles. [Core #19](https://github.com/auto44e/jeios/issues/19)
+tracks audit and enforcement with CI #18. Incremental adoption supports each gate;
+it does not replace M3a or establish NASA certification.

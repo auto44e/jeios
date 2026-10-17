@@ -1,5 +1,28 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Ecosystem coding-policy refresh — observed 2026-10-17T00:12:28+00:00
+
+Owner direction: 2026-10-16T20:01:26-04:00, reaffirmed
+2026-10-16T20:08:52-04:00. Inspected `auto44e/jeios` branch
+`docs/posix-ldap-20261016` at `1c394d0aa878ce1404df1c70fe25b3232a276d3e`.
+Core PR #17 and mobile PR #8 were observed open/unmerged. This update extends
+PR #17; core #19 is open for policy audit/enforcement alongside CI #18.
+No board membership or reviewer assignment is claimed.
+
+Implemented: documentation policy and contributor guidance only; runtime remains
+core M1/M2 AMD64 and mobile planning scaffold. Planned: ecosystem-wide NASA/JPL-
+inspired rules, risk profiles, baseline audit and staged automated enforcement.
+Blocked/unverified: no complete existing-code audit, independent review or NASA
+certification; no new analyzer/workflow or native mobile qualification.
+Core CODING_STANDARD.md is the shared proposal in PR #17; mobile references it.
+Next: core M3a and mobile MP0, with bounded #19/#18 enforcement work alongside.
+
+Validation: `ASAN_OPTIONS=detect_leaks=0 make check` passed core, boot-parser, allocator and ELF checks. The previously observed local LeakSanitizer process-inspection limitation remains; ASan/UBSan stayed enabled.
+Documentation links, conflict markers and `git diff --check` checked separately
+before publication. No emulator rerun for documentation-only edits. New-head
+remote CI must be observed separately. Historical evidence below retains its
+original revision/time; this entry supersedes earlier current-status wording.
+
 ## CI planning refresh — observed 2026-10-16T23:57:44+00:00
 
 Owner request: 2026-10-16T19:55:53-04:00. Inspected core PR #17 head

@@ -124,3 +124,10 @@ checks need their own reviewed setup; this plan changes none of those settings.
 
 Pin applicable upstream revisions when implementing; moving documentation links
 are design references, not reproducible build dependencies.
+
+## Coding-policy enforcement
+
+[CODING_STANDARD.md](CODING_STANDARD.md) supplies risk profiles and JCS rule IDs.
+Core #19 maps rules to versioned checkers or manual evidence alongside #18.
+Demonstrate that new gates reject representative defects before relying on them.
+No whole-ecosystem compliance or new static-analysis job is claimed by this plan.

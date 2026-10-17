@@ -178,3 +178,10 @@ failure injection and fuzzing, supplemented by native kernel execution and stora
 crash-recovery qualification. [Core #18](https://github.com/auto44e/jeios/issues/18)
 is the first bounded CI implementation task. Existing gates remain mandatory;
 M3a and mobile MP0 remain next. This update adds planning only, not workflow jobs.
+
+## Ecosystem assurance direction — 2026-10-16
+
+[CODING_STANDARD.md](CODING_STANDARD.md) defines NASA/JPL-inspired risk profiles
+and ten project rules. Core #19 tracks baseline audit and enforcement, alongside
+CI #18. Apply across core, services, apps, tooling and mobile; no compliance audit
+or new CI checks are claimed. M3a remains next.
