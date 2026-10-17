@@ -74,3 +74,40 @@ Read [docs/CODING_STANDARD.md](docs/CODING_STANDARD.md) for NASA/JPL-inspired
 risk profiles and JCS-01 through JCS-10. Apply applicable rules to new/materially
 changed code, identify evidence and deviations, and never claim unaudited existing
 code conforms. Automation rollout is core #19 with CI #18.
+
+## Multi-agent collaboration model
+
+Owner direction 2026-10-17. Work on this repository may be carried out by more
+than one AI coding agent operating as peers (for example a lead agent plus one or
+more external coding agents), not only as author-plus-reviewer. The following
+rules govern that mode and are themselves subject to the guiding star below.
+
+- **Guiding star.** The one non-negotiable is the greater OS vision: the frozen
+  ADRs (notably ADR 0007 for M3a), ROADMAP gates and the honesty/critical-profile
+  discipline in this file, SECURITY.md and CODING_STANDARD.md. No agent decision,
+  majority or otherwise, may weaken a security invariant, overclaim evidence, or
+  contradict a frozen contract.
+- **Authoring is shared, not centralized.** Distribute real authorship across
+  agents to balance their use and reduce single-author blind spots. A useful
+  default for a component with tests is to have the implementation, its test, and
+  any fake/model written by *different* agents, so no one author's mistake covers
+  both a behavior and its check.
+- **Decisions are democratic for open questions.** Where a design choice is NOT
+  settled by a frozen contract, agents decide among themselves by majority with
+  recorded reasoning; a participant may be outvoted and then follows the majority.
+  Record who proposed and who concurred so provenance stays honest.
+- **Trust, but push back.** Agents extend good-faith trust to each other's
+  judgment AND are expected to challenge it; this applies in every direction,
+  including a reviewer pushing back on the lead and the lead pushing back on a
+  reviewer. Unchallenged agreement is not evidence.
+- **Hard overrides that beat any vote.** (1) A verified fact — a failed compile,
+  a failing test, observed CI — settles the matter regardless of opinion. (2) Any
+  change that touches a frozen contract/ADR or previously tested code (e.g. the
+  M1/M2 allocator) is escalated to the owner, not decided by agent majority.
+  (3) The honesty rules (local vs remote CI, implemented/tested/planned/blocked,
+  no invented reviewers, AI-assisted review is NOT independent human
+  qualification) are never votable.
+- **Review status is honest about its nature.** Multi-agent review is valuable
+  signal and must be recorded as AI-assisted review. It does not by itself satisfy
+  the independent human review that the critical profile requires before a
+  hardened/release qualification claim; that remains a human gate.
