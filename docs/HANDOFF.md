@@ -1,5 +1,36 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M3a #4 step 3: CPL3 entry/return — real ring-3 execution — observed 2026-10-17T12:20:00+00:00
+
+Branch `feat/m3a-4-step3-cpl3-entry`. The scheduler now IRETQs into ring 3.
+Added: thread kind (kernel/user) + `je_thread_create_user` (synthesizes the
+initial user frame on the process's held kstack, requires NX per D2);
+`je_sched_interrupt` validates the incoming frame by kind and, for a user next
+thread, runs `je_uframe_check` (pure, hostable, unit-tested) to validate+sanitize
+RFLAGS, sets TSS.RSP0, loads the process CR3 before the single IRETQ; kernel
+threads get RSP0=0 + kernel root. `je_sched_reap` excludes user threads (kstack
+is vm-owned — avoids double-free); `je_sched_drop_user` detaches + restores the
+kstack guard before `je_vm_destroy`. D7 `je_arch_cpu_policy_init` sets
+CR0.EM/MP/TS, clears CR4.OSFXSR/OSXMMEXCPT/OSXSAVE/FSGSBASE, nulls DS/ES/FS/GS.
+Gates stay DPL0 — the D6 `int 0x80` gate lands in step 4 (ADR amendment: present
+by end of #4, wired to fault-local death; option 3, owner-approved).
+
+Peer process: pre-write design vote (both agents) caught the reap double-free and
+the first-entry-must-ride-a-real-trap rule; Codex cross-review then found four
+defects, all fixed: incomplete segment/FSGSBASE normalization, D7 marker
+overclaim (now proven by an executing #UD test, mode 10), an RFLAGS/DF
+contract-vs-impl mismatch (DF now cleared, test asserts it), and an ignored
+`drop_user` teardown result (now checked).
+
+Tested in QEMU (this env): `make check` PASS (+`test_uframe`), `make smoke` PASS
+(a built-in ring-3 loop reached CPL3, survived >=16 preemptions, advanced its
+heartbeat ~9-17M times, torn down clean), `make integration` PASS (10 modes; new
+mode 10 = user `xorps` at CPL3 -> `#UD` from a cs=0x33 frame, hardware D7 proof).
+All three CI smoke profiles pass locally; M2 markers unchanged (sign-off
+condition). Next (step 4): fault-local offender death + install/wire the D6
+`int 0x80` gate to it. NOT yet claimed: inter-process isolation, fault-locality,
+the gate, syscalls. AI-assisted review only; not independent human qualification.
+
 ## M3a #4 step 2: real per-process page tables + CR3 (CPL0) — observed 2026-10-17T11:45:00+00:00
 
 Branch `feat/m3a-4-step2-vm-backend`. The real arch backend

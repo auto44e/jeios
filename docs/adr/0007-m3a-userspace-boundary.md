@@ -313,6 +313,32 @@ alias-protection step.
     review, not independent human qualification (see Status of claims).
     Documentation only; no #3 code lands with this amendment.
 
+- 2026-10-17 (owner-approved scoping decision for #4 — the D6 `int 0x80` gate):
+  D6 mandates "one dedicated DPL3 interrupt gate at vector `0x80` with IST=0". A
+  multi-agent design review for #4 flagged that installing a *live* DPL3 gate
+  before a syscall handler exists (handler arrives in #5) would let any ring-3
+  task vector into the kernel with no service behind it. Three options were
+  weighed: (1) defer the gate to #5 and amend this ADR to say so; (2) install the
+  gate in #4 but wire it to fault-local process death rather than a syscall
+  handler; (3) — adopted — the same as (2) but sequenced so the gate is installed
+  *and* wired to the fault-local death path together in #4's fault-locality step,
+  so it is never momentarily a user-triggerable kernel panic. Owner approved (3).
+  Consequences: the D6 gate **is present and correct by the end of #4** (dedicated,
+  DPL3, IST=0, using the current thread's TSS.RSP0) — D6 is satisfied, not
+  deferred. Its #4 behavior is "reject = terminate the offending process"
+  (identical to any other illegal ring-3 action); #5 only repoints the existing
+  gate at the real syscall dispatcher, adding no new GDT/IDT wiring. This
+  *strengthens* the #4 fault-locality claim: a user invoking the syscall vector
+  before syscalls exist is killed, not serviced, and the kernel and peers survive.
+  M3a #4 is decomposed into reviewable, individually QEMU-verified steps: step 1
+  (ring-3 GDT descriptors, merged), step 2 (real per-process page tables + CR3,
+  CPL0-verified, merged), step 3 (CPL3 entry/return — CR3 + TSS.RSP0 switch,
+  validated/sanitized user return, D7 enforcement; gates stay DPL0 here), step 4
+  (fault-local death + this `int 0x80` gate installed and wired to it), step 5
+  (two-task containment qualification / syscall handler). AI-assisted review, not
+  independent human qualification (see Status of claims). Documentation decision;
+  the gate code lands in #4 step 4.
+
 ## References
 
 - [M3A.md](../M3A.md) (proposal this ADR freezes), [ROADMAP.md](../ROADMAP.md),
