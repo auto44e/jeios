@@ -380,6 +380,15 @@ uint64_t je_sched_dispatches_of(je_vm *vm, uint32_t index)
             return threads[i].dispatches;
     return 0;
 }
+/* M3a #5 step (b): the currently-running user process (vm + index), for user-copy
+ * prevalidation. Returns JE_OK only when the current thread is a user thread. */
+je_status je_sched_current_user(je_vm **vm, uint32_t *index)
+{
+    if (!ready || threads[current].kind!=THREAD_USER) return JE_ERR_INVALID;
+    if (vm) *vm=threads[current].vm;
+    if (index) *index=threads[current].vm_index;
+    return JE_OK;
+}
 uint64_t je_sched_min_dispatches(void)
 {
     uint64_t min=UINT64_MAX;

@@ -33,9 +33,11 @@ _Static_assert(JE_ABI_INVALID == 2, "abi invalid");
 typedef enum {
     JE_SYS_ABI_QUERY = 0,  /* abi_query(which): RDI 0=version,1=profile -> RDX */
     JE_SYS_YIELD     = 1,  /* yield(): reschedule caller; no authority grant */
-    JE_SYS_EXIT      = 2   /* exit(code): RDI=code; terminate process, no return */
-    /* op 3 (copy_probe) is reserved for M3a #5 step (b); until then it is
-     * UNSUPPORTED like any unknown op — no stub that reports success. */
+    JE_SYS_EXIT      = 2,  /* exit(code): RDI=code; terminate process, no return */
+    JE_SYS_COPY_PROBE = 3  /* dev-only copy_probe(src=RDI, dst=RSI, len=RDX), <=256 */
+#ifdef JE_DEV_COPY_INJECT
+    , JE_SYS_COPY_FIXUP_INJECT = 4  /* dev-only: raw-copy an unmapped page to test the fixup */
+#endif
 } je_abi_op;
 
 /* abi_query selectors (RDI). */

@@ -361,6 +361,54 @@ exception-fixup copy sites, or any user-pointer handling — no step-(a) op take
 pointer. No stable ABI promise. AI-assisted review only; not independent human
 qualification.
 
+## M3a #5 step (b) — recoverable user copies + exception fixup — 2026-10-17
+
+The final M3a piece: `copy_from_user`/`copy_to_user` (ADR D9) with prevalidation
+and an exception-fixup net, plus the dev-only `copy_probe` syscall (op 3).
+`kernel/core/usercopy.c` + `kernel/arch/x86_64/usercopy.S`.
+
+Every copy prevalidates the user span before touching it: canonical, no
+wraparound, entirely inside the arena (never a kernel range), and — per page —
+present with the required permission (`read_user_pte`; writes need RW/NX).
+Zero-length touches neither pointer. The copy itself runs through ONE approved
+assembly site (`je_copy_user_run`); its two faulting instructions (load, store)
+have exact RIPs registered with the #PF handler. A per-thread copy scope
+(`active`, direction, `[lo,hi)` span, owner vm+index) is set before the copy and
+cleared on EVERY exit path.
+
+`je_usercopy_try_fixup` (called from `je_trap_dispatch` on a `cs==8` vector-14
+fault, before the fatal path) recovers ONLY when: PFEC is not-present (P=0) and
+not a protection/reserved/fetch fault; the faulting RIP is EXACTLY one of the two
+approved copy instructions (never a range match); a scope is active; CR2 is inside
+the declared span; the owner is the current user process; and the PFEC write bit
+matches the direction (load site↔read fault, store site↔write fault). Anything
+else keeps the fatal PANIC. A recovered fault returns JE_ABI_INVALID — a
+prevalidated copy should not fault in M3a, so a recovery indicates a validator/
+scope bug and is reported as a copy failure, not masked. A *protection* fault is
+deliberately NOT recovered (it would hide an invariant break).
+
+`copy_probe(src,dst,len)` op 3 (dev tool, ≤256 B): stage src→kernel scratch via
+`copy_from_user`, then `copy_to_user`→dst; accepts overlap; zero-len = OK/no-op;
+any adversarial span → INVALID with no copy and no output commit.
+
+Verified in QEMU (this env): `make check` PASS (test_syscall incl. the op-3
+decode + an assertion the dev-inject symbols are ABSENT from the default ELF),
+`make smoke` PASS — the boot runs the copy_probe battery (valid + zero → OK;
+null / kernel-range / len>256 → INVALID; the valid copy's bytes verified moved),
+with peer B live. `make integration` PASS — 11 modes; the new mode 11 (built with
+`-DJE_DEV_COPY_INJECT`, which the default kernel never gets) raw-copies a
+deliberately unmapped arena page and proves the fixup RECOVERS the copy-site #PF
+(kernel survives), while the pre-existing kernel-fault modes (4/5) still PANIC —
+confirming an unrelated kernel #PF is NOT wrongly recovered. All three CI smoke
+profiles pass; M2's 4 markers unchanged.
+
+Honest limits (recorded): SMAP/SMEP are not enabled in M3a, so the fixup net
+covers faults from the approved copy site only, not stray kernel dereferences of
+mapped user addresses; "never recovers an unrelated fault" holds under the stated
+invariants (uncorrupted kernel state), not against arbitrary prior corruption.
+This closes the ADR 0007 M3a userspace boundary. AI-assisted review only; not
+independent human qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

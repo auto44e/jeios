@@ -43,6 +43,7 @@ je_status je_sched_death_record(je_vm *vm, uint32_t index, uint64_t *vec, uint64
                                 uint64_t *rip, uint64_t *cs, uint64_t *cr2);
 je_status je_sched_death_reason(je_vm *vm, uint32_t index, uint64_t *reason, uint64_t *code);
 uint64_t je_sched_dispatches_of(je_vm *vm, uint32_t index);
+je_status je_sched_current_user(je_vm **vm, uint32_t *index);
 bool je_sched_finished(void);
 je_status je_sched_reap(void);
 uint64_t je_sched_ticks(void);

@@ -54,9 +54,12 @@ Next is M3, split into independently reviewable subgates:
   two-task isolation qualification + the real syscall handler (copy-in/out) behind
   the int 0x80 gate, landing in steps: step (a) — the v0 syscall dispatcher
   (abi_query/yield/exit, UNSUPPORTED/INVALID, ABI isolated from internal status,
-  validated syscall returns) — is done and QEMU-verified; step (b) (copy_from/to_user,
-  copy_probe, the exception-fixup copy sites) and the adversarial-pointer /
-  fault-recovery qualification remain.
+  validated syscall returns) — and step (b) — copy_from/to_user + copy_probe with
+  per-page prevalidation and the exact-RIP exception-fixup copy sites — are both
+  done and QEMU-verified. With #2–#5 complete, the ADR 0007 M3a userspace
+  boundary is implemented end to end (private address spaces, ring-3 execution,
+  fault-local death, bounded syscalls, recoverable user copies), proven in QEMU
+  and peer-cross-reviewed (not independent human qualification).
 - **M3b:** typed handles with generation counters, rights attenuation, explicit
   object lifetime and checked syscall layouts. Test stale/forged handles and
   denied operations without side effects.

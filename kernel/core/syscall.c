@@ -15,6 +15,7 @@
 #include <jeios/syscall.h>
 #include <jeios/sched.h>
 #include <jeios/trap.h>
+#include <jeios/usercopy.h>
 
 /* Pure decode: given the operation and its six argument registers, decide the
  * action, the ABI status to return in RAX, and any scalar result for RDX. No
@@ -40,6 +41,19 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
         /* code = RDI; RSI..R9 reserved must be zero. */
         if (rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_result=rdi; *out_status=JE_ABI_OK; return JE_SYSCALL_EXIT;
+    case JE_SYS_COPY_PROBE:
+        /* dev-only copy_probe(src=RDI, dst=RSI, len=RDX); R10/R8/R9 reserved=0.
+         * The actual copy (with prevalidation + fixup) is performed by the glue;
+         * the pure decoder only rejects nonzero reserved args here. */
+        if (r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_COPY_PROBE;
+#ifdef JE_DEV_COPY_INJECT
+    case JE_SYS_COPY_FIXUP_INJECT:
+        /* dev-only: uaddr=RDI (an unmapped arena page); glue raw-copies to prove
+         * the fixup recovers. Guarded out of the default build entirely. */
+        if (rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_COPY_FIXUP_INJECT;
+#endif
     default:
         /* Unknown op: UNSUPPORTED regardless of arguments (full 64-bit op). */
         *out_status=JE_ABI_UNSUPPORTED; return JE_SYSCALL_RETURN;
@@ -67,6 +81,22 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         return je_sched_interrupt(f, false);
     case JE_SYSCALL_EXIT:
         return je_sched_exit_current(f, result);
+    case JE_SYSCALL_COPY_PROBE: {
+        /* dev-only: stage <=256 user bytes src->kernel->dst with prevalidation
+         * and the exception-fixup net. src=RDI, dst=RSI, len=RDX. */
+        je_abi_status s = je_copy_probe(f->rdi, f->rsi, f->rdx);
+        f->rax = (uint64_t)s; f->rdx = 0;
+        return je_sched_return_to_user(f);
+    }
+#ifdef JE_DEV_COPY_INJECT
+    case JE_SYSCALL_COPY_FIXUP_INJECT: {
+        /* dev-only: raw-copy an unmapped arena page to prove the fixup recovers;
+         * RDX reports 1 if recovered. RDI = the unmapped user address. */
+        int recovered = je_copy_fixup_inject(f->rdi);
+        f->rax = (uint64_t)JE_ABI_OK; f->rdx = (uint64_t)recovered;
+        return je_sched_return_to_user(f);
+    }
+#endif
     case JE_SYSCALL_RETURN:
     default:
         f->rax = (uint64_t)status; f->rdx = result;
