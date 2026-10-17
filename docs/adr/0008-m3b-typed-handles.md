@@ -1,12 +1,13 @@
 # ADR 0008: Freeze the M3b typed-handle contract
 
-Status: **proposed**, 2026-10-17. Scope: M3b only. One owner decision is required
-before this ADR is accepted (see **D-OPEN** at the end). No kernel code changes
-accompany this ADR; it converts the M3b handle proposals into reviewed decisions
-that issue [#7](https://github.com/auto44e/jeios/issues/7) implements and tests
-against, landed as small PRs mirroring the M3a sequence. Reviewed baseline: `main`
-at the M3a completion merge (`b28f947`); the M3a qualification retrospective
-[M3A_RETRO.md](../M3A_RETRO.md) landed just after, at `73cefa1`.
+Status: **accepted contract, 2026-10-17** (owner-approved; the one open decision,
+D-OPEN, was resolved in favour of **Option A** — see below). Scope: M3b only. No
+kernel code changes accompany this ADR; it converts the M3b handle proposals into
+reviewed decisions that issue [#7](https://github.com/auto44e/jeios/issues/7)
+implements and tests against, landed as small PRs mirroring the M3a sequence.
+Reviewed baseline: `main` at the M3a completion merge (`b28f947`); the M3a
+qualification retrospective [M3A_RETRO.md](../M3A_RETRO.md) landed just after, at
+`73cefa1`. The ADR itself was merged in PR #33.
 
 ## Context
 
@@ -57,7 +58,7 @@ M3b delivers a **bounded, process-local, typed handle table** with:
 
 **Attenuation (deriving a weaker handle) and multi-handle references to one object
 are NOT frozen by this ADR** and are NOT in the first PR; they are deferred to a
-later PR + ADR amendment (see D-OPEN and the follow-up note in D3), because the
+later PR + ADR amendment (see D-RESOLVED and the follow-up note in D3), because the
 same-slot-vs-fresh-slot design question materially changes quota, close semantics,
 and reference ownership and should be decided against running code. What is frozen
 here is only: the rights mask exists and is checked on use, and any future
@@ -288,50 +289,51 @@ Typed rights checking on use, typed objects, attenuation + cross-handle referenc
 PRs, each with its own tests and — for the teardown PR — owner sign-off on any
 death-path edit.
 
-## D-OPEN. Owner decision required before acceptance: the slot-vs-instance split
+## D-RESOLVED. Owner decision (resolved): the slot-vs-instance split — **Option A**
 
 M3b slots name objects; a **service restart** (M3c) replaces the object behind a
-name. The question the ADR must settle concretely (the peers split on this):
+name. The peers split on how a handle stays safe across that restart; the owner
+resolved it: **Option A is accepted for M3b**, with B / a hybrid A+B recorded as a
+future consideration (see "Future consideration" below).
 
-- **Option A (recommended):** the handle carries **only** the slot generation. A
+- **Option A (ACCEPTED):** the handle carries **only** the slot generation. A
   service restart is modelled as **close + re-allocate**: the slot is revoked, its
   **generation bumped**, and a *new* handle minted for the restarted instance. Old
   handles go `STALE` automatically. The handle encoding stays narrow (index +
   slot-gen, exactly D2); there is no second epoch field and no caller-supplied
   instance generation to compare. Restart safety falls out of the existing
-  generation mechanism.
-- **Option B:** the handle **also** carries an **instance epoch** (a second field),
-  so a slot can be rebound to a restarted instance *without* a generation bump and
-  a stale-instance handle is caught by comparing the epoch. This survives "same
-  slot, same slot-generation, new instance" but **widens the handle ABI** (less
-  room for index/slot-gen in 32 bits, or a wider handle) and adds a field to every
-  lookup.
+  generation mechanism. This keeps the 32-bit encoding in D2 intact, needs no new
+  comparison in the lookup hot path, and reuses the generation mechanism the first
+  PR already tests exhaustively (a restart is just a close+allocate).
+- **Option B (not chosen for M3b):** the handle **also** carries an **instance
+  epoch** (a second field), so a slot can be rebound to a restarted instance
+  *without* a generation bump and a stale-instance handle is caught by comparing
+  the epoch. This survives "same slot, same slot-generation, new instance" but
+  **widens the handle ABI** (less room for index/slot-gen in 32 bits, or a wider
+  handle) and adds a field to every lookup — a capability M3b does not need.
 
-**Recommendation: Option A.** It keeps the 32-bit encoding in D2 intact, needs no
-new comparison in the lookup hot path, and reuses the generation mechanism we are
-already testing exhaustively — a restart is just a close+allocate, which the first
-PR already covers.
+**Scope caveat (carried forward to M3c).** Option A fully handles **single-process,
+local slot reuse**, which is all M3b itself needs. It does **not** by itself make a
+*cross-process* alias stale when a shared object is restarted — closing and
+reallocating one process's slot says nothing about another process's handle to the
+same object. That cross-process "restart revokes every alias" property is an
+**object-wide incarnation** question that only arises once M3c introduces
+transferable endpoints, and it is **deferred to the M3c ADR** as its own decision
+(either every alias checks a shared incarnation value, or restart walks and revokes
+all naming slots).
 
-**Scope caveat the owner must note (raised in review):** Option A fully handles
-**single-process, local slot reuse**, which is all M3b itself needs. It does **not**
-by itself make a *cross-process* alias stale when a shared object is restarted —
-closing and reallocating one process's slot says nothing about another process's
-handle to the same object. That cross-process "restart revokes every alias"
-property is an **object-wide incarnation** question that only arises once M3c
-introduces transferable endpoints, and it must be frozen **then**, in the M3c ADR,
-as its own decision (either every alias checks a shared incarnation value, or
-restart walks and revokes all naming slots). Option B's per-handle instance epoch
-is *one* possible input to that later decision but is **not** required by M3b and
-is **not** automatically sufficient for the cross-process case either. So: pick A
-for M3b now; defer object-wide restart semantics to M3c explicitly.
+**Future consideration (owner direction):** revisit Option B — or a **hybrid A+B**
+— when M3c forces the object-wide incarnation decision. The natural hybrid keeps
+Option A's narrow per-process handle as-is and adds a *separate* object-side
+incarnation counter checked only on cross-process / transferred references, so the
+common single-process lookup stays exactly as frozen here while restarted shared
+objects still invalidate every alias. That evaluation is a **documentation/ADR
+update at M3c**, not an M3b change: because Option A does not widen the handle ABI,
+adopting a hybrid later is additive (a new check on the transfer path) rather than
+a breaking re-encode — so starting with A costs nothing if B-like behavior is added
+later. Nothing in the M3b first PR forecloses it.
 
-If the owner instead prefers to carry an instance epoch in the handle from the
-start (Option B), D2's bit split and D3's lookup rule change accordingly and must
-be re-frozen before the first PR.
-
-This is the single contract decision blocking acceptance. Everything else above is
-proposed-and-ready; on the owner's choice here, ADR 0008 moves to **accepted** and
-the first PR (D9) can begin.
+With D-RESOLVED settled, the first PR (D9) may begin.
 
 ## Consequences
 
@@ -345,5 +347,5 @@ the first PR (D9) can begin.
   fault-death path untouched until an explicit, owner-signed teardown PR.
 
 AI-assisted design (including a two-round peer cross-talk debate); not independent
-human qualification. The owner is the merge gate and the decider of **D-OPEN** and
-of any D7 death-path change.
+human qualification. The owner is the merge gate; D-RESOLVED records the owner's
+Option-A decision, and any D7 death-path change remains owner-gated.
