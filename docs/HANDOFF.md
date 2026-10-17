@@ -1,5 +1,27 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Multi-agent collaboration model — observed 2026-10-17T06:05:00+00:00
+
+Owner direction 2026-10-17: work may be done by multiple AI coding agents as
+peers (shared authorship, democratic decisions on open questions, mutual
+pushback), bounded by the greater OS vision. The governing rules are recorded in
+[AGENTS.md](../AGENTS.md) ("Multi-agent collaboration model"). Key points: the
+frozen ADRs/ROADMAP and the honesty/critical-profile discipline are the
+non-negotiable guiding star; authorship is spread across agents (ideally
+implementation, test and fake written by different agents); open design choices
+are decided by recorded majority with pushback expected in every direction; and
+three hard overrides beat any vote — a verified fact (compile/test/CI), any change
+touching a frozen contract or tested code (escalated to the owner), and the
+honesty rules (local≠remote CI, implemented/tested/planned/blocked, no invented
+reviewers, AI-assisted review is NOT independent human qualification).
+
+Implemented: contributor-guidance/process documentation only. No kernel, build or
+boot behavior changed; M1/M2 AMD64 remains the implemented baseline and the mobile
+scaffold is unchanged. Planned: continue M3a #3 under this model. Blocked/
+unverified: nothing new; this entry adds no code and makes no runtime claim.
+Validation: `ASAN_OPTIONS=detect_leaks=0 make check`, `git diff --check` and
+relative-link checks passed locally at this base; remote CI observed separately.
+
 ## M3a boundary-contract ADR — observed 2026-10-17T00:38:00+00:00
 
 Inspected `auto44e/jeios` branch `docs/adr-0007-m3a-boundary` created from `main`
