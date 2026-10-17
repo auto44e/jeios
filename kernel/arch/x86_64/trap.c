@@ -21,7 +21,7 @@ _Static_assert(sizeof(struct tss64) == 104, "TSS layout");
 _Static_assert(sizeof(je_trap_frame) == 176, "trap frame size");
 _Static_assert(offsetof(je_trap_frame, vector) == 120, "assembly frame offset");
 static struct gate idt[256] __attribute__((aligned(16)));
-static uint64_t gdt[5] __attribute__((aligned(16)));
+static uint64_t gdt[7] __attribute__((aligned(16)));
 static struct tss64 tss;
 /* First page becomes unmapped guard in M1b; next four pages hold the stack. */
 unsigned char je_df_stack[5 * 4096] __attribute__((aligned(4096)));
@@ -31,6 +31,13 @@ void je_arch_traps_init(void)
 {
     gdt[1] = UINT64_C(0x00af9a000000ffff);
     gdt[2] = UINT64_C(0x00cf92000000ffff);
+    /* Ring-3 descriptors (DPL=3), appended after the kernel/TSS selectors so the
+     * existing kernel selectors keep their values (ADR 0007 D6). No user task
+     * executes yet (M3a #4 step 1); these only make the selectors available.
+     *   gdt[5] user data  (selector 0x2b = index 5, RPL 3): present, DPL3, R/W.
+     *   gdt[6] user code  (selector 0x33 = index 6, RPL 3): present, DPL3, L, exec/read. */
+    gdt[5] = UINT64_C(0x00cff2000000ffff);
+    gdt[6] = UINT64_C(0x00affa000000ffff);
     tss.ist[0] = (uintptr_t)je_df_stack + sizeof(je_df_stack);
     tss.ist[1] = (uintptr_t)je_nmi_stack + sizeof(je_nmi_stack);
     tss.iomap = (uint16_t)sizeof(tss); /* No I/O bitmap within the TSS limit. */

@@ -45,7 +45,11 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
 #if JE_TEST_MODE == 1
     __asm__ volatile("ud2");
 #elif JE_TEST_MODE == 2
-    __asm__ volatile("movw %0,%%ds" : : "r"((uint16_t)0x28));
+    /* #GP from loading a selector outside the GDT limit. The GDT now has 7
+     * entries (…, user data 0x28, user code 0x30), so 0x28 is a valid DPL3
+     * selector and would NOT fault. Use 0x38 (index 7), still past the limit,
+     * so the CPU raises #GP with error code = selector = 0x38. */
+    __asm__ volatile("movw %0,%%ds" : : "r"((uint16_t)0x38));
 #elif JE_TEST_MODE == 3
     je_arch_test_double_fault();
 #endif

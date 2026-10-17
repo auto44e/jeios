@@ -1,5 +1,31 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M3a #4 step 1: ring-3 GDT descriptors — observed 2026-10-17T11:00:00+00:00
+
+First step of M3a #4 on branch `feat/m3a-4-step1-gdt-user` from `main`
+`11375f1`. Appends user (DPL=3) descriptors to the GDT (grown 5→7 entries):
+`gdt[5]` user data (selector 0x2b), `gdt[6]` user code (selector 0x33, L=1),
+after the existing kernel/TSS selectors (ADR 0007 D6). No user task executes
+yet — this only makes the selectors available for the CPL3 entry work in later
+#4 steps.
+
+Implemented: GDT growth + the mode-2 fault-test fix. Because the GDT now covers
+index 6, the old mode-2 selector 0x28 became valid (would not fault); the test
+and tools/integration.py now use 0x38 (index 7, past the limit) → #GP error 0x38.
+A pre-write design review caught that leaving 0x28 would make the test hang
+rather than fail. IMPLEMENTATION.md and DEVELOPMENT.md mode-2 references updated.
+
+Tested (this env; QEMU/GRUB available): `make check` PASS, `make smoke` PASS,
+`make integration` PASS — mode 2 observes #GP vector=0x0d error=0x38; all seven
+fault modes pass. Descriptor bytes decoded (data P=1 DPL=3 type=0x2; code P=1
+DPL=3 type=0xa L=1). No M1/M2 regression; no sched.c change in this step.
+Planned next (#4): step 2 real per-process page-table backend + CR3; then CPL3
+entry/TSS.RSP0; fault-local death; the two-task QEMU containment proof. The
+`int 0x80` DPL3 gate is deferred to #5 (a handler-less DPL3 gate would be
+user-triggerable kernel death). Owner signed off on the upcoming sched.c change
+(per-process reap + ring-aware frame validation) conditioned on no regression.
+AI-assisted review only; not independent human qualification.
+
 ## Boot toolchain verified in this environment — observed 2026-10-17T08:08:00+00:00
 
 The QEMU/GRUB boot toolchain is installed and working on the current build

@@ -76,7 +76,7 @@ watchdog exists yet.
 | Mode | Injection | Required vector/error | Mechanism exercised |
 | --- | --- | --- | --- |
 | 1 | UD2 | #UD 6 / 0 | No-error-code exception frame |
-| 2 | Out-of-table GDT selector 0x28 | #GP 13 / 0x28 | CPU error-code frame |
+| 2 | Out-of-table GDT selector 0x38 | #GP 13 / 0x38 | CPU error-code frame |
 | 3 | #PF with absent #PF gate | #DF 8 / 0 | TSS emergency stack before new mappings |
 | 4 | Write kernel code | #PF 14 / 3 | Read-only supervisor mapping and CR0.WP |
 | 5 | Read bootstrap guard | #PF 14 / 0 | Absent guard mapping |
