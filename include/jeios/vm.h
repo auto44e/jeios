@@ -29,6 +29,7 @@
 #include <stddef.h>
 #include <jeios/alloc.h>
 #include <jeios/status.h>
+#include <jeios/handle.h>    /* M3b: per-process handle table storage */
 
 /* User arena is the half-open range [JE_VM_ARENA_BASE, +JE_VM_ARENA_SIZE). */
 #define JE_VM_ARENA_BASE   UINT64_C(0x40000000)
@@ -47,6 +48,11 @@
 #define JE_VM_KSTACK_PAGES    5u   /* reserved+held here, allocated in #4 */
 #define JE_VM_MAX_SEGMENTS    8u
 #define JE_VM_QUOTA_PAGES (JE_VM_TABLE_PAGES + JE_VM_MAX_USER_PAGES + JE_VM_KSTACK_PAGES)
+/* M3b: per-process handle-table capacity (ADR 0008). Kept small deliberately —
+ * the table is inline in je_vm_process and SELF is the only object kind so far.
+ * REVISIT (docs): revisit this cap and the struct-size budget as object kinds
+ * and reference semantics arrive in later M3b/M3c PRs. */
+#define JE_VM_HANDLE_CAP      16u
 _Static_assert(JE_VM_QUOTA_PAGES == 73u, "admission quota");
 
 /* Frame kind and the single permitted leaf permission per kind:
@@ -219,6 +225,15 @@ typedef struct {
     je_vm_extent extents[JE_VM_MAX_EXTENTS];
     size_t      journal_count;
     je_vm_journal_entry journal[JE_VM_MAX_JOURNAL];
+    /* M3b: per-process handle table (ADR 0008). Inline storage; initialized at
+     * spawn and reclaimed by the existing teardown/unwind that zeroes this whole
+     * struct (a zeroed table has capacity 0, so every lookup fails BADINDEX —
+     * fail-safe even if init never ran). SELF-only handles in M3b own no external
+     * resource, so a faulted-but-not-yet-destroyed process holding one is inert.
+     * REVISIT (docs): struct-size budget as the handle count / object kinds grow;
+     * owner-approved growth per the M3b second-PR decision. */
+    je_handle_table  htable;
+    je_handle_slot   hslots[JE_VM_HANDLE_CAP];
 } je_vm_process;
 
 typedef struct {

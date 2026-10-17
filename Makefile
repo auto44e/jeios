@@ -42,8 +42,8 @@ test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm
 	./$(BUILD)/test_handle_rw
 check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
-	@echo "ABI isolation: abi.h must not include the internal status.h"
-	@! grep -qE '^[[:space:]]*#[[:space:]]*include.*status\.h' include/jeios/abi.h
+	@echo "ABI isolation: abi.h must not include the internal status.h or handle.h"
+	@! grep -qE '^[[:space:]]*#[[:space:]]*include.*(status|handle)\.h' include/jeios/abi.h
 	@echo "Dev-inject isolation: the fixup-injection path must be absent from the default kernel"
 	@! nm $(BUILD)/jeios.elf | grep -qiE 'copy_fixup_inject|user_inject'
 iso: all
@@ -68,9 +68,9 @@ $(BUILD)/test_alloc: tests/test_alloc.c kernel/core/alloc.c kernel/core/boot.c $
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_alloc.c kernel/core/alloc.c kernel/core/boot.c -o $@
 
-$(BUILD)/test_vm: tests/test_vm.c tests/vm_fake.c kernel/core/vm.c kernel/core/alloc.c kernel/core/boot.c $(wildcard include/jeios/*.h)
+$(BUILD)/test_vm: tests/test_vm.c tests/vm_fake.c kernel/core/vm.c kernel/core/alloc.c kernel/core/boot.c kernel/core/handle.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_vm.c tests/vm_fake.c kernel/core/vm.c kernel/core/alloc.c kernel/core/boot.c -o $@
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_vm.c tests/vm_fake.c kernel/core/vm.c kernel/core/alloc.c kernel/core/boot.c kernel/core/handle.c -o $@
 
 $(BUILD)/test_uframe: tests/test_uframe.c kernel/core/uframe.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)

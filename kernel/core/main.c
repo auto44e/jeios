@@ -88,15 +88,16 @@ extern unsigned char je_user_syscall_start[], je_user_syscall_end[];
 extern unsigned char je_user_unknownop_start[], je_user_unknownop_end[];
 extern unsigned char je_user_badret_start[], je_user_badret_end[];
 extern unsigned char je_user_copyprobe_start[], je_user_copyprobe_end[];
+extern unsigned char je_user_handle_start[], je_user_handle_end[];
 #ifdef JE_DEV_COPY_INJECT
 extern unsigned char je_user_inject_start[], je_user_inject_end[];
 #endif
 extern unsigned char je_user_badrsp_start[], je_user_badrsp_end[];
 static je_vm vm_s3;
-static unsigned char vm_blob_s3[256];
+static unsigned char vm_blob_s3[1024];
 typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_EXIT=3,
                PROG_SYSCALL=4, PROG_UNKNOWNOP=5, PROG_BADRSP=6, PROG_BADRET=7,
-               PROG_COPYPROBE=8, PROG_INJECT=9 } user_prog;
+               PROG_COPYPROBE=8, PROG_INJECT=9, PROG_HANDLE=10 } user_prog;
 static int vm_s3_inited;
 /* Initialize the shared step-3/4 vm once (it holds up to JE_VM_MAX_PROCESSES
  * processes — A and B share it, matching the 2-process admission quota). */
@@ -122,6 +123,7 @@ static uint32_t vm_s3_build(user_prog prog)
     case PROG_BADRSP:    start=je_user_badrsp_start;    end=je_user_badrsp_end;    break;
     case PROG_BADRET:    start=je_user_badret_start;    end=je_user_badret_end;    break;
     case PROG_COPYPROBE: start=je_user_copyprobe_start; end=je_user_copyprobe_end; break;
+    case PROG_HANDLE:    start=je_user_handle_start;    end=je_user_handle_end;    break;
 #ifdef JE_DEV_COPY_INJECT
     case PROG_INJECT:    start=je_user_inject_start;    end=je_user_inject_end;    break;
 #endif
@@ -554,6 +556,61 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             je_arch_console_write("M3a-s5b: exception-fixup recovered load+store copy-site #PF (dev inject); kernel alive\r\n");
         }
 #endif
+
+        /* --- M3b second PR: per-process handle table + handle syscalls --- */
+        /* Process H mints a SELF handle, queries it (type==SELF), closes it, and
+         * probes the stale/forged/bound/wide/quota/reuse cases, recording each
+         * status for us to assert. Proves the handle table is wired to a live
+         * process and the JE_HANDLE_* -> JE_ABI_* mapping is distinct (not
+         * collapsed to INVALID). (This exercises ONE process's table; it does not
+         * by itself prove tables are PER-process — that distinction is covered by
+         * construction + the hosted vm/table tests, not claimed from this run.) */
+        {
+            uint32_t H=vm_s3_build(PROG_HANDLE);
+            uint64_t hdisp0;
+            if (je_thread_create_user(&vm_s3, H)!=JE_OK) fail("JeiOS fatal: s5c handle thread\r\n");
+            hdisp0=je_sched_dispatches_of(&vm_s3,H);
+            for (uint64_t sp=0; je_sched_dispatches_of(&vm_s3,H)-hdisp0<JE_THREAD_MAX*3; ) {
+                (void)je_arch_irq_save();
+                if (++sp>100000000ull) fail("JeiOS fatal: s5c handle no progress\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            /* self#1: OK + a nonzero handle. */
+            if (vm_s3_scratch(H,0x1020)!=JE_ABI_OK)        fail("JeiOS fatal: s5c self not OK\r\n");
+            if (vm_s3_scratch(H,0x1028)==0u)               fail("JeiOS fatal: s5c self handle zero\r\n");
+            /* query(live): OK + type == SELF. */
+            if (vm_s3_scratch(H,0x1030)!=JE_ABI_OK)        fail("JeiOS fatal: s5c query(live) not OK\r\n");
+            if (vm_s3_scratch(H,0x1038)!=JE_ABI_OBJ_SELF)  fail("JeiOS fatal: s5c query(live) wrong type\r\n");
+            /* close(live): OK. */
+            if (vm_s3_scratch(H,0x1040)!=JE_ABI_OK)        fail("JeiOS fatal: s5c close(live) not OK\r\n");
+            /* query/close of the now-closed handle: STALE (distinct status). */
+            if (vm_s3_scratch(H,0x1048)!=JE_ABI_H_STALE)   fail("JeiOS fatal: s5c query(closed) not STALE\r\n");
+            if (vm_s3_scratch(H,0x1050)!=JE_ABI_H_STALE)   fail("JeiOS fatal: s5c close(closed) not STALE\r\n");
+            /* handle 0 and index==capacity: BADINDEX. */
+            if (vm_s3_scratch(H,0x1058)!=JE_ABI_H_BADINDEX) fail("JeiOS fatal: s5c close(0) not BADINDEX\r\n");
+            if (vm_s3_scratch(H,0x1060)!=JE_ABI_H_BADINDEX) fail("JeiOS fatal: s5c bound-index not BADINDEX\r\n");
+            /* slot reuse: self#2 took slot 0 at a new generation. */
+            if (vm_s3_scratch(H,0x1088)!=JE_ABI_OK)        fail("JeiOS fatal: s5c self#2 not OK\r\n");
+            if (vm_s3_scratch(H,0x1078)==0u)               fail("JeiOS fatal: s5c self#2 handle zero\r\n");
+            if (vm_s3_scratch(H,0x1078)==vm_s3_scratch(H,0x1028))
+                fail("JeiOS fatal: s5c reused handle equals the stale one\r\n");
+            /* RE-STALE: the OLD self#1 handle, presented AFTER slot 0 was reused,
+             * is STALE — the real proof that reuse invalidates old names. */
+            if (vm_s3_scratch(H,0x1090)!=JE_ABI_H_STALE)   fail("JeiOS fatal: s5c old handle not re-staled after reuse\r\n");
+            /* wrong generation on a live slot: STALE. */
+            if (vm_s3_scratch(H,0x1068)!=JE_ABI_H_STALE)   fail("JeiOS fatal: s5c wrong-gen not STALE\r\n");
+            /* wide handle (bits 63:32 set): INVALID at decode, before narrowing. */
+            if (vm_s3_scratch(H,0x1070)!=JE_ABI_INVALID)   fail("JeiOS fatal: s5c wide-handle not INVALID\r\n");
+            /* quota (distinct from NOSLOTS): the mint loop ends at QUOTA after
+             * EXACTLY 14 more successful mints (quota 15 minus the live self#2),
+             * a measured fact — not merely "ended at QUOTA". */
+            if (vm_s3_scratch(H,0x1080)!=JE_ABI_H_QUOTA)   fail("JeiOS fatal: s5c quota not QUOTA\r\n");
+            if (vm_s3_scratch(H,0x1098)!=14u)              fail("JeiOS fatal: s5c quota count != 14\r\n");
+            (void)je_arch_irq_save();
+            if (je_sched_drop_user(&vm_s3, H)!=JE_OK) fail("JeiOS fatal: s5c handle drop\r\n");
+            if (je_vm_destroy(&vm_s3, H)!=JE_OK) fail("JeiOS fatal: s5c handle destroy\r\n");
+            je_arch_console_write("M3b-s1: handle self/query/close OK; stale/badindex/wide distinct; reuse re-stales old handle; QUOTA at exactly CAP-1; B alive\r\n");
+        }
 
         /* Tear down B; all step-3/4/5a pages must be back to the pre-s4 baseline. */
         (void)je_arch_irq_save();

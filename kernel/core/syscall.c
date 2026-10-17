@@ -16,6 +16,10 @@
 #include <jeios/sched.h>
 #include <jeios/trap.h>
 #include <jeios/usercopy.h>
+#ifndef JE_SYSCALL_HOSTED_TEST
+#include <jeios/vm.h>
+#include <jeios/handle.h>
+#endif
 
 /* Pure decode: given the operation and its six argument registers, decide the
  * action, the ABI status to return in RAX, and any scalar result for RDX. No
@@ -47,6 +51,24 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
          * the pure decoder only rejects nonzero reserved args here. */
         if (r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_COPY_PROBE;
+    case JE_SYS_HANDLE_SELF:
+        /* handle_self(): no arguments; RDI..R9 reserved must be zero. The glue
+         * mints a SELF handle in the current process's table. */
+        if (rdi|rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_HANDLE_SELF;
+    case JE_SYS_HANDLE_CLOSE:
+        /* handle_close(h=RDI): RSI..R9 reserved must be zero. A handle value with
+         * bits 63:32 set is rejected here as INVALID before it is ever narrowed
+         * to the 32-bit je_handle (decode-INVALID precedes BADINDEX/STALE). */
+        if (rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_HANDLE_CLOSE;
+    case JE_SYS_HANDLE_QUERY:
+        /* handle_query(h=RDI): RSI..R9 reserved must be zero; same wide-handle
+         * rejection as close. The glue returns the object type in RDX. */
+        if (rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_HANDLE_QUERY;
 #ifdef JE_DEV_COPY_INJECT
     case JE_SYS_COPY_FIXUP_INJECT:
         /* dev-only: uaddr=RDI (an unmapped arena page); glue raw-copies to prove
@@ -61,6 +83,37 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
 }
 
 #ifndef JE_SYSCALL_HOSTED_TEST
+/* M3b: SELF is the only object kind so far — a kernel-minted, immortal,
+ * resource-free process-identity capability (no dereferenceable pointer). */
+#define JE_HANDLE_TYPE_SELF JE_ABI_OBJ_SELF
+
+/* Exhaustive, single-point mapping of internal JE_HANDLE_* results to the v0
+ * ABI status namespace (ADR 0008 D2: distinct, not collapsed). Keeping it here
+ * in the glue is what lets abi.h stay independent of handle.h. */
+static je_abi_status handle_status_to_abi(je_handle_status s)
+{
+    switch (s) {
+    case JE_HANDLE_OK:        return JE_ABI_OK;
+    case JE_HANDLE_STALE:     return JE_ABI_H_STALE;
+    case JE_HANDLE_BADINDEX:  return JE_ABI_H_BADINDEX;
+    case JE_HANDLE_WRONGTYPE: return JE_ABI_H_WRONGTYPE;
+    case JE_HANDLE_DENIED:    return JE_ABI_H_DENIED;
+    case JE_HANDLE_QUOTA:     return JE_ABI_H_QUOTA;
+    case JE_HANDLE_NOSLOTS:   return JE_ABI_H_NOSLOTS;
+    }
+    return JE_ABI_INVALID;   /* unreachable; fail closed if the enum ever grows */
+}
+
+/* Resolve the CURRENT user process's handle table. Identity comes ONLY from the
+ * scheduler (je_sched_current_user), never from a syscall argument. Returns NULL
+ * if the caller is not a user thread (the glue maps that to JE_ABI_INVALID). */
+static je_handle_table *current_htable(void)
+{
+    je_vm *vm; uint32_t index;
+    if (je_sched_current_user(&vm, &index) != JE_OK) return (je_handle_table *)0;
+    return &vm->procs[index].htable;
+}
+
 /* Kernel glue. Returns the frame to iretq to (the caller for RETURN/invalid, a
  * live successor for YIELD/EXIT). Must only be called for a user-origin int 0x80
  * frame (je_trap_dispatch enforces cs&3==3; the scheduler helpers re-check the
@@ -86,6 +139,39 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
          * and the exception-fixup net. src=RDI, dst=RSI, len=RDX. */
         je_abi_status s = je_copy_probe(f->rdi, f->rsi, f->rdx);
         f->rax = (uint64_t)s; f->rdx = 0;
+        return je_sched_return_to_user(f);
+    }
+    case JE_SYSCALL_HANDLE_SELF: {
+        /* Mint a SELF handle in the caller's own table. SELF carries no object
+         * pointer and no rights (rights are descriptive-only / unenforced in
+         * M3b; REVISIT in docs). Handle returned in RDX. */
+        je_handle_table *t = current_htable();
+        if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+        je_handle h = 0;
+        je_handle_status s = je_handle_alloc(t, (void *)0, JE_HANDLE_TYPE_SELF, 0u, &h);
+        f->rax = (uint64_t)handle_status_to_abi(s);
+        f->rdx = (uint64_t)h;                 /* 0 on failure (alloc clears out) */
+        return je_sched_return_to_user(f);
+    }
+    case JE_SYSCALL_HANDLE_CLOSE: {
+        je_handle_table *t = current_htable();
+        if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+        je_handle_status s = je_handle_close(t, (je_handle)f->rdi);
+        f->rax = (uint64_t)handle_status_to_abi(s); f->rdx = 0;
+        return je_sched_return_to_user(f);
+    }
+    case JE_SYSCALL_HANDLE_QUERY: {
+        /* Look up the handle for its object type. No expected-type/rights are
+         * required from ring 3 in M3b, so WRONGTYPE/DENIED are not user-reachable
+         * here (they are covered by the hosted table tests and the mapper). On OK,
+         * RDX = object type; otherwise RDX = 0. */
+        je_handle_table *t = current_htable();
+        if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+        void *obj;
+        je_handle_status s = je_handle_lookup(t, (je_handle)f->rdi,
+                                              JE_HANDLE_TYPE_SELF, 0u, &obj);
+        f->rax = (uint64_t)handle_status_to_abi(s);
+        f->rdx = (s == JE_HANDLE_OK) ? (uint64_t)JE_HANDLE_TYPE_SELF : 0u;
         return je_sched_return_to_user(f);
     }
 #ifdef JE_DEV_COPY_INJECT
