@@ -38,8 +38,11 @@ https://cdrdv2-public.intel.com/868137/325462-089-sdm-vol-1-2abcd-3abcd-4.pdf
 ## Verification history
 
 M1a: GCC/ELF checks, hosted core tests, QEMU normal boot and modes 1, 2, 3
-passed before proceeding to M1b. Mode 2 uses GDT selector 0x28, just beyond the
-installed table limit, to deterministically exercise #GP with error code 0x28. Consult HANDOFF.md for final observed
+passed before proceeding to M1b. Mode 2 uses GDT selector 0x38, just beyond the
+installed table limit, to deterministically exercise #GP with error code 0x38.
+(Originally 0x28; the GDT grew to 7 entries when ring-3 user descriptors were
+added for M3a #4, so 0x28 became the valid user-data selector and the test moved
+to 0x38.) Consult HANDOFF.md for final observed
 results after the complete phase sequence.
 
 ## M1b: boot data and protected mappings
