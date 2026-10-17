@@ -180,6 +180,13 @@ Before launching untrusted code, establish ring-3 entry, a user/kernel mapping
 split, validated copy primitives, per-process lifetime/authority rules and vetted
 hardening prerequisites. Do not present seven ring-0 threads as sandboxed apps.
 
+The M3a userspace-boundary contract is now frozen in
+[ADR 0007](adr/0007-m3a-userspace-boundary.md) (accepted 2026-10-17): 2 MiB
+per-process arena, NX-required launch, enforced no-FPU/SIMD policy, experimental
+ABI v0, user-copy fixup discipline and proof-by-test acceptance. That ADR is a
+reviewed decision, not an implementation; no M3a kernel code exists yet. Issues
+#3–#6 implement and qualify against it; CI/enforcement is sequenced with #18/#19.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

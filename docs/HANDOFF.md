@@ -1,5 +1,43 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M3a boundary-contract ADR — observed 2026-10-17T00:38:00+00:00
+
+Inspected `auto44e/jeios` branch `docs/adr-0007-m3a-boundary` created from `main`
+at `33604256cc3b47634ded2b7c341aa430a90b0867`. No open PRs existed in either
+repository at inspection. This change adds
+[docs/adr/0007-m3a-userspace-boundary.md](adr/0007-m3a-userspace-boundary.md) and
+will be submitted as an unmerged review PR for [issue #2](https://github.com/auto44e/jeios/issues/2).
+
+Implemented: documentation only — an accepted ADR that freezes the M3a
+userspace-boundary contract (scope, NX-required launch profile, 2 MiB arena and
+ownership rules, admission bounds, lifecycle, ring-3 entry/return, enforced
+no-FPU/SIMD policy, built-in image + experimental ABI v0, user-copy discipline,
+nonblocking syscall model, and the reserved-but-unimplemented M3b/M3c surface). No
+kernel, build, test or boot behavior changed. Runtime remains core M1/M2 AMD64 and
+the mobile planning scaffold.
+
+Planned: M3a implementation against this contract — issue #3 (private VM + bounded
+image), #4 (CPL3 scheduling + local faults), #5 (syscalls + user copies), #6 (M3a
+qualification). CI/enforcement sequenced with #18 and coding-policy evidence with
+#19. Blocked/unverified: no M3a code, no independent review, no hardened
+qualification, no FPU/SMP/userspace runtime; remote CI for this new head must be
+observed separately. M3A.md's M3b/M3c numbers remain proposals, not frozen here.
+
+Decision rationale (for all agents/people): the project's discipline is to freeze
+the contract in an ADR before writing kernel code; M3A.md explicitly deferred its
+numbers/ABI to "the first ADR"; AGENT_START lists #2 (boundary contracts) as the
+first work-sequence item and the prerequisite for #3–#6. ADR 0007 is therefore the
+correctly-sequenced, highest-value first change. It supersedes the
+"proposed/recommendation" wording of M3A.md sections 2–5 for M3a only.
+
+Validation: `ASAN_OPTIONS=detect_leaks=0 make check` passed core, boot-parser,
+allocator and ELF checks on GCC 13.3.0 at this base commit (documentation-only
+change; no boot code touched, so the emulator workload was not rerun). Relative
+Markdown targets, conflict markers and `git diff --check` checked before
+publication. Local PASS is not a substitute for remote CI on the new head.
+Historical evidence below retains its original revision/time; this entry
+supersedes earlier current-status wording.
+
 ## Ecosystem coding-policy refresh — observed 2026-10-17T00:12:28+00:00
 
 Owner direction: 2026-10-16T20:01:26-04:00, reaffirmed
