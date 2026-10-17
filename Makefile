@@ -8,10 +8,16 @@ TEST_MODE ?= 0
 BUILD := build/$(TEST_MODE)
 WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
 CPPFLAGS := -Iinclude -DJE_TEST_MODE=$(TEST_MODE)
+# Dev-only fixup-injection path is compiled ONLY in the dedicated test mode 11,
+# never in the default (mode 0) kernel. A make-check assertion proves its symbols
+# are absent from the default ELF.
+ifeq ($(TEST_MODE),11)
+CPPFLAGS += -DJE_DEV_COPY_INJECT
+endif
 CFLAGS := -std=c11 -O2 -g $(WARN) -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -m64 -march=x86-64 -mno-red-zone -mgeneral-regs-only
 CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c kernel/core/boot.c kernel/core/alloc.c
-SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
-OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o $(BUILD)/kernel/arch/x86_64/trap_entry.o $(BUILD)/kernel/arch/x86_64/register_probe.o $(BUILD)/kernel/arch/x86_64/user_demo.o
+SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
+OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o $(BUILD)/kernel/arch/x86_64/trap_entry.o $(BUILD)/kernel/arch/x86_64/register_probe.o $(BUILD)/kernel/arch/x86_64/user_demo.o $(BUILD)/kernel/arch/x86_64/usercopy.o
 .PHONY: all check test iso smoke clean
 all: $(BUILD)/jeios.elf
 $(BUILD)/jeios.elf: $(OBJECTS) kernel/arch/x86_64/linker.ld
@@ -21,7 +27,7 @@ $(BUILD)/%.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 $(BUILD)/%.o: %.S
 	@mkdir -p $(@D)
-	$(CC) -m64 -ffreestanding -fno-pie -c $< -o $@
+	$(CC) $(CPPFLAGS) -m64 -ffreestanding -fno-pie -c $< -o $@
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
@@ -36,6 +42,8 @@ check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
 	@echo "ABI isolation: abi.h must not include the internal status.h"
 	@! grep -qE '^[[:space:]]*#[[:space:]]*include.*status\.h' include/jeios/abi.h
+	@echo "Dev-inject isolation: the fixup-injection path must be absent from the default kernel"
+	@! nm $(BUILD)/jeios.elf | grep -qiE 'copy_fixup_inject|user_inject'
 iso: all
 	grub-file --is-x86-multiboot2 $(BUILD)/jeios.elf
 	@mkdir -p $(BUILD)/iso/boot/grub

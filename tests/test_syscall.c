@@ -38,13 +38,19 @@ int main(void)
     /* exit with a nonzero reserved arg -> INVALID, and must NOT exit. */
     assert(dec(JE_SYS_EXIT, 42, 1,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
 
+    /* copy_probe (op 3): src/dst/len in RDI/RSI/RDX; R10/R8/R9 reserved. The
+     * pure decoder returns the COPY_PROBE action (the glue does the real copy),
+     * and rejects nonzero reserved args as INVALID without a copy action. */
+    assert(dec(JE_SYS_COPY_PROBE, 0x40000000,0x40000040,16,0,0,0,&st,&res)==JE_SYSCALL_COPY_PROBE && st==JE_ABI_OK);
+    assert(dec(JE_SYS_COPY_PROBE, 0,0,0, 1,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* r10 reserved */
+    assert(dec(JE_SYS_COPY_PROBE, 0,0,0, 0,0,9,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* r9 reserved */
+
     /* Unknown op -> UNSUPPORTED regardless of args, result 0. */
-    assert(dec(3, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
     assert(dec(0xdeadbeef, 1,2,3,4,5,6,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
     /* Full 64-bit op decode: 0x1_0000_0000 must NOT alias op 0 (abi_query). */
     assert(dec(UINT64_C(0x100000000), 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
-    /* op 3 (copy_probe) is reserved for step (b): UNSUPPORTED now, no success. */
-    assert(dec(3, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
+    /* op 4 and up are unknown in step (b): UNSUPPORTED, no success. */
+    assert(dec(4, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
 
     printf("syscall: PASS (abi_query, yield, exit, reserved-arg, full-width op, unsupported)\n");
     return 0;

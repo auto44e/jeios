@@ -147,6 +147,100 @@ je_user_badret_start:
     jmp je_user_badret_start   /* unreached */
 je_user_badret_end:
 
+/* M3a #5 step (b): a user program that exercises copy_probe (op 3) across a
+ * battery of cases and records each returned status into its data page, so the
+ * kernel can read back the results. Layout of recorded statuses (at data page
+ * 0x40001000, after the heartbeat word which stays at +0): each case stores its
+ * JE_ABI status at a fixed offset. src/dst are in-arena scratch at +0x100/+0x180.
+ *   +0x20 valid small copy       (expect OK)
+ *   +0x28 len=0                  (expect OK)
+ *   +0x30 null src               (expect INVALID)
+ *   +0x38 kernel-range src       (expect INVALID)
+ *   +0x40 len>256                (expect INVALID)
+ * After the battery it loops on the heartbeat so the kernel sees it alive.
+ * RAX=3 (copy_probe), RDI=src, RSI=dst, RDX=len; reserved R10/R8/R9=0. */
+.globl je_user_copyprobe_start
+.globl je_user_copyprobe_end
+je_user_copyprobe_start:
+    /* helper expectation: a macro-free sequence; registers set per call. */
+    /* case: valid small copy (16 bytes, arena scratch src+0x100 -> dst+0x180) */
+    movq $3, %rax
+    movq $0x40001100, %rdi      /* src in-arena */
+    movq $0x40001180, %rsi      /* dst in-arena */
+    movq $16, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    movq %rax, 0x40001020
+    /* case: len == 0 (expect OK, no touch) */
+    movq $3, %rax
+    movq $0x40001100, %rdi
+    movq $0x40001180, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    movq %rax, 0x40001028
+    /* case: null src (expect INVALID) */
+    movq $3, %rax
+    xorq %rdi, %rdi
+    movq $0x40001180, %rsi
+    movq $16, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    movq %rax, 0x40001030
+    /* case: kernel-range src 0x100000 (expect INVALID) */
+    movq $3, %rax
+    movq $0x100000, %rdi
+    movq $0x40001180, %rsi
+    movq $16, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    movq %rax, 0x40001038
+    /* case: len > 256 (expect INVALID) */
+    movq $3, %rax
+    movq $0x40001100, %rdi
+    movq $0x40001180, %rsi
+    movq $300, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    movq %rax, 0x40001040
+7:
+    incq 0x40001000             /* heartbeat; keep running */
+    jmp 7b
+je_user_copyprobe_end:
+
+#ifdef JE_DEV_COPY_INJECT
+/* M3a #5 step (b), DEV-ONLY (compile-guarded): invoke the fixup-injection op
+ * (RAX=4) with RDI = an unmapped arena page (0x40003000), record the recovered
+ * flag (RDX) at heartbeat+0x20, then loop. Proves the kernel recovered a
+ * copy-site #PF rather than panicking. Absent from the default build. */
+.globl je_user_inject_start
+.globl je_user_inject_end
+je_user_inject_start:
+    movq $4, %rax               /* JE_SYS_COPY_FIXUP_INJECT */
+    movq $0x40003000, %rdi      /* unmapped arena page */
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    movq %rdx, 0x40001020        /* recovered flag */
+8:
+    incq 0x40001000
+    jmp 8b
+je_user_inject_end:
+#endif
+
 /* M3a #4 step 4: a user program that corrupts its own RSP to an out-of-arena
  * value WITHOUT faulting, then loops. It never traps itself; the scheduler must
  * terminate it at its next dispatch (je_uframe_check fails) instead of halting

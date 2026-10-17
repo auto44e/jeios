@@ -5,6 +5,7 @@
 #include <jeios/trap.h>
 #include <jeios/sched.h>
 #include <jeios/syscall.h>
+#include <jeios/usercopy.h>
 /* Intel SDM Vol.3A: 64-bit interrupt handling, IST and TSS; Vol.2: LIDT/LTR.
  * Source references and ABI rationale are in docs/IMPLEMENTATION.md. */
 struct __attribute__((packed)) gate {
@@ -126,6 +127,12 @@ je_trap_frame *je_trap_dispatch(je_trap_frame *f)
     if (f->vector==0x81) return je_sched_interrupt(f,false);
     uint64_t cr2 = 0;
     if (f->vector == 14) __asm__ volatile("mov %%cr2,%0" : "=r"(cr2));
+    /* M3a #5 step (b): a CPL0 (#cs==8) not-present #PF at the approved user-copy
+     * site, under an active matching copy scope, recovers to the fixup entry
+     * (returns a copy failure); ANY other kernel #PF stays fatal. The hook does
+     * the full predicate (exact RIP, PFEC, scope, CR2 span, owner, direction). */
+    if (f->vector == 14 && f->cs == 8 && je_usercopy_try_fixup(f, cr2, f->error))
+        return f;
     /* M3a #5: a user-origin int 0x80 is a SYSCALL (dispatch on RAX), not a fault.
      * Route it before the fault-termination path. A kernel-origin int 0x80 is
      * never issued by the kernel and stays fatal (falls through to PANIC). */

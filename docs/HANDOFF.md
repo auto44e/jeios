@@ -1,5 +1,42 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M3a #5 step (b): recoverable user copies + exception fixup — observed 2026-10-17T19:50:00+00:00
+
+Branch `feat/m3a-5b-user-copy`. The FINAL M3a piece. `kernel/core/usercopy.c` +
+`kernel/arch/x86_64/usercopy.S` add `copy_from_user`/`copy_to_user` (ADR D9) and
+the dev-only `copy_probe` syscall (op 3). Every copy prevalidates the span
+(canonical, no wrap, in-arena, per-page present+permission) before touching it,
+copies through ONE approved assembly site, and a per-thread copy scope + the
+#PF-handler fixup (`je_usercopy_try_fixup`, called from `je_trap_dispatch`)
+recover ONLY a not-present (P=0) fault at the EXACT copy-site RIP with an active,
+owner-matched, direction-matched scope and CR2 in the declared span. Any other
+kernel #PF — protection fault, different RIP, no scope — stays fatal. A recovered
+fault → JE_ABI_INVALID (treated as a copy failure, not masked).
+
+Dispatch order: `cs==8` vector-14 → try fixup → else existing kernel PANIC; then
+the user int 0x80 / fault-terminate paths unchanged. The dev-only fixup-injection
+op (op 4) and its user stub are compiled ONLY under `-DJE_DEV_COPY_INJECT`
+(TEST_MODE 11); a `make check` `nm` assertion proves those symbols are absent
+from the default kernel.
+
+Peer: design done via a 2-round cross-talk DEBATE (the new peer-debate tool). The
+debate's key refinement: recover only P=0 not-present faults, treat a protection
+fault after validation as fatal (don't mask a validator bug). Codex's follow-up
+check corrected the injection to run from a real CPL3 syscall context (genuine
+owner/scope), flagged a stale bootstrap self-test call (removed), and had me
+tighten `cs&3==0` to exact `cs==8`.
+
+Tested in QEMU (this env): `make check` PASS (op-3 decode test + ABI isolation +
+dev-inject-absent-from-default-ELF assertions), `make smoke` PASS — the boot runs
+the copy_probe battery (valid+zero OK; null/kernel-range/len>256 INVALID; valid
+bytes verified moved) with peer B live. `make integration` PASS — 11 modes; mode
+11 proves the fixup RECOVERS a copy-site #PF (dev inject) while modes 4/5 still
+PANIC on a kernel-origin fault (not wrongly recovered). All three CI smoke
+profiles pass; M2's 4 markers unchanged. Honest limits recorded: no SMAP/SMEP, so
+the net covers the approved site only; fail-closed under uncorrupted-kernel
+invariants, not absolute. This COMPLETES the ADR 0007 M3a userspace boundary
+(#2–#5). AI-assisted review only; not independent human qualification.
+
 ## M3a #5 step (a): v0 syscall dispatcher — observed 2026-10-17T17:40:00+00:00
 
 Branch `feat/m3a-5a-syscall-dispatch`. The DPL3 `int 0x80` gate now dispatches a

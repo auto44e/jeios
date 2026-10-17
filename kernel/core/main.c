@@ -87,11 +87,16 @@ extern unsigned char je_user_exit_start[], je_user_exit_end[];
 extern unsigned char je_user_syscall_start[], je_user_syscall_end[];
 extern unsigned char je_user_unknownop_start[], je_user_unknownop_end[];
 extern unsigned char je_user_badret_start[], je_user_badret_end[];
+extern unsigned char je_user_copyprobe_start[], je_user_copyprobe_end[];
+#ifdef JE_DEV_COPY_INJECT
+extern unsigned char je_user_inject_start[], je_user_inject_end[];
+#endif
 extern unsigned char je_user_badrsp_start[], je_user_badrsp_end[];
 static je_vm vm_s3;
 static unsigned char vm_blob_s3[256];
 typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_EXIT=3,
-               PROG_SYSCALL=4, PROG_UNKNOWNOP=5, PROG_BADRSP=6, PROG_BADRET=7 } user_prog;
+               PROG_SYSCALL=4, PROG_UNKNOWNOP=5, PROG_BADRSP=6, PROG_BADRET=7,
+               PROG_COPYPROBE=8, PROG_INJECT=9 } user_prog;
 static int vm_s3_inited;
 /* Initialize the shared step-3/4 vm once (it holds up to JE_VM_MAX_PROCESSES
  * processes — A and B share it, matching the 2-process admission quota). */
@@ -116,6 +121,10 @@ static uint32_t vm_s3_build(user_prog prog)
     case PROG_UNKNOWNOP: start=je_user_unknownop_start; end=je_user_unknownop_end; break;
     case PROG_BADRSP:    start=je_user_badrsp_start;    end=je_user_badrsp_end;    break;
     case PROG_BADRET:    start=je_user_badret_start;    end=je_user_badret_end;    break;
+    case PROG_COPYPROBE: start=je_user_copyprobe_start; end=je_user_copyprobe_end; break;
+#ifdef JE_DEV_COPY_INJECT
+    case PROG_INJECT:    start=je_user_inject_start;    end=je_user_inject_end;    break;
+#endif
     default:             start=je_user_demo_start;      end=je_user_demo_end;      break;
     }
     size_t code_len=(size_t)(end-start);
@@ -477,6 +486,74 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (je_sched_reap_dead()<0) fail("JeiOS fatal: s5a badret reap\r\n");
             je_arch_console_write("M3a-s5a: bad frame on syscall return -> BAD_RETURN death (validated); B alive\r\n");
         }
+        /* --- step-(b): copy_probe battery + fixup recovery --- */
+        /* The user program seeds a source pattern, runs copy_probe across valid
+         * and adversarial cases, and records each returned status; we read them
+         * back and also verify the valid copy's destination content. */
+        {
+            uint32_t C=vm_s3_build(PROG_COPYPROBE);
+            /* Seed the in-arena source (0x1100) with a known pattern at CPL0. */
+            {
+                uint64_t flags=je_arch_irq_save();
+                uint64_t kroot=je_arch_kernel_root_phys();
+                je_arch_cr3_load(vm_s3.procs[C].root);
+                volatile unsigned char *srcp=(volatile unsigned char *)(uintptr_t)(JE_VM_ARENA_BASE+0x1100);
+                for (unsigned i=0;i<16;++i) srcp[i]=(unsigned char)(0xA0u+i);
+                je_arch_cr3_load(kroot);
+                je_arch_irq_restore(flags);
+            }
+            uint64_t cdisp0;
+            if (je_thread_create_user(&vm_s3, C)!=JE_OK) fail("JeiOS fatal: s5b copyprobe thread\r\n");
+            cdisp0=je_sched_dispatches_of(&vm_s3,C);
+            for (uint64_t sp=0; je_sched_dispatches_of(&vm_s3,C)-cdisp0<JE_THREAD_MAX*3; ) {
+                (void)je_arch_irq_save();
+                if (++sp>100000000ull) fail("JeiOS fatal: s5b copyprobe no progress\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            /* Read back the 5 recorded statuses. */
+            if (vm_s3_scratch(C,0x1020)!=JE_ABI_OK)      fail("JeiOS fatal: s5b valid copy not OK\r\n");
+            if (vm_s3_scratch(C,0x1028)!=JE_ABI_OK)      fail("JeiOS fatal: s5b zero-len not OK\r\n");
+            if (vm_s3_scratch(C,0x1030)!=JE_ABI_INVALID) fail("JeiOS fatal: s5b null src not INVALID\r\n");
+            if (vm_s3_scratch(C,0x1038)!=JE_ABI_INVALID) fail("JeiOS fatal: s5b kernel src not INVALID\r\n");
+            if (vm_s3_scratch(C,0x1040)!=JE_ABI_INVALID) fail("JeiOS fatal: s5b len>256 not INVALID\r\n");
+            /* Verify the valid copy actually moved the bytes (dst at 0x1180). */
+            {
+                uint64_t flags=je_arch_irq_save();
+                uint64_t kroot=je_arch_kernel_root_phys();
+                je_arch_cr3_load(vm_s3.procs[C].root);
+                volatile unsigned char *dstp=(volatile unsigned char *)(uintptr_t)(JE_VM_ARENA_BASE+0x1180);
+                int ok=1; for (unsigned i=0;i<16;++i) if (dstp[i]!=(unsigned char)(0xA0u+i)) ok=0;
+                je_arch_cr3_load(kroot);
+                je_arch_irq_restore(flags);
+                if (!ok) fail("JeiOS fatal: s5b valid copy content wrong\r\n");
+            }
+            (void)je_arch_irq_save();
+            if (je_sched_drop_user(&vm_s3, C)!=JE_OK) fail("JeiOS fatal: s5b copyprobe drop\r\n");
+            if (je_vm_destroy(&vm_s3, C)!=JE_OK) fail("JeiOS fatal: s5b copyprobe destroy\r\n");
+            je_arch_console_write("M3a-s5b: copy_probe valid+zero OK, null/kernel/len>256 INVALID, bytes moved; B alive\r\n");
+        }
+#ifdef JE_DEV_COPY_INJECT
+        /* DEV-ONLY fixup-recovery proof: a user task invokes the inject op, which
+         * raw-copies an unmapped arena page from its syscall context; the fixup
+         * must RECOVER the not-present copy-site #PF (RDX=1) and the kernel must
+         * stay alive. Compile-guarded; absent from the default build. */
+        {
+            uint32_t I=vm_s3_build(PROG_INJECT);
+            uint64_t idisp0;
+            if (je_thread_create_user(&vm_s3, I)!=JE_OK) fail("JeiOS fatal: s5b inject thread\r\n");
+            idisp0=je_sched_dispatches_of(&vm_s3,I);
+            for (uint64_t sp=0; je_sched_dispatches_of(&vm_s3,I)-idisp0<JE_THREAD_MAX*2; ) {
+                (void)je_arch_irq_save();
+                if (++sp>100000000ull) fail("JeiOS fatal: s5b inject no progress\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            if (vm_s3_scratch(I,0x1020)!=1u) fail("JeiOS fatal: s5b fixup did not recover\r\n");
+            (void)je_arch_irq_save();
+            if (je_sched_drop_user(&vm_s3, I)!=JE_OK) fail("JeiOS fatal: s5b inject drop\r\n");
+            if (je_vm_destroy(&vm_s3, I)!=JE_OK) fail("JeiOS fatal: s5b inject destroy\r\n");
+            je_arch_console_write("M3a-s5b: exception-fixup recovered load+store copy-site #PF (dev inject); kernel alive\r\n");
+        }
+#endif
 
         /* Tear down B; all step-3/4/5a pages must be back to the pre-s4 baseline. */
         (void)je_arch_irq_save();
