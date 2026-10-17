@@ -39,6 +39,8 @@ Next is M3, split into independently reviewable subgates:
 - **M3a:** private user address spaces, ring-3 entry/return, user-copy fault
   containment and a bounded user program loader. Prove two actual CPL3 tasks
   cannot access each other's memory or kernel state. A task fault must be local.
+  The boundary contract is frozen in [ADR 0007](adr/0007-m3a-userspace-boundary.md)
+  (accepted 2026-10-17); issues #3–#6 implement and qualify against it.
 - **M3b:** typed handles with generation counters, rights attenuation, explicit
   object lifetime and checked syscall layouts. Test stale/forged handles and
   denied operations without side effects.
