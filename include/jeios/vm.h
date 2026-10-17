@@ -261,4 +261,11 @@ je_status je_vm_destroy(je_vm *vm, uint32_t index);
  * extent disjointness. */
 je_status je_vm_audit(const je_vm *vm, uint32_t index);
 
+/* M3a #4: the real arch backend (kernel/arch/x86_64/vm_backend.c) implementing
+ * the ops above against actual page tables. Returns a singleton ops vector bound
+ * to `pages` (the same allocator admission uses). CPL0 construction only in #4
+ * step 2; CR3 switching/ring-3 are later steps. Not part of the hosted #3
+ * contract — hosted tests use their own fake ops. */
+const je_vm_ops *je_arch_vm_ops(je_pages *pages, int nx_available);
+
 #endif

@@ -221,6 +221,39 @@ freestanding flags. Not implemented/claimed here: real CR3/TLB, CPL3 execution,
 U/S or NX hardware enforcement, GDT/TSS/syscalls — all issue #4 in QEMU. No
 independent human qualification; remote CI observed separately.
 
+## M3a #4 step 2 — real per-process page tables + CR3 (CPL0) — 2026-10-17
+
+`kernel/arch/x86_64/vm_backend.c` implements the real `je_vm_ops` seam against
+actual page tables, and `paging.c` gains the kernel-share / user-alias / CR3
+seam (`je_kernel_pd_phys`, `je_user_alias_set/get`, `je_arch_cr3_read/load`,
+`je_arch_kernel_root_phys`). The #3 builder now drives real hardware: each
+process gets a private PML4/PDPT/PD/PT (one TABLE extent) wired
+`PML4[0]→PDPT→PDPT[0]=shared kernel PD (U clear)→…` and `PDPT[1]→PD[0]→PT`
+mapping only the 2 MiB arena. Intermediate entries carry W|U (effective write
+permission is the AND of W across levels under CR0.WP); leaf bits decide the
+real per-page permission (CODE=RX, RODATA=R/NX, DATA=RW/NX). `out_root` is the
+PML4 physical, a valid CR3 (`_Static_assert` pins frames < 1 GiB).
+
+Owner-approved tested-code changes: `je_arch_page_guard` now refuses any leaf
+that is not the exact allocator-default RW pattern (masking CPU Accessed/Dirty),
+so the guard path can no longer silently un-demote a published RO_NX user alias
+(ADR D3); the same A/D mask applies to the user-alias CAS.
+
+Verified in QEMU (this env): `make check` PASS, `make smoke` PASS — mode 0 boots
+through `M3a-s2: process built; audit ok; root distinct` / `arena mapped under
+proc root; data RW; kernel root restored` / `process destroyed; page accounting
+restored`. `make integration` PASS — all 9 fault modes, including the two new
+step-2 probes: mode 8 (read arena under the kernel root) → `#PF err 0`
+`cr2=0x40000000` (arena genuinely unmapped in the kernel root); mode 9 (write
+the USER_CODE page under the process root) → `#PF err 3` `cr2=0x40000000`
+(RX leaf is read-only; CR0.WP enforces it even at CPL0).
+
+SCOPE / not claimed here: CPL0 construction and CPL0 CR3 load only. NO ring-3
+execution, NO `sched.c` CR3 switch, NO TSS.RSP0 — those are step 3 and proven in
+QEMU there. CPL0 cannot prove U/S ring-3 enforcement, user-mode NX fetch, or
+scheduler address-space switching; this step does not assert them. AI-assisted
+peer review only; not independent human qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

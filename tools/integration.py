@@ -5,7 +5,8 @@ import subprocess
 from pathlib import Path
 from emulator import boot
 
-for mode, vector, error in [(1, 6, 0), (2, 13, 0x38), (3, 8, 0), (4, 14, 3), (5, 14, 0), (6, 14, 17), (7, 8, 0)]:
+for mode, vector, error in [(1, 6, 0), (2, 13, 0x38), (3, 8, 0), (4, 14, 3), (5, 14, 0), (6, 14, 17), (7, 8, 0),
+                            (8, 14, 0), (9, 14, 3)]:
     result = subprocess.run(["make", "iso", f"TEST_MODE={mode}"], stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     assert result.returncode == 0, result.stdout
@@ -18,6 +19,13 @@ for mode, vector, error in [(1, 6, 0), (2, 13, 0x38), (3, 8, 0), (4, 14, 3), (5,
         address = next(int(line.split()[0], 16) for line in symbols.splitlines()
                        if len(line.split()) == 3 and line.split()[2] == symbol_name)
         expected.append(f"cr2=0x{address:016x}".encode())
+    if mode in (8, 9):
+        # M3a #4 step 2 fault probes fire after the real-page-table build; the
+        # faulting address is the arena base in both cases (mode 8: not-present
+        # read under the kernel root; mode 9: write to the RX user CODE leaf
+        # under the process root, CR0.WP making it fault at CPL0).
+        expected.insert(1, b"M3a-s2: process built; audit ok; root distinct")
+        expected.append(f"cr2=0x{0x40000000:016x}".encode())
     output = boot(Path(f"build/{mode}/jeios.iso"), terminal=b"JeiOS fatal: exception; halted",
                   expected=expected)
     print(f"fault mode {mode}: PASS\n{output}")

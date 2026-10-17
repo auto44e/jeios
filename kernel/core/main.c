@@ -7,6 +7,7 @@
 #include <jeios/trap.h>
 #include <jeios/boot.h>
 #include <jeios/paging.h>
+#include <jeios/vm.h>
 static je_boot_context boot;
 static _Noreturn void fail(const char *message)
 {
@@ -35,6 +36,46 @@ static void worker(void *argument)
         if (p[i]!=(unsigned char)(i^id)) fail("JeiOS fatal: heap corruption\r\n");
     if (je_kfree(p)!=JE_OK) fail("JeiOS fatal: worker free\r\n");
     atomic_fetch_add_explicit(&completed,1,memory_order_release);
+}
+
+/* ---- M3a #4 step 2: CPL0 real-page-table / real-CR3 boot check ------------ */
+static je_vm vm_s2;
+static unsigned char vm_blob_s2[128];
+static je_vm_image vm_image_s2(void)
+{
+    je_vm_image image = {0};
+    image.version = JE_VM_IMAGE_VERSION;
+    image.segment_count = 3u;
+    image.entry_offset = 0u;
+    image.segments[0] = (je_vm_segment){ 0u, 16u, 0u,               JE_PAGE_SIZE, JE_VM_R|JE_VM_X, 0u };
+    image.segments[1] = (je_vm_segment){ 32u, 12u, 2u*JE_PAGE_SIZE, JE_PAGE_SIZE, JE_VM_R,         0u };
+    image.segments[2] = (je_vm_segment){ 64u, 8u,  4u*JE_PAGE_SIZE, JE_PAGE_SIZE, JE_VM_R|JE_VM_W,  0u };
+    return image;
+}
+static void vm_blob_init_s2(void)
+{
+    for (size_t i=0;i<sizeof(vm_blob_s2);++i) vm_blob_s2[i]=0;
+    for (size_t i=0;i<16u;++i) vm_blob_s2[i]=(unsigned char)(0x10u+i);  /* CODE page byte 0 = 0x10 */
+    for (size_t i=0;i<12u;++i) vm_blob_s2[32u+i]=(unsigned char)(0x80u+i);
+    for (size_t i=0;i<8u;++i)  vm_blob_s2[64u+i]=(unsigned char)(0xe0u+i);
+}
+/* Build one process with the real backend and audit it. Returns its root phys
+ * (CR3 value) via *out_root and the arena-absolute address of a USER_DATA page.
+ * Fails hard (never returns) on any build/audit error. */
+static uint32_t vm_s2_build(uint64_t *out_root)
+{
+    int nx = je_arch_has_nx();
+    const je_vm_ops *ops = je_arch_vm_ops(&je_kernel_pages, nx);
+    if (je_vm_init(&vm_s2, ops, &je_kernel_pages, 0)!=JE_OK) fail("JeiOS fatal: s2 vm_init\r\n");
+    je_vm_image img = vm_image_s2();
+    vm_blob_init_s2();
+    if (je_vm_image_validate(&img, sizeof vm_blob_s2)!=JE_OK) fail("JeiOS fatal: s2 image\r\n");
+    uint32_t idx;
+    if (je_vm_build(&vm_s2, &img, vm_blob_s2, sizeof vm_blob_s2, nx, &idx)!=JE_OK)
+        fail("JeiOS fatal: s2 build\r\n");
+    if (je_vm_audit(&vm_s2, idx)!=JE_OK) fail("JeiOS fatal: s2 audit\r\n");
+    *out_root = vm_s2.procs[idx].root;
+    return idx;
 }
 _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
 {
@@ -100,6 +141,48 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
     if (je_sched_reap()!=JE_OK || je_kernel_pages.free_count!=free_before)
         fail("JeiOS fatal: stack or heap resource leak\r\n");
     je_arch_console_write("M2: exited threads reaped; page accounting restored\r\n");
+
+    /* M3a #4 step 2: real per-process page tables + real CR3, exercised at CPL0
+     * only (no ring-3, no sched CR3 switch). The happy path runs every boot so
+     * `make smoke` covers it; modes 8/9 provoke the single-shot fault probes. */
+    {
+        size_t vm_free_before=je_kernel_pages.free_count;
+        uint64_t proc_root=0;
+        uint32_t vm_idx=vm_s2_build(&proc_root);
+        uint64_t kroot=je_arch_kernel_root_phys();
+        if (je_arch_cr3_read()!=kroot) fail("JeiOS fatal: s2 kernel root mismatch\r\n");
+        if (proc_root==kroot || proc_root==0) fail("JeiOS fatal: s2 root not distinct\r\n");
+        je_arch_console_write("M3a-s2: process built; audit ok; root distinct\r\n");
+#if JE_TEST_MODE == 8
+        /* Under the KERNEL root, the arena is unmapped -> #PF not-present (err 0). */
+        volatile unsigned char *p=(volatile unsigned char *)(uintptr_t)JE_VM_ARENA_BASE;
+        unsigned char sink=*p; (void)sink;
+        fail("JeiOS fatal: s2 arena readable under kernel root\r\n");
+#endif
+        je_arch_cr3_load(proc_root);
+        if (je_arch_cr3_read()!=proc_root) fail("JeiOS fatal: s2 cr3 load\r\n");
+        /* Entry byte of the CODE page is the first blob byte (0x10). */
+        volatile unsigned char *entry=(volatile unsigned char *)(uintptr_t)JE_VM_ARENA_BASE;
+        if (*entry!=0x10u) { je_arch_cr3_load(kroot); fail("JeiOS fatal: s2 arena content\r\n"); }
+        /* USER_DATA page at arena offset 4*PAGE is writable at CPL0 (W=1). */
+        volatile unsigned char *data=(volatile unsigned char *)(uintptr_t)(JE_VM_ARENA_BASE+4u*JE_PAGE_SIZE);
+        *data=0x5au; if (*data!=0x5au) { je_arch_cr3_load(kroot); fail("JeiOS fatal: s2 data rw\r\n"); }
+#if JE_TEST_MODE == 9
+        /* CODE page leaf is RX (W=0); a CPL0 write faults #PF present|write (err 3)
+         * because CR0.WP makes the supervisor honour the read-only user leaf. */
+        volatile unsigned char *code=(volatile unsigned char *)(uintptr_t)JE_VM_ARENA_BASE;
+        *code=0xffu;
+        je_arch_cr3_load(kroot);
+        fail("JeiOS fatal: s2 code page writable\r\n");
+#endif
+        je_arch_cr3_load(kroot);
+        if (je_arch_cr3_read()!=kroot) fail("JeiOS fatal: s2 cr3 restore\r\n");
+        je_arch_console_write("M3a-s2: arena mapped under proc root; data RW; kernel root restored\r\n");
+        if (je_vm_destroy(&vm_s2, vm_idx)!=JE_OK) fail("JeiOS fatal: s2 destroy\r\n");
+        if (je_kernel_pages.free_count!=vm_free_before) fail("JeiOS fatal: s2 page leak\r\n");
+        je_arch_console_write("M3a-s2: process destroyed; page accounting restored\r\n");
+    }
+
     je_arch_console_write("JeiOS: initialization complete; halted\r\n");
     je_arch_halt();
 }
