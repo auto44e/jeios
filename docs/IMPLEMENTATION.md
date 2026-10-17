@@ -289,6 +289,39 @@ inter-process isolation, fault-local offender death (a user fault still PANICs
 until step 4), the `int 0x80` gate, syscalls, kernel-unreachable-from-ring3 as a
 positive claim, SMEP/SMAP, SMP, remote CI, independent human qualification.
 
+## M3a #4 step 4 — fault-local death + D6 int 0x80 gate + H1 fix — 2026-10-17
+
+#4's core acceptance. A synchronous USER fault, a user `int 0x80`, or
+bad-return-state terminates ONLY the offending process; kernel + peers survive.
+`je_trap_dispatch` routes user-origin faults in an explicit terminate-list (and
+user int 0x80) to `je_sched_fault_terminate`, which marks the current user thread
+DYING and returns a live successor's frame (NMI/#DF/#MC/reserved + kernel-origin
+faults stay fatal). The dying task's kstack/CR3 are freed later by the bootstrap
+reaper `je_sched_reap_dead` (asserts IF=0; not-current / not-active-CR3 /
+not-active-RSP0 guards), never inside the handler (the iretq epilogue still runs
+on that RSP0 kstack). **Security fix (H1):** `je_sched_interrupt` previously
+halted the whole kernel (`abort_scheduler`) when a next user thread's saved frame
+failed validation — a userspace DoS; now that thread is terminated and another
+candidate chosen. The D6 gate is `idt[0x80]=0xee` (DPL3, IST=0, interrupt gate),
+the only user-reachable gate; no syscall handler yet, so user int 0x80 is an
+unsupported op routed to death. `vm.c` is untouched: DYING/REAPABLE are modeled
+in the scheduler slot; the vm record stays READY until `je_vm_destroy`.
+
+Verified in QEMU (this env): `make check` PASS, `make smoke` PASS — the boot runs
+the two-task proof (A dies by user #PF vector 14 / cs=0x33 / CR2=unmapped arena
+page; B proven to advance AFTER A's death; A reaped from bootstrap while B lives;
+user int 0x80 and bad-RSP(H1) death causes each exercised fault-locally with B
+alive; B torn down, page count back to the pre-step-4 baseline). `make
+integration` PASS — 10 modes; mode 10 flipped: user #UD now terminates the task
+(fault-local), kernel halts normally. All three CI smoke profiles pass locally;
+M2 markers unchanged.
+
+Invariants recorded: single-CPU, PCID off, IF=0 in the fault handler — SMP would
+need a per-CPU off-stack handshake before freeing a dying kstack. NOT claimed:
+two-task isolation qualification, syscalls/ABI, copy-in/out, a process exit path,
+general/complete reclamation across all paths, SMP. AI-assisted review only; not
+independent human qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

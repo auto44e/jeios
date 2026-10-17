@@ -23,6 +23,17 @@ je_status je_sched_drop_user(je_vm *vm, uint32_t index);
 je_status je_thread_sleep(uint64_t ticks);
 _Noreturn void je_thread_exit(void);
 je_trap_frame *je_sched_interrupt(je_trap_frame *frame,bool timer);
+/* M3a #4 step 4: terminate ONLY the current user process on a synchronous user
+ * fault (or user int 0x80); returns a live successor's frame to iretq to. Called
+ * from je_trap_dispatch with interrupts disabled. Never requeues the dead task. */
+je_trap_frame *je_sched_fault_terminate(je_trap_frame *frame, uint64_t cr2);
+/* M3a #4 step 4: reap DYING user processes from bootstrap (slot 0, irq off)
+ * while peers run. Returns count reaped, or a negative je_status on violation. */
+int je_sched_reap_dead(void);
+bool je_sched_has_dying(void);
+je_status je_sched_death_record(je_vm *vm, uint32_t index, uint64_t *vec, uint64_t *err,
+                                uint64_t *rip, uint64_t *cs, uint64_t *cr2);
+uint64_t je_sched_dispatches_of(je_vm *vm, uint32_t index);
 bool je_sched_finished(void);
 je_status je_sched_reap(void);
 uint64_t je_sched_ticks(void);

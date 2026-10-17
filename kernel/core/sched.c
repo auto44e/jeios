@@ -6,7 +6,7 @@
 #include <jeios/uframe.h>
 #include <jeios/vm.h>
 #define STACK_PAGES 5u
-typedef enum { EMPTY, RUNNING, READY, SLEEPING, ZOMBIE } state;
+typedef enum { EMPTY, RUNNING, READY, SLEEPING, ZOMBIE, DYING } state;
 typedef enum { THREAD_KERNEL = 0, THREAD_USER = 1 } thread_kind;
 typedef struct {
     state state;
@@ -22,6 +22,9 @@ typedef struct {
     uint64_t root, rsp0_top;
     je_vm *vm;
     uint32_t vm_index;
+    /* M3a #4 step 4: death record for a DYING user thread (set by
+     * je_sched_fault_terminate, read by the bootstrap reaper and the proof). */
+    uint64_t death_vector, death_error, death_rip, death_cs, death_cr2;
 } thread;
 static thread threads[JE_THREAD_MAX];
 static unsigned current;
@@ -65,7 +68,7 @@ je_status je_thread_create(void (*entry)(void *),void *arg)
     *(uintptr_t *)rsp=(uintptr_t)je_thread_exit;
     je_trap_frame *f=(void *)(rsp-sizeof(*f));
     *f=(je_trap_frame){.rip=(uintptr_t)trampoline,.cs=8,.rflags=0x202,.rsp=rsp,.ss=16};
-    threads[slot]=(thread){READY,f,entry,arg,base,0,0,THREAD_KERNEL,0,0,0,0};
+    threads[slot]=(thread){READY,f,entry,arg,base,0,0,THREAD_KERNEL,0,0,0,0,0,0,0,0,0};
     return JE_OK;
 }
 
@@ -100,9 +103,58 @@ je_status je_thread_create_user(je_vm *vm, uint32_t index)
     f->rip = JE_VM_ARENA_BASE + p->entry;
     f->rsp = JE_VM_ARENA_BASE + JE_VM_ARENA_SIZE;
     f->rflags = 0x202u; /* IF=1, bit1; validator re-sanitizes on every dispatch */
-    threads[slot]=(thread){READY,f,0,0,0,0,0,THREAD_USER,p->root,rsp0_top,vm,index};
+    threads[slot]=(thread){READY,f,0,0,0,0,0,THREAD_USER,p->root,rsp0_top,vm,index,0,0,0,0,0};
     return JE_OK;
 }
+/* M3a #4 step 4: mark a user thread DYING with a death record (never requeued;
+ * reclaimed later by je_sched_reap_dead from bootstrap). Kernel threads never
+ * take this path. */
+static void mark_dying(unsigned slot, uint64_t vec, uint64_t err, uint64_t rip,
+                       uint64_t cs, uint64_t cr2)
+{
+    threads[slot].state=DYING;
+    threads[slot].frame=0;
+    threads[slot].death_vector=vec; threads[slot].death_error=err;
+    threads[slot].death_rip=rip; threads[slot].death_cs=cs; threads[slot].death_cr2=cr2;
+}
+
+/* Install the chosen next thread's address space and return its frame. For a
+ * user next thread, validate+sanitize its saved frame first; if that FAILS the
+ * thread is terminated (DYING) and we retry with another candidate — a user
+ * task must never be able to halt the kernel via a bad saved frame (fault
+ * locality; fixes the pre-step-4 abort-on-bad-return-state hole). Bootstrap
+ * (slot 0) is always READY, so a live candidate always exists. Returns the
+ * frame to iretq to; never requeues a DYING/ZOMBIE thread. */
+static je_trap_frame *select_and_install_next(void)
+{
+    for (unsigned attempt=0; attempt<JE_THREAD_MAX; ++attempt) {
+        unsigned next=current;
+        for (unsigned n=1;n<=JE_THREAD_MAX;++n) {
+            unsigned candidate=(current+n)%JE_THREAD_MAX;
+            if (threads[candidate].state==READY) { next=candidate;break; }
+        }
+        if (threads[next].state!=READY || !threads[next].frame) abort_scheduler();
+        if (threads[next].kind==THREAD_USER) {
+            uint64_t sane;
+            if (!je_uframe_check(threads[next].frame, JE_VM_ARENA_BASE, JE_VM_ARENA_SIZE, &sane)) {
+                /* Bad saved return state -> terminate THIS task, not the kernel. */
+                mark_dying(next, UINT64_C(0xbad), 0, threads[next].frame->rip,
+                           threads[next].frame->cs, 0);
+                continue; /* pick another candidate */
+            }
+            threads[next].frame->rflags = sane;
+            je_arch_tss_set_rsp0(threads[next].rsp0_top);
+            je_arch_cr3_load(threads[next].root);
+        } else {
+            je_arch_tss_set_rsp0(0); /* poison: CPL0->CPL0 never consults RSP0 */
+            je_arch_cr3_load(je_arch_kernel_root_phys());
+        }
+        current=next;threads[current].state=RUNNING;++threads[current].dispatches;
+        return threads[current].frame;
+    }
+    abort_scheduler(); /* unreachable: bootstrap is always a valid kernel candidate */
+}
+
 je_trap_frame *je_sched_interrupt(je_trap_frame *f,bool timer)
 {
     if (!ready || threads[current].state==EMPTY) abort_scheduler();
@@ -125,31 +177,27 @@ je_trap_frame *je_sched_interrupt(je_trap_frame *f,bool timer)
     for (unsigned i=1;i<JE_THREAD_MAX;++i)
         if (threads[i].state==SLEEPING && threads[i].wake<=je_timer_ticks) threads[i].state=READY;
     if (threads[current].state==RUNNING) threads[current].state=READY;
-    unsigned next=current;
-    for (unsigned n=1;n<=JE_THREAD_MAX;++n) {
-        unsigned candidate=(current+n)%JE_THREAD_MAX;
-        if (threads[candidate].state==READY) { next=candidate;break; }
-    }
-    if (threads[next].state!=READY || !threads[next].frame) abort_scheduler();
-    /* For a user NEXT thread: validate + sanitize its saved frame before we
-     * commit any state, then set TSS.RSP0 and load its CR3. For a kernel NEXT
-     * thread: restore the kernel root and poison RSP0 (fail-closed). CR3/RSP0
-     * are installed while still executing on the shared kernel subtree, so the
-     * subsequent GPR pops + iretq remain mapped (step 2 topology). */
-    if (threads[next].kind==THREAD_USER) {
-        uint64_t sane;
-        if (!je_uframe_check(threads[next].frame, JE_VM_ARENA_BASE, JE_VM_ARENA_SIZE, &sane))
-            abort_scheduler();
-        threads[next].frame->rflags = sane;
-        je_arch_tss_set_rsp0(threads[next].rsp0_top);
-        je_arch_cr3_load(threads[next].root);
-    } else {
-        je_arch_tss_set_rsp0(0); /* poison: CPL0->CPL0 never consults RSP0 */
-        je_arch_cr3_load(je_arch_kernel_root_phys());
-    }
-    if (timer && next!=current) ++preemptions;
-    current=next;threads[current].state=RUNNING;++threads[current].dispatches;
-    return threads[current].frame;
+    unsigned before=current;
+    je_trap_frame *nf=select_and_install_next();
+    if (timer && current!=before) ++preemptions;
+    return nf;
+}
+
+/* M3a #4 step 4: a SYNCHRONOUS user fault (or user int 0x80) terminates ONLY the
+ * current user process; the kernel and peers keep running. Called from
+ * je_trap_dispatch with interrupts disabled, on the dying task's own per-process
+ * RSP0 kstack — so we must NOT free that kstack here (the C frame + the iretq
+ * epilogue still run on it). We mark the task DYING and return a LIVE successor's
+ * frame; the bootstrap reaper reclaims the dead process later. Never requeues
+ * the dying task. */
+je_trap_frame *je_sched_fault_terminate(je_trap_frame *f, uint64_t cr2)
+{
+    if (!ready || threads[current].kind!=THREAD_USER) abort_scheduler(); /* only user tasks die here */
+    /* Confirm the frame really is the current user task's (defense in depth). */
+    if (f->cs != JE_UFRAME_USER_CS || f->ss != JE_UFRAME_USER_SS ||
+        (uintptr_t)f != (uintptr_t)(threads[current].rsp0_top - sizeof(*f))) abort_scheduler();
+    mark_dying(current, f->vector, f->error, f->rip, f->cs, cr2);
+    return select_and_install_next();
 }
 je_status je_thread_sleep(uint64_t duration)
 {
@@ -215,6 +263,70 @@ je_status je_sched_drop_user(je_vm *vm, uint32_t index)
             return JE_OK;
         }
     return JE_ERR_INVALID;
+}
+
+/* M3a #4 step 4: reclaim DYING user processes while peers keep running. Runs in
+ * bootstrap (slot 0) with interrupts disabled (caller's responsibility). For
+ * each DYING user slot: assert it is not current, not the active CR3, and not
+ * the active TSS.RSP0 (the task has been iretq'd away from), then restore its
+ * kstack guard and destroy its vm process (freeing the held run + tables). The
+ * vm record stays READY until destroy (D5's DYING/REAPABLE are modeled in the
+ * scheduler slot, not vm.c). Returns the number reaped, or a negative je_status
+ * on an invariant violation. Single-CPU/PCID-off invariant: after one iretq away
+ * from the dead task, nothing else runs on its kstack. */
+int je_sched_reap_dead(void)
+{
+    if (!ready || current!=0) return (int)JE_ERR_BUSY;
+    /* Must run with interrupts disabled: the three liveness guards below and the
+     * destroy must be atomic vs a timer dispatch. Enforce it here rather than
+     * trusting the caller (defense in depth). */
+    uint64_t rflags; __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
+    if (rflags & (UINT64_C(1)<<9)) abort_scheduler(); /* IF set -> misuse */
+    uint64_t active_cr3=je_arch_cr3_read(), active_rsp0=je_arch_tss_get_rsp0();
+    int reaped=0;
+    for (unsigned i=1;i<JE_THREAD_MAX;++i) if (threads[i].state==DYING) {
+        if (i==current) return (int)JE_ERR_BUSY;
+        if (threads[i].root==active_cr3) return (int)JE_ERR_BUSY;    /* still the live address space */
+        if (threads[i].rsp0_top==active_rsp0) return (int)JE_ERR_BUSY; /* still the live kernel stack */
+        je_vm *vm=threads[i].vm; uint32_t idx=threads[i].vm_index;
+        je_status s=je_sched_drop_user(vm, idx); /* restores the kstack guard, clears the slot */
+        if (s!=JE_OK) return (int)s;
+        s=je_vm_destroy(vm, idx);                /* frees the held kstack run + page tables */
+        if (s!=JE_OK) return (int)s;
+        ++reaped;
+    }
+    return reaped;
+}
+
+/* M3a #4 step 4 proof accessors: whether a DYING user slot exists and its death
+ * record, plus a single-slot dispatch counter so the proof can show a peer
+ * progressed AFTER a specific death. Slot identity is by vm process. */
+bool je_sched_has_dying(void)
+{
+    for (unsigned i=1;i<JE_THREAD_MAX;++i) if (threads[i].state==DYING) return true;
+    return false;
+}
+je_status je_sched_death_record(je_vm *vm, uint32_t index, uint64_t *vec, uint64_t *err,
+                                uint64_t *rip, uint64_t *cs, uint64_t *cr2)
+{
+    for (unsigned i=1;i<JE_THREAD_MAX;++i)
+        if (threads[i].kind==THREAD_USER && threads[i].vm==vm && threads[i].vm_index==index &&
+            threads[i].state==DYING) {
+            if (vec) *vec=threads[i].death_vector;
+            if (err) *err=threads[i].death_error;
+            if (rip) *rip=threads[i].death_rip;
+            if (cs)  *cs=threads[i].death_cs;
+            if (cr2) *cr2=threads[i].death_cr2;
+            return JE_OK;
+        }
+    return JE_ERR_INVALID;
+}
+uint64_t je_sched_dispatches_of(je_vm *vm, uint32_t index)
+{
+    for (unsigned i=1;i<JE_THREAD_MAX;++i)
+        if (threads[i].kind==THREAD_USER && threads[i].vm==vm && threads[i].vm_index==index)
+            return threads[i].dispatches;
+    return 0;
 }
 uint64_t je_sched_min_dispatches(void)
 {

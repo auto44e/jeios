@@ -1,5 +1,64 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M3a #4 step 4: fault-local process death + D6 int 0x80 gate + H1 fix — observed 2026-10-17T15:30:00+00:00
+
+Branch `feat/m3a-4-step4-fault-local`. #4's core acceptance: a synchronous USER
+fault — or a user `int 0x80`, or bad-return-state — terminates ONLY the
+offending process; the kernel and peers keep running.
+
+- `je_trap_dispatch` routes a user-origin ((cs&3)==3) synchronous fault in the
+  explicit terminate-list {0,1,3,4,5,6,7,10,11,12,13,14,16,17,19} OR a user
+  `int 0x80` to `je_sched_fault_terminate`. NMI(2)/#DF(8)/#MC(18)/reserved and
+  any kernel-origin fault stay fatal PANIC (unchanged).
+- `je_sched_fault_terminate` marks the current user thread DYING (death record),
+  returns a LIVE successor's frame. It does NOT free the dying task's kstack/CR3
+  (kernel C still runs on that RSP0 kstack); the bootstrap reaper frees it later.
+  Triple-checks cs/ss + kind==USER + frame==rsp0_top-sizeof before acting.
+- **H1 security fix:** `je_sched_interrupt` previously called `abort_scheduler()`
+  (whole-kernel halt) when a *next* user thread's saved frame failed
+  `je_uframe_check` — a userspace DoS (ring-3 sets a bad RSP, never faults,
+  kernel dies at its next dispatch). The shared `select_and_install_next` now
+  terminates that thread and retries another candidate; bootstrap is always a
+  live fallback. A user task can no longer halt the kernel via a bad saved frame.
+- D6 gate: `idt[0x80].attributes=0xee` (present, DPL3, IST=0, 64-bit interrupt
+  gate — IF cleared on entry). Only vector 0x80 is user-reachable; kernel 0x80
+  PANICs; every other gate stays DPL0 (user int of any other vector -> #GP ->
+  terminate). No syscall handler yet — a user int 0x80 is an unsupported op
+  routed to death (ADR amendment option 3 satisfied).
+- Reaper `je_sched_reap_dead` (bootstrap, slot 0, asserts IF=0): for each DYING
+  user slot, assert not-current / not-active-CR3 / not-active-RSP0, then
+  `je_sched_drop_user` (restore kstack guard) + `je_vm_destroy`. New DYING slot
+  state; `vm.c` UNTOUCHED (the vm record stays READY until destroy; D5's
+  DYING/REAPABLE are modeled in the scheduler slot). Invariant recorded:
+  single-CPU, PCID off, IF=0 in the fault handler — SMP would need a per-CPU
+  off-stack handshake.
+
+Tested in QEMU (this env): `make check` PASS, `make smoke` PASS — the normal boot
+runs the two-task acceptance: A (reads an unmapped arena page) dies by user #PF
+(vector 14, cs=0x33, CR2=the unmapped page); B (heartbeat loop) is proven to
+advance AFTER A's death (heartbeat + dispatch + preemption all strictly increased
+from the post-death snapshot); A is reaped from bootstrap while B stays live; then
+the user `int 0x80` and bad-RSP(H1) death causes are each exercised and
+terminated fault-locally with B still running; B torn down with page accounting
+back to the pre-step-4 baseline. `make integration` PASS — 10 modes; mode 10
+FLIPPED from step 3: user `xorps` #UD now terminates the task (fault-local) and
+the kernel reaches the normal halt (asserts no "JeiOS fatal:"). All three CI
+smoke profiles pass locally; M2's 4 markers unchanged (owner sign-off condition).
+
+Peer: pre-write design vote (both agents) found the H1 kernel-DoS in merged main
+and the "first entry rides a real trap" rule; Codex cross-review then confirmed no
+UAF/escape and flagged hardening (reaper now self-asserts IF=0; ss checked in
+terminate) + test gaps (int 0x80 and H1 death now runtime-tested, not just
+claimed) + wording, all addressed.
+
+Honest claims: synchronous user faults, bad-return-state, and user int 0x80 kill
+only the offender; a peer is shown to progress after the death; the faulted
+process is reclaimed (per-cause reaps + aggregate page-count equality); the D6
+gate is present and leads to death. NOT claimed: two-task isolation qualification,
+syscalls/ABI, copy-in/out, a process exit path, general/complete reclamation
+across all paths, SMP. #4 acceptance is met; #5 is the integrated qualification +
+syscalls. AI-assisted review only; not independent human qualification.
+
 ## M3a #4 step 3: CPL3 entry/return — real ring-3 execution — observed 2026-10-17T12:20:00+00:00
 
 Branch `feat/m3a-4-step3-cpl3-entry`. The scheduler now IRETQs into ring 3.
