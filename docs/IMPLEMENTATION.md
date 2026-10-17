@@ -409,6 +409,43 @@ invariants (uncorrupted kernel state), not against arbitrary prior corruption.
 This closes the ADR 0007 M3a userspace boundary. AI-assisted review only; not
 independent human qualification.
 
+## M3b first PR — pure typed handle table — 2026-10-17
+
+First implementation step of M3b (ADR 0008, Option A): a pure, process-local,
+bounded, typed handle table. `kernel/core/handle.c` + `include/jeios/handle.h`,
+standalone — **no syscalls, no object destruction, no kernel wiring, no M3a path
+touched** (the module compiles into the kernel under the strict flags but is not
+yet called). Exercised entirely by the hosted `test_handle`.
+
+Handle = `uint32` (production 16 index / 16 generation); value 0 is the invalid
+null; slot generations start at 1 so slot 0's first handle is nonzero; the width
+is a compile-time parameter with the production 16/16 split pinned by
+`_Static_assert` (plus asserts that each field is in [1,31] and the pair sums to
+32). Slots run a `FREE/LIVE/RETIRED` state machine; `lookup` checks state before
+generation; `close` bumps the generation or, at `GEN_MAX`, **retires** the slot
+(never wraps — retired capacity is permanently lost); `alloc` takes the lowest
+FREE index (deterministic internal policy), requires a non-NULL `out`, and reports
+`QUOTA` (live at quota) in precedence over `NOSLOTS` (no FREE slot). The security
+claim is stale-name protection, NOT an unforgeable capability; no SMP claim; sound
+under the UP/IF=0 precondition.
+
+Verified in this env (ASan+UBSan hosted): `make check` PASS including
+`test_handle` at the **production 16/16** width (encode/decode, alloc/lookup/close,
+forged/stale/wrong-type/denied, QUOTA precedence, `table_init` rejections, the
+non-NULL-`out` rule) **and** `test_handle_rw` at a **reduced width** (`gen_bits=2`)
+that exhaustively drives generation **saturation → RETIRED**, retired-capacity
+loss, and `NOSLOTS`-via-retirement. The full M3a suite is unchanged — 11
+integration modes, M2's 4 markers, the ELF/ABI/dev-inject assertions — and all 3
+CI smoke profiles pass, as expected since the module is not yet wired in.
+
+Peer cross-review (two independent reads) found no correctness defect in the
+production build and drove two hardening fixes applied here: the degenerate-width
+`_Static_assert` (a 0-width field would be `1u<<32` UB) and rejecting a NULL
+`alloc` out (which would otherwise consume a LIVE slot whose handle is lost), plus
+the `table_init` rejection-path tests. Deferred per ADR 0008 to later PRs: typed
+rights checking on use, attenuation + references, and the owner-gated process-death
+teardown wiring. AI-assisted review only; not independent human qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

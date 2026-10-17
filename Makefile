@@ -16,7 +16,7 @@ CPPFLAGS += -DJE_DEV_COPY_INJECT
 endif
 CFLAGS := -std=c11 -O2 -g $(WARN) -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -m64 -march=x86-64 -mno-red-zone -mgeneral-regs-only
 CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c kernel/core/boot.c kernel/core/alloc.c
-SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
+SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/handle.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
 OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o $(BUILD)/kernel/arch/x86_64/trap_entry.o $(BUILD)/kernel/arch/x86_64/register_probe.o $(BUILD)/kernel/arch/x86_64/user_demo.o $(BUILD)/kernel/arch/x86_64/usercopy.o
 .PHONY: all check test iso smoke clean
 all: $(BUILD)/jeios.elf
@@ -31,13 +31,15 @@ $(BUILD)/%.o: %.S
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
 	./$(BUILD)/test_vm
 	./$(BUILD)/test_uframe
 	./$(BUILD)/test_syscall
+	./$(BUILD)/test_handle
+	./$(BUILD)/test_handle_rw
 check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
 	@echo "ABI isolation: abi.h must not include the internal status.h"
@@ -77,4 +79,15 @@ $(BUILD)/test_uframe: tests/test_uframe.c kernel/core/uframe.c $(wildcard includ
 $(BUILD)/test_syscall: tests/test_syscall.c kernel/core/syscall.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -DJE_SYSCALL_HOSTED_TEST -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_syscall.c kernel/core/syscall.c -o $@
+
+# M3b handle table: production 16/16 width (boundary + semantics coverage).
+$(BUILD)/test_handle: tests/test_handle.c kernel/core/handle.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_handle.c kernel/core/handle.c -o $@
+
+# Same test at a reduced generation width (gen_bits=2 -> GEN_MAX=3) so
+# saturation/retirement/capacity-loss are exhaustively exercised (ADR 0008 D5).
+$(BUILD)/test_handle_rw: tests/test_handle.c kernel/core/handle.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -DJE_HANDLE_TEST_WIDTH -DJE_HANDLE_INDEX_BITS=30u -DJE_HANDLE_GEN_BITS=2u -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_handle.c kernel/core/handle.c -o $@
 
