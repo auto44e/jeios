@@ -62,47 +62,54 @@ RX, constants R/NX, data/BSS/stack RW/NX; W+X is never mapped.
 
 Every new user page **and every page-table page (PML4, PDPT, user PD, user PT)**
 is zeroed before it is installed or linked in. Publication order (corrected
-2026-10-17; supersedes the earlier "publish RX then
-demote alias" wording): for each frame — allocate → zero → copy image bytes
-through a supervisor-writable alias. For an **executable** (`USER_CODE`) frame
-only: unmap and flush any temporary loader alias, then **demote the frame's
-identity alias to RO/NX via `je_user_alias_set`** → flush →
-**then install the user RX leaf
-PTE**, so a user-X mapping and a writable alias never coexist. (After this, the
-identity alias is the only remaining alias of an executable frame.) For a
-`USER_DATA` (including stack) frame: flush → install the RW/NX user leaf PTE (its
-identity alias stays writable; the frame is never user-executable, so no W+X
-arises). Teardown is the exact reverse: clear the user PTE → flush → for an
-executable frame only, restore its identity alias to RW via `je_user_alias_set` →
-free. An executable frame must have its alias back to RW before
+2026-10-17; supersedes the earlier "publish RX then demote alias" wording; a
+"non-writable user frame" below means `USER_CODE` (RX) or `USER_RODATA` (R/NX),
+the two kinds that carry no writable user mapping): for each frame — allocate →
+zero → copy image bytes through a supervisor-writable alias. For a **non-writable
+user frame** (`USER_CODE` or `USER_RODATA`): unmap and flush any temporary loader
+alias, then **demote the frame's identity alias to RO/NX via `je_user_alias_set`**
+→ flush → **then install the user leaf PTE** (RX for `USER_CODE`, R/NX for
+`USER_RODATA`), so a user-visible mapping and a writable alias never coexist.
+(After this, no *writable* alias of the frame remains — its identity alias is
+RO/NX and the user leaf is RX or R/NX.)
+For a `USER_DATA` (including stack) frame: flush → install the RW/NX user leaf PTE
+(its identity alias stays writable; the frame is never user-executable, so no W+X
+arises). Teardown is the exact reverse: clear the user PTE → flush → for a
+non-writable user frame only, restore its identity alias to RW via
+`je_user_alias_set` → free. Such a frame must have its alias back to RW before
 `je_pages_free`, because the allocator/heap zeroes through the identity alias; if
 the alias restore fails, panic rather than free (freeing a RO frame would fault a
 later zeroing in CPL0).
 
 Alias protection uses two disjoint per-frame paths. The **user path** operates
-only on `USER_CODE` frames in the caller process's owned extents and moves them
-`RW ↔ RO_NX` through a single named operation, `je_user_alias_set`, which does a
-compare-and-set against the exact expected old PTE value and never falls back to
-`je_arch_page_restore`; it refuses `USER_DATA`, `TABLE`, frames outside the
-caller's extents and the kernel image. The **kernel-stack path** is the
-pre-existing `RW ↔ GUARD` guard-page handling for kernel stacks (not an owned
-extent, not a user frame) and uses `je_arch_page_restore`, which unconditionally
-rewrites `present|write|nx`; it is never used on a user-frame alias. An explicit
-per-process owned-extents list (independent of virtual address), with a frame
-*kind* (`USER_CODE`, `USER_DATA`, `TABLE`) and owner, is the only source
-permitted to populate user PTEs. Stack frames are classified as `USER_DATA`
-(there is no separate `STACK` kind). The PTE-install
-operation takes an owned-frame reference `(extent, page index)`, never a raw
-physical address, and **rejects `kind == TABLE`**; `USER_CODE` installs only as
-RX, `USER_DATA` only as RW/NX. MMIO, reserved pages, page-table frames and
-another owner's frames therefore cannot be expressed as a user mapping. No user
-operation accepts a physical address.
+only on `USER_CODE` and `USER_RODATA` frames in the caller process's owned
+extents and moves them `RW ↔ RO_NX` through a single named operation,
+`je_user_alias_set`, which does a compare-and-set against the exact expected old
+PTE value and never falls back to `je_arch_page_restore`; it refuses `USER_DATA`,
+`TABLE`, frames outside the caller's extents and the kernel image. The
+**kernel-stack path** is the pre-existing `RW ↔ GUARD` guard-page handling for
+kernel stacks (not an owned extent, not a user frame) and uses
+`je_arch_page_restore`, which unconditionally rewrites `present|write|nx`; it is
+never used on a user-frame alias. An explicit per-process owned-extents list
+(independent of virtual address), with a frame *kind* (`USER_CODE`,
+`USER_RODATA`, `USER_DATA`, `TABLE`) and owner, is the only source permitted to
+populate user PTEs. Stack frames are classified as `USER_DATA` (there is no
+separate `STACK` kind). The PTE-install operation takes an owned-frame reference
+`(extent, page index)`, never a raw physical address, and **rejects
+`kind == TABLE`**; `USER_CODE` installs only as RX, `USER_RODATA` only as R/NX,
+`USER_DATA` only as RW/NX. MMIO, reserved pages, page-table frames and another
+owner's frames therefore cannot be expressed as a user mapping. No user operation
+accepts a physical address.
 
-Demotion scope is deliberate: only **executable** (`USER_CODE`) user frames have
-their writable alias removed (demoted to RO/NX). `USER_DATA` frames (including stack)
-keep a writable identity alias — that is how the kernel scrubs and recycles them — and
-are never user-executable, so no W+X exists anywhere. The Consequences section's
-"no writable alias for executable user frames" is the precise claim.
+Demotion scope (amended 2026-10-17, owner-approved): frames that carry **no
+writable user mapping** — `USER_CODE` (RX) and `USER_RODATA` (R/NX) — have their
+writable identity alias removed (demoted to RO/NX via `je_user_alias_set`).
+`USER_DATA` frames (including stack) keep a writable identity alias — that is how
+the kernel scrubs and recycles them — and are never user-executable, so no W+X
+exists anywhere. Only `USER_CODE` is executable; `USER_RODATA` is read-only and
+non-executable (ADR D3 "constants R/NX"). The Consequences section's "no writable
+alias for a non-writable user frame (USER_CODE or USER_RODATA)" is the precise
+claim.
 
 ### D4. Admission bounds (M3a fixtures)
 At most 2 user processes; 1 user thread each; ≤64 user pages/process (incl. a
@@ -113,17 +120,30 @@ and reject insufficient memory atomically. An unmapped page sits below the user
 stack; segment edges are unmapped where feasible.
 
 Amendment 2026-10-17 (allocation vs reservation): the 73-page budget is the
-admission *quota*; it is not all allocated by issue #3. Issue #3 allocates only
-the 4 table pages and the declared user pages (image + 4-page stack, ≤64). It
-additionally *holds* the 5 kernel-stack pages as a reservation against free
-memory at admission time — counting them in the atomic admission check and
-keeping them out of other allocations — even though issue #4 (ring-3 entry and
-the per-thread kernel stack loaded into the per-CPU TSS.RSP0) performs the actual
-kernel-stack allocation. Without that held reservation, #4 could fail after #3's admission succeeded, breaking the
-"reject atomically" rule. Admission arithmetic and the 2-process limit are
-enforced in #3. The kernel reserve is a fixed minimum of free pages that
-admission must leave untouched; its exact value is set when #3 lands and recorded
-in IMPLEMENTATION.md, so the atomic-reject test has a concrete threshold.
+admission *quota*; it is not all consumed the same way by issue #3. Issue #3
+allocates the 4 table pages, the declared user pages (image + 4-page stack, ≤64),
+**and** the 5 kernel-stack pages — the last as a concrete contiguous
+`je_pages_alloc(5)` run recorded by physical base in the process record and
+handed to issue #4 (ring-3 entry and the per-thread kernel stack loaded into the
+per-CPU TSS.RSP0), which takes over that exact run rather than allocating again.
+A *count-only* reservation was rejected: the M2 allocator is first-fit
+contiguous, so merely lowering the free count leaves fragmentation able to deny a
+5-page run later, and #4 could still fail after #3 admitted — breaking the
+"reject atomically" rule. Allocating the concrete run at admission closes that
+gap and needs no change to tested M2 allocator code. Ownership: the kstack run is
+part of the process's build journal (a distinct journal entry, **not** an
+owned-extents entry — the owned-extents list holds only user-PTE-populating
+frames), so if the process dies or build fails before #4 takes it over, teardown
+(D5) frees the run. #3 does not apply the `RW ↔ GUARD` guard page to the run;
+that guard is part of #4's kernel-stack setup, and #4/D5 must restore that guard
+page to RW via `je_arch_page_restore` before the run is freed (same
+restore-before-free reason as the user-frame aliases above). Admission arithmetic and the 2-process limit are enforced in
+#3. Admission counts pages, not contiguity, so a per-step allocation can still
+fail on fragmentation; the build journal unwinds that cleanly. The kernel reserve
+is a fixed minimum of free pages that admission must leave free *after* the full
+73-page need (including the kstack run) is accounted; its exact value is set when
+#3 lands and recorded in IMPLEMENTATION.md, so the atomic-reject test has a
+concrete threshold.
 
 ### D5. Lifecycle
 `BUILDING → READY/RUNNING → DYING → REAPABLE → FREE`. A fault or exit first
@@ -181,8 +201,11 @@ page. All bound checks are subtraction-based on `uint64_t`
 (`src_size <= blob_len - src_off`, `mem_size <= ARENA - tgt_off`,
 `src_size <= mem_size`) and are applied *before* any page rounding, so rounding
 cannot wrap. Segment count is bounded and checked before indexing; permissions
-reject unknown bits, `perm == 0`, W|X, and X-or-W without R. The page budget sums
-per-segment pages plus the 4-page stack and must be ≤64 user pages.
+reject unknown bits, `perm == 0`, W|X, and X-or-W without R. The three legal
+permission combinations map to kinds (amended 2026-10-17): `R|X` → `USER_CODE`
+(installed RX), `R` → `USER_RODATA` (installed R/NX), `R|W` → `USER_DATA`
+(installed RW/NX). The page budget sums per-segment pages plus the 4-page stack
+and must be ≤64 user pages.
 
 ### D9. User-copy discipline
 `copy_from_user`/`copy_to_user` take numeric user addresses + bounded lengths;
@@ -216,8 +239,8 @@ not a user ABI and must not leak their numbering.
 ## Consequences
 
 - `paging.c`'s single static root and writable identity map must gain per-process
-  roots and lose writable aliases for executable user frames; this is the main
-  integration hazard.
+  roots and lose writable aliases for non-writable user frames (`USER_CODE` and
+  `USER_RODATA`); this is the main integration hazard.
 - Adding user GDT descriptors invalidates the existing fault test's assumption
   that selector `0x28` is outside the GDT; that test and its expected error must
   be updated when the GDT grows (tracked with the #4 change).
@@ -252,13 +275,43 @@ alias-protection step.
 - 2026-10-17: corrected D3 publication order (demote writable aliases to RO/NX
   before installing the user RX PTE, not after); added the per-frame alias state
   machine and the owned-frame-reference PTE-install rule; pinned D4 allocation-vs-
-  reservation and the kernel reserve; pinned D8 arena half-openness, page-aligned
+  reservation (a count-only *held reservation* — **superseded by Decision 2 in the
+  next entry**, which allocates a concrete contiguous run instead) and the kernel
+  reserve; pinned D8 arena half-openness, page-aligned
   segments, page-granule overlap and arena-relative entry. Prompted by an
   external multi-agent design review (three AI coding agents) against commit
   `88e3f00`; the reviews converged on the D3 ordering hazard and the alias-ledger
   requirement. This is AI-assisted review, not the independent human
   qualification the critical profile requires (see Status of claims). This is a
   contract correction before any #3 code; it does not change the M3a scope.
+
+- 2026-10-17 (owner-approved design decisions for #3, with reasoning recorded for
+  all agents/people):
+  - **Decision 1 — add a `USER_RODATA` kind.** ADR D3 requires "constants R/NX",
+    but the first #3 interface draft modeled only RX (code) and RW/NX (data).
+    Options were (a) add a read-only/NX kind, or (b) defer rodata and accept only
+    RX+RW, noting the gap. Owner approved (a). `USER_RODATA` installs R/NX and, like
+    `USER_CODE`, has its writable identity alias demoted to RO/NX on publish (it is
+    non-writable); unlike `USER_CODE` it is non-executable. D3/D8 updated above.
+  - **Decision 2 — hold the 5 kernel-stack pages as a concrete contiguous run,
+    not a count-only reservation.** Goal: make admission truthful so #4 cannot
+    fail after #3 admits. The original recommendation was to add a new
+    `je_pages_reserve`/`release` primitive to the M2 allocator. A multi-agent
+    review showed a count-only reservation cannot keep the promise — the M2
+    allocator is first-fit contiguous, so fragmentation can still deny a 5-page run
+    later. The adopted design instead allocates the concrete 5-page run now via the
+    existing `je_pages_alloc` and hands that exact run to #4. This is strictly
+    better than the original rec: it keeps a stronger guarantee AND requires no
+    change to tested M2 code. D4 updated above.
+  - Process: these two decisions were validated with the two external coding
+    agents, which also caught (and this agent then fixed) a C11 error (`_Noreturn`
+    on a struct member — the header did not compile, confirmed by a local
+    compile) and an initially half-applied rodata edit (the D3 summary paragraph
+    was updated but the D3 body — publication order, the `je_user_alias_set`
+    scope, the kind list and the install rule — still said USER_CODE-only; the D3
+    body, Consequences and D4 are all corrected here). Recorded as AI-assisted
+    review, not independent human qualification (see Status of claims).
+    Documentation only; no #3 code lands with this amendment.
 
 ## References
 
