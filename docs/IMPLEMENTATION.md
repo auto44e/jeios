@@ -595,6 +595,46 @@ ARM64 build/smoke unaffected. Peer design pass (two-round debate) drove the hone
 "hook not enforcement" framing and the output-masking/compile-assert hardening.
 AI-assisted review only; not independent human qualification.
 
+## M3b fourth PR — attenuation (handle_dup); rights enforcement made real — 2026-10-18
+
+Adds handle **attenuation** and, with it, makes rights enforcement genuinely
+ring-3-observable (the "B/A+B" payoff from the rights-hook PR). New op
+**`handle_dup` (op 9)** and pure primitive `je_handle_dup_self`: derive a NEW
+handle to the same object as the source with a rights **subset**. Owner decision:
+landed as **"Refs #7", not "Closes"** — #7 stays open for the reference-count /
+overflow / instance-generation work that belongs to M3c (it needs a destroyable
+object, which M3b's immortal SELF is not).
+
+Semantics (frozen in the ADR 0008 amendment): **fresh-slot** — the derived handle
+gets its own slot/index/generation and independent `close`, and counts against
+quota (not a re-label of the source slot). **SELF-only** — the primitive copies
+the binding with no retain/refcount (sound only because SELF owns nothing); every
+other type is `WRONGTYPE`; M3c must add a retain-before-commit path for
+destroyable endpoints. **No DUP/GRANT right** — any holder may derive an
+equal-or-weaker handle; a superset request is `DENIED` (never escalates); an
+**unknown** rights bit is a malformed call → `INVALID` in decode, distinct from a
+known-but-unheld right → `DENIED`. `handle_query`/`handle_close` stay **rightless**
+so a zero-rights derived handle still learns its type and can be closed (no slot
+leak). `lookup`/`rights_of`/`dup_self` all share the one `resolve_slot` helper.
+
+Verified in this env: `make check` PASS — `test_syscall` covers the op-9 decode
+(reserved-arg, wide-handle, wide-rights, unknown-rights-bit → INVALID; clean subset
+→ DUP); `test_handle` `test_dup` covers fresh-slot distinct handle, subset OK,
+**attenuation→DENIED**, superset DENIED, WRONGTYPE, the derived handle surviving
+the source's close, independent close, and NULL-out. `make smoke` PASS with the
+updated `M3b-s1` marker: a ring-3 task derives a rights-less handle and
+`handle_rights` on it returns **DENIED from ring 3** — the real enforcement proof,
+not a hosted one. 11 integration modes, M2's 4 markers, CI profiles, and the
+ARM64 build/smoke all unchanged.
+
+Design + review via a role-assigned peer debate (implementor vs adversarial
+reviewer). Key findings adopted: refcount-on-SELF would be untestable theatre
+(so attenuation-only, refcount deferred to M3c); a generic `derive` that copies an
+opaque pointer without a retain is a latent UAF API (so SELF-only, type-gated);
+the superset test must use a known-but-unheld right (unknown bit is INVALID); and
+#7 cannot honestly be closed by this PR. AI-assisted review only; not independent
+human qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

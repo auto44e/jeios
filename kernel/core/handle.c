@@ -143,6 +143,35 @@ je_handle_status je_handle_rights_of(const je_handle_table *t, je_handle h,
     return JE_HANDLE_OK;
 }
 
+je_handle_status je_handle_dup_self(je_handle_table *t, je_handle src,
+                                    uint32_t expected_type, uint32_t new_rights,
+                                    je_handle *out)
+{
+    if (!out) return JE_HANDLE_BADINDEX;
+    *out = 0u;
+    /* SELF-ONLY by construction, not merely by what the caller passes. This path
+     * copies the object binding with NO retain/refcount, which is sound only for
+     * SELF (owns nothing, never destroyed). A destroyable type reaching here
+     * would be a latent UAF, so reject anything but SELF outright — even if a
+     * caller asks for a different expected_type. M3c adds a retain-based derive
+     * for destroyable objects; it must NOT reuse this function. */
+    if (expected_type != JE_HANDLE_OBJ_SELF) return JE_HANDLE_WRONGTYPE;
+    /* Resolve the source as SELF with NO required rights (any holder may
+     * attenuate); the subset check below enforces "only remove rights". This
+     * also returns WRONGTYPE if the named slot is not actually a SELF object. */
+    const je_handle_slot *s;
+    je_handle_status r = resolve_slot(t, src, JE_HANDLE_OBJ_SELF, 0u, &s);
+    if (r != JE_HANDLE_OK) return r;
+    /* Subset: the derived handle may not hold a right the source lacks. */
+    if ((new_rights & ~s->rights) != 0u) return JE_HANDLE_DENIED;
+    /* Fresh slot bound to the same object; copy the binding (SELF owns nothing,
+     * so no retain is needed). Read the fields before allocate (which never
+     * touches this LIVE slot, but capture first regardless). */
+    void *object = s->object;
+    uint32_t type = s->type;
+    return je_handle_alloc(t, object, type, new_rights, out);
+}
+
 je_handle_status je_handle_close(je_handle_table *t, je_handle h)
 {
     uint32_t index, generation;

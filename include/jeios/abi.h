@@ -32,7 +32,8 @@ typedef enum {
     JE_ABI_H_STALE     = 3,  /* slot FREE/RETIRED or generation mismatch */
     JE_ABI_H_BADINDEX  = 4,  /* handle 0, or index >= table capacity */
     JE_ABI_H_WRONGTYPE = 5,  /* live slot, wrong object type (hosted-only in M3b) */
-    JE_ABI_H_DENIED    = 6,  /* live slot, insufficient rights (hosted-only in M3b) */
+    JE_ABI_H_DENIED    = 6,  /* live slot, insufficient rights (ring-3-observable
+                              * via handle_dup attenuation since the M3b dup PR) */
     JE_ABI_H_QUOTA     = 7,  /* allocate: live-slot count at the process quota */
     JE_ABI_H_NOSLOTS   = 8   /* allocate: no FREE slot remains */
 } je_abi_status;
@@ -61,9 +62,13 @@ typedef enum {
     JE_SYS_HANDLE_CLOSE = 6, /* handle_close(h=RDI): close; status in RAX */
     JE_SYS_HANDLE_QUERY = 7, /* handle_query(h=RDI): -> RDX = object type (rights
                               * NOT exposed here; reserved out bits zero) */
-    JE_SYS_HANDLE_RIGHTS = 8 /* handle_rights(h=RDI): -> RDX = rights mask of the
+    JE_SYS_HANDLE_RIGHTS = 8, /* handle_rights(h=RDI): -> RDX = rights mask of the
                               * handle, masked to JE_ABI_RIGHTS_KNOWN. Requires
                               * the INSPECT right (policy hook; see note below). */
+    JE_SYS_HANDLE_DUP = 9    /* handle_dup(h=RDI, new_rights=RSI): derive a new
+                              * handle to the same object with a rights SUBSET.
+                              * -> RDX = new handle. Attenuation only (never a
+                              * superset: a right the source lacks -> DENIED). */
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYS_COPY_FIXUP_INJECT = 4  /* dev-only: raw-copy an unmapped page to test the fixup */
 #endif
@@ -77,19 +82,20 @@ _Static_assert(JE_SYS_HANDLE_SELF == 5, "abi op handle_self");
 _Static_assert(JE_SYS_HANDLE_CLOSE == 6, "abi op handle_close");
 _Static_assert(JE_SYS_HANDLE_QUERY == 7, "abi op handle_query");
 _Static_assert(JE_SYS_HANDLE_RIGHTS == 8, "abi op handle_rights");
+_Static_assert(JE_SYS_HANDLE_DUP == 9, "abi op handle_dup");
 
 /* M3b rights ABI (ADR 0008 revisit, frozen here). Rights are a fixed uint32_t
  * bitmask. handle_rights masks its output to JE_ABI_RIGHTS_KNOWN so no internal
- * bit can leak to ring 3. Unknown bits crossing the boundary are rejected when a
- * caller-supplied mask first exists (M3c attenuation); in M3b every mint uses a
- * kernel constant, asserted known at compile time.
+ * bit can leak to ring 3. A caller-supplied rights mask with an UNKNOWN bit is
+ * rejected as INVALID in the handle_dup decode (the first ring-3 path that takes
+ * a rights mask); every kernel mint uses a constant, asserted known at compile
+ * time.
  *
- * HONESTY (recorded in docs): this is a rights ABI + enforcement POLICY HOOK, not
- * end-to-end ring-3 enforcement. Because the only ring-3 minting path
- * (handle_self) always grants INSPECT, ring 3 can observe success and the mask,
- * but CANNOT observe DENIED/WRONGTYPE yet. Genuine ring-3-observable denial
- * arrives with M3c attenuation (which can mint a rights-reduced handle) — planned
- * as the (B)/A+B follow-up. The denial branch is exercised by hosted tests now. */
+ * Rights became genuinely enforced (not just a policy hook) with the handle_dup
+ * attenuation PR: a process can derive a handle that DROPS INSPECT, and
+ * handle_rights on that derived handle returns DENIED — ring-3-observable, proven
+ * in QEMU (the M3b-s1 marker), no longer hosted-only. WRONGTYPE from ring 3 is
+ * still not reachable (SELF is the only type), and remains hosted-tested. */
 #define JE_ABI_RIGHT_INSPECT 0x1u              /* may read the object's metadata */
 #define JE_ABI_RIGHTS_KNOWN  (JE_ABI_RIGHT_INSPECT)
 _Static_assert(JE_ABI_RIGHT_INSPECT == 0x1u, "abi right inspect");

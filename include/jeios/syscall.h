@@ -17,7 +17,8 @@ typedef enum {
     JE_SYSCALL_HANDLE_SELF  = 5,
     JE_SYSCALL_HANDLE_CLOSE = 6,
     JE_SYSCALL_HANDLE_QUERY = 7,
-    JE_SYSCALL_HANDLE_RIGHTS = 8
+    JE_SYSCALL_HANDLE_RIGHTS = 8,
+    JE_SYSCALL_HANDLE_DUP = 9
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYSCALL_COPY_FIXUP_INJECT = 4  /* glue raw-copies an unmapped page (fixup test) */
 #endif

@@ -41,6 +41,14 @@ typedef uint32_t je_handle;          /* the ABI handle value (0 == invalid) */
 #define JE_HANDLE_GEN_MASK   ((1u << JE_HANDLE_GEN_BITS) - 1u)
 #define JE_HANDLE_GEN_MAX    JE_HANDLE_GEN_MASK      /* saturation point */
 
+/* Object type values carried in a slot. Type 0 is reserved/invalid (a zeroed
+ * slot never reads as a valid type). JE_HANDLE_OBJ_SELF is the M3b identity
+ * capability — the ONLY type that may be duplicated via je_handle_dup_self,
+ * because it owns no external resource and is never destroyed. It MUST equal the
+ * ABI's JE_ABI_OBJ_SELF; a syscall-layer _Static_assert pins the two together.
+ * (The table defines its own copy so handle.c has no ABI include.) */
+#define JE_HANDLE_OBJ_SELF 1u
+
 /* Status (ADR 0008 D8). These names map to the v0 ABI status namespace at the
  * syscall boundary in a later PR; they never carry internal je_status numbers.
  * Kept as a distinct enum here so the pure table has no ABI coupling yet. */
@@ -121,6 +129,32 @@ je_handle_status je_handle_lookup(const je_handle_table *t, je_handle h,
 je_handle_status je_handle_rights_of(const je_handle_table *t, je_handle h,
                                      uint32_t expected_type, uint32_t required_rights,
                                      uint32_t *out_rights);
+
+/* Attenuate (M3b final PR, ADR 0008 amendment): derive a NEW handle to the same
+ * object as `src`, with a rights SUBSET. Fresh-slot semantics: the new handle
+ * gets its own slot, index, generation and close, and counts against quota — it
+ * is a genuine second name for the object, not a re-labelling of src's slot.
+ *
+ * SELF-ONLY by contract: `expected_type` must be the SELF type. The table copies
+ * the object binding from src's slot into the new slot WITHOUT any retain/refcount
+ * step, which is sound ONLY because SELF owns no external resource and is never
+ * destroyed. A destroyable object type (M3c endpoints) MUST NOT be duplicated via
+ * this path — M3c adds a retain-before-commit derive for those.
+ *
+ * Rights rule: `new_rights` must be a subset of src's rights
+ * (new_rights & ~src.rights == 0); a request for any right src lacks returns
+ * DENIED (never a clipped/weaker grant). Equality is allowed (a pure alias).
+ * `new_rights` must contain only known bits — the CALLER (syscall glue) is
+ * responsible for rejecting unknown bits as INVALID before calling this.
+ *
+ * Order: resolve src (BADINDEX -> STALE -> WRONGTYPE), then the subset check
+ * (DENIED), then allocate the new slot (QUOTA before NOSLOTS). On any failure
+ * *out is 0 and the table is unchanged. `out` is REQUIRED. A closed src cannot
+ * be duplicated (STALE); an already-derived handle survives src's close (its own
+ * slot). */
+je_handle_status je_handle_dup_self(je_handle_table *t, je_handle src,
+                                    uint32_t expected_type, uint32_t new_rights,
+                                    je_handle *out);
 
 /* Close a handle: LIVE -> FREE, bump generation; if the bump would exceed
  * JE_HANDLE_GEN_MAX the slot goes RETIRED instead (never wraps). Closing a
