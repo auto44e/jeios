@@ -364,3 +364,77 @@ AI-assisted design (a two-round role-assigned peer debate: implementor vs
 adversarial reviewer); not independent human qualification. The owner is the merge
 gate and the decider of D-OWNER-1 and D-OWNER-2 (both resolved above with owner
 approval on 2026-10-18); on acceptance, D-SEQ step 2 (lifecycle) may begin.
+
+## AMENDMENT (2026-10-18, owner-approved) — step-3 wiring decisions
+
+Two decisions were needed to implement D-SEQ step 3 (the owner-signed process-death
+release walk + typed close dispatcher + ring-3 `endpoint_create`). Both were raised
+by an implementor-vs-adversarial-reviewer debate on the *wiring* and approved by the
+owner; they refine, not contradict, the frozen contract above.
+
+### A3-1. `je_vm_destroy` runs the release walk + unwind + table-zero as ONE
+### IRQ-disabled critical section (owner-gated death-path behaviour change)
+
+The release walk is invoked through a **generic teardown hook** on `je_vm`
+(`void (*teardown)(void *ctx, je_handle_table *t)` + `void *teardown_ctx`,
+zero-defaulted by `je_vm_init`), called inside `je_vm_destroy` **after** the
+`!vm`/`state != READY` checks and **immediately before** `unwind()`. This is the
+single choke point covering the reap path (`sched.c`) and every direct `main.c`
+caller, and it keeps `vm.c` endpoint-agnostic (the hook is NULL in the vm unit
+test, which gains a fake-hook ordering case). The pool is one kernel-owned static
+in a new `endpoint_kern.c`; `je_vm` never holds an endpoint-typed pointer.
+
+The debate found a **real tested-path hazard** in the naive "walk then unwind at
+IF=0" plan: the direct `je_vm_destroy` callers in `main.c` can run with **IF=1**
+(the bootstrap thread after `sti`), so a timer could preempt **between the walk
+and the `*p = {0}` table-zeroing** while the peer process is live — the peer's
+`HANDLE_CLOSE` would then mutate the same channel record mid-teardown (the exact
+use-after-free this PR exists to prevent). **Resolution:** `je_vm_destroy`
+**saves-and-disables IRQs around the entire hook+unwind+zero sequence and restores
+after** — it no longer merely trusts the caller's IF=0. `vm.c` reaches the arch
+IRQ-save through the same indirection pattern (a hook/stub, NULL/no-op in the unit
+test) so the fake backend stays arch-free. This changes behaviour in the
+owner-gated death path and is therefore owner-signed.
+
+### A3-2. `endpoint_create` (op 10) returns BOTH handles packed in RDX
+
+`endpoint_create` takes no handle args (all of RDI/RSI/RDX/R10/R8/R9 must be zero,
+else INVALID), mints both ends into the **caller's own** table with
+`JE_EP_RIGHTS_ALL`, and is transactional (both slots + both refs + the pool record
+all-or-nothing; a one-slot/full-table failure leaves the pool and the caller table
+unchanged). The v0 ABI gives one status (RAX) and one scalar (RDX); two 32-bit
+handles are returned by **packing them into RDX**: `RDX[31:0] = h0`,
+`RDX[63:32] = h1`. RDX is **undefined on failure**. This is lossless only because a
+handle is 32 bits, so `abi.h` pins `_Static_assert(sizeof(je_handle) == 4)` (and
+the ABI endpoint object-type / rights bits are pinned equal to the table-side
+copies). Rejected alternatives: a second "claim-peer" op (leaves a half-claimed
+state) and `copy_to_user` of the pair (adds a fault/partial-write rollback for no
+gain). The packed shape **freezes "a handle is ≤32 bits" into the v0 ABI**; a later
+milestone that needs wider handles or >2 returned capabilities writes a new ADR.
+
+`endpoint_create` returns `JE_ABI_UNSUPPORTED` on a VM with no teardown hook
+installed, so "an endpoint slot exists in a ring-3 table ⇒ that VM's `je_vm_destroy`
+walks it" holds **by construction**, not by convention — the structural discharge
+of endpoint.h's load-bearing precondition. Pool exhaustion on create maps to the
+existing `JE_ABI_H_NOSLOTS` (no new status).
+
+### A3-3. Typed close dispatch is an exact read-only type peek, not a fallthrough
+
+Ring-3 `HANDLE_CLOSE` (op 6) must route an ENDPOINT handle through
+`je_endpoint_handle_close` (which drops the ref) and a SELF handle through raw
+`je_handle_close`. The glue does a **read-only type peek then an exact branch**
+(SELF → raw close; ENDPOINT → endpoint close; any other/unknown/corrupt type →
+fail closed), rather than a "try SELF, else endpoint" fallthrough (which would
+obscure BADINDEX/STALE/WRONGTYPE precedence and silently admit a future type). The
+peek+close are atomic because the `int 0x80` path runs at IF=0 on one CPU — stated
+as an explicit, SMP-revisit assumption, not a general proof. The table API does not
+grow a typed-close; the walk and the dispatcher use one new **read-only** iterator
+(`je_handle_live_at`) so endpoint code never writes table internals (table purity
+preserved).
+
+Scope honesty: because `endpoint_create` puts both ends in the caller's table, the
+ring-3 fault-death proof shows **no-survivor reclaim + pool-returns-to-baseline +
+repeated-fault-no-exhaustion**; the *survivor observes PEER_CLOSED* case is proven
+in a **kernel-only self-test** (two tables via `je_endpoint_channel_create`), since
+a cross-process surviving peer needs transfer (D-SEQ step 5). The ring-3 proof is
+labelled reclaim-only and does not claim the survivor case.

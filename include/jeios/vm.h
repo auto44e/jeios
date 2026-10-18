@@ -242,6 +242,21 @@ typedef struct {
                                     * backend allocates/holds from (single truth) */
     size_t    reserve_pages;       /* min free pages admission must leave; 0 ok */
     je_vm_process procs[JE_VM_MAX_PROCESSES];
+    /* M3c (ADR 0009 A3-1): process-death teardown hook + an IRQ critical-section
+     * pair, installed by kernel VM wiring and left NULL by the vm unit test (which
+     * keeps vm.c endpoint- and arch-agnostic). je_vm_destroy, if `teardown` is
+     * set, runs teardown(teardown_ctx, &proc.htable) — the endpoint release walk —
+     * immediately before unwind(); and if `irq_save` is set, wraps the whole
+     * hook+unwind+zero sequence in irq_save()/irq_restore() so a timer cannot
+     * preempt between the walk and the table-zeroing (the direct main.c destroy
+     * callers may run with IF=1). All four are a single write at wiring time and
+     * immutable thereafter. NULL => current behaviour (no walk, no extra IRQ
+     * save), which is exactly what the unit test and the build-failure unwind
+     * want. */
+    void     (*teardown)(void *ctx, je_handle_table *t);
+    void      *teardown_ctx;
+    uint64_t (*irq_save)(void);    /* disable IRQs, return prior flags */
+    void     (*irq_restore)(uint64_t flags);
 } je_vm;
 
 je_status je_vm_init(je_vm *vm, const je_vm_ops *ops, je_pages *pages,

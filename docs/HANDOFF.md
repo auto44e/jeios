@@ -32,18 +32,24 @@ progress on x86-64, and a second architecture, **ARM64 (MP1)**, now boots.
   endpoint pool, channel record, **split refcount** (`handle_refs` vs
   `inflight_refs`), retain/release, destruction-on-last-ref, `REFOVERFLOW`, the
   endpoint-aware alloc/dup/close seam (table stays pure), and retain-before-commit
-  endpoint dup (while `dup_self` stays SELF-only). **Create is kernel-only** (no
-  ring-3 route) until the owner-signed step 3 wires the death-path release walk +
-  the typed close dispatcher + ring-3 `endpoint_create` together. Hosted
-  `test_endpoint` proves destruction + REFOVERFLOW + rollback; smoke/integration/
-  CI-NX/ARM unaffected. ADR 0009 D4a also appended endpoint rights
-  (`SEND=0x2`…), an owner-approved ABI change that flipped the tested
-  `dup(self,0x2)` result INVALID→DENIED — handled by Option A (see
-  IMPLEMENTATION.md "M3c rights-bit discrepancy"). **Remaining D-SEQ:** step 3
-  (death-path + ring-3 create, owner-signed), 4 (non-blocking data IPC), 5
-  (capability transfer + cycle invariant), 6 (waits, owner-gated — edits
-  `sched.c`), 7 (bootstrap fixture). #8 closes when the sequence completes; this
-  also discharges #7's deferred refcount/overflow/instance-generation.
+  endpoint dup (while `dup_self` stays SELF-only). Step 2 kept create kernel-only;
+  **step 3 (owner-signed) is now done**: the process-death **release walk** (via a
+  generic `je_vm` teardown hook run inside an **IRQ critical section** in
+  `je_vm_destroy` — A3-1), the **typed close dispatcher** (ring-3 HANDLE_CLOSE
+  routes endpoint handles through the endpoint layer — A3-3), and **ring-3
+  `endpoint_create` (op 10)** returning both handles **packed in RDX** (A3-2)
+  shipped together. Proven in QEMU: `M3c-s3a` (kernel self-test: survivor-peer
+  PEER_CLOSED, record freed on survivor close) and `M3c-s3b` (ring-3 create →
+  typed close → fault → reap reclaims the channel; pool baseline held across
+  >POOL_CAP cycles). ADR 0009 was amended (A3-1/A3-2/A3-3, owner-approved) for the
+  IRQ-save death-path change and the packed-RDX ABI shape. Earlier, ADR 0009 D4a
+  appended endpoint rights (`SEND=0x2`…), an owner-approved ABI change that flipped
+  the tested `dup(self,0x2)` result INVALID→DENIED (Option A; see IMPLEMENTATION.md
+  "M3c rights-bit discrepancy"). **Remaining D-SEQ:** step 4 (non-blocking data IPC
+  — `try_send`/`try_recv`), 5 (capability transfer + cycle invariant), 6 (waits,
+  owner-gated — edits `sched.c`), 7 (bootstrap fixture). #8 closes when the
+  sequence completes; this already discharges #7's deferred refcount/overflow
+  (endpoints are now genuinely destroyed + reclaimed on process death).
 
 Full qualification evidence for M3a is in `docs/M3A_RETRO.md`; the per-PR ledger is
 `docs/IMPLEMENTATION.md`. Everything above is QEMU/hosted-verified and

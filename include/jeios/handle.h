@@ -161,4 +161,15 @@ je_handle_status je_handle_dup_self(je_handle_table *t, je_handle src,
  * stale/free/retired handle returns STALE and changes nothing. */
 je_handle_status je_handle_close(je_handle_table *t, je_handle h);
 
+/* Read-only slot enumerator (M3c): if slot `index` is LIVE, write its current
+ * handle (encode of index+generation) to *out_handle and its object type to
+ * *out_type, and return true; otherwise return false and write nothing. Never
+ * mutates the table and never exposes the object pointer. This lets an
+ * object-aware layer (e.g. the endpoint release walk + the typed-close
+ * dispatcher) find and re-address LIVE slots of its type WITHOUT reaching into
+ * `slots` directly, preserving table purity. `index` >= capacity returns false.
+ * Both out params are REQUIRED. */
+bool je_handle_live_at(const je_handle_table *t, uint32_t index,
+                       je_handle *out_handle, uint32_t *out_type);
+
 #endif /* JEIOS_HANDLE_H */

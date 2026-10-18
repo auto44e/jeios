@@ -442,4 +442,41 @@ je_user_handle_start:
     incq 0x40001000
     jmp 11b
 je_user_handle_end:
+
+/* ---- M3c s3: endpoint create + typed close + fault-death ------------------
+ * endpoint_create (op 10) -> RDX packs (h1<<32)|h0. Store the pair, close h0 via
+ * HANDLE_CLOSE (op 6, which must route through the typed endpoint close and keep
+ * the channel alive because h1 still names the other end), store that status,
+ * then fault by reading an unmapped arena page so the kernel reaps us and checks
+ * the pool. Scratch offsets 0x1200.. avoid the handle stub's 0x1000-0x10f8. */
+.globl je_user_epfault_start
+.globl je_user_epfault_end
+je_user_epfault_start:
+    movq $4, %rax              /* brief heartbeat so we're seen running */
+20:
+    incq 0x40001000
+    decq %rax
+    jnz 20b
+    /* endpoint_create(): all args zero. */
+    movq $10, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001200      /* create status -> +0x200 */
+    movq %rdx, 0x40001208      /* packed handles  -> +0x208 */
+    movq %rdx, %r14            /* keep the pair */
+    /* h0 = low 32 bits; close it via HANDLE_CLOSE (op 6). Writing EDI
+     * zero-extends into RDI, isolating the low dword (h0). */
+    movq %r14, %rdi
+    movl %edi, %edi
+    movq $6, %rax
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001210      /* close(h0) status -> +0x210 */
+    /* Now fault: the surviving h1 is still LIVE, so reap must release it and the
+     * channel must return to the pool. */
+    movq 0x40003000, %rax      /* unmapped arena page -> #PF */
+21:
+    jmp 21b                    /* unreached */
+je_user_epfault_end:
 .section .note.GNU-stack,"",@progbits
