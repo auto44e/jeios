@@ -581,6 +581,11 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             /* query(live): OK + type == SELF. */
             if (vm_s3_scratch(H,0x1030)!=JE_ABI_OK)        fail("JeiOS fatal: s5c query(live) not OK\r\n");
             if (vm_s3_scratch(H,0x1038)!=JE_ABI_OBJ_SELF)  fail("JeiOS fatal: s5c query(live) wrong type\r\n");
+            /* rights(live) op8: OK + mask == INSPECT (0x1). This is the rights
+             * policy hook — ring 3 sees the granted right; DENIED is hosted-only
+             * in M3b (no ring-3 path mints a rights-reduced handle yet). */
+            if (vm_s3_scratch(H,0x10a0)!=JE_ABI_OK)        fail("JeiOS fatal: s5c rights not OK\r\n");
+            if (vm_s3_scratch(H,0x10a8)!=JE_ABI_RIGHT_INSPECT) fail("JeiOS fatal: s5c rights mask != INSPECT\r\n");
             /* close(live): OK. */
             if (vm_s3_scratch(H,0x1040)!=JE_ABI_OK)        fail("JeiOS fatal: s5c close(live) not OK\r\n");
             /* query/close of the now-closed handle: STALE (distinct status). */
@@ -609,7 +614,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             (void)je_arch_irq_save();
             if (je_sched_drop_user(&vm_s3, H)!=JE_OK) fail("JeiOS fatal: s5c handle drop\r\n");
             if (je_vm_destroy(&vm_s3, H)!=JE_OK) fail("JeiOS fatal: s5c handle destroy\r\n");
-            je_arch_console_write("M3b-s1: handle self/query/close OK; stale/badindex/wide distinct; reuse re-stales old handle; QUOTA at exactly CAP-1; B alive\r\n");
+            je_arch_console_write("M3b-s1: handle self/query/rights/close OK; INSPECT right exposed; stale/badindex/wide distinct; reuse re-stales old handle; QUOTA at exactly CAP-1; B alive\r\n");
         }
 
         /* Tear down B; all step-3/4/5a pages must be back to the pre-s4 baseline. */

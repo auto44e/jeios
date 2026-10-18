@@ -193,12 +193,44 @@ static void test_init_rejections(void)
     assert(t.live == 0u);                 /* nothing was consumed */
 }
 
+static void test_rights_of(void)
+{
+    je_handle_table t = mk(CAP);
+    int obj = 0;
+    je_handle h_ins, h_none;
+    uint32_t r;
+    /* a handle WITH the inspect right (0x1) and one WITHOUT any rights (0) */
+    assert(je_handle_alloc(&t, &obj, 7u, 0x1u, &h_ins) == JE_HANDLE_OK);
+    assert(je_handle_alloc(&t, &obj, 7u, 0x0u, &h_none) == JE_HANDLE_OK);
+
+    /* rights_of requiring 0x1: OK on the granted handle, returns the full mask */
+    assert(je_handle_rights_of(&t, h_ins, 7u, 0x1u, &r) == JE_HANDLE_OK && r == 0x1u);
+    /* requiring 0x1 on a rights-0 handle: DENIED (the branch ring 3 can't reach
+     * in M3b until attenuation exists — proven here in the hosted suite). Also
+     * confirm *out_rights is left untouched on a failure. */
+    r = 0xdeadu;
+    assert(je_handle_rights_of(&t, h_none, 7u, 0x1u, &r) == JE_HANDLE_DENIED);
+    assert(r == 0xdeadu);                 /* untouched on failure */
+    /* required=0 on the rights-0 handle: OK, returns the (empty) mask */
+    assert(je_handle_rights_of(&t, h_none, 7u, 0x0u, &r) == JE_HANDLE_OK && r == 0x0u);
+    /* wrong type -> WRONGTYPE (also hosted-only in M3b) */
+    assert(je_handle_rights_of(&t, h_ins, 9u, 0x1u, &r) == JE_HANDLE_WRONGTYPE);
+    /* a well-formed handle naming an out-of-range index -> BADINDEX (distinct
+     * from the malformed zero handle). encode(CAP,1) is index==capacity. */
+    assert(je_handle_rights_of(&t, je_handle_encode(CAP, 1u), 7u, 0u, &r) == JE_HANDLE_BADINDEX);
+    /* stale after close -> STALE; forged (zero) -> BADINDEX */
+    assert(je_handle_close(&t, h_ins) == JE_HANDLE_OK);
+    assert(je_handle_rights_of(&t, h_ins, 7u, 0x1u, &r) == JE_HANDLE_STALE);
+    assert(je_handle_rights_of(&t, 0u, 7u, 0u, &r) == JE_HANDLE_BADINDEX);
+}
+
 int main(void)
 {
     test_encode_decode();
     test_alloc_lookup_close();
     test_quota();
     test_init_rejections();
+    test_rights_of();
 #ifdef JE_HANDLE_TEST_WIDTH
     test_saturation_and_retirement();
     test_noslots_via_retirement();

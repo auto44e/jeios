@@ -69,6 +69,13 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
         if (rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_HANDLE_QUERY;
+    case JE_SYS_HANDLE_RIGHTS:
+        /* handle_rights(h=RDI): RSI..R9 reserved must be zero; wide handle
+         * rejected before narrowing. The glue looks the handle up requiring the
+         * INSPECT right and returns the masked rights mask in RDX. */
+        if (rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_HANDLE_RIGHTS;
 #ifdef JE_DEV_COPY_INJECT
     case JE_SYS_COPY_FIXUP_INJECT:
         /* dev-only: uaddr=RDI (an unmapped arena page); glue raw-copies to prove
@@ -84,8 +91,13 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
 
 #ifndef JE_SYSCALL_HOSTED_TEST
 /* M3b: SELF is the only object kind so far — a kernel-minted, immortal,
- * resource-free process-identity capability (no dereferenceable pointer). */
-#define JE_HANDLE_TYPE_SELF JE_ABI_OBJ_SELF
+ * resource-free process-identity capability (ADR 0008). It is granted the
+ * INSPECT right so handle_rights has a right to check; the mask is a kernel
+ * constant asserted to contain only known bits (no unknown bit can be minted). */
+#define JE_HANDLE_TYPE_SELF   JE_ABI_OBJ_SELF
+#define JE_HANDLE_RIGHTS_SELF JE_ABI_RIGHT_INSPECT
+_Static_assert((JE_HANDLE_RIGHTS_SELF & ~JE_ABI_RIGHTS_KNOWN) == 0u,
+               "SELF must be minted only with known rights bits");
 
 /* Exhaustive, single-point mapping of internal JE_HANDLE_* results to the v0
  * ABI status namespace (ADR 0008 D2: distinct, not collapsed). Keeping it here
@@ -143,12 +155,16 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
     }
     case JE_SYSCALL_HANDLE_SELF: {
         /* Mint a SELF handle in the caller's own table. SELF carries no object
-         * pointer and no rights (rights are descriptive-only / unenforced in
-         * M3b; REVISIT in docs). Handle returned in RDX. */
+         * pointer; it is granted the INSPECT right (JE_HANDLE_RIGHTS_SELF) so
+         * handle_rights has a right to check. Enforcement is a policy hook in
+         * M3b: every ring-3 SELF mint grants INSPECT, so ring 3 cannot observe a
+         * DENIED here until M3c attenuation mints a rights-reduced handle.
+         * Handle returned in RDX. */
         je_handle_table *t = current_htable();
         if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
         je_handle h = 0;
-        je_handle_status s = je_handle_alloc(t, (void *)0, JE_HANDLE_TYPE_SELF, 0u, &h);
+        je_handle_status s = je_handle_alloc(t, (void *)0, JE_HANDLE_TYPE_SELF,
+                                             JE_HANDLE_RIGHTS_SELF, &h);
         f->rax = (uint64_t)handle_status_to_abi(s);
         f->rdx = (uint64_t)h;                 /* 0 on failure (alloc clears out) */
         return je_sched_return_to_user(f);
@@ -172,6 +188,23 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
                                               JE_HANDLE_TYPE_SELF, 0u, &obj);
         f->rax = (uint64_t)handle_status_to_abi(s);
         f->rdx = (s == JE_HANDLE_OK) ? (uint64_t)JE_HANDLE_TYPE_SELF : 0u;
+        return je_sched_return_to_user(f);
+    }
+    case JE_SYSCALL_HANDLE_RIGHTS: {
+        /* Look up the handle requiring the INSPECT right, and return its rights
+         * mask (masked to the known ABI bits, so an internal bit can never leak).
+         * NOTE (policy hook, not end-to-end enforcement in M3b): since the only
+         * ring-3 mint path grants INSPECT, ring 3 cannot reach DENIED here yet;
+         * that branch is exercised by the hosted tests and becomes ring-3-
+         * observable with M3c attenuation. */
+        je_handle_table *t = current_htable();
+        if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+        uint32_t rights = 0;
+        je_handle_status s = je_handle_rights_of(t, (je_handle)f->rdi,
+                                                 JE_HANDLE_TYPE_SELF,
+                                                 JE_ABI_RIGHT_INSPECT, &rights);
+        f->rax = (uint64_t)handle_status_to_abi(s);
+        f->rdx = (s == JE_HANDLE_OK) ? (uint64_t)(rights & JE_ABI_RIGHTS_KNOWN) : 0u;
         return je_sched_return_to_user(f);
     }
 #ifdef JE_DEV_COPY_INJECT

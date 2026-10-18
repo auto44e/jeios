@@ -120,6 +120,25 @@ later:
   width and per-bit meaning are assigned in the ABI header; **unknown rights bits
   are rejected** (not silently ignored) wherever a rights value crosses the
   boundary.
+  - *Assigned 2026-10-18 (M3b third PR):* `uint32_t`, `JE_ABI_RIGHT_INSPECT = 0x1`,
+    `JE_ABI_RIGHTS_KNOWN = INSPECT`, in `abi.h`. `handle_rights` (op 8) returns the
+    mask masked to the known bits. **Owner decision recorded:** this PR exposes the
+    rights ABI and wires the enforcement check as a POLICY HOOK (option A); it is
+    NOT end-to-end ring-3 enforcement, because no ring-3 path yet mints a
+    rights-reduced handle, so DENIED/WRONGTYPE are hosted-test-only. The **(B)/A+B
+    follow-up** — genuine ring-3-observable denial — lands with M3c attenuation,
+    which also introduces the runtime rejection of unknown caller-supplied rights
+    bits (in M3b every mint is a kernel constant, compile-asserted known).
+  - *Open question for M3c (raised in review, not yet decided):* `handle_query`
+    (op 7, returns the object TYPE) requires **no** right, while `handle_rights`
+    (op 8) requires INSPECT. Once attenuation can mint a zero-rights handle,
+    `query` would still reveal the type while `rights` returns DENIED. Decide
+    before M3c makes that observable whether reading the type should also require
+    INSPECT, or whether INSPECT is narrowed to "the rights mask only" — so op 7's
+    frozen meaning is settled deliberately, not changed implicitly later.
+  - *Not frozen:* `JE_ABI_RIGHTS_KNOWN` is a per-ABI-version SET that grows as M3c
+    adds rights bits; the individual bit *values* are what's frozen. Userspace
+    learns the known set via a version bump or a future `abi_query` selector.
 
 > Encoding/decoding is pure and will be unit-tested in isolation (like
 > `je_syscall_decode` in M3a): `encode(index, gen)`, `decode(h) -> {index, gen}`,

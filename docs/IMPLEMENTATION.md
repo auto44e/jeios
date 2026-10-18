@@ -559,6 +559,42 @@ marker (now a real probe + range), `_file_end` placement, `--orphan-handling`,
 and the DAIF-by-construction mask. AI-assisted review only; not independent human
 qualification.
 
+## M3b third PR — rights ABI exposure + enforcement policy hook — 2026-10-18
+
+Freezes the handle **rights ABI** (ADR 0008's deferred revisit) and wires rights
+enforcement on a live syscall path, WITHOUT attenuation/references (next PR) and
+without touching M3a's fault-death path. Rights are a fixed `uint32_t` mask;
+`JE_ABI_RIGHT_INSPECT = 0x1`, `JE_ABI_RIGHTS_KNOWN = INSPECT`, defined in `abi.h`
+and pinned with `_Static_assert` (the glue maps them; `abi.h` stays independent of
+`status.h` and `handle.h`). SELF is now minted with INSPECT (a kernel constant,
+compile-asserted to contain only known bits). New op **`handle_rights` (op 8)**:
+`lookup` requiring INSPECT, returns the slot's rights mask in RDX **masked to
+`JE_ABI_RIGHTS_KNOWN`** so no internal bit can leak. `handle_query` (op 7) stays
+type-only; `handle_close` requires no right.
+
+A pure accessor `je_handle_rights_of()` was added to the handle API (same validity
+checks as lookup, returns the rights mask) — additive, the table stays ABI-
+agnostic.
+
+**HONESTY — this is a rights ABI + policy HOOK, not end-to-end enforcement, and
+the docs/markers say so.** Because the only ring-3 minting path (`handle_self`)
+always grants INSPECT, ring 3 can observe success and the mask but **cannot reach
+DENIED or WRONGTYPE** yet. Those branches are exercised by the hosted tests only.
+Genuine ring-3-observable denial arrives with **M3c attenuation** (which can mint a
+rights-reduced handle) — the planned **(B)/A+B follow-up**, chosen by the owner:
+do the ABI-exposure hook now (A), make enforcement genuinely demonstrable when
+attenuation lands (B/A+B).
+
+Verified in this env: `make check` PASS — hosted `test_syscall` covers the op-8
+decode (reserved-arg + wide-handle rejection), `test_handle` exercises
+`je_handle_rights_of` including the **DENIED** (rights-0 slot) and **WRONGTYPE**
+branches that ring 3 can't reach in M3b. `make smoke` PASS with the updated
+`M3b-s1` marker — a ring-3 task calls `handle_rights` and gets OK + mask == INSPECT
+(`0x1`). 11 integration modes, M2's 4 markers, all CI profiles unchanged; the
+ARM64 build/smoke unaffected. Peer design pass (two-round debate) drove the honest
+"hook not enforcement" framing and the output-masking/compile-assert hardening.
+AI-assisted review only; not independent human qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

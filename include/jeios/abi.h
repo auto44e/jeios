@@ -59,8 +59,11 @@ typedef enum {
     JE_SYS_HANDLE_SELF  = 5, /* handle_self(): mint a handle to this process's
                               * SELF object -> handle in RDX, status in RAX */
     JE_SYS_HANDLE_CLOSE = 6, /* handle_close(h=RDI): close; status in RAX */
-    JE_SYS_HANDLE_QUERY = 7  /* handle_query(h=RDI): -> RDX = object type (rights
-                              * NOT exposed in M3b; reserved out bits zero) */
+    JE_SYS_HANDLE_QUERY = 7, /* handle_query(h=RDI): -> RDX = object type (rights
+                              * NOT exposed here; reserved out bits zero) */
+    JE_SYS_HANDLE_RIGHTS = 8 /* handle_rights(h=RDI): -> RDX = rights mask of the
+                              * handle, masked to JE_ABI_RIGHTS_KNOWN. Requires
+                              * the INSPECT right (policy hook; see note below). */
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYS_COPY_FIXUP_INJECT = 4  /* dev-only: raw-copy an unmapped page to test the fixup */
 #endif
@@ -73,6 +76,24 @@ typedef enum {
 _Static_assert(JE_SYS_HANDLE_SELF == 5, "abi op handle_self");
 _Static_assert(JE_SYS_HANDLE_CLOSE == 6, "abi op handle_close");
 _Static_assert(JE_SYS_HANDLE_QUERY == 7, "abi op handle_query");
+_Static_assert(JE_SYS_HANDLE_RIGHTS == 8, "abi op handle_rights");
+
+/* M3b rights ABI (ADR 0008 revisit, frozen here). Rights are a fixed uint32_t
+ * bitmask. handle_rights masks its output to JE_ABI_RIGHTS_KNOWN so no internal
+ * bit can leak to ring 3. Unknown bits crossing the boundary are rejected when a
+ * caller-supplied mask first exists (M3c attenuation); in M3b every mint uses a
+ * kernel constant, asserted known at compile time.
+ *
+ * HONESTY (recorded in docs): this is a rights ABI + enforcement POLICY HOOK, not
+ * end-to-end ring-3 enforcement. Because the only ring-3 minting path
+ * (handle_self) always grants INSPECT, ring 3 can observe success and the mask,
+ * but CANNOT observe DENIED/WRONGTYPE yet. Genuine ring-3-observable denial
+ * arrives with M3c attenuation (which can mint a rights-reduced handle) — planned
+ * as the (B)/A+B follow-up. The denial branch is exercised by hosted tests now. */
+#define JE_ABI_RIGHT_INSPECT 0x1u              /* may read the object's metadata */
+#define JE_ABI_RIGHTS_KNOWN  (JE_ABI_RIGHT_INSPECT)
+_Static_assert(JE_ABI_RIGHT_INSPECT == 0x1u, "abi right inspect");
+_Static_assert((JE_ABI_RIGHTS_KNOWN & ~UINT64_C(0xffffffff)) == 0u, "rights fit u32");
 
 /* abi_query selectors (RDI). */
 #define JE_ABI_QUERY_VERSION 0u
