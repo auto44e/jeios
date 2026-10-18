@@ -19,6 +19,8 @@
 #ifndef JE_SYSCALL_HOSTED_TEST
 #include <jeios/vm.h>
 #include <jeios/handle.h>
+#include <jeios/endpoint.h>
+#include <jeios/endpoint_kern.h>
 #endif
 
 /* Pure decode: given the operation and its six argument registers, decide the
@@ -86,6 +88,11 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
         if ((rdi >> 32) || (rsi >> 32)) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rsi & ~(uint64_t)JE_ABI_RIGHTS_KNOWN) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_HANDLE_DUP;
+    case JE_SYS_ENDPOINT_CREATE:
+        /* endpoint_create(): takes NO args; every register reserved. Mints both
+         * ends into the caller's table (dispatch side). All-zero args or INVALID. */
+        if (rdi|rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_ENDPOINT_CREATE;
 #ifdef JE_DEV_COPY_INJECT
     case JE_SYS_COPY_FIXUP_INJECT:
         /* dev-only: uaddr=RDI (an unmapped arena page); glue raw-copies to prove
@@ -140,6 +147,44 @@ static je_handle_table *current_htable(void)
     return &vm->procs[index].htable;
 }
 
+/* Resolve the current user process as (vm,index) for the endpoint ops, which
+ * need the vm (teardown-hook check + pool) not just the table. Returns false for
+ * a non-user caller. */
+static bool current_vm_index(je_vm **out_vm, uint32_t *out_index)
+{
+    return je_sched_current_user(out_vm, out_index) == JE_OK;
+}
+
+/* M3c (A3-2): a handle packs losslessly into half of the RDX scalar only because
+ * it is 32 bits. The endpoint_create two-handle return depends on this. */
+_Static_assert(sizeof(je_handle) == 4u, "endpoint_create packs two handles in RDX");
+/* The table-side endpoint type/rights copies must equal the ABI ones the glue
+ * uses, or typed dispatch and create would disagree. */
+_Static_assert(JE_ENDPOINT_OBJ_TYPE == JE_ABI_OBJ_ENDPOINT, "endpoint type: table vs ABI");
+_Static_assert(JE_EP_RIGHT_SEND == JE_ABI_RIGHT_SEND
+               && JE_EP_RIGHT_RECV == JE_ABI_RIGHT_RECV
+               && JE_EP_RIGHT_TRANSFER == JE_ABI_RIGHT_TRANSFER
+               && JE_EP_RIGHT_INSPECT == JE_ABI_RIGHT_INSPECT,
+               "endpoint rights: table vs ABI");
+
+/* Map endpoint-layer status to the v0 ABI (reuses the JE_ABI_H_* namespace; the
+ * glue is the only place endpoint.h and abi.h meet). */
+static je_abi_status ep_status_to_abi(je_ep_status s)
+{
+    switch (s) {
+    case JE_EP_OK:          return JE_ABI_OK;
+    case JE_EP_BADINDEX:    return JE_ABI_H_BADINDEX;
+    case JE_EP_STALE:       return JE_ABI_H_STALE;
+    case JE_EP_WRONGTYPE:   return JE_ABI_H_WRONGTYPE;
+    case JE_EP_DENIED:      return JE_ABI_H_DENIED;
+    case JE_EP_QUOTA:       return JE_ABI_H_QUOTA;
+    case JE_EP_NOSLOTS:     return JE_ABI_H_NOSLOTS;
+    case JE_EP_REFOVERFLOW: return JE_ABI_H_REFOVERFLOW;
+    case JE_EP_CORRUPT:     return JE_ABI_UNSUPPORTED; /* unwired vm / invariant */
+    }
+    return JE_ABI_INVALID;
+}
+
 /* Kernel glue. Returns the frame to iretq to (the caller for RETURN/invalid, a
  * live successor for YIELD/EXIT). Must only be called for a user-origin int 0x80
  * frame (je_trap_dispatch enforces cs&3==3; the scheduler helpers re-check the
@@ -183,10 +228,37 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         return je_sched_return_to_user(f);
     }
     case JE_SYSCALL_HANDLE_CLOSE: {
-        je_handle_table *t = current_htable();
-        if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        je_handle_status s = je_handle_close(t, (je_handle)f->rdi);
-        f->rax = (uint64_t)handle_status_to_abi(s); f->rdx = 0;
+        /* Typed close dispatch (A3-3): peek the slot's object type, then branch
+         * EXACTLY — SELF -> raw table close; ENDPOINT -> endpoint-aware close
+         * (drops the handle_ref); any other/unknown type -> fail closed. The peek
+         * and the close are atomic because this int 0x80 path runs at IF=0 on one
+         * CPU (SMP revisit). A raw je_handle_close on an endpoint slot would leak
+         * a ref, which is exactly what this dispatch prevents. */
+        je_vm *vm; uint32_t index;
+        if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+        je_handle_table *t = &vm->procs[index].htable;
+        je_handle h = (je_handle)f->rdi;
+        uint32_t type = 0u; je_handle peek = 0u;
+        /* The decoder already rejected a wide handle (rdi>>32) as INVALID. Decode
+         * to an index and read the slot type via the read-only iterator, matching
+         * on the same generation by re-encoding and comparing. */
+        uint32_t di = 0u, dg = 0u; je_handle_decode(h, &di, &dg);
+        bool live = je_handle_live_at(t, di, &peek, &type) && peek == h;
+        if (live && type == JE_ABI_OBJ_ENDPOINT) {
+            je_ep_status s = je_endpoint_kern_close(vm, index, h);
+            f->rax = (uint64_t)ep_status_to_abi(s); f->rdx = 0;
+        } else if (live && type != JE_ABI_OBJ_SELF) {
+            /* A LIVE slot of a type that is neither ENDPOINT nor SELF must FAIL
+             * CLOSED (A3-3): routing it to raw je_handle_close would drop a ref a
+             * future typed object owns. Unreachable today (only SELF/ENDPOINT are
+             * minted), but the contract is enforced, not assumed. */
+            f->rax = (uint64_t)JE_ABI_H_WRONGTYPE; f->rdx = 0;
+        } else {
+            /* SELF, or a not-live handle (stale/forged/free/retired): raw close
+             * gives the exact OK/BADINDEX/STALE status. */
+            je_handle_status s = je_handle_close(t, h);
+            f->rax = (uint64_t)handle_status_to_abi(s); f->rdx = 0;
+        }
         return je_sched_return_to_user(f);
     }
     case JE_SYSCALL_HANDLE_QUERY: {
@@ -235,6 +307,22 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
                                                 (uint32_t)f->rsi, &nh);
         f->rax = (uint64_t)handle_status_to_abi(s);
         f->rdx = (uint64_t)nh;                /* 0 on failure (dup clears out) */
+        return je_sched_return_to_user(f);
+    }
+    case JE_SYSCALL_ENDPOINT_CREATE: {
+        /* endpoint_create() (A3-2): mint both ends into the caller's own table
+         * via the kernel pool wrapper, which refuses unless this vm has the
+         * teardown hook installed (UNSUPPORTED) so a created endpoint is always
+         * on a death path that reclaims it. On OK, pack the two 32-bit handles:
+         * RDX[31:0]=h0, RDX[63:32]=h1. RDX is left 0 on failure (undefined by
+         * ABI, but we zero it rather than leak a stale value). */
+        je_vm *vm; uint32_t index;
+        if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+        je_handle h0 = 0u, h1 = 0u;
+        je_ep_status s = je_endpoint_kern_create(vm, index, &h0, &h1);
+        f->rax = (uint64_t)ep_status_to_abi(s);
+        f->rdx = (s == JE_EP_OK)
+               ? ((uint64_t)h0 | ((uint64_t)h1 << 32)) : 0u;
         return je_sched_return_to_user(f);
     }
 #ifdef JE_DEV_COPY_INJECT

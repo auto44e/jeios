@@ -385,8 +385,19 @@ je_status je_vm_destroy(je_vm *vm, uint32_t index)
 {
     if (!vm || !vm->ops || index >= JE_VM_MAX_PROCESSES) return JE_ERR_INVALID;
     if (vm->procs[index].state != JE_VM_READY) return JE_ERR_INVALID;
-    /* teardown is the reverse journal replay, identical to build-failure unwind. */
+    /* A3-1: the release walk + unwind + the *p={0} zeroing in unwind() must be
+     * ONE critical section. The direct main.c destroy callers may run with IF=1,
+     * so an IF=0 precondition is not enough: a timer preempting between the walk
+     * and the zeroing, while the peer process is live, would let the peer's
+     * HANDLE_CLOSE mutate the same channel record mid-teardown (a UAF). Hold IRQs
+     * off across the whole sequence when the kernel installed the guard; NULL
+     * (the unit test) keeps the prior behaviour. The teardown hook (the endpoint
+     * release walk) runs after the checks above and immediately before unwind. */
+    uint64_t irq = 0u;
+    if (vm->irq_save) irq = vm->irq_save();
+    if (vm->teardown) vm->teardown(vm->teardown_ctx, &vm->procs[index].htable);
     unwind(vm, index);
+    if (vm->irq_restore) vm->irq_restore(irq);
     return JE_OK;
 }
 

@@ -9,6 +9,8 @@
 #include <jeios/paging.h>
 #include <jeios/vm.h>
 #include <jeios/abi.h>
+#include <jeios/endpoint.h>
+#include <jeios/endpoint_kern.h>
 static je_boot_context boot;
 static _Noreturn void fail(const char *message)
 {
@@ -89,6 +91,7 @@ extern unsigned char je_user_unknownop_start[], je_user_unknownop_end[];
 extern unsigned char je_user_badret_start[], je_user_badret_end[];
 extern unsigned char je_user_copyprobe_start[], je_user_copyprobe_end[];
 extern unsigned char je_user_handle_start[], je_user_handle_end[];
+extern unsigned char je_user_epfault_start[], je_user_epfault_end[];
 #ifdef JE_DEV_COPY_INJECT
 extern unsigned char je_user_inject_start[], je_user_inject_end[];
 #endif
@@ -97,7 +100,8 @@ static je_vm vm_s3;
 static unsigned char vm_blob_s3[1024];
 typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_EXIT=3,
                PROG_SYSCALL=4, PROG_UNKNOWNOP=5, PROG_BADRSP=6, PROG_BADRET=7,
-               PROG_COPYPROBE=8, PROG_INJECT=9, PROG_HANDLE=10 } user_prog;
+               PROG_COPYPROBE=8, PROG_INJECT=9, PROG_HANDLE=10,
+               PROG_EPFAULT=11 } user_prog;
 static int vm_s3_inited;
 /* Initialize the shared step-3/4 vm once (it holds up to JE_VM_MAX_PROCESSES
  * processes — A and B share it, matching the 2-process admission quota). */
@@ -106,6 +110,11 @@ static void vm_s3_init_once(void)
     if (vm_s3_inited) return;
     const je_vm_ops *ops=je_arch_vm_ops(&je_kernel_pages, je_arch_has_nx());
     if (je_vm_init(&vm_s3, ops, &je_kernel_pages, 0)!=JE_OK) fail("JeiOS fatal: s3 vm_init\r\n");
+    /* M3c (A3-1): install the endpoint teardown hook + the IRQ critical-section
+     * pair so je_vm_destroy reclaims any endpoint this vm's processes hold and
+     * does so atomically vs a timer. SELF-only processes see a no-op walk; the
+     * s3 endpoint fault-death test (below) relies on this being installed. */
+    je_endpoint_kern_install(&vm_s3);
     vm_s3_inited=1;
 }
 /* Build one user process into the shared vm from the selected program (code at
@@ -124,6 +133,7 @@ static uint32_t vm_s3_build(user_prog prog)
     case PROG_BADRET:    start=je_user_badret_start;    end=je_user_badret_end;    break;
     case PROG_COPYPROBE: start=je_user_copyprobe_start; end=je_user_copyprobe_end; break;
     case PROG_HANDLE:    start=je_user_handle_start;    end=je_user_handle_end;    break;
+    case PROG_EPFAULT:   start=je_user_epfault_start;   end=je_user_epfault_end;   break;
 #ifdef JE_DEV_COPY_INJECT
     case PROG_INJECT:    start=je_user_inject_start;    end=je_user_inject_end;    break;
 #endif
@@ -633,6 +643,99 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (je_sched_drop_user(&vm_s3, H)!=JE_OK) fail("JeiOS fatal: s5c handle drop\r\n");
             if (je_vm_destroy(&vm_s3, H)!=JE_OK) fail("JeiOS fatal: s5c handle destroy\r\n");
             je_arch_console_write("M3b-s1: handle self/query/rights/dup/close OK; attenuation drops INSPECT -> handle_rights DENIED (enforcement real); superset DENIED; unknown-right INVALID; reuse re-stales; QUOTA at CAP-1; B alive\r\n");
+        }
+
+        /* --- M3c s3: endpoint lifecycle wired to ring 3 + process-death reclaim.
+         * Two proofs:
+         *   (A) a KERNEL-ONLY self-test of the survivor-peer case — one process
+         *       table holds end0, the OTHER holds end1; destroying the holder of
+         *       end0 must leave end1 PEER_CLOSED and the record still allocated
+         *       (survivor keeps it), and closing end1 then frees it. (A ring-3
+         *       cross-process peer needs transfer (step 5); this proves the
+         *       survivor semantics honestly without claiming the ring-3 path does.)
+         *   (B) a RING-3 fault-death loop: a process calls endpoint_create, closes
+         *       one end via the typed dispatch, then faults; after reap the pool
+         *       MUST return to baseline. Looped > JE_EP_POOL_CAP times to prove no
+         *       leak exhausts the pool. */
+        {
+            /* (A) survivor-peer, kernel-only, using two live process tables. The
+             * two s4 processes A/B are gone by here; build two fresh SELF-less
+             * holders is overkill — reuse the raw channel-create against two
+             * distinct process htables we construct via short-lived vms is also
+             * heavy. Simplest honest proof: two tables are &vm_s3.procs[0/1]
+             * htables, which are FREE here; init two throwaway tables on the stack
+             * is cleaner and needs no vm. */
+            je_handle_slot sa[4], sb[4];
+            je_handle_table ta, tb;
+            if (!je_handle_table_init(&ta, sa, 4u, 3u)
+                || !je_handle_table_init(&tb, sb, 4u, 3u))
+                fail("JeiOS fatal: s3 survivor tables\r\n");
+            /* Use a local pool for this structural proof (the kernel pool is for
+             * the ring-3 path). */
+            static je_endpoint_pool sp;
+            je_endpoint_pool_init(&sp);
+            je_handle ea=0, eb=0;
+            if (je_endpoint_channel_create(&sp, &ta, JE_EP_RIGHTS_ALL,
+                                           &tb, JE_EP_RIGHTS_ALL, &ea, &eb)!=JE_EP_OK)
+                fail("JeiOS fatal: s3 survivor create\r\n");
+            if (je_endpoint_pool_allocated(&sp)!=1u) fail("JeiOS fatal: s3 survivor not 1\r\n");
+            /* Holder of end0 (table ta) 'dies': release its endpoints. */
+            if (je_endpoint_release_table(&sp, &ta)!=1) fail("JeiOS fatal: s3 survivor walk!=1\r\n");
+            /* Survivor (tb) still holds end1: record stays allocated, end1 is
+             * PEER_CLOSED. */
+            if (je_endpoint_pool_allocated(&sp)!=1u) fail("JeiOS fatal: s3 survivor freed early\r\n");
+            je_ep_channel *rec; uint8_t side;
+            if (je_endpoint_resolve(&sp, &tb, eb, &rec, &side)!=JE_EP_OK) fail("JeiOS fatal: s3 survivor resolve\r\n");
+            if (je_endpoint_end_state(rec, side)!=JE_EP_END_PEER_CLOSED) fail("JeiOS fatal: s3 survivor not PEER_CLOSED\r\n");
+            /* Survivor closes its end -> record freed. */
+            if (je_endpoint_release_table(&sp, &tb)!=1) fail("JeiOS fatal: s3 survivor close\r\n");
+            if (je_endpoint_pool_allocated(&sp)!=0u) fail("JeiOS fatal: s3 survivor not reclaimed\r\n");
+            je_arch_console_write("M3c-s3a: survivor-peer PEER_CLOSED; record held by survivor; reclaimed on its close (kernel self-test)\r\n");
+
+            /* (B) ring-3 endpoint fault-death loop. Pool must start and end at 0,
+             * and never climb despite N>POOL_CAP fault/reap cycles. */
+            if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s3 kpool not 0 at start\r\n");
+            for (unsigned iter=0; iter<JE_EP_POOL_CAP+3u; ++iter) {
+                uint32_t E=vm_s3_build(PROG_EPFAULT);
+                if (je_thread_create_user(&vm_s3, E)!=JE_OK) fail("JeiOS fatal: s3 ep thread\r\n");
+                /* Run until E has faulted (its slot is DYING). It creates an
+                 * endpoint, closes one end, then reads an unmapped page -> #PF. */
+                for (uint64_t sp2=0; !je_sched_has_dying(); ) {
+                    (void)je_arch_irq_save();
+                    if (++sp2>100000000ull) fail("JeiOS fatal: s3 ep did not fault\r\n");
+                    __asm__ volatile("sti; hlt":::"memory");
+                }
+                /* With IRQs off, read what E recorded before it faulted: create OK,
+                 * both packed handle halves nonzero AND distinct (proves the A3-2
+                 * pack order/distinctness, not just "nonzero"), and the typed
+                 * close of h0 OK (h1 kept the channel alive -> pool is 1). */
+                (void)je_arch_irq_save();
+                if (vm_s3_scratch(E,0x1200)!=JE_ABI_OK)   fail("JeiOS fatal: s3 ep create not OK\r\n");
+                {
+                    uint64_t packed=vm_s3_scratch(E,0x1208);
+                    uint32_t eh0=(uint32_t)(packed & 0xffffffffu);
+                    uint32_t eh1=(uint32_t)(packed >> 32);
+                    if (eh0==0u || eh1==0u) fail("JeiOS fatal: s3 ep a packed handle is zero\r\n");
+                    if (eh0==eh1)           fail("JeiOS fatal: s3 ep packed handles not distinct\r\n");
+                }
+                if (vm_s3_scratch(E,0x1210)!=JE_ABI_OK)   fail("JeiOS fatal: s3 ep typed close(h0) not OK\r\n");
+                if (je_endpoint_kernel_allocated()!=1u)   fail("JeiOS fatal: s3 ep pool not 1 at fault\r\n");
+                /* E died by a user #PF on the unmapped page, not some other kill. */
+                {
+                    uint64_t Ev,Ee,Er,Ec,Ecr2;
+                    if (je_sched_death_record(&vm_s3,E,&Ev,&Ee,&Er,&Ec,&Ecr2)!=JE_OK)
+                        fail("JeiOS fatal: s3 ep no death record\r\n");
+                    if (Ev!=14u || Ec!=0x33u) fail("JeiOS fatal: s3 ep not a user #PF\r\n");
+                }
+                /* Reap the faulted process; the release walk (under the IRQ
+                 * critical section in je_vm_destroy) must drop the surviving h1
+                 * and free the channel -> pool back to baseline 0. Exactly ONE
+                 * process (E) is DYING here, so reap_dead must report 1 — proving
+                 * the live peer B was not touched. */
+                if (je_sched_reap_dead()!=1) fail("JeiOS fatal: s3 ep reap != 1\r\n");
+                if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s3 ep pool leak after reap\r\n");
+            }
+            je_arch_console_write("M3c-s3b: ring-3 endpoint_create + typed close; fault-death reap reclaims the channel; pool baseline held across >POOL_CAP cycles\r\n");
         }
 
         /* Tear down B; all step-3/4/5a pages must be back to the pre-s4 baseline. */

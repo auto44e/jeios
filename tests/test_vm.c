@@ -460,11 +460,66 @@ static void test_rollback(void)
     }
 }
 
+/* M3c (ADR 0009 A3-1): prove je_vm_destroy runs the teardown hook BEFORE the
+ * table is zeroed, wrapped in a paired irq_save/irq_restore, and that NULL hooks
+ * (the default) preserve the prior behaviour. Uses fakes — no endpoint state. */
+static int hook_calls, irq_saves, irq_restores, hook_saw_live_table;
+static uint64_t fake_irq_save(void) { irq_saves++; return 0x1234u; }
+static void fake_irq_restore(uint64_t f) { assert(f == 0x1234u); irq_restores++; }
+static void fake_teardown(void *ctx, je_handle_table *t)
+{
+    (void)ctx;
+    hook_calls++;
+    /* The hook must run while the process is still intact: its handle table is
+     * still initialized (capacity nonzero), i.e. unwind()'s *p={0} has NOT run
+     * yet. And irq_save must already have happened, irq_restore not yet. */
+    if (t && t->capacity != 0u) hook_saw_live_table = 1;
+    assert(irq_saves == 1 && irq_restores == 0);
+}
+
+static void test_teardown_hook(void)
+{
+    const je_vm_image image = image_fixture();
+    uint32_t index = UINT32_MAX;
+    init_blob();
+
+    /* With the hook + irq pair installed: destroy runs hook before zeroing, and
+     * pairs save/restore exactly once. */
+    reset_vm(0u);
+    vm.teardown = fake_teardown;
+    vm.teardown_ctx = (void *)0;
+    vm.irq_save = fake_irq_save;
+    vm.irq_restore = fake_irq_restore;
+    hook_calls = irq_saves = irq_restores = hook_saw_live_table = 0;
+    assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &index) == JE_OK);
+    assert(je_vm_destroy(&vm, index) == JE_OK);
+    assert(hook_calls == 1);               /* hook ran exactly once */
+    assert(hook_saw_live_table == 1);      /* BEFORE the table was zeroed */
+    assert(irq_saves == 1 && irq_restores == 1);  /* paired */
+    assert(all_processes_free(&vm));       /* and the zeroing still happened */
+
+    /* Early return (bad state) must NOT run the hook or touch IRQs. */
+    hook_calls = irq_saves = irq_restores = 0;
+    assert(je_vm_destroy(&vm, index) == JE_ERR_INVALID);  /* already FREE */
+    assert(hook_calls == 0 && irq_saves == 0 && irq_restores == 0);
+
+    /* NULL hooks (the unit-test default elsewhere): destroy still works, no hook,
+     * no IRQ calls — the pre-M3c behaviour. */
+    reset_vm(0u);   /* zeroes vm, so all four fields are NULL again */
+    index = UINT32_MAX;
+    hook_calls = irq_saves = irq_restores = 0;
+    assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &index) == JE_OK);
+    assert(je_vm_destroy(&vm, index) == JE_OK);
+    assert(hook_calls == 0 && irq_saves == 0 && irq_restores == 0);
+    assert(all_processes_free(&vm));
+}
+
 int main(void)
 {
     test_image_validation();
     test_admission();
     test_build_audit_and_teardown();
     test_rollback();
-    puts("vm: PASS (validation, admission, audit, permissions, zeroing, rollback, teardown)");
+    test_teardown_hook();
+    puts("vm: PASS (validation, admission, audit, permissions, zeroing, rollback, teardown, death-hook)");
 }

@@ -195,3 +195,15 @@ je_handle_status je_handle_close(je_handle_table *t, je_handle h)
     t->live--;
     return JE_HANDLE_OK;
 }
+
+bool je_handle_live_at(const je_handle_table *t, uint32_t index,
+                       je_handle *out_handle, uint32_t *out_type)
+{
+    if (!out_handle || !out_type) return false;
+    if (!t || index >= t->capacity) return false;
+    const je_handle_slot *s = &t->slots[index];
+    if (s->state != JE_HSLOT_LIVE) return false;
+    *out_handle = je_handle_encode(index, s->generation);
+    *out_type = s->type;
+    return true;
+}

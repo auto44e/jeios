@@ -97,8 +97,13 @@ int main(void)
      * dup(self,0x2)==INVALID assertion is intentionally retired; its unknown-bit
      * INTENT is preserved by the next line on a genuinely-unknown bit. */
     assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0x80000000u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
-    /* op 10 and up unknown. */
-    assert(dec(10, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
+    /* endpoint_create (op 10): no args -> ENDPOINT_CREATE action, OK; any
+     * reserved arg -> INVALID. (Dispatch/mint is kernel-only; decode is pure.) */
+    assert(dec(JE_SYS_ENDPOINT_CREATE, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_ENDPOINT_CREATE && st==JE_ABI_OK);
+    assert(dec(JE_SYS_ENDPOINT_CREATE, 1,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    assert(dec(JE_SYS_ENDPOINT_CREATE, 0,0,0,0,0,9,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    /* op 11 and up unknown. */
+    assert(dec(11, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
 
     printf("syscall: PASS (abi_query, yield, exit, copy_probe, handle self/close/query/rights/dup, "
            "reserved-arg, wide-handle, unknown-rights, full-width op, unsupported)\n");

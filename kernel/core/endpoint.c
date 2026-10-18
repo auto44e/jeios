@@ -315,3 +315,29 @@ je_ep_status je_endpoint_handle_dup(je_endpoint_pool *pool, je_handle_table *t,
     *out = nh;
     return JE_EP_OK;
 }
+
+/* ---- process-death release walk (A3-1) ----------------------------------- */
+
+int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t)
+{
+    if (!pool || !t) return -1;
+    int released = 0;
+    /* Reading t->capacity is table METADATA (public struct field), not slot
+     * internals; slot contents are reached only via the read-only iterator. */
+    for (uint32_t i = 0; i < t->capacity; ++i) {
+        je_handle h = 0u;
+        uint32_t type = 0u;
+        if (!je_handle_live_at(t, i, &h, &type)) continue;
+        if (type != JE_ENDPOINT_OBJ_TYPE) continue;   /* leave SELF etc. to the zero */
+        je_ep_status s = je_endpoint_handle_close(pool, t, h);
+        if (s != JE_EP_OK) return -1;   /* invariant break: caller must fail-stop */
+        released++;
+    }
+    /* Post-condition: no endpoint slot may remain LIVE. */
+    for (uint32_t i = 0; i < t->capacity; ++i) {
+        je_handle h = 0u; uint32_t type = 0u;
+        if (je_handle_live_at(t, i, &h, &type) && type == JE_ENDPOINT_OBJ_TYPE)
+            return -1;   /* a LIVE endpoint survived the walk -> fatal */
+    }
+    return released;
+}

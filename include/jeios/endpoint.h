@@ -199,4 +199,19 @@ je_ep_status je_endpoint_release_inflight(je_endpoint_pool *pool,
 je_ep_end_state je_endpoint_end_state(const je_ep_channel *rec, uint8_t side);
 uint32_t        je_endpoint_pool_allocated(const je_endpoint_pool *pool);
 
+/* Process-death RELEASE WALK (ADR 0009 D-OWNER-2 + AMENDMENT A3-1): drop every
+ * LIVE endpoint handle in table `t`, closing peers and freeing now-unreferenced
+ * channels, so a dying process leaks no pool record. Enumerates `t` via the
+ * read-only je_handle_live_at iterator and closes each endpoint slot through
+ * je_endpoint_handle_close (never writes `t->slots` directly, never touches any
+ * other table — a surviving peer only sees its end go PEER_CLOSED). Idempotent
+ * by construction: each slot owns exactly one handle_ref and is invalidated
+ * before its ref drops. Returns the number of endpoint handles released. A
+ * resolve/close failure on a slot the iterator just reported LIVE is an
+ * invariant violation: the caller MUST treat a negative return as fatal (the
+ * record pool is corrupt) and stop before any table-zeroing. On success every
+ * endpoint slot in `t` is guaranteed no longer LIVE. MUST run with IF=0 (the
+ * caller — je_vm_destroy — holds the IRQ-disabled critical section, A3-1). */
+int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t);
+
 #endif /* JEIOS_ENDPOINT_H */

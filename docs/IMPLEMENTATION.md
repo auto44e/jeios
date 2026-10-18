@@ -723,6 +723,82 @@ a *bad* security analogy (it is a real ring-3 dev op; endpoint create has no
 ring-3 surface at all). AI-assisted review only; not independent human
 qualification.
 
+## M3c death-path release walk + typed dispatch + ring-3 endpoint_create — 2026-10-18
+
+ADR 0009 **D-SEQ step 3**, the owner-signed tested-death-path PR (the amendment
+A3-1/A3-2/A3-3 decisions, both owner-approved). Ships three things together so a
+user process can never die holding an endpoint before teardown reclaims it:
+
+**Process-death release walk.** `je_endpoint_release_table(pool, t)` (in the pure
+`endpoint.c`) enumerates a dying process's table via a new **read-only** iterator
+`je_handle_live_at` (added to `handle.c`, so endpoint code never writes table
+internals — table purity preserved) and closes each LIVE endpoint handle through
+`je_endpoint_handle_close`, dropping its ref, closing peers, and freeing
+now-unreferenced channels. It post-asserts no endpoint slot remains LIVE and
+returns <0 on any invariant break; the kernel hook treats that as fatal
+(`console_write`+`halt`) **before** any table zeroing — a leak is never zeroed
+away into a lie. A SELF handle in the same table is left for the existing zeroing.
+
+**Wired through a generic `je_vm` hook + IRQ critical section (A3-1).** `je_vm`
+gained `teardown`/`teardown_ctx` and `irq_save`/`irq_restore`, all zero-defaulted
+by `je_vm_init` so `test_vm.c`/`vm_fake.c` are untouched and `vm.c` stays
+endpoint- and arch-agnostic. `je_vm_destroy` now, after its existing checks, runs
+the hook (the release walk) and `unwind` **inside one `irq_save()/irq_restore()`
+critical section**. This is the owner-gated behaviour change: the naive "walk then
+unwind at IF=0" plan had a real hazard the peer review caught — the direct
+`main.c` destroy callers can run with IF=1, so a timer preempting between the walk
+and the `*p={0}` zeroing, while the peer process is live, would let the peer's
+HANDLE_CLOSE mutate the same channel record mid-teardown (a UAF). The IRQ save
+closes that window. The kernel pool + hook live in a new `endpoint_kern.c` (the
+only file with endpoint global state); `je_endpoint_kern_install(vm)` sets the
+four fields once.
+
+**Typed close dispatch (A3-3).** Ring-3 `HANDLE_CLOSE` (op 6) now does a read-only
+type peek (`je_handle_live_at` + generation match) then an exact branch: ENDPOINT
+→ `je_endpoint_kern_close` (drops the ref), else raw `je_handle_close` (SELF).
+Atomic because the int 0x80 path runs at IF=0 on one CPU (stated as an explicit
+SMP-revisit assumption, not a general proof). No ring-3 op allocates a slot of a
+caller-chosen type, and op 9 stays SELF-only, so raw endpoint alloc is
+unreachable — the structural discharge of endpoint.h's precondition.
+
+**Ring-3 `endpoint_create` (op 10, A3-2).** Takes no args (all reserved zero else
+INVALID), mints both ends into the caller's table with all endpoint rights,
+transactional. The v0 ABI's single RDX scalar carries **both 32-bit handles
+packed**: `RDX[31:0]=h0`, `RDX[63:32]=h1`, undefined on failure —
+`_Static_assert(sizeof(je_handle)==4)` pins the losslessness. It returns
+`UNSUPPORTED` on a VM with no teardown hook, so "an endpoint in a ring-3 table ⇒
+that VM's destroy walks it" holds by construction (the create wrapper
+`je_endpoint_kern_create` enforces the same for kernel callers). `JE_ABI_OBJ_ENDPOINT`
+and the endpoint rights bits are `_Static_assert`-pinned equal to the table-side
+copies in the glue; pool exhaustion maps to the existing `JE_ABI_H_NOSLOTS`.
+
+**Proofs.** Two QEMU markers extend the fault-death family:
+- `M3c-s3a` (**kernel self-test**): one table holds end0, another holds end1;
+  releasing the end0 holder leaves end1 `PEER_CLOSED` with the record still
+  allocated (survivor keeps it), and the survivor's close then frees it — the
+  honest survivor-peer proof (a ring-3 cross-process peer needs transfer, step 5,
+  so this is deliberately kernel-only and labelled as such).
+- `M3c-s3b` (**ring-3**): a process calls `endpoint_create`, closes h0 via the
+  typed dispatch (pool is 1 — h1 keeps the channel), then faults; after
+  `reap_dead` the pool is back to baseline 0, held across `JE_EP_POOL_CAP+3`
+  fault/reap cycles (no leak exhausts the pool). Scope-honest: it proves
+  reclaim + no-exhaustion, not the survivor case.
+
+Hosted coverage added: `test_endpoint` gains release-walk cases (mixed
+endpoints+SELF, idempotent re-walk, dup/both-ends-in-dying-table); `test_syscall`
+asserts op 10 decodes to `ENDPOINT_CREATE` (op 11 is the new UNSUPPORTED
+boundary); and `test_vm` gains a **fake-hook ordering test** proving `je_vm_destroy`
+runs the teardown hook while the table is still live (before the `*p={0}`
+zeroing), pairs `irq_save`/`irq_restore` exactly once, skips both on the
+bad-state early return, and preserves the prior behaviour when the hooks are NULL
+(the default everywhere else). `make check` / `smoke` / `integration` / 3 CI NX
+profiles / ARM64 all green.
+
+Design + implementation cross-review via a role-assigned peer debate. The IRQ
+critical-section hazard and the packed-RDX ABI shape were both escalated to and
+approved by the owner (recorded as ADR 0009 AMENDMENT A3-1/A3-2). AI-assisted
+review only; not independent human qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

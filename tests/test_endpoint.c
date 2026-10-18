@@ -259,8 +259,52 @@ int main(void)
         assert(je_endpoint_handle_close(&g_pool, &g_t, 0u) == JE_EP_BADINDEX);
     }
 
+    /* 11. Release walk (je_endpoint_release_table): simulates process death. A
+     * table with endpoint handles is walked; every endpoint handle is released,
+     * no endpoint slot remains LIVE, and records with no surviving ref are freed.
+     * A SELF handle in the same table is left untouched (only the zero reclaims
+     * it, as today). */
+    fresh(QUOTA);
+    {
+        /* Two channels fully owned by this one table (both ends here), plus a
+         * dup, plus a SELF handle that must survive the walk. */
+        je_handle a0=0,a1=0,b0=0,b1=0,dup=0,self=0;
+        make_pair(&a0,&a1);
+        make_pair(&b0,&b1);
+        assert(je_endpoint_handle_dup(&g_pool,&g_t,a0,JE_EP_RIGHTS_ALL,&dup)==JE_EP_OK);
+        assert(je_handle_alloc(&g_t,(void*)0,JE_HANDLE_OBJ_SELF,
+                               JE_EP_RIGHT_INSPECT,&self)==JE_HANDLE_OK);
+        assert(je_endpoint_pool_allocated(&g_pool)==2u);
+        uint32_t live_before = g_t.live;   /* 5 endpoint handles + 1 self = 6 */
+
+        int released = je_endpoint_release_table(&g_pool, &g_t);
+        assert(released == 5);                      /* a0,a1,b0,b1,dup */
+        assert(je_endpoint_pool_allocated(&g_pool)==0u);  /* both records freed */
+        /* No endpoint slot LIVE; the SELF slot still LIVE. */
+        je_ep_channel *rec; uint8_t side;
+        assert(je_endpoint_resolve(&g_pool,&g_t,a0,&rec,&side)==JE_EP_STALE);
+        void *obj=(void*)1;
+        assert(je_handle_lookup(&g_t,self,JE_HANDLE_OBJ_SELF,0u,&obj)==JE_HANDLE_OK);
+        assert(g_t.live == live_before - 5u);       /* only endpoints dropped */
+
+        /* Idempotent: a second walk releases nothing and still succeeds. */
+        assert(je_endpoint_release_table(&g_pool, &g_t) == 0);
+    }
+
+    /* 12. Release walk, same channel's two ends both in the dying table but one
+     * via a dup: last release frees the record, no mid-walk UAF. */
+    fresh(QUOTA);
+    {
+        je_handle c0=0,c1=0,c0dup=0;
+        make_pair(&c0,&c1);
+        assert(je_endpoint_handle_dup(&g_pool,&g_t,c0,JE_EP_RIGHTS_ALL,&c0dup)==JE_EP_OK);
+        /* end0 has 2 handle_refs (c0,c0dup), end1 has 1 (c1). */
+        assert(je_endpoint_release_table(&g_pool,&g_t) == 3);
+        assert(je_endpoint_pool_allocated(&g_pool)==0u);
+    }
+
     printf("endpoint: PASS (create, split-ref close/destruction, dup "
            "acquire-before-commit, REFOVERFLOW, DENIED/WRONGTYPE, inflight keep-"
-           "alive, pool-exhaustion + create-unwind)\n");
+           "alive, pool-exhaustion + create-unwind, release-walk)\n");
     return 0;
 }

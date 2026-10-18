@@ -76,6 +76,15 @@ typedef enum {
                               * handle to the same object with a rights SUBSET.
                               * -> RDX = new handle. Attenuation only (never a
                               * superset: a right the source lacks -> DENIED). */
+    , JE_SYS_ENDPOINT_CREATE = 10 /* M3c (ADR 0009 A3-2) endpoint_create(): no
+                              * args (all of RDI/RSI/RDX/R10/R8/R9 zero, else
+                              * INVALID). Mints BOTH ends of a fresh channel into
+                              * the caller's own table with all endpoint rights.
+                              * Transactional. -> RAX status; RDX packs the two
+                              * 32-bit handles: RDX[31:0]=h0, RDX[63:32]=h1. RDX
+                              * is UNDEFINED on failure. UNSUPPORTED on a VM with
+                              * no teardown hook (so an endpoint can only exist in
+                              * a table whose death path reclaims it). */
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYS_COPY_FIXUP_INJECT = 4  /* dev-only: raw-copy an unmapped page to test the fixup */
 #endif
@@ -85,11 +94,15 @@ typedef enum {
  * kernel-minted, immortal, resource-free process-identity capability. Type 0 is
  * reserved/invalid so a zeroed slot never reads as a valid type. */
 #define JE_ABI_OBJ_SELF 1u
+/* M3c endpoint object type (ADR 0009). Pinned equal to the table-side
+ * JE_ENDPOINT_OBJ_TYPE in the syscall glue via _Static_assert. */
+#define JE_ABI_OBJ_ENDPOINT 2u
 _Static_assert(JE_SYS_HANDLE_SELF == 5, "abi op handle_self");
 _Static_assert(JE_SYS_HANDLE_CLOSE == 6, "abi op handle_close");
 _Static_assert(JE_SYS_HANDLE_QUERY == 7, "abi op handle_query");
 _Static_assert(JE_SYS_HANDLE_RIGHTS == 8, "abi op handle_rights");
 _Static_assert(JE_SYS_HANDLE_DUP == 9, "abi op handle_dup");
+_Static_assert(JE_SYS_ENDPOINT_CREATE == 10, "abi op endpoint_create");
 
 /* M3b rights ABI (ADR 0008 revisit, frozen here). Rights are a fixed uint32_t
  * bitmask. handle_rights masks its output to JE_ABI_RIGHTS_KNOWN so no internal
