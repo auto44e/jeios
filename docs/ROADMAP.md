@@ -31,12 +31,15 @@ M0, M1a, M1b and the scoped M2 BSP foundation are implemented on
 main (foundation PR #1 merged 2026-10-13); see IMPLEMENTATION.md and HANDOFF.md for exact evidence.
 M1 has validated maps/reservations, fatal exceptions and hardware permission tests.
 **Update 2026-10-18:** M3a (the userspace boundary) is complete and qualified
-(see `docs/M3A_RETRO.md`). **M3b** (typed handles, ADR 0008) is in progress —
-the handle table, the first handle syscalls, and the rights ABI + policy hook are
-merged; attenuation + references (which also makes rights enforcement genuinely
-ring-3-observable) remain, then M3b closes. A second architecture, **ARM64 MP1
-step 1** (ADR 0002), now boots on QEMU virt-8.2. **M3c** (capability IPC + waits +
-init) is next after M3b.
+(see `docs/M3A_RETRO.md`). **M3b** (typed handles, ADR 0008) is complete and
+merged — the handle table, the handle syscalls, the rights ABI, and attenuation
+(which made rights enforcement genuinely ring-3-observable) all shipped. A second
+architecture, **ARM64 MP1 step 1** (ADR 0002), now boots on QEMU virt-8.2.
+**M3c** (capability IPC + waits + init, **ADR 0009** accepted) is in progress: its
+contract is frozen and **D-SEQ step 2 (endpoint lifecycle — pool + split refcount
++ destruction + retain-on-dup, create kernel-only)** is implemented; the remaining
+steps are the owner-signed death-path + ring-3 create, non-blocking data IPC,
+capability transfer, waits, and the bootstrap fixture.
 M2 has bounded page/heap allocation, timer preemption, guarded kernel threads,
 yield/sleep/exit and deferred stack reclamation. This is not a general scheduler,
 SMP implementation, userspace sandbox, or complete hardening milestone.
@@ -121,7 +124,7 @@ These design additions do not change the current implementation focus (M3b, then
 
 Apache-2.0 is selected for original project code; see ADR 0005.
 [M3A.md](M3A.md) supplies a proposed implementation sequence, not a completed gate.
-M3a is complete; M3b handles is in progress, followed by M3c IPC/init. The ARM64 MP track runs alongside (MP1 booted).
+M3a and M3b are complete; M3c IPC/init is in progress (ADR 0009; endpoint lifecycle landed). The ARM64 MP track runs alongside (MP1 booted).
 
 [ACCELERATORS.md](ACCELERATORS.md) defines open-standards-first GPU/NPU support
 across planned platforms, qualified per device. M4 supplies device/buffer/DMA
@@ -143,7 +146,7 @@ These requirements extend the later backlog; M3a remains the next kernel task.
 [MOBILE.md](MOBILE.md) links auto44e/jeios-mobile: MP0 ARM64 contract, MP1-MP3
 native virtual execution/isolation, MP4 Pixel feasibility, MP5-MP6 physical mobile
 bring-up/services, AC0-AC2 future Android compatibility. Fresh C kernel remains
-shared; no AOSP/Linux host or lunch target. (M3a is complete; M3b is in progress; ARM64 MP1 booted.)
+shared; no AOSP/Linux host or lunch target. (M3a and M3b are complete; M3c is in progress; ARM64 MP1 booted.)
 
 ## Zero trust throughout the ecosystem — 2026-10-14
 
@@ -157,7 +160,7 @@ or a reason to skip M3a. See HANDOFF.md for dated current status and history.
 [STANDARDS.md](STANDARDS.md): target POSIX.1-2024 as a core application environment;
 M6 remains an initial tested subset followed by complete-profile qualification.
 Built-in LDAPv3 provider/identity integration is also core, with optional enrollment.
-M3-M6 and security prerequisites still apply; M3a is complete and M3b is the current focus.
+M3-M6 and security prerequisites still apply; M3a and M3b are complete and M3c is the current focus.
 Track [POSIX #15](https://github.com/auto44e/jeios/issues/15) and
 [LDAP #16](https://github.com/auto44e/jeios/issues/16). Certification, AD DS/GPO and
 cloud enrollment are separate goals, not implied completion.

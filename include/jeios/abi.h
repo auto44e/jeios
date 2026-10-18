@@ -35,7 +35,13 @@ typedef enum {
     JE_ABI_H_DENIED    = 6,  /* live slot, insufficient rights (ring-3-observable
                               * via handle_dup attenuation since the M3b dup PR) */
     JE_ABI_H_QUOTA     = 7,  /* allocate: live-slot count at the process quota */
-    JE_ABI_H_NOSLOTS   = 8   /* allocate: no FREE slot remains */
+    JE_ABI_H_NOSLOTS   = 8,  /* allocate: no FREE slot remains */
+    JE_ABI_H_REFOVERFLOW = 9 /* M3c (ADR 0009 D4): acquiring an owning reference
+                              * past the configured JE_EP_REF_MAX policy bound;
+                              * acquires nothing, object unchanged. RESERVED here
+                              * (no ring-3 endpoint op yet) — first surfaced by a
+                              * later M3c syscall; pinned now so the number is
+                              * frozen in the v0 ABI. */
 } je_abi_status;
 _Static_assert(JE_ABI_OK == 0, "abi ok");
 _Static_assert(JE_ABI_UNSUPPORTED == 1, "abi unsupported");
@@ -48,6 +54,7 @@ _Static_assert(JE_ABI_H_WRONGTYPE == 5, "abi h_wrongtype");
 _Static_assert(JE_ABI_H_DENIED == 6, "abi h_denied");
 _Static_assert(JE_ABI_H_QUOTA == 7, "abi h_quota");
 _Static_assert(JE_ABI_H_NOSLOTS == 8, "abi h_noslots");
+_Static_assert(JE_ABI_H_REFOVERFLOW == 9, "abi h_refoverflow");
 
 /* Operation numbers (full 64-bit RAX; any value not listed is UNSUPPORTED). */
 typedef enum {
@@ -97,8 +104,24 @@ _Static_assert(JE_SYS_HANDLE_DUP == 9, "abi op handle_dup");
  * in QEMU (the M3b-s1 marker), no longer hosted-only. WRONGTYPE from ring 3 is
  * still not reachable (SELF is the only type), and remains hosted-tested. */
 #define JE_ABI_RIGHT_INSPECT 0x1u              /* may read the object's metadata */
-#define JE_ABI_RIGHTS_KNOWN  (JE_ABI_RIGHT_INSPECT)
+/* M3c endpoint rights (ADR 0009 D4a), appended to the known set here. These are
+ * the first rights beyond INSPECT, so they are the first to make the handle_dup
+ * decode's "unknown bit -> INVALID" gate (syscall.c) distinguish a known-but-
+ * unheld right (DENIED, decided in the glue) from a malformed bit (INVALID).
+ * NOTE (ABI behaviour change, owner-approved 2026-10-18, Option A): appending
+ * SEND=0x2 makes 0x2 a KNOWN bit, so the ring-3 call dup(self, 0x2) — asserted in
+ * M3b's test_syscall.c to return INVALID while 0x2 was unknown — now returns
+ * DENIED (0x2 is a known right a SELF handle does not hold). The test is updated
+ * to assert the new DENIED result for 0x2 AND to re-prove the unknown-bit->INVALID
+ * contract on a still-unknown bit; see test_syscall.c and docs/IMPLEMENTATION.md. */
+#define JE_ABI_RIGHT_SEND     0x2u             /* endpoint: may try_send */
+#define JE_ABI_RIGHT_RECV     0x4u             /* endpoint: may try_recv */
+#define JE_ABI_RIGHT_TRANSFER 0x8u             /* endpoint: may grant to a peer */
+#define JE_ABI_RIGHTS_KNOWN  (JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_SEND \
+                              | JE_ABI_RIGHT_RECV | JE_ABI_RIGHT_TRANSFER)
 _Static_assert(JE_ABI_RIGHT_INSPECT == 0x1u, "abi right inspect");
+_Static_assert(JE_ABI_RIGHT_SEND == 0x2u && JE_ABI_RIGHT_RECV == 0x4u
+               && JE_ABI_RIGHT_TRANSFER == 0x8u, "abi endpoint rights pinned");
 _Static_assert((JE_ABI_RIGHTS_KNOWN & ~UINT64_C(0xffffffff)) == 0u, "rights fit u32");
 
 /* abi_query selectors (RDI). */

@@ -83,9 +83,20 @@ int main(void)
     /* wide handle or wide rights -> INVALID */
     assert(dec(JE_SYS_HANDLE_DUP, UINT64_C(0x100000000), 0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
     assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, UINT64_C(0x100000000),0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
-    /* unknown rights bit (0x2 is not in JE_ABI_RIGHTS_KNOWN) -> INVALID (malformed),
-     * NOT DENIED (which is for a known-but-unheld right, decided in the glue). */
-    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0x2u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    /* Rights-bit decode contract. HISTORY (M3b): while 0x2 was an UNKNOWN bit,
+     * dup(self, 0x2) returned INVALID (malformed). M3c (ADR 0009 D4a) appends
+     * SEND=0x2 to JE_ABI_RIGHTS_KNOWN, so 0x2 is now a KNOWN right a SELF handle
+     * does not hold -> the decode passes and the glue returns DENIED. We assert
+     * the new DENIED result for 0x2, and re-prove the unknown-bit->INVALID
+     * contract on a bit that is still unknown (0x80000000). See
+     * docs/IMPLEMENTATION.md "M3c rights-bit discrepancy" for the rationale. */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_SEND,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
+    /* ^ 0x2 is now a well-formed (known) rights request: decode accepts it and
+     * returns the DUP action; the known-but-unheld -> DENIED decision happens in
+     * the glue (handle_dup_self subset check), not the decoder. The old
+     * dup(self,0x2)==INVALID assertion is intentionally retired; its unknown-bit
+     * INTENT is preserved by the next line on a genuinely-unknown bit. */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0x80000000u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
     /* op 10 and up unknown. */
     assert(dec(10, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
 
