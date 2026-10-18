@@ -76,6 +76,16 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
         if (rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_HANDLE_RIGHTS;
+    case JE_SYS_HANDLE_DUP:
+        /* handle_dup(h=RDI, new_rights=RSI): RDX/R10/R8/R9 reserved must be zero;
+         * both the handle (RDI) and the rights (RSI) must fit 32 bits; and the
+         * rights must contain only KNOWN bits (an unknown bit is a malformed call
+         * -> INVALID, distinct from asking for a known-but-unheld right which the
+         * glue reports as DENIED). The glue does the resolve + subset + allocate. */
+        if (rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if ((rdi >> 32) || (rsi >> 32)) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if (rsi & ~(uint64_t)JE_ABI_RIGHTS_KNOWN) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_HANDLE_DUP;
 #ifdef JE_DEV_COPY_INJECT
     case JE_SYS_COPY_FIXUP_INJECT:
         /* dev-only: uaddr=RDI (an unmapped arena page); glue raw-copies to prove
@@ -98,6 +108,10 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
 #define JE_HANDLE_RIGHTS_SELF JE_ABI_RIGHT_INSPECT
 _Static_assert((JE_HANDLE_RIGHTS_SELF & ~JE_ABI_RIGHTS_KNOWN) == 0u,
                "SELF must be minted only with known rights bits");
+/* The table's SELF-only dup gate uses JE_HANDLE_OBJ_SELF; it MUST equal the ABI
+ * SELF type the glue mints/passes, or dup_self would reject legitimate SELF
+ * handles (or the gate would be bypassable). Pin them together here. */
+_Static_assert(JE_HANDLE_OBJ_SELF == JE_ABI_OBJ_SELF, "SELF type: table vs ABI");
 
 /* Exhaustive, single-point mapping of internal JE_HANDLE_* results to the v0
  * ABI status namespace (ADR 0008 D2: distinct, not collapsed). Keeping it here
@@ -155,11 +169,10 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
     }
     case JE_SYSCALL_HANDLE_SELF: {
         /* Mint a SELF handle in the caller's own table. SELF carries no object
-         * pointer; it is granted the INSPECT right (JE_HANDLE_RIGHTS_SELF) so
-         * handle_rights has a right to check. Enforcement is a policy hook in
-         * M3b: every ring-3 SELF mint grants INSPECT, so ring 3 cannot observe a
-         * DENIED here until M3c attenuation mints a rights-reduced handle.
-         * Handle returned in RDX. */
+         * pointer; it is granted the INSPECT right (JE_HANDLE_RIGHTS_SELF). A
+         * freshly minted SELF holds INSPECT, so DENIED is not observable on it
+         * directly — but handle_dup can derive a rights-reduced handle on which
+         * handle_rights then returns DENIED (ring-3-observable). Handle in RDX. */
         je_handle_table *t = current_htable();
         if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
         je_handle h = 0;
@@ -193,10 +206,9 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
     case JE_SYSCALL_HANDLE_RIGHTS: {
         /* Look up the handle requiring the INSPECT right, and return its rights
          * mask (masked to the known ABI bits, so an internal bit can never leak).
-         * NOTE (policy hook, not end-to-end enforcement in M3b): since the only
-         * ring-3 mint path grants INSPECT, ring 3 cannot reach DENIED here yet;
-         * that branch is exercised by the hosted tests and becomes ring-3-
-         * observable with M3c attenuation. */
+         * DENIED here IS ring-3-observable: handle_dup can derive a handle that
+         * lacks INSPECT, and this op on that handle returns DENIED (proven by the
+         * M3b-s1 QEMU marker). */
         je_handle_table *t = current_htable();
         if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
         uint32_t rights = 0;
@@ -205,6 +217,24 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
                                                  JE_ABI_RIGHT_INSPECT, &rights);
         f->rax = (uint64_t)handle_status_to_abi(s);
         f->rdx = (s == JE_HANDLE_OK) ? (uint64_t)(rights & JE_ABI_RIGHTS_KNOWN) : 0u;
+        return je_sched_return_to_user(f);
+    }
+    case JE_SYSCALL_HANDLE_DUP: {
+        /* Attenuate: derive a new SELF handle (RDI) with a rights SUBSET (RSI).
+         * The decoder already rejected unknown rights bits as INVALID; here a
+         * request for a known-but-unheld right returns DENIED (never escalates).
+         * The new handle is a fresh, independently-closable slot naming the same
+         * SELF object; it counts against quota. This is where DENIED becomes
+         * genuinely ring-3-observable: dup(self, 0) yields a rights-less handle on
+         * which handle_rights then returns DENIED. */
+        je_handle_table *t = current_htable();
+        if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+        je_handle nh = 0;
+        je_handle_status s = je_handle_dup_self(t, (je_handle)f->rdi,
+                                                JE_HANDLE_TYPE_SELF,
+                                                (uint32_t)f->rsi, &nh);
+        f->rax = (uint64_t)handle_status_to_abi(s);
+        f->rdx = (uint64_t)nh;                /* 0 on failure (dup clears out) */
         return je_sched_return_to_user(f);
     }
 #ifdef JE_DEV_COPY_INJECT

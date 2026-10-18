@@ -74,10 +74,22 @@ int main(void)
     assert(dec(JE_SYS_HANDLE_RIGHTS, 0x00010000,0,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_RIGHTS && st==JE_ABI_OK);
     assert(dec(JE_SYS_HANDLE_RIGHTS, 0x00010000,0,0,1,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
     assert(dec(JE_SYS_HANDLE_RIGHTS, UINT64_C(0x100000000),0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
-    /* op 9 and up unknown. */
-    assert(dec(9, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
+    /* handle_dup(h=RDI, new_rights=RSI): clean subset -> DUP action, OK. */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_INSPECT,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK); /* drop all rights */
+    /* reserved RDX/R10/R8/R9 nonzero -> INVALID */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0, 1,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0, 0,1,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    /* wide handle or wide rights -> INVALID */
+    assert(dec(JE_SYS_HANDLE_DUP, UINT64_C(0x100000000), 0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, UINT64_C(0x100000000),0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    /* unknown rights bit (0x2 is not in JE_ABI_RIGHTS_KNOWN) -> INVALID (malformed),
+     * NOT DENIED (which is for a known-but-unheld right, decided in the glue). */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0x2u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    /* op 10 and up unknown. */
+    assert(dec(10, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
 
-    printf("syscall: PASS (abi_query, yield, exit, copy_probe, handle self/close/query/rights, "
-           "reserved-arg, wide-handle, full-width op, unsupported)\n");
+    printf("syscall: PASS (abi_query, yield, exit, copy_probe, handle self/close/query/rights/dup, "
+           "reserved-arg, wide-handle, unknown-rights, full-width op, unsupported)\n");
     return 0;
 }

@@ -224,6 +224,72 @@ static void test_rights_of(void)
     assert(je_handle_rights_of(&t, 0u, 7u, 0u, &r) == JE_HANDLE_BADINDEX);
 }
 
+static void test_dup(void)
+{
+    const uint32_t SELF = JE_HANDLE_OBJ_SELF;   /* the only duplicable type */
+    je_handle_table t = mk(CAP);
+    int obj = 0;
+    je_handle src, d_full, d_weak, nh;
+    uint32_t r;
+    void *o;
+
+    /* source with INSPECT (0x1) at slot 0 */
+    assert(je_handle_alloc(&t, &obj, SELF, 0x1u, &src) == JE_HANDLE_OK);
+
+    /* dup with the full right -> OK, a DIFFERENT handle at a DIFFERENT slot
+     * (fresh-slot), same object, same rights. */
+    assert(je_handle_dup_self(&t, src, SELF, 0x1u, &d_full) == JE_HANDLE_OK);
+    assert(d_full != src);
+    { uint32_t i,g; je_handle_decode(d_full,&i,&g); assert(i == 1u); }  /* lowest free */
+    assert(je_handle_rights_of(&t, d_full, SELF, 0x1u, &r) == JE_HANDLE_OK && r == 0x1u);
+    assert(je_handle_lookup(&t, d_full, SELF, 0u, &o) == JE_HANDLE_OK && o == &obj);
+
+    /* dup dropping the right -> OK, a rights-0 handle. rights_of requiring INSPECT
+     * on it is DENIED — the genuine attenuation->enforcement proof. */
+    assert(je_handle_dup_self(&t, src, SELF, 0x0u, &d_weak) == JE_HANDLE_OK);
+    assert(je_handle_rights_of(&t, d_weak, SELF, 0x1u, &r) == JE_HANDLE_DENIED);
+    assert(je_handle_rights_of(&t, d_weak, SELF, 0x0u, &r) == JE_HANDLE_OK && r == 0x0u);
+
+    /* superset request (a right the source lacks) -> DENIED, table unchanged. */
+    uint32_t live_before = t.live;
+    assert(je_handle_dup_self(&t, src, SELF, 0x3u, &nh) == JE_HANDLE_DENIED);
+    assert(nh == 0u && t.live == live_before);        /* no effect on failure */
+
+    /* a non-SELF type can NEVER be duplicated via this path, even if the named
+     * slot's type matches the requested expected_type — the gate is structural,
+     * not caller-trusted. (This is the latent-UAF guard for M3c.) */
+    je_handle other;
+    assert(je_handle_alloc(&t, &obj, 9u /* not SELF */, 0x1u, &other) == JE_HANDLE_OK);
+    live_before = t.live;
+    assert(je_handle_dup_self(&t, other, 9u, 0x0u, &nh) == JE_HANDLE_WRONGTYPE);
+    assert(nh == 0u && t.live == live_before);
+
+    /* cannot dup a stale source; derived handles survive the source's close */
+    assert(je_handle_close(&t, src) == JE_HANDLE_OK);
+    live_before = t.live;
+    assert(je_handle_dup_self(&t, src, SELF, 0x1u, &nh) == JE_HANDLE_STALE);
+    assert(nh == 0u && t.live == live_before);        /* no effect on failure */
+    assert(je_handle_lookup(&t, d_full, SELF, 0u, &o) == JE_HANDLE_OK);  /* alive */
+    assert(je_handle_lookup(&t, d_weak, SELF, 0u, &o) == JE_HANDLE_OK);
+    /* each derived handle closes independently */
+    assert(je_handle_close(&t, d_weak) == JE_HANDLE_OK);
+    assert(je_handle_lookup(&t, d_full, SELF, 0u, &o) == JE_HANDLE_OK);  /* still alive */
+    assert(je_handle_close(&t, d_full) == JE_HANDLE_OK);
+
+    /* dup at QUOTA -> QUOTA, *out 0, table unchanged (quota<capacity so it's
+     * QUOTA not NOSLOTS). Fill to the quota from one SELF source, then dup. */
+    je_handle_table t2;
+    je_handle_slot slots2[CAP];
+    assert(je_handle_table_init(&t2, slots2, CAP, 2u));   /* quota 2 */
+    je_handle a, b;
+    assert(je_handle_alloc(&t2, &obj, SELF, 0x1u, &a) == JE_HANDLE_OK);
+    assert(je_handle_alloc(&t2, &obj, SELF, 0x1u, &b) == JE_HANDLE_OK);  /* live==quota */
+    live_before = t2.live;
+    assert(je_handle_dup_self(&t2, a, SELF, 0x1u, &nh) == JE_HANDLE_QUOTA);
+    assert(nh == 0u && t2.live == live_before);
+    (void) b;
+}
+
 int main(void)
 {
     test_encode_decode();
@@ -231,6 +297,7 @@ int main(void)
     test_quota();
     test_init_rejections();
     test_rights_of();
+    test_dup();
 #ifdef JE_HANDLE_TEST_WIDTH
     test_saturation_and_retirement();
     test_noslots_via_retirement();

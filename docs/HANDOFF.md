@@ -5,14 +5,17 @@
 Implemented and merged beyond M3a: **M3b** (typed handle table, ADR 0008) is in
 progress on x86-64, and a second architecture, **ARM64 (MP1)**, now boots.
 
-- **M3b** (issue #7, ADR 0008 accepted, Option A): the pure handle table landed
-  (`kernel/core/handle.c`+`handle.h`), then was wired into `je_vm_process` with the
-  first handle syscalls — `handle_self` (5), `handle_close` (6), `handle_query` (7,
-  type), and now `handle_rights` (8). SELF is the only object kind (immortal,
-  resource-free, minted with the INSPECT right). The rights ABI is frozen
-  (`JE_ABI_RIGHT_INSPECT=0x1`). **Remaining for M3b:** attenuation + references —
-  which also makes rights enforcement genuinely ring-3-observable (DENIED/WRONGTYPE
-  are hosted-test-only today; the "(B)/A+B" follow-up in ADR 0008). Then M3b closes.
+- **M3b** (issue #7, ADR 0008 accepted, Option A): the pure handle table, the
+  handle syscalls (`handle_self`/`close`/`query`/`rights`), the rights ABI, AND
+  **attenuation** (`handle_dup`, op 9) are all merged. Attenuation made rights
+  enforcement genuinely ring-3-observable: a process derives a rights-reduced
+  handle and `handle_rights` on it returns DENIED (QEMU `M3b-s1` proof). SELF is
+  the only object kind; dup is SELF-only (structurally type-gated — a destroyable
+  type would be a latent UAF without a retain, which M3c must add). **#7 stays
+  OPEN** (landed "Refs #7"): its remaining acceptance — bounded per-object
+  **reference count + overflow**, destruction-on-last-reference, and the
+  **service-instance vs slot generation** split — needs a destroyable object and
+  is M3c work.
 - **ARM64 MP1 step 1** (jeios-mobile#1, ADR 0002): boots on QEMU `virt-8.2` /
   `cortex-a72` (direct `-kernel`, no firmware) — entry EL1, stack, TCR_EL1 interim,
   BSS clear, DTB pointer recorded, bounded PL011 console, ordered markers. Separate

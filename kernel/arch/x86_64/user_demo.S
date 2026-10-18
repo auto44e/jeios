@@ -295,6 +295,59 @@ je_user_handle_start:
     int $0x80
     movq %rax, 0x400010a0
     movq %rdx, 0x400010a8
+    /* --- attenuation (op 9) matrix, from the live self#1 in r11 --- */
+    /* dup(self#1, INSPECT): full-rights alias -> status@+0xb0, new handle@+0xb8.
+     * Keep the derived weak handle's value for the enforcement step below. */
+    movq $9, %rax
+    movq %r11, %rdi
+    movq $0x1, %rsi             /* new_rights = INSPECT */
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400010b0
+    movq %rdx, 0x400010b8
+    /* dup(self#1, 0): derive a RIGHTS-LESS handle -> status@+0xc0, handle@+0xc8 */
+    movq $9, %rax
+    movq %r11, %rdi
+    xorq %rsi,%rsi             /* new_rights = 0 (drop INSPECT) */
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400010c0
+    movq %rdx, 0x400010c8
+    movq %rdx, %r12            /* keep the weak (no-INSPECT) handle */
+    /* THE ENFORCEMENT PROOF: handle_rights(weak) requires INSPECT, which this
+     * derived handle lacks -> DENIED (status 6), from ring 3 -> status@+0xd0 */
+    movq $8, %rax
+    movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400010d0
+    /* dup(weak, INSPECT): superset request (weak lacks INSPECT) -> DENIED@+0xd8 */
+    movq $9, %rax
+    movq %r12, %rdi
+    movq $0x1, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400010d8
+    /* dup(self#1, 0x2): unknown rights bit -> INVALID (2)@+0xe0 */
+    movq $9, %rax
+    movq %r11, %rdi
+    movq $0x2, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400010e0
+    /* close(weak) must work even with 0 rights -> OK@+0xe8 (no slot leak) */
+    movq $6, %rax
+    movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400010e8
+    /* close the full-rights alias too (slot from +0xb8), so the later quota
+     * count starts from a known live set (only self#1 live again). -> @+0xf0 */
+    movq $6, %rax
+    movq 0x400010b8, %rdi      /* d_full handle */
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400010f0
     /* close(live, h=self#1) -> status@+0x40 */
     movq $6, %rax
     movq %r11, %rdi

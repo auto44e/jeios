@@ -63,6 +63,9 @@ same-slot-vs-fresh-slot design question materially changes quota, close semantic
 and reference ownership and should be decided against running code. What is frozen
 here is only: the rights mask exists and is checked on use, and any future
 attenuation may only ever *remove* rights, never add them.
+*(Superseded 2026-10-18: attenuation IS now implemented and frozen — fresh-slot,
+SELF-only — by the AMENDMENT after D6 below. Multi-handle **references** (refcount
+/ overflow / instance-generation) remain deferred to M3c.)*
 
 Retained from M3a: one CPU, PIC/PIT, IF=0 on kernel paths, the per-process arena,
 and the v0 syscall gate. **Not** in M3b: transferring a handle to another process
@@ -129,13 +132,13 @@ later:
     follow-up** — genuine ring-3-observable denial — lands with M3c attenuation,
     which also introduces the runtime rejection of unknown caller-supplied rights
     bits (in M3b every mint is a kernel constant, compile-asserted known).
-  - *Open question for M3c (raised in review, not yet decided):* `handle_query`
-    (op 7, returns the object TYPE) requires **no** right, while `handle_rights`
-    (op 8) requires INSPECT. Once attenuation can mint a zero-rights handle,
-    `query` would still reveal the type while `rights` returns DENIED. Decide
-    before M3c makes that observable whether reading the type should also require
-    INSPECT, or whether INSPECT is narrowed to "the rights mask only" — so op 7's
-    frozen meaning is settled deliberately, not changed implicitly later.
+  - *Open question for M3c (RESOLVED 2026-10-18 by the amendment after D6):*
+    `handle_query` (op 7, type) requires **no** right and `handle_rights` (op 8)
+    requires INSPECT. The resolution: **query/close stay rightless** — a
+    zero-rights handle still learns its type and can be closed (else dropping the
+    last right would leak a slot). INSPECT gates reading the *rights mask*, not the
+    type. (Proposed by the adversarial reviewer in the attenuation design debate;
+    concurred by the implementor; owner-approved with the attenuation PR.)
   - *Not frozen:* `JE_ABI_RIGHTS_KNOWN` is a per-ABI-version SET that grows as M3c
     adds rights bits; the individual bit *values* are what's frozen. Userspace
     learns the known set via a version bump or a future `abi_query` selector.
@@ -183,6 +186,36 @@ the **rights** mask. The lifetime rules:
    and acquires nothing; the object is destroyed only when the count reaches zero
    **and** no `LIVE` slot names it. The acquire-then-commit ordering is frozen in
    D8 so a failed acquire cannot leak a slot.
+
+> **AMENDMENT 2026-10-18 (M3b attenuation PR; owner-approved, landed as "Refs #7"
+> not "Closes").** Attenuation is now implemented and its semantics are frozen
+> here, superseding the "a later PR decides" wording in items 5–6 above:
+> - **Fresh-slot.** `handle_dup`/`je_handle_dup_self` derives a NEW handle in its
+>   own slot (own index, generation, independent `close`), bound to the SAME
+>   object with a rights **subset**, and it **counts against quota**. It does NOT
+>   annotate the source slot. Consequence: the earlier claim "exactly one `LIVE`
+>   slot names an object" is **no longer true** — multiple LIVE slots may now name
+>   the same object. For the only object kind that exists (SELF), that is safe
+>   because SELF owns no external resource and is never destroyed.
+> - **SELF-only, no retain yet.** The derive primitive copies the object binding
+>   with **no refcount/retain** step, which is sound ONLY for SELF. It rejects
+>   every other type (`WRONGTYPE`). A destroyable object type (M3c endpoints) MUST
+>   add a retain-before-commit path; this ADR does not grant one.
+> - **No DUP/GRANT right.** Any holder may derive an equal-or-weaker handle;
+>   equality is a pure alias, a superset request is `DENIED` (never a clipped
+>   grant). `new_rights` with an **unknown** bit is a malformed call → `INVALID`
+>   (rejected in decode), distinct from a known-but-unheld right → `DENIED`.
+> - **Rightless close/query stay rightless.** A zero-rights derived handle still
+>   resolves its type via `handle_query` and can be `close`d (else dropping the
+>   last right would leak a slot until process death).
+> - **Enforcement is now genuinely ring-3-observable** (the B/A+B payoff from the
+>   rights PR): `dup(self, 0)` yields a rights-less handle on which `handle_rights`
+>   returns `DENIED` from ring 3 — proven by the `M3b-s1` QEMU marker, not just
+>   hosted tests.
+> - **Still deferred to M3c (issue #7 remains OPEN):** the bounded per-object
+>   **reference count + `_REFOVERFLOW`**, destruction-on-last-reference, and the
+>   **service-instance vs slot generation** split. These need a destroyable object
+>   (endpoints), which M3b does not have.
 
 ### D4. Generation saturation retires the slot (no wraparound)
 
