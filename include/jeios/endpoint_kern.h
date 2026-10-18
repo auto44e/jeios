@@ -36,6 +36,18 @@ je_ep_status je_endpoint_kern_create(je_vm *vm, uint32_t index,
 /* Typed close of handle `h` as an endpoint in `vm`'s process `index` table. */
 je_ep_status je_endpoint_kern_close(je_vm *vm, uint32_t index, je_handle h);
 
+/* Data IPC (M3c step 4): forward to the pure send/peek/commit against the kernel
+ * pool, resolving the caller's table. The glue does copy_from/to_user around
+ * these (D6). */
+je_ep_status je_endpoint_kern_send(je_vm *vm, uint32_t index, je_handle h,
+                                   const void *kbuf, size_t len);
+je_ep_status je_endpoint_kern_send_preflight(je_vm *vm, uint32_t index,
+                                             je_handle h, size_t len);
+je_ep_status je_endpoint_kern_recv_peek(je_vm *vm, uint32_t index, je_handle h,
+                                        void *out_kbuf, size_t cap,
+                                        size_t *out_len, je_ep_recv_lease *lease);
+je_ep_status je_endpoint_kern_recv_commit(const je_ep_recv_lease *lease);
+
 /* Pool occupancy (live channel records). Kernel-internal / self-test only. */
 uint32_t je_endpoint_kernel_allocated(void);
 

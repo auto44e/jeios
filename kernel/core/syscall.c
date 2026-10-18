@@ -21,6 +21,7 @@
 #include <jeios/handle.h>
 #include <jeios/endpoint.h>
 #include <jeios/endpoint_kern.h>
+#include <jeios/arch.h>
 #endif
 
 /* Pure decode: given the operation and its six argument registers, decide the
@@ -93,6 +94,21 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
          * ends into the caller's table (dispatch side). All-zero args or INVALID. */
         if (rdi|rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_ENDPOINT_CREATE;
+    case JE_SYS_TRY_SEND:
+        /* try_send(h=RDI, ubuf=RSI, len=RDX, meta=R10, R8, R9). Shape checks only;
+         * the copy + enqueue happen in the glue. R10[7:0]=cap_count must be 0
+         * (data-only, D9); R10[63:8] reserved must be 0; so R10 must be 0 entirely
+         * this step. R8 (step-5 cap-array ptr) and R9 reserved must be 0. len must
+         * be <= JE_EP_MSG_MAX. Handle must fit 32 bits. */
+        if (r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if (rdx > (uint64_t)JE_ABI_MSG_MAX) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_TRY_SEND;
+    case JE_SYS_TRY_RECV:
+        /* try_recv(h=RDI, ubuf=RSI, cap=RDX, R10/R8/R9 reserved must be 0). */
+        if (r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_TRY_RECV;
 #ifdef JE_DEV_COPY_INJECT
     case JE_SYS_COPY_FIXUP_INJECT:
         /* dev-only: uaddr=RDI (an unmapped arena page); glue raw-copies to prove
@@ -166,6 +182,7 @@ _Static_assert(JE_EP_RIGHT_SEND == JE_ABI_RIGHT_SEND
                && JE_EP_RIGHT_TRANSFER == JE_ABI_RIGHT_TRANSFER
                && JE_EP_RIGHT_INSPECT == JE_ABI_RIGHT_INSPECT,
                "endpoint rights: table vs ABI");
+_Static_assert(JE_EP_MSG_MAX == JE_ABI_MSG_MAX, "endpoint msg max: table vs ABI");
 
 /* Map endpoint-layer status to the v0 ABI (reuses the JE_ABI_H_* namespace; the
  * glue is the only place endpoint.h and abi.h meet). */
@@ -180,6 +197,11 @@ static je_abi_status ep_status_to_abi(je_ep_status s)
     case JE_EP_QUOTA:       return JE_ABI_H_QUOTA;
     case JE_EP_NOSLOTS:     return JE_ABI_H_NOSLOTS;
     case JE_EP_REFOVERFLOW: return JE_ABI_H_REFOVERFLOW;
+    case JE_EP_QUEUE_FULL:  return JE_ABI_H_QUEUE_FULL;
+    case JE_EP_SHORT_BUFFER: return JE_ABI_H_SHORT_BUFFER;
+    case JE_EP_PEER_CLOSED: return JE_ABI_H_PEER_CLOSED;
+    case JE_EP_EMPTY:       return JE_ABI_H_EMPTY;
+    case JE_EP_INVALID:     return JE_ABI_INVALID;
     case JE_EP_CORRUPT:     return JE_ABI_UNSUPPORTED; /* unwired vm / invariant */
     }
     return JE_ABI_INVALID;
@@ -323,6 +345,57 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         f->rax = (uint64_t)ep_status_to_abi(s);
         f->rdx = (s == JE_EP_OK)
                ? ((uint64_t)h0 | ((uint64_t)h1 << 32)) : 0u;
+        return je_sched_return_to_user(f);
+    }
+    case JE_SYSCALL_TRY_SEND: {
+        /* D6 send: read-only PREFLIGHT (so a bad ubuf never masks DENIED/
+         * PEER_CLOSED/QUEUE_FULL, and user memory is not read for an
+         * unauthorized handle) -> copy_from_user into a STACK staging buffer
+         * (fault -> INVALID, nothing enqueued) -> pure try_send re-checks +
+         * enqueues. */
+        je_vm *vm; uint32_t index;
+        if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+        je_handle h = (je_handle)f->rdi;
+        uint64_t ubuf = f->rsi, len = f->rdx;   /* decode bounded len <= MSG_MAX */
+        je_ep_status pf = je_endpoint_kern_send_preflight(vm, index, h, (size_t)len);
+        if (pf != JE_EP_OK) { f->rax=(uint64_t)ep_status_to_abi(pf); f->rdx=0; return je_sched_return_to_user(f); }
+        uint8_t staging[JE_EP_MSG_MAX];
+        if (len != 0u) {
+            je_abi_status cs = je_copy_from_user(staging, ubuf, len);
+            if (cs != JE_ABI_OK) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+        }
+        je_ep_status s = je_endpoint_kern_send(vm, index, h, staging, (size_t)len);
+        f->rax = (uint64_t)ep_status_to_abi(s); f->rdx = 0;
+        return je_sched_return_to_user(f);
+    }
+    case JE_SYSCALL_TRY_RECV: {
+        /* D6 recv: PEEK into a stack buffer (no dequeue) -> glue checks cap ->
+         * copy_to_user (fault -> INVALID, message stays queued) -> INFALLIBLE
+         * commit (dequeue). A commit mismatch halts (double-deliver hazard). */
+        je_vm *vm; uint32_t index;
+        if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+        je_handle h = (je_handle)f->rdi;
+        uint64_t ubuf = f->rsi, cap = f->rdx;
+        uint8_t staging[JE_EP_MSG_MAX];
+        size_t mlen = 0u;
+        je_ep_recv_lease lease;
+        je_ep_status s = je_endpoint_kern_recv_peek(vm, index, h, staging,
+                                                    (size_t)cap, &mlen, &lease);
+        if (s == JE_EP_SHORT_BUFFER) { f->rax=(uint64_t)JE_ABI_H_SHORT_BUFFER; f->rdx=(uint64_t)mlen; return je_sched_return_to_user(f); }
+        if (s != JE_EP_OK) { f->rax=(uint64_t)ep_status_to_abi(s); f->rdx=0; return je_sched_return_to_user(f); }
+        /* Peek OK: copy out, then commit. Zero-length delivers nothing to copy. */
+        if (mlen != 0u) {
+            je_abi_status cs = je_copy_to_user(ubuf, staging, (uint64_t)mlen);
+            if (cs != JE_ABI_OK) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+        }
+        je_ep_status cm = je_endpoint_kern_recv_commit(&lease);
+        if (cm != JE_EP_OK) {
+            /* Impossible under IF=0 single-CPU; a retry would double-deliver, so
+             * this is a kernel invariant violation, not a user status. */
+            je_arch_console_write("JeiOS fatal: recv commit mismatch\r\n");
+            je_arch_halt();
+        }
+        f->rax = (uint64_t)JE_ABI_OK; f->rdx = (uint64_t)mlen;
         return je_sched_return_to_user(f);
     }
 #ifdef JE_DEV_COPY_INJECT

@@ -479,4 +479,166 @@ je_user_epfault_start:
 21:
     jmp 21b                    /* unreached */
 je_user_epfault_end:
+
+/* ---- M3c s4: data IPC self-loopback (both ends in this one process's table) --
+ * endpoint_create gives h0 (RDX[31:0]) and h1 (RDX[63:32]). A send on h0 lands in
+ * h1's inbound; recv on h1 reads it. Proves ring-3 copy-in / queue / direction /
+ * copy-out rollback / SHORT_BUFFER / QUEUE_FULL / PEER_CLOSED. It does NOT prove
+ * cross-address-space delivery (one process holds both ends).
+ * Scratch: src payload @0x1300 (8 bytes), recv dst @0x1340, results @0x1380+. */
+.globl je_user_epipc_start
+.globl je_user_epipc_end
+je_user_epipc_start:
+    movq $4, %rax
+30:
+    incq 0x40001000
+    decq %rax
+    jnz 30b
+    /* seed an 8-byte source payload at 0x40001300 = 0xdeadbeef11223344 */
+    movq $0xdeadbeef11223344, %rbx
+    movq %rbx, 0x40001300
+    /* create() */
+    movq $10, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001380      /* create status */
+    movq %rdx, %r14            /* h0 = low32 */
+    movl %r14d, %r14d
+    movq %rdx, %r13
+    shrq $32, %r13             /* h1 = high32 */
+    /* send(h0, src=0x1300, len=8) */
+    movq $11, %rax
+    movq %r14, %rdi
+    movq $0x40001300, %rsi
+    movq $8, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001388      /* send status */
+    /* recv(h0) -> EMPTY (direction: nothing landed in h0's inbound) */
+    movq $12, %rax
+    movq %r14, %rdi
+    movq $0x40001340, %rsi
+    movq $64, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001390      /* expect JE_ABI_H_EMPTY (13) */
+    /* recv(h1, cap=1) -> SHORT_BUFFER, RDX=8 */
+    movq $12, %rax
+    movq %r13, %rdi
+    movq $0x40001340, %rsi
+    movq $1, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001398      /* expect SHORT_BUFFER (11) */
+    movq %rdx, 0x400013a0      /* expect required len 8 */
+    /* recv(h1, unmapped dst 0x40003000) -> INVALID; message stays queued */
+    movq $12, %rax
+    movq %r13, %rdi
+    movq $0x40003000, %rsi
+    movq $64, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400013a8      /* expect INVALID (2) */
+    /* recv(h1, good dst) -> OK, 8 bytes, payload matches */
+    movq $12, %rax
+    movq %r13, %rdi
+    movq $0x40001340, %rsi
+    movq $64, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400013b0      /* expect OK (0) */
+    movq %rdx, 0x400013b8      /* expect 8 */
+    movq 0x40001340, %rbx      /* delivered payload */
+    movq %rbx, 0x400013c0      /* expect 0xdeadbeef11223344 */
+    /* recv(h1) again -> EMPTY (delivered exactly once) */
+    movq $12, %rax
+    movq %r13, %rdi
+    movq $0x40001340, %rsi
+    movq $64, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400013c8      /* expect EMPTY (13) */
+    /* bad-source send(h0, src=unmapped) -> INVALID; nothing enqueued */
+    movq $11, %rax
+    movq %r14, %rdi
+    movq $0x40003000, %rsi
+    movq $8, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400013d0      /* expect INVALID (2) */
+    /* recv(h1) -> EMPTY (bad send enqueued nothing) */
+    movq $12, %rax
+    movq %r13, %rdi
+    movq $0x40001340, %rsi
+    movq $64, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400013d8      /* expect EMPTY (13) */
+    /* fill the queue: 4 sends OK, 5th QUEUE_FULL */
+    movq $4, %r12
+31:
+    movq $11, %rax
+    movq %r14, %rdi
+    movq $0x40001300, %rsi
+    movq $8, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    decq %r12
+    jnz 31b
+    movq %rax, 0x400013e0      /* 4th send status: expect OK */
+    movq $11, %rax             /* 5th send -> QUEUE_FULL */
+    movq %r14, %rdi
+    movq $0x40001300, %rsi
+    movq $8, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400013e8      /* expect QUEUE_FULL (10) */
+    /* data-only reject: send with R10 cap_count=1 -> INVALID */
+    movq $11, %rax
+    movq %r14, %rdi
+    movq $0x40001300, %rsi
+    movq $8, %rdx
+    movq $1, %r10
+    xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400013f0      /* expect INVALID (2) */
+    /* close h0; now h1's peer is gone. Drain the 4 queued, then PEER_CLOSED. */
+    movq $6, %rax
+    movq %r14, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400013f8      /* close(h0) status: expect OK */
+    /* drain 4 */
+    movq $4, %r12
+32:
+    movq $12, %rax
+    movq %r13, %rdi
+    movq $0x40001340, %rsi
+    movq $64, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    decq %r12
+    jnz 32b
+    movq %rax, 0x40001400      /* 4th drained recv: expect OK (drain despite peer gone) */
+    /* now empty + peer gone -> PEER_CLOSED */
+    movq $12, %rax
+    movq %r13, %rdi
+    movq $0x40001340, %rsi
+    movq $64, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001408      /* expect PEER_CLOSED (12) */
+    /* send(h1) -> peer (h0 end) closed -> PEER_CLOSED */
+    movq $11, %rax
+    movq %r13, %rdi
+    movq $0x40001300, %rsi
+    movq $8, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001410      /* expect PEER_CLOSED (12) */
+    /* done; heartbeat loop so the kernel sees progress then tears us down. */
+33:
+    incq 0x40001000
+    jmp 33b
+je_user_epipc_end:
 .section .note.GNU-stack,"",@progbits

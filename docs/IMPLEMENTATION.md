@@ -799,6 +799,94 @@ critical-section hazard and the packed-RDX ABI shape were both escalated to and
 approved by the owner (recorded as ADR 0009 AMENDMENT A3-1/A3-2). AI-assisted
 review only; not independent human qualification.
 
+## M3c non-blocking data IPC (try_send / try_recv) — 2026-10-18
+
+ADR 0009 **D-SEQ step 4**, the first PR that moves message bytes through
+endpoints. Non-blocking, bounded, copied, **data-only** (D9). Not owner-gated
+except for one small approved touch (below).
+
+**Queue model (Model A).** Each end gained an `inbound` ring queue
+(`JE_EP_QUEUE_DEPTH=4` messages, each up to `JE_EP_MSG_MAX=64` payload bytes — a
+newly chosen policy bound, pinned by `_Static_assert(sizeof(je_ep_channel)<=640)`;
+the pool is ~2.1 KB BSS). `try_send` on end `i` enqueues into `end[i^1].inbound`
+(deliver to peer); `try_recv` on end `j` drains `end[j].inbound`. EOF/PEER_CLOSED
+is decided off the **caller's own** `state` (release_handle already moves a
+survivor to PEER_CLOSED), so there is no `i` vs `i^1` mistake on the EOF path —
+the only `i^1` index is the enqueue target. Recv: nonempty → deliver (drain
+first, regardless of peer state); empty+PEER_CLOSED → PEER_CLOSED (EOF);
+empty+OPEN → EMPTY. **Data owns no references** — queued messages never touch
+`handle_refs`/`inflight_refs`, so the free rule is unchanged.
+
+**Copy ordering (D6), the peek/commit seam.** `endpoint.c` stays pure (no
+`copy_*_user`): it moves kernel bytes only, and the glue wraps it.
+- **Send:** glue runs a read-only `je_endpoint_send_preflight` (resolve + SEND
+  right + self-state + peer-queue-full) FIRST — so a bad user pointer never masks
+  DENIED/PEER_CLOSED/QUEUE_FULL and user memory is never read for an unauthorized
+  handle — THEN `copy_from_user` into a **stack** staging buffer (fault → INVALID,
+  nothing enqueued) THEN the pure `try_send` re-checks + enqueues. Status
+  precedence frozen: decode INVALID (meta/reserved/len/wide-handle, before any
+  user access) → BADINDEX/STALE/WRONGTYPE → DENIED → PEER_CLOSED → QUEUE_FULL →
+  copy-fault INVALID (last — the copy runs only after a clean preflight, so a bad
+  ubuf never masks a handle/queue status).
+- **Recv:** pure `recv_peek` copies the head message into a kernel-stack buffer
+  (no dequeue) and returns a `{rec,side,generation,head,len}` lease; the glue
+  checks `cap < len` → SHORT_BUFFER (RDX=required len, not dequeued), else
+  `copy_to_user` (fault → INVALID, message stays queued), then the **infallible**
+  `recv_commit` dequeues. A commit lease mismatch (impossible under IF=0
+  single-CPU) halts the kernel — never a user status, because a retry would
+  double-deliver. No `inflight` lease is held across the user copy (both peers
+  agreed it's unneeded under IF=0 and would wrongly spend the REF_MAX budget).
+
+**Data-only enforcement (D9).** `try_send`'s `R10[7:0]=cap_count` must be 0 and
+`R10[63:8]`/R8/R9 reserved must be 0 (rejected INVALID at decode) — no capability
+can be queued before transfer (step 5).
+
+**Owner-approved lifecycle touch.** `release_handle` now discards the *closing*
+end's inbound queue (no one can read it), and `maybe_free_record` zeroes both
+queues on free (no stale payload into a reused record). This is a change to
+M3c-tested lifecycle code (per AGENTS.md) — **owner-approved 2026-10-18**. The
+free *condition* and refcount rule are unchanged; only zeroing/discard was added,
+covered by a free-with-nonempty-queue test (returns to baseline).
+
+**ABI (ops 11/12, statuses 10–13).** `try_send`=11, `try_recv`=12; statuses
+`JE_ABI_H_QUEUE_FULL=10`, `SHORT_BUFFER=11`, `PEER_CLOSED=12`, `EMPTY=13`
+(appended, pinned). `JE_ABI_MSG_MAX=64` is ABI-visible, pinned equal to the
+table-side bound. recv returns bytes-written (or required-len on SHORT_BUFFER) in
+`RDX[31:0]`; `RDX[63:32]` reserved 0.
+
+**ABI forward note (owner-flagged, item 2).** The v0 single-RDX scalar cannot
+carry *received capability handles*, which step 5 (transfer) will need. R8/R9 and
+`RDX[63:32]` are reserved-must-be-0 now; **step 5 MUST add a new op or an
+out-register/out-struct extension — it must NOT overload `try_recv`'s RDX**. This
+is recorded so step 5 does not silently imply the current ABI is transfer-ready.
+
+**Proofs.** Hosted `test_endpoint` gains the full battery: send/recv roundtrip,
+direction (recv on the sender's end is EMPTY), FIFO, QUEUE_FULL, SHORT_BUFFER (no
+dequeue), PEER_CLOSED drain-then-EOF, rights DENIED (send without SEND / recv
+without RECV), zero-length (OK with len 0, distinct from EMPTY), `len>MSG_MAX`
+INVALID, free-with-nonempty-queue, and a stale-lease commit → CORRUPT.
+`test_syscall` covers the op-11/12 decode (R10 cap_count/reserved, R8/R9,
+len>MSG_MAX, wide-handle; op 13 the new UNSUPPORTED boundary). The ring-3
+**`M3c-s4`** marker is a self-loopback (create puts both ends in one table):
+proves copy-in, queue, direction, SHORT_BUFFER, the **copy-out FAILURE leaves the
+message queued and a retry delivers it exactly once** (D6 rollback, ring-3 — the
+dst is a pre-validated unmapped page, so the copy is rejected at span
+prevalidation, NOT a mid-copy #PF/fixup; the rollback *property* is proven, the
+fault *mechanism* is exercised separately by the M3a copy-fixup inject path),
+QUEUE_FULL, the data-only reject, drain-then-PEER_CLOSED, and channel reclamation
+on exit. FIFO ordering is proven in the hosted test (the ring-3 stub sends
+identical payloads, so the marker does not claim FIFO). **Honesty:** it does NOT
+prove cross-address-space delivery (one process
+holds both ends) — that waits on transfer (step 5). `make check` / `smoke` /
+`integration` / 3 CI NX profiles (incl. 16M) / ARM64 all green.
+
+Design + implementation cross-review via a role-assigned peer debate. Key fixes
+adopted before PR: the send **preflight** ordering (copy-first would mis-rank
+INVALID over DENIED/QUEUE_FULL); the peek/commit seam with an **infallible**
+post-copy commit (a fallible commit would double-deliver); no inflight lease;
+zero exactly `len` bytes out (no stack leak). AI-assisted review; not independent
+human qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

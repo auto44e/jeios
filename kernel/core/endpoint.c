@@ -14,8 +14,25 @@ _Static_assert(JE_EP_REF_MAX >= JE_EP_QUEUE_DEPTH + JE_EP_MAX_WAITERS,
                "JE_EP_REF_MAX must cover queue depth + waiters");
 _Static_assert(JE_EP_REF_MAX <= 0xffffu, "ref counts are uint16_t");
 _Static_assert(JE_EP_POOL_CAP >= 1u, "pool must have at least one record");
+_Static_assert(JE_EP_MSG_MAX <= 255u, "per-slot length fits uint8_t");
+_Static_assert(JE_EP_QUEUE_DEPTH <= 255u, "head/count fit uint8_t");
+/* Keep the static kernel pool bounded: 2 inbound queues per record dominate. */
+_Static_assert(sizeof(je_ep_channel) <= 640u, "channel record size budget");
 
 /* ---- pool / record helpers ------------------------------------------------ */
+
+/* Reset (empty + zero) one inbound queue. Zeroing the payload bytes prevents a
+ * stale message surviving into a reused slot and never lets uninitialized bytes
+ * reach a reader (defense in depth; recv copies only len bytes regardless). */
+static void queue_reset(je_ep_queue *q)
+{
+    q->head = 0u;
+    q->count = 0u;
+    for (uint8_t i = 0; i < JE_EP_QUEUE_DEPTH; ++i) {
+        q->len[i] = 0u;
+        for (uint16_t b = 0; b < JE_EP_MSG_MAX; ++b) q->buf[i][b] = 0u;
+    }
+}
 
 void je_endpoint_pool_init(je_endpoint_pool *pool)
 {
@@ -30,6 +47,7 @@ void je_endpoint_pool_init(je_endpoint_pool *pool)
             r->end[s].handle_refs = 0u;
             r->end[s].inflight_refs = 0u;
             r->end[s].side = s;
+            queue_reset(&r->end[s].inbound);
         }
     }
 }
@@ -80,6 +98,7 @@ static void maybe_free_record(je_endpoint_pool *pool, je_ep_channel *rec)
     for (uint8_t s = 0; s < 2u; ++s) {
         rec->end[s].state = JE_EP_END_FREE;
         rec->end[s].side = s;
+        queue_reset(&rec->end[s].inbound);   /* no stale payload into reuse */
     }
     if (pool->allocated_count) pool->allocated_count--;
 }
@@ -139,12 +158,27 @@ static void release_handle(je_endpoint_pool *pool, je_ep_channel *rec, uint8_t s
         e->state = JE_EP_END_CLOSED;
         je_ep_end *peer = &rec->end[side ^ 1u];
         if (peer->state == JE_EP_END_OPEN) peer->state = JE_EP_END_PEER_CLOSED;
-        /* Inbound queue discard happens here in the data-IPC PR (empty now). */
+        /* Discard THIS (closing) end's inbound queue: no one can ever read it
+         * again. The peer's inbound is left intact so a survivor can drain it
+         * (D6). Data messages own no refs, so this never affects the free rule. */
+        queue_reset(&e->inbound);
         maybe_free_record(pool, rec);
     }
 }
 
 /* ---- inflight ref API (tested directly; used by queue/wait PRs) ----------- */
+
+/* Is `rec` one of this pool's channel records? Uses uintptr_t comparison (not
+ * relational pointer comparison, which is UB for a pointer outside the array)
+ * and requires exact slot alignment, so a forged/other-pool pointer fails. */
+static bool rec_in_pool(const je_endpoint_pool *pool, const je_ep_channel *rec)
+{
+    uintptr_t base = (uintptr_t)&pool->rec[0];
+    uintptr_t top  = (uintptr_t)&pool->rec[JE_EP_POOL_CAP];   /* one-past-end */
+    uintptr_t p    = (uintptr_t)rec;
+    if (p < base || p >= top) return false;
+    return ((p - base) % sizeof(pool->rec[0])) == 0u;         /* slot-aligned */
+}
 
 je_ep_status je_endpoint_retain_inflight(je_endpoint_pool *pool,
                                          je_ep_channel *rec, uint8_t side)
@@ -156,8 +190,7 @@ je_ep_status je_endpoint_retain_inflight(je_endpoint_pool *pool,
      * reused record in the SAME pool — the ADR 0009 borrowed-pointer rule makes
      * that a trusted-caller precondition, and the queue/wait PR that first holds
      * such a pair MUST carry the record generation to detour reuse. */
-    if (rec < &pool->rec[0] || rec > &pool->rec[JE_EP_POOL_CAP - 1u]
-        || !rec->allocated) return JE_EP_CORRUPT;
+    if (!rec_in_pool(pool, rec) || !rec->allocated) return JE_EP_CORRUPT;
     je_ep_end *e = &rec->end[side];
     if (e->inflight_refs >= JE_EP_REF_MAX) return JE_EP_REFOVERFLOW;
     e->inflight_refs++;
@@ -168,8 +201,7 @@ je_ep_status je_endpoint_release_inflight(je_endpoint_pool *pool,
                                           je_ep_channel *rec, uint8_t side)
 {
     if (!pool || !rec || side > 1u) return JE_EP_CORRUPT;
-    if (rec < &pool->rec[0] || rec > &pool->rec[JE_EP_POOL_CAP - 1u]
-        || !rec->allocated) return JE_EP_CORRUPT;
+    if (!rec_in_pool(pool, rec) || !rec->allocated) return JE_EP_CORRUPT;
     je_ep_end *e = &rec->end[side];
     if (e->inflight_refs == 0u) return JE_EP_CORRUPT;   /* underflow guard */
     e->inflight_refs--;
@@ -340,4 +372,119 @@ int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t)
             return -1;   /* a LIVE endpoint survived the walk -> fatal */
     }
     return released;
+}
+
+/* ---- non-blocking data IPC (M3c step 4, D6 / D9) ------------------------- */
+
+uint8_t je_endpoint_inbound_count(const je_ep_channel *rec, uint8_t side)
+{
+    if (!rec || side > 1u) return 0u;
+    return rec->end[side].inbound.count;
+}
+
+je_ep_status je_endpoint_send_preflight(je_endpoint_pool *pool, je_handle_table *t,
+                                        je_handle h, size_t len)
+{
+    je_ep_channel *rec = (je_ep_channel *)0;
+    uint8_t side = 0u;
+    if (len > JE_EP_MSG_MAX) return JE_EP_INVALID;
+
+    /* Resolve + SEND right (BADINDEX -> STALE -> WRONGTYPE -> DENIED). */
+    je_ep_status rs = je_endpoint_resolve(pool, t, h, &rec, &side);
+    if (rs != JE_EP_OK) return rs;
+    uint32_t rights = 0u;
+    je_handle_status gr = je_handle_rights_of(t, h, JE_ENDPOINT_OBJ_TYPE,
+                                              JE_EP_RIGHT_SEND, &rights);
+    if (gr != JE_HANDLE_OK) return hstat(gr);   /* DENIED if SEND not held */
+
+    /* A message delivered on end `side` lands in the PEER end's inbound. If THIS
+     * end is peer-closed, nobody will ever read it -> PEER_CLOSED. */
+    if (rec->end[side].state == JE_EP_END_PEER_CLOSED
+        || rec->end[side].state == JE_EP_END_CLOSED) return JE_EP_PEER_CLOSED;
+    if (rec->end[side ^ 1u].inbound.count >= JE_EP_QUEUE_DEPTH)
+        return JE_EP_QUEUE_FULL;
+    return JE_EP_OK;
+}
+
+je_ep_status je_endpoint_try_send(je_endpoint_pool *pool, je_handle_table *t,
+                                  je_handle h, const void *kbuf, size_t len)
+{
+    je_ep_channel *rec = (je_ep_channel *)0;
+    uint8_t side = 0u;
+    if (len != 0u && !kbuf) return JE_EP_INVALID;
+    /* Re-run the full preflight (the glue ran it once before the copy; this is
+     * the same pure validator, so the check+enqueue are atomic under IF=0 with
+     * no new logic). */
+    je_ep_status pf = je_endpoint_send_preflight(pool, t, h, len);
+    if (pf != JE_EP_OK) return pf;
+    (void)je_endpoint_resolve(pool, t, h, &rec, &side);   /* cannot fail now */
+
+    je_ep_queue *q = &rec->end[side ^ 1u].inbound;   /* peer's inbound */
+    uint8_t tail = (uint8_t)((q->head + q->count) % JE_EP_QUEUE_DEPTH);
+    for (uint8_t b = 0; b < (uint8_t)len; ++b)
+        q->buf[tail][b] = ((const uint8_t *)kbuf)[b];
+    q->len[tail] = (uint8_t)len;
+    q->count++;
+    return JE_EP_OK;
+}
+
+je_ep_status je_endpoint_recv_peek(je_endpoint_pool *pool, je_handle_table *t,
+                                   je_handle h, void *out_kbuf, size_t cap,
+                                   size_t *out_len, je_ep_recv_lease *lease)
+{
+    je_ep_channel *rec = (je_ep_channel *)0;
+    uint8_t side = 0u;
+    if (!out_len) return JE_EP_INVALID;
+    *out_len = 0u;
+
+    je_ep_status rs = je_endpoint_resolve(pool, t, h, &rec, &side);
+    if (rs != JE_EP_OK) return rs;
+    uint32_t rights = 0u;
+    je_handle_status gr = je_handle_rights_of(t, h, JE_ENDPOINT_OBJ_TYPE,
+                                              JE_EP_RIGHT_RECV, &rights);
+    if (gr != JE_HANDLE_OK) return hstat(gr);   /* DENIED if RECV not held */
+
+    je_ep_queue *q = &rec->end[side].inbound;    /* this end's own inbound */
+    if (q->count == 0u) {
+        /* Empty: EOF if the peer is gone, else would-block EMPTY. */
+        return (rec->end[side].state == JE_EP_END_PEER_CLOSED)
+               ? JE_EP_PEER_CLOSED : JE_EP_EMPTY;
+    }
+    uint8_t mlen = q->len[q->head];
+    *out_len = mlen;                 /* report length even on SHORT_BUFFER */
+    if (cap < mlen) return JE_EP_SHORT_BUFFER;   /* no copy, no dequeue */
+    if (mlen != 0u && !out_kbuf) return JE_EP_INVALID;   /* NULL dst guard */
+    for (uint8_t b = 0; b < mlen; ++b)
+        ((uint8_t *)out_kbuf)[b] = q->buf[q->head][b];
+    if (lease) {
+        lease->rec = rec;
+        lease->side = side;
+        lease->generation = rec->generation;
+        lease->head = q->head;
+        lease->len = mlen;
+    }
+    return JE_EP_OK;
+}
+
+je_ep_status je_endpoint_recv_commit(je_endpoint_pool *pool,
+                                     const je_ep_recv_lease *lease)
+{
+    if (!pool || !lease || !lease->rec) return JE_EP_CORRUPT;
+    je_ep_channel *rec = lease->rec;
+    if (!rec_in_pool(pool, rec)) return JE_EP_CORRUPT;
+    /* The lease must still name the exact head it observed: record allocated,
+     * same generation, same side, nonempty, same head index, same length. Under
+     * IF=0 single-CPU this always holds between peek and commit (nothing can run
+     * in between); a mismatch is a kernel invariant violation, never ordinary. */
+    if (!rec->allocated || rec->generation != lease->generation || lease->side > 1u)
+        return JE_EP_CORRUPT;
+    je_ep_queue *q = &rec->end[lease->side].inbound;
+    if (q->count == 0u || q->head != lease->head || q->len[q->head] != lease->len)
+        return JE_EP_CORRUPT;
+    /* Dequeue the head: zero the vacated slot, advance. */
+    q->len[q->head] = 0u;
+    for (uint16_t b = 0; b < JE_EP_MSG_MAX; ++b) q->buf[q->head][b] = 0u;
+    q->head = (uint8_t)((q->head + 1u) % JE_EP_QUEUE_DEPTH);
+    q->count--;
+    return JE_EP_OK;
 }

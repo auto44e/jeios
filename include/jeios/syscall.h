@@ -19,9 +19,12 @@ typedef enum {
     JE_SYSCALL_HANDLE_QUERY = 7,
     JE_SYSCALL_HANDLE_RIGHTS = 8,
     JE_SYSCALL_HANDLE_DUP = 9,
-    JE_SYSCALL_ENDPOINT_CREATE = 10  /* M3c: glue mints both ends into the
+    JE_SYSCALL_ENDPOINT_CREATE = 10, /* M3c: glue mints both ends into the
                                       * caller's table and packs the two handles
                                       * into RDX (A3-2) */
+    JE_SYSCALL_TRY_SEND = 11,        /* M3c D6: glue copies user->staging then
+                                      * enqueues into the peer inbound */
+    JE_SYSCALL_TRY_RECV = 12         /* M3c D6: glue peeks, copies out, commits */
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYSCALL_COPY_FIXUP_INJECT = 4  /* glue raw-copies an unmapped page (fixup test) */
 #endif
