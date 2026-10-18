@@ -1,5 +1,34 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Current status — observed 2026-10-18 (read this first)
+
+Implemented and merged beyond M3a: **M3b** (typed handle table, ADR 0008) is in
+progress on x86-64, and a second architecture, **ARM64 (MP1)**, now boots.
+
+- **M3b** (issue #7, ADR 0008 accepted, Option A): the pure handle table landed
+  (`kernel/core/handle.c`+`handle.h`), then was wired into `je_vm_process` with the
+  first handle syscalls — `handle_self` (5), `handle_close` (6), `handle_query` (7,
+  type), and now `handle_rights` (8). SELF is the only object kind (immortal,
+  resource-free, minted with the INSPECT right). The rights ABI is frozen
+  (`JE_ABI_RIGHT_INSPECT=0x1`). **Remaining for M3b:** attenuation + references —
+  which also makes rights enforcement genuinely ring-3-observable (DENIED/WRONGTYPE
+  are hosted-test-only today; the "(B)/A+B" follow-up in ADR 0008). Then M3b closes.
+- **ARM64 MP1 step 1** (jeios-mobile#1, ADR 0002): boots on QEMU `virt-8.2` /
+  `cortex-a72` (direct `-kernel`, no firmware) — entry EL1, stack, TCR_EL1 interim,
+  BSS clear, DTB pointer recorded, bounded PL011 console, ordered markers. Separate
+  `kernel/arch/aarch64/` + `mk/aarch64.mk` (`make aarch64`, `make smoke-aarch64`);
+  the x86-64 flow is untouched. **Not yet enforced (deferred to MP2+):** VBAR
+  vectors + the D5 trap frame (ESR/FAR/ELR/SPSR) + the deliberate-fault test, the
+  TBI behavioral test, DTB *validation*, and the MMU.
+- **M3c** (issue #8): not started. Blocked on M3b completion. Will add endpoints,
+  bounded copied messages, transactional handle transfer, waits, and a minimal init
+  — and settle the object-wide-incarnation question deferred from ADR 0008 D-RESOLVED.
+
+Full qualification evidence for M3a is in `docs/M3A_RETRO.md`; the per-PR ledger is
+`docs/IMPLEMENTATION.md`. Everything above is QEMU/hosted-verified and
+peer-cross-reviewed (AI-assisted, not independent human qualification); the owner is
+the merge gate.
+
 ## M3a #5 step (b): recoverable user copies + exception fixup — observed 2026-10-17T19:50:00+00:00
 
 Branch `feat/m3a-5b-user-copy`. The FINAL M3a piece. `kernel/core/usercopy.c` +

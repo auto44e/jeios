@@ -98,9 +98,13 @@ je_handle_status je_handle_alloc(je_handle_table *t, void *object,
     return JE_HANDLE_NOSLOTS;    /* all slots LIVE or RETIRED */
 }
 
-je_handle_status je_handle_lookup(const je_handle_table *t, je_handle h,
-                                  uint32_t expected_type, uint32_t required_rights,
-                                  void **out_object)
+/* Shared slot resolver for lookup and rights_of, so the two can never drift in
+ * their validity precedence (BADINDEX -> STALE -> WRONGTYPE -> DENIED). On OK,
+ * *out_slot points at the live slot; on any failure returns the specific status
+ * and writes nothing. Pure; never mutates the table. */
+static je_handle_status resolve_slot(const je_handle_table *t, je_handle h,
+                                     uint32_t expected_type, uint32_t required_rights,
+                                     const je_handle_slot **out_slot)
 {
     uint32_t index, generation;
     if (!t) return JE_HANDLE_BADINDEX;
@@ -113,7 +117,29 @@ je_handle_status je_handle_lookup(const je_handle_table *t, je_handle h,
     if (s->generation != generation) return JE_HANDLE_STALE;
     if (s->type != expected_type) return JE_HANDLE_WRONGTYPE;
     if ((s->rights & required_rights) != required_rights) return JE_HANDLE_DENIED;
+    *out_slot = s;
+    return JE_HANDLE_OK;
+}
+
+je_handle_status je_handle_lookup(const je_handle_table *t, je_handle h,
+                                  uint32_t expected_type, uint32_t required_rights,
+                                  void **out_object)
+{
+    const je_handle_slot *s;
+    je_handle_status r = resolve_slot(t, h, expected_type, required_rights, &s);
+    if (r != JE_HANDLE_OK) return r;
     if (out_object) *out_object = s->object;
+    return JE_HANDLE_OK;
+}
+
+je_handle_status je_handle_rights_of(const je_handle_table *t, je_handle h,
+                                     uint32_t expected_type, uint32_t required_rights,
+                                     uint32_t *out_rights)
+{
+    const je_handle_slot *s;
+    je_handle_status r = resolve_slot(t, h, expected_type, required_rights, &s);
+    if (r != JE_HANDLE_OK) return r;
+    if (out_rights) *out_rights = s->rights;
     return JE_HANDLE_OK;
 }
 

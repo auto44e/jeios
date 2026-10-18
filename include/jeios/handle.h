@@ -113,6 +113,15 @@ je_handle_status je_handle_lookup(const je_handle_table *t, je_handle h,
                                   uint32_t expected_type, uint32_t required_rights,
                                   void **out_object);
 
+/* Read a live handle's rights mask. Same validity checks as lookup (well-formed,
+ * index in range, slot LIVE, generation match, type == expected_type) AND the
+ * slot must hold `required_rights`; on success writes the slot's full rights
+ * mask to *out_rights and returns OK, else the specific status and nothing.
+ * Pure; never mutates the table. (Added for the M3b rights-introspection op.) */
+je_handle_status je_handle_rights_of(const je_handle_table *t, je_handle h,
+                                     uint32_t expected_type, uint32_t required_rights,
+                                     uint32_t *out_rights);
+
 /* Close a handle: LIVE -> FREE, bump generation; if the bump would exceed
  * JE_HANDLE_GEN_MAX the slot goes RETIRED instead (never wraps). Closing a
  * stale/free/retired handle returns STALE and changes nothing. */

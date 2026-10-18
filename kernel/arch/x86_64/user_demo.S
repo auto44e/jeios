@@ -287,6 +287,14 @@ je_user_handle_start:
     int $0x80
     movq %rax, 0x40001030
     movq %rdx, 0x40001038
+    /* rights(live, h=self#1) op8 -> status@+0xa0, rights mask(RDX)@+0xa8.
+     * SELF is minted with INSPECT(0x1), so expect OK + 0x1. */
+    movq $8, %rax
+    movq %r11, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400010a0
+    movq %rdx, 0x400010a8
     /* close(live, h=self#1) -> status@+0x40 */
     movq $6, %rax
     movq %r11, %rdi
