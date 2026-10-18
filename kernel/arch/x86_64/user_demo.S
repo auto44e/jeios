@@ -328,10 +328,13 @@ je_user_handle_start:
     xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
     movq %rax, 0x400010d8
-    /* dup(self#1, 0x2): unknown rights bit -> INVALID (2)@+0xe0 */
+    /* dup(self#1, 0x80000000): still-UNKNOWN rights bit -> INVALID (2)@+0xe0.
+     * (M3c made 0x2=SEND a KNOWN right per ADR 0009 D4a, so the unknown-bit
+     * contract is now proven on bit 31, which remains unknown. 0x80000000 fits
+     * 32 bits so it passes the wide-rights check and reaches the known-bit gate.) */
     movq $9, %rax
     movq %r11, %rdi
-    movq $0x2, %rsi
+    movq $0x80000000, %rsi
     xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
     movq %rax, 0x400010e0

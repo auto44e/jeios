@@ -635,6 +635,94 @@ the superset test must use a known-but-unheld right (unknown bit is INVALID); an
 #7 cannot honestly be closed by this PR. AI-assisted review only; not independent
 human qualification.
 
+## M3c lifecycle (endpoint pool + split refcount + retain-on-dup) — 2026-10-18
+
+ADR 0009 accepted; this is **D-SEQ step 2**, the first destroyable, refcounted
+kernel object. New hostable module `kernel/core/endpoint.c` +
+`include/jeios/endpoint.h`, built on the `handle.c` pattern: includes only
+`<jeios/handle.h>` (no `vm.h`/`sched.h`/`abi.h`), allocates nothing (caller
+supplies the `je_endpoint_pool`), zero global state. A **channel** is one pool
+record holding both ends (`end[2]`), so a peer pointer is always to the same
+record and can never dangle. Each end carries a **split refcount** —
+`handle_refs` (LIVE handle slots; drives OPEN/CLOSED) and `inflight_refs`
+(queued caps + waiters; both empty this PR) — and the record is freed only when
+**both ends have both counts at 0**. `JE_EP_REF_MAX=8` is a small configured
+policy bound (`_Static_assert JE_EP_REF_MAX >= JE_EP_QUEUE_DEPTH + JE_EP_MAX_WAITERS`),
+so `REFOVERFLOW` is reachable in a hosted test; acquiring past it acquires
+nothing and leaves the object unchanged (fail-closed, not saturate).
+
+**The table stayed pure** (ADR 0009 D2/D3): `handle.c` is byte-for-byte
+unchanged and never dereferences the opaque `object`. All retain/release lives
+in `endpoint.c`, which maps a slot's `object` (= `&rec->end[side]`) back to its
+end by bounds-checking the pointer into the pool (never deref an unvalidated
+pointer; a stray pointer fails `JE_EP_CORRUPT`). The dup path is the endpoint
+equivalent of `je_handle_dup_self` but **with retain-before-commit**
+(`je_endpoint_handle_dup`): resolve → subset-check (DENIED) → retain
+(REFOVERFLOW) → `je_handle_alloc` (QUOTA before NOSLOTS), releasing the retained
+ref on every alloc failure. `je_handle_dup_self` **stays SELF-only** (an endpoint
+handle through it still returns WRONGTYPE) — exactly as its header demanded.
+
+**Create is kernel-only** (`je_endpoint_channel_create`): transactional (both
+mints + the record unwind completely on any failure), used only by the hosted
+test. There is **no ring-3 `endpoint_create`** — no `abi.h` op, no decode case,
+no dispatch — so no user process can create (then die holding) an endpoint
+before the owner-signed death-path release-walk PR (D-OWNER-2) wires reclamation.
+That PR also owes the **typed close dispatcher** that makes the load-bearing
+precondition true table-wide (today a raw `je_handle_close`/table-zero of an
+endpoint slot would *leak* a ref — a leak, not a UAF — which this PR keeps
+impossible by minting endpoints only into kernel-local tables, never a process's
+own `htable`). `endpoint.c` is compiled into the kernel (links clean, no
+undefined symbols) but unreferenced — the intended "kernel-only, no ring-3 route"
+state.
+
+**Tests:** `tests/test_endpoint.c` (hostable, ASan/UBSan) proves create, the
+split-ref close semantics (first close keeps the end OPEN, last close →
+CLOSED + peer PEER_CLOSED, both-ends-zero frees the record and bumps the internal
+generation), dup independence, REFOVERFLOW (count + table live-count + out
+unchanged), dup rollback on QUOTA, DENIED on a superset dup, WRONGTYPE for a SELF
+handle and for `dup_self` on an endpoint, an `inflight_ref` keeping the record
+alive past both handle closes, and pool-exhaustion + second-mint-failure unwind.
+`make check` / `smoke` / `integration` / the 3 CI NX profiles / the ARM64 build
+all green.
+
+### M3c rights-bit discrepancy (owner-approved Option A, 2026-10-18)
+
+ADR 0009 D4a appends the endpoint rights `SEND=0x2`, `RECV=0x4`, `TRANSFER=0x8`
+to `JE_ABI_RIGHTS_KNOWN` (INSPECT stays `0x1`). This is an **ABI behaviour
+change to previously-tested ring-3 code**: M3b asserted `dup(self, 0x2) → INVALID`
+*because 0x2 was an unknown bit*. With `SEND=0x2` now known, that call passes the
+decode's known-bit gate and the glue returns **DENIED** (a known right a SELF
+handle does not hold). The owner chose **Option A**: accept the INVALID→DENIED
+change as correct, update the assertion to its new result, AND keep proving the
+unknown-bit→INVALID *contract* on a bit that is still unknown. Concretely:
+
+- `tests/test_syscall.c`: the old `dup(self,0x2)==INVALID` line is retired; it now
+  asserts `dup(self, SEND)` decodes to the DUP action (OK at the decoder; the
+  DENIED is a glue-level decision) **and** `dup(self, 0x80000000)==INVALID`
+  (bit 31, still unknown) re-proves the contract. A HISTORY comment records the
+  old behaviour.
+- `kernel/arch/x86_64/user_demo.S` + `kernel/core/main.c` (the QEMU `M3b-s1`
+  proof): the ring-3 "unknown-right" dup changed from `0x2` to `0x80000000`; the
+  marker still prints `unknown-right INVALID`.
+
+Both edits preserve the original assertion's *intent* (an unknown rights bit is
+rejected as malformed) on a genuinely-unknown bit, rather than silently deleting
+it — the owner asked to keep the old check's meaning visible alongside the new
+reality. `0x80000000` fits 32 bits, so it passes the wide-rights check and
+reaches the known-bit gate (a `>>32` value would be rejected earlier, also as
+INVALID, but for the wrong reason). `JE_ABI_H_REFOVERFLOW=9` was appended to the
+ABI status enum (pinned), reserved until the first M3c ring-3 endpoint op maps it.
+
+Design + review via a role-assigned peer debate (implementor vs adversarial
+reviewer) on the *implementation seam* (the ADR itself was already frozen). Key
+findings adopted: distinct `retain_handle`/`retain_inflight` APIs (one ambiguous
+`retain()` invites bumping the wrong counter); the raw-close-unreachable
+invariant must be enforced by a typed dispatcher, not by "callers remember the
+wrapper" (so create stays kernel-only until that PR); the s5b inject precedent is
+a *bad* security analogy (it is a real ring-3 dev op; endpoint create has no
+ring-3 surface at all). AI-assisted review only; not independent human
+qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

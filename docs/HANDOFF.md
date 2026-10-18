@@ -23,9 +23,27 @@ progress on x86-64, and a second architecture, **ARM64 (MP1)**, now boots.
   the x86-64 flow is untouched. **Not yet enforced (deferred to MP2+):** VBAR
   vectors + the D5 trap frame (ESR/FAR/ELR/SPSR) + the deliberate-fault test, the
   TBI behavioral test, DTB *validation*, and the MMU.
-- **M3c** (issue #8): not started. Blocked on M3b completion. Will add endpoints,
-  bounded copied messages, transactional handle transfer, waits, and a minimal init
-  — and settle the object-wide-incarnation question deferred from ADR 0008 D-RESOLVED.
+- **M3c** (issue #8, **ADR 0009 accepted**): in progress. The contract is frozen
+  (endpoint/channel object, split refcount + destruction, bounded data-only
+  messages, waits, transactional attenuated transfer, bootstrap fixture; two
+  owner-gated decisions — terminal-destruction/no-incarnation-counter, and the
+  process-death release walk as its own owner-signed PR). **D-SEQ step 2
+  (lifecycle)** is implemented: `kernel/core/endpoint.c` + `endpoint.h` — the
+  endpoint pool, channel record, **split refcount** (`handle_refs` vs
+  `inflight_refs`), retain/release, destruction-on-last-ref, `REFOVERFLOW`, the
+  endpoint-aware alloc/dup/close seam (table stays pure), and retain-before-commit
+  endpoint dup (while `dup_self` stays SELF-only). **Create is kernel-only** (no
+  ring-3 route) until the owner-signed step 3 wires the death-path release walk +
+  the typed close dispatcher + ring-3 `endpoint_create` together. Hosted
+  `test_endpoint` proves destruction + REFOVERFLOW + rollback; smoke/integration/
+  CI-NX/ARM unaffected. ADR 0009 D4a also appended endpoint rights
+  (`SEND=0x2`…), an owner-approved ABI change that flipped the tested
+  `dup(self,0x2)` result INVALID→DENIED — handled by Option A (see
+  IMPLEMENTATION.md "M3c rights-bit discrepancy"). **Remaining D-SEQ:** step 3
+  (death-path + ring-3 create, owner-signed), 4 (non-blocking data IPC), 5
+  (capability transfer + cycle invariant), 6 (waits, owner-gated — edits
+  `sched.c`), 7 (bootstrap fixture). #8 closes when the sequence completes; this
+  also discharges #7's deferred refcount/overflow/instance-generation.
 
 Full qualification evidence for M3a is in `docs/M3A_RETRO.md`; the per-PR ledger is
 `docs/IMPLEMENTATION.md`. Everything above is QEMU/hosted-verified and

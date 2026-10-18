@@ -597,7 +597,9 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (vm_s3_scratch(H,0x10d0)!=JE_ABI_H_DENIED)  fail("JeiOS fatal: s5c rights(weak) not DENIED\r\n");
             /* superset request (weak lacks INSPECT) -> DENIED, never escalates. */
             if (vm_s3_scratch(H,0x10d8)!=JE_ABI_H_DENIED)  fail("JeiOS fatal: s5c dup superset not DENIED\r\n");
-            /* unknown rights bit (0x2) -> INVALID (malformed), not DENIED. */
+            /* still-unknown rights bit (0x80000000) -> INVALID (malformed), not
+             * DENIED. 0x2 is now the KNOWN right SEND (ADR 0009 D4a), so the
+             * unknown-bit contract moved to bit 31; see user_demo.S +0xe0. */
             if (vm_s3_scratch(H,0x10e0)!=JE_ABI_INVALID)   fail("JeiOS fatal: s5c dup unknown-right not INVALID\r\n");
             /* a rights-0 handle still closes (no slot leak). */
             if (vm_s3_scratch(H,0x10e8)!=JE_ABI_OK)        fail("JeiOS fatal: s5c close(weak) not OK\r\n");
