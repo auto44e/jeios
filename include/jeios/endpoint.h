@@ -52,8 +52,12 @@
  * and exhaustion are reachable in hosted tests; these are POLICY, never hardware
  * limits. Pinned by _Static_assert in endpoint.c. -------------------------- */
 #define JE_EP_POOL_CAP      4u    /* channel records in a pool */
-#define JE_EP_QUEUE_DEPTH   4u    /* messages per end (queue unused this PR) */
+#define JE_EP_QUEUE_DEPTH   4u    /* messages per end inbound queue */
 #define JE_EP_MAX_WAITERS   2u    /* waiters per end (unused this PR) */
+/* M3c step 4: max payload BYTES per message (a policy bound, newly chosen here —
+ * ADR 0009 said the message max is pinned in an M3c PR; the lifecycle PR did not,
+ * so this is it). <= 255 so a per-slot length fits a uint8_t. */
+#define JE_EP_MSG_MAX       64u
 /* Each ref counter must admit every non-handle owning ref the design can force
  * (queued caps + waiters) without spuriously overflowing a legitimate acquire,
  * AND be small enough to hit in a test. handle_refs is bounded by table slots;
@@ -90,9 +94,24 @@ typedef enum {
     JE_EP_QUOTA,        /* table live-slot quota reached */
     JE_EP_NOSLOTS,      /* no FREE table slot, or pool exhausted */
     JE_EP_REFOVERFLOW,  /* acquiring past JE_EP_REF_MAX; nothing acquired */
+    JE_EP_QUEUE_FULL,   /* try_send: peer inbound at JE_EP_QUEUE_DEPTH */
+    JE_EP_SHORT_BUFFER, /* try_recv: caller buffer < head message; not dequeued */
+    JE_EP_PEER_CLOSED,  /* try_send to a peer-closed end, or try_recv drained+EOF */
+    JE_EP_EMPTY,        /* try_recv: OPEN end, empty queue (would block) */
+    JE_EP_INVALID,      /* malformed pure-layer arg (e.g. len > JE_EP_MSG_MAX) */
     JE_EP_CORRUPT       /* an object pointer that is not a valid pool end
                          * (should be impossible; fail closed, never deref) */
 } je_ep_status;
+
+/* One inbound message queue (a ring buffer of fixed-max-size messages). Holds
+ * DATA ONLY (ADR 0009 D9): payload bytes, never capabilities, until step 5. The
+ * queue owns no references — data never affects handle_refs/inflight_refs. */
+typedef struct {
+    uint8_t  buf[JE_EP_QUEUE_DEPTH][JE_EP_MSG_MAX];
+    uint8_t  len[JE_EP_QUEUE_DEPTH];  /* valid payload bytes per slot (<= MSG_MAX) */
+    uint8_t  head;                    /* index of the oldest message */
+    uint8_t  count;                   /* number queued (0..JE_EP_QUEUE_DEPTH) */
+} je_ep_queue;
 
 /* An end's lifecycle state (ADR 0009 D2). */
 typedef enum {
@@ -102,13 +121,14 @@ typedef enum {
     JE_EP_END_CLOSED      /* this end has no handle refs left */
 } je_ep_end_state;
 
-/* One end of a channel. `queue`/waiter storage is reserved for later PRs; this
- * PR only touches the two counts and the state. */
+/* One end of a channel. `inbound` holds messages sent by the PEER and waiting for
+ * THIS end's try_recv (Model A). Waiter storage is reserved for step 6. */
 typedef struct {
     je_ep_end_state state;
     uint16_t        handle_refs;    /* LIVE handle slots naming this end */
     uint16_t        inflight_refs;  /* queued caps + waiters (unused this PR) */
     uint8_t         side;           /* 0 or 1; peer is record->end[side ^ 1] */
+    je_ep_queue     inbound;        /* messages awaiting this end's try_recv */
 } je_ep_end;
 
 /* A channel record: both ends in one allocation, so a peer pointer is always to
@@ -195,9 +215,66 @@ je_ep_status je_endpoint_retain_inflight(je_endpoint_pool *pool,
 je_ep_status je_endpoint_release_inflight(je_endpoint_pool *pool,
                                           je_ep_channel *rec, uint8_t side);
 
+/* ---- Non-blocking data IPC (M3c step 4, ADR 0009 D6, data-only per D9) ------
+ * All pure/hostable: they move KERNEL bytes only (the glue does copy_from/to_user
+ * around them, honoring D6's copy-then-enqueue / peek-copy-then-dequeue ordering).
+ * A message is bytes only — no capabilities until step 5. */
+
+/* try_send PREFLIGHT: the read-only half of send — resolve the handle (needs
+ * SEND), check self-end state and peer-inbound capacity — WITHOUT touching user
+ * memory or mutating anything. The glue calls this FIRST (so a bad user pointer
+ * never masks a DENIED/PEER_CLOSED/QUEUE_FULL status, and user memory is never
+ * read for an unauthorized handle), THEN copy_from_user into staging, THEN
+ * je_endpoint_try_send to enqueue. Returns the same status precedence try_send
+ * would (BADINDEX/STALE/WRONGTYPE -> DENIED -> PEER_CLOSED -> QUEUE_FULL -> OK).
+ * `len` is validated (> JE_EP_MSG_MAX -> JE_EP_INVALID). */
+je_ep_status je_endpoint_send_preflight(je_endpoint_pool *pool, je_handle_table *t,
+                                        je_handle h, size_t len);
+
+/* try_send: enqueue a COPY of kbuf[0..len) (kernel memory) into the PEER end's
+ * inbound queue. len must be <= JE_EP_MSG_MAX (else JE_EP_INVALID). Resolves the
+ * handle as an endpoint requiring the SEND right. Status precedence:
+ * BADINDEX/STALE/WRONGTYPE -> DENIED -> PEER_CLOSED (self end peer-closed) ->
+ * QUEUE_FULL -> OK. On any non-OK status NOTHING is enqueued. kbuf may be NULL
+ * iff len == 0 (a valid empty message). */
+je_ep_status je_endpoint_try_send(je_endpoint_pool *pool, je_handle_table *t,
+                                  je_handle h, const void *kbuf, size_t len);
+
+/* A recv lease token (D6 / endpoint.h generation-carry rule): identifies the
+ * exact head message a peek observed, so commit dequeues only that message. */
+typedef struct {
+    je_ep_channel *rec;
+    uint8_t        side;
+    uint32_t       generation;  /* rec->generation at peek time */
+    uint8_t        head;        /* queue head index at peek time */
+    uint8_t        len;         /* head message length at peek time */
+} je_ep_recv_lease;
+
+/* try_recv PEEK: resolve the handle (needs RECV), apply the state/empty rules,
+ * and — on OK — copy the head message into out_kbuf (kernel memory, up to cap
+ * bytes) WITHOUT dequeuing, writing *out_len = message length and filling *lease.
+ * If cap < message length: returns JE_EP_SHORT_BUFFER, writes *out_len = required
+ * length, copies nothing, no lease. Empty+OPEN -> JE_EP_EMPTY; empty+peer-closed
+ * -> JE_EP_PEER_CLOSED (EOF); nonempty -> deliver regardless of peer state (drain
+ * first). Copies into a CALLER buffer (the glue's kernel stack), so the glue
+ * never holds a pointer into pool storage across copy_to_user. */
+je_ep_status je_endpoint_recv_peek(je_endpoint_pool *pool, je_handle_table *t,
+                                   je_handle h, void *out_kbuf, size_t cap,
+                                   size_t *out_len, je_ep_recv_lease *lease);
+
+/* try_recv COMMIT: dequeue the message the lease identifies. Called by the glue
+ * ONLY after a successful copy_to_user. INFALLIBLE for a valid lease: if the
+ * lease no longer matches (record freed/reused/mutated — impossible under IF=0
+ * via ordinary API), it returns JE_EP_CORRUPT and the caller MUST treat that as
+ * fatal (a retry would double-deliver). Zeroes the vacated slot. */
+je_ep_status je_endpoint_recv_commit(je_endpoint_pool *pool,
+                                     const je_ep_recv_lease *lease);
+
 /* Read-only accessors for tests/assertions (never mutate). */
 je_ep_end_state je_endpoint_end_state(const je_ep_channel *rec, uint8_t side);
 uint32_t        je_endpoint_pool_allocated(const je_endpoint_pool *pool);
+/* Inbound queue depth for a resolved end (tests). */
+uint8_t         je_endpoint_inbound_count(const je_ep_channel *rec, uint8_t side);
 
 /* Process-death RELEASE WALK (ADR 0009 D-OWNER-2 + AMENDMENT A3-1): drop every
  * LIVE endpoint handle in table `t`, closing peers and freeing now-unreferenced

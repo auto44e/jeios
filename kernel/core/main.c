@@ -92,6 +92,7 @@ extern unsigned char je_user_badret_start[], je_user_badret_end[];
 extern unsigned char je_user_copyprobe_start[], je_user_copyprobe_end[];
 extern unsigned char je_user_handle_start[], je_user_handle_end[];
 extern unsigned char je_user_epfault_start[], je_user_epfault_end[];
+extern unsigned char je_user_epipc_start[], je_user_epipc_end[];
 #ifdef JE_DEV_COPY_INJECT
 extern unsigned char je_user_inject_start[], je_user_inject_end[];
 #endif
@@ -101,7 +102,7 @@ static unsigned char vm_blob_s3[1024];
 typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_EXIT=3,
                PROG_SYSCALL=4, PROG_UNKNOWNOP=5, PROG_BADRSP=6, PROG_BADRET=7,
                PROG_COPYPROBE=8, PROG_INJECT=9, PROG_HANDLE=10,
-               PROG_EPFAULT=11 } user_prog;
+               PROG_EPFAULT=11, PROG_EPIPC=12 } user_prog;
 static int vm_s3_inited;
 /* Initialize the shared step-3/4 vm once (it holds up to JE_VM_MAX_PROCESSES
  * processes — A and B share it, matching the 2-process admission quota). */
@@ -134,6 +135,7 @@ static uint32_t vm_s3_build(user_prog prog)
     case PROG_COPYPROBE: start=je_user_copyprobe_start; end=je_user_copyprobe_end; break;
     case PROG_HANDLE:    start=je_user_handle_start;    end=je_user_handle_end;    break;
     case PROG_EPFAULT:   start=je_user_epfault_start;   end=je_user_epfault_end;   break;
+    case PROG_EPIPC:     start=je_user_epipc_start;     end=je_user_epipc_end;     break;
 #ifdef JE_DEV_COPY_INJECT
     case PROG_INJECT:    start=je_user_inject_start;    end=je_user_inject_end;    break;
 #endif
@@ -736,6 +738,50 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                 if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s3 ep pool leak after reap\r\n");
             }
             je_arch_console_write("M3c-s3b: ring-3 endpoint_create + typed close; fault-death reap reclaims the channel; pool baseline held across >POOL_CAP cycles\r\n");
+        }
+
+        /* --- M3c s4: non-blocking data IPC (try_send/try_recv), ring-3
+         * self-loopback (both ends in one process's table). Proves copy-in/queue/
+         * direction/copy-out rollback/SHORT_BUFFER/QUEUE_FULL/PEER_CLOSED/rights.
+         * NOT cross-address-space delivery (one process holds both ends). */
+        {
+            if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s4 kpool not 0\r\n");
+            uint32_t P=vm_s3_build(PROG_EPIPC);
+            uint64_t pd0=je_sched_dispatches_of(&vm_s3,P);
+            if (je_thread_create_user(&vm_s3, P)!=JE_OK) fail("JeiOS fatal: s4 ipc thread\r\n");
+            /* It runs the whole IPC script then loops on the heartbeat (no fault),
+             * so wait for enough dispatches to guarantee completion. */
+            for (uint64_t sp=0; je_sched_dispatches_of(&vm_s3,P)-pd0<JE_THREAD_MAX*4; ) {
+                (void)je_arch_irq_save();
+                if (++sp>100000000ull) fail("JeiOS fatal: s4 ipc no progress\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            (void)je_arch_irq_save();
+            /* Verify the recorded results (offsets match the stub). */
+            if (vm_s3_scratch(P,0x1380)!=JE_ABI_OK)          fail("JeiOS fatal: s4 create not OK\r\n");
+            if (vm_s3_scratch(P,0x1388)!=JE_ABI_OK)          fail("JeiOS fatal: s4 send not OK\r\n");
+            if (vm_s3_scratch(P,0x1390)!=JE_ABI_H_EMPTY)     fail("JeiOS fatal: s4 recv(h0) not EMPTY (direction)\r\n");
+            if (vm_s3_scratch(P,0x1398)!=JE_ABI_H_SHORT_BUFFER) fail("JeiOS fatal: s4 not SHORT_BUFFER\r\n");
+            if (vm_s3_scratch(P,0x13a0)!=8u)                 fail("JeiOS fatal: s4 short-buffer wrong len\r\n");
+            if (vm_s3_scratch(P,0x13a8)!=JE_ABI_INVALID)     fail("JeiOS fatal: s4 bad-dst recv not INVALID\r\n");
+            if (vm_s3_scratch(P,0x13b0)!=JE_ABI_OK)          fail("JeiOS fatal: s4 recv not OK\r\n");
+            if (vm_s3_scratch(P,0x13b8)!=8u)                 fail("JeiOS fatal: s4 recv wrong len\r\n");
+            if (vm_s3_scratch(P,0x13c0)!=0xdeadbeef11223344ull) fail("JeiOS fatal: s4 payload mismatch (survived faulted copy-out)\r\n");
+            if (vm_s3_scratch(P,0x13c8)!=JE_ABI_H_EMPTY)     fail("JeiOS fatal: s4 not delivered exactly once\r\n");
+            if (vm_s3_scratch(P,0x13d0)!=JE_ABI_INVALID)     fail("JeiOS fatal: s4 bad-src send not INVALID\r\n");
+            if (vm_s3_scratch(P,0x13d8)!=JE_ABI_H_EMPTY)     fail("JeiOS fatal: s4 bad send enqueued something\r\n");
+            if (vm_s3_scratch(P,0x13e0)!=JE_ABI_OK)          fail("JeiOS fatal: s4 fill send not OK\r\n");
+            if (vm_s3_scratch(P,0x13e8)!=JE_ABI_H_QUEUE_FULL) fail("JeiOS fatal: s4 not QUEUE_FULL\r\n");
+            if (vm_s3_scratch(P,0x13f0)!=JE_ABI_INVALID)     fail("JeiOS fatal: s4 cap_count send not INVALID (data-only)\r\n");
+            if (vm_s3_scratch(P,0x13f8)!=JE_ABI_OK)          fail("JeiOS fatal: s4 close(h0) not OK\r\n");
+            if (vm_s3_scratch(P,0x1400)!=JE_ABI_OK)          fail("JeiOS fatal: s4 drain-after-peer-close not OK\r\n");
+            if (vm_s3_scratch(P,0x1408)!=JE_ABI_H_PEER_CLOSED) fail("JeiOS fatal: s4 drained recv not PEER_CLOSED\r\n");
+            if (vm_s3_scratch(P,0x1410)!=JE_ABI_H_PEER_CLOSED) fail("JeiOS fatal: s4 send to closed peer not PEER_CLOSED\r\n");
+            /* Tear down P; its channel (h1 still live) must be reclaimed. */
+            if (je_sched_drop_user(&vm_s3, P)!=JE_OK) fail("JeiOS fatal: s4 ipc drop\r\n");
+            if (je_vm_destroy(&vm_s3, P)!=JE_OK) fail("JeiOS fatal: s4 ipc destroy\r\n");
+            if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s4 ipc pool leak\r\n");
+            je_arch_console_write("M3c-s4: ring-3 try_send/try_recv loopback OK (direction, SHORT_BUFFER, copy-out failure leaves msg queued -> delivered once, QUEUE_FULL, data-only reject, drain-then-PEER_CLOSED); channel reclaimed on exit\r\n");
         }
 
         /* Tear down B; all step-3/4/5a pages must be back to the pre-s4 baseline. */

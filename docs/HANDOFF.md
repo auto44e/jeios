@@ -45,11 +45,26 @@ progress on x86-64, and a second architecture, **ARM64 (MP1)**, now boots.
   IRQ-save death-path change and the packed-RDX ABI shape. Earlier, ADR 0009 D4a
   appended endpoint rights (`SEND=0x2`…), an owner-approved ABI change that flipped
   the tested `dup(self,0x2)` result INVALID→DENIED (Option A; see IMPLEMENTATION.md
-  "M3c rights-bit discrepancy"). **Remaining D-SEQ:** step 4 (non-blocking data IPC
-  — `try_send`/`try_recv`), 5 (capability transfer + cycle invariant), 6 (waits,
-  owner-gated — edits `sched.c`), 7 (bootstrap fixture). #8 closes when the
-  sequence completes; this already discharges #7's deferred refcount/overflow
-  (endpoints are now genuinely destroyed + reclaimed on process death).
+  "M3c rights-bit discrepancy"). **Step 4 (non-blocking data IPC) is now done**:
+  `try_send` (op 11) / `try_recv` (op 12) move bounded, copied, **data-only**
+  messages through per-end inbound ring queues (Model A: send on end i → peer
+  inbound), honoring the D6 copy ordering (send: preflight → copy_from_user into
+  stack staging → enqueue; recv: peek → copy_to_user → infallible commit, so a
+  copy-out fault leaves the message queued). Statuses QUEUE_FULL/SHORT_BUFFER/
+  PEER_CLOSED/EMPTY (10–13) added; `JE_ABI_MSG_MAX=64`, DEPTH=4 (policy bounds,
+  ~2.1 KB pool). D9 data-only is enforced (R10 cap_count must be 0). An
+  owner-approved touch to the tested lifecycle path discards/zeroes inbound
+  queues on close/free (free condition unchanged). Proven ring-3 by the `M3c-s4`
+  self-loopback marker (direction, FIFO, SHORT_BUFFER, copy-out-fault rollback →
+  delivered once, QUEUE_FULL, data-only reject, drain-then-PEER_CLOSED) — which
+  does NOT prove cross-address-space delivery (one process holds both ends; that
+  needs transfer). **ABI forward note:** the single RDX scalar can't return
+  received capability handles, so **step 5 MUST add a new op / out-register
+  extension, not overload `try_recv`** (R8/R9 and RDX[63:32] reserved now).
+  **Remaining D-SEQ:** step 5 (capability transfer + the D9 cycle invariant), 6
+  (waits, owner-gated — edits `sched.c`), 7 (bootstrap fixture). #8 closes when
+  the sequence completes; #7's deferred refcount/overflow is already discharged
+  (endpoints are genuinely destroyed + reclaimed on process death).
 
 Full qualification evidence for M3a is in `docs/M3A_RETRO.md`; the per-PR ledger is
 `docs/IMPLEMENTATION.md`. Everything above is QEMU/hosted-verified and

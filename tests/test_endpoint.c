@@ -303,8 +303,191 @@ int main(void)
         assert(je_endpoint_pool_allocated(&g_pool)==0u);
     }
 
+    /* 13. Data IPC: send/recv roundtrip + FIFO, via the pure peek/commit seam.
+     * Helper to do a full recv (peek into a local buf, then commit). */
+    fresh(QUOTA);
+    make_pair(&h0, &h1);
+    {
+        /* send on h0 -> lands in end1 inbound (peer). recv on h1 reads it. */
+        uint8_t msg[8] = {10,11,12,13,14,15,16,17};
+        assert(je_endpoint_try_send(&g_pool,&g_t,h0,msg,8)==JE_EP_OK);
+        je_ep_channel *rec; uint8_t side;
+        assert(je_endpoint_resolve(&g_pool,&g_t,h1,&rec,&side)==JE_EP_OK);
+        assert(je_endpoint_inbound_count(rec,side)==1u);
+        /* recv on h0 is EMPTY (direction: nothing landed in end0 inbound). */
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0; je_ep_recv_lease lz;
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h0,rb,sizeof rb,&rl,&lz)==JE_EP_EMPTY);
+        /* recv on h1 delivers the message. */
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_OK);
+        assert(rl==8u);
+        for (int i=0;i<8;i++) assert(rb[i]==msg[i]);
+        assert(je_endpoint_recv_commit(&g_pool,&lz)==JE_EP_OK);
+        assert(je_endpoint_inbound_count(rec,side)==0u);
+        /* now empty -> EMPTY. */
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_EMPTY);
+    }
+
+    /* 14. FIFO order + QUEUE_FULL at DEPTH + no-refcount-interaction. */
+    fresh(QUOTA);
+    make_pair(&h0,&h1);
+    {
+        je_ep_channel *rec; uint8_t side;
+        assert(je_endpoint_resolve(&g_pool,&g_t,h0,&rec,&side)==JE_EP_OK);
+        uint16_t hr0=rec->end[0].handle_refs, hr1=rec->end[1].handle_refs;
+        for (uint8_t i=0;i<JE_EP_QUEUE_DEPTH;i++) {
+            uint8_t m[1]={ (uint8_t)(100+i) };
+            assert(je_endpoint_try_send(&g_pool,&g_t,h0,m,1)==JE_EP_OK);
+        }
+        /* queue full now -> QUEUE_FULL, nothing enqueued. */
+        uint8_t mf[1]={9};
+        assert(je_endpoint_try_send(&g_pool,&g_t,h0,mf,1)==JE_EP_QUEUE_FULL);
+        /* data did NOT touch refcounts. */
+        assert(rec->end[0].handle_refs==hr0 && rec->end[1].handle_refs==hr1);
+        assert(rec->end[0].inflight_refs==0u && rec->end[1].inflight_refs==0u);
+        /* drain in FIFO order. */
+        for (uint8_t i=0;i<JE_EP_QUEUE_DEPTH;i++) {
+            uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0; je_ep_recv_lease lz;
+            assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_OK);
+            assert(rl==1u && rb[0]==(uint8_t)(100+i));
+            assert(je_endpoint_recv_commit(&g_pool,&lz)==JE_EP_OK);
+        }
+    }
+
+    /* 15. SHORT_BUFFER: peek reports length, copies nothing, does NOT dequeue. */
+    fresh(QUOTA);
+    make_pair(&h0,&h1);
+    {
+        uint8_t m[5]={1,2,3,4,5};
+        assert(je_endpoint_try_send(&g_pool,&g_t,h0,m,5)==JE_EP_OK);
+        uint8_t rb[2]={0xAA,0xBB}; size_t rl=0; je_ep_recv_lease lz;
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,2,&rl,&lz)==JE_EP_SHORT_BUFFER);
+        assert(rl==5u);                 /* required length reported */
+        assert(rb[0]==0xAA && rb[1]==0xBB);  /* nothing copied */
+        /* still queued: a big-enough recv delivers it. */
+        uint8_t rb2[JE_EP_MSG_MAX];
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb2,sizeof rb2,&rl,&lz)==JE_EP_OK);
+        assert(rl==5u);
+        assert(je_endpoint_recv_commit(&g_pool,&lz)==JE_EP_OK);
+    }
+
+    /* 16. PEER_CLOSED: send to a peer-closed end; drain-then-EOF on recv. */
+    fresh(QUOTA);
+    make_pair(&h0,&h1);
+    {
+        uint8_t m[3]={7,8,9};
+        /* h0 sends one, then h0 closes: end1 (h1's end) goes PEER_CLOSED but its
+         * inbound still holds the message. */
+        assert(je_endpoint_try_send(&g_pool,&g_t,h0,m,3)==JE_EP_OK);
+        assert(je_endpoint_handle_close(&g_pool,&g_t,h0)==JE_EP_OK);
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0; je_ep_recv_lease lz;
+        /* drain first (message delivered despite peer gone). */
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_OK);
+        assert(rl==3u && rb[0]==7);
+        assert(je_endpoint_recv_commit(&g_pool,&lz)==JE_EP_OK);
+        /* now empty + peer gone -> PEER_CLOSED (EOF). */
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_PEER_CLOSED);
+        /* send on h1 -> its peer (end0) is CLOSED -> PEER_CLOSED. */
+        assert(je_endpoint_send_preflight(&g_pool,&g_t,h1,3)==JE_EP_PEER_CLOSED);
+    }
+
+    /* 17. Rights: send needs SEND, recv needs RECV (DENIED otherwise). */
+    fresh(QUOTA);
+    {
+        /* end0 has SEND only; end1 has RECV only. */
+        je_handle s0=0,r1=0;
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHT_SEND,
+                                          &g_t,JE_EP_RIGHT_RECV,&s0,&r1)==JE_EP_OK);
+        uint8_t m[1]={1};
+        /* s0 can send; r1 cannot send (no SEND) -> DENIED. */
+        assert(je_endpoint_send_preflight(&g_pool,&g_t,s0,1)==JE_EP_OK);
+        assert(je_endpoint_send_preflight(&g_pool,&g_t,r1,1)==JE_EP_DENIED);
+        assert(je_endpoint_try_send(&g_pool,&g_t,s0,m,1)==JE_EP_OK);
+        /* r1 can recv; s0 cannot recv (no RECV) -> DENIED. */
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0; je_ep_recv_lease lz;
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,s0,rb,sizeof rb,&rl,&lz)==JE_EP_DENIED);
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,r1,rb,sizeof rb,&rl,&lz)==JE_EP_OK);
+    }
+
+    /* 18. Zero-length message is valid and distinct from EMPTY. */
+    fresh(QUOTA);
+    make_pair(&h0,&h1);
+    {
+        assert(je_endpoint_try_send(&g_pool,&g_t,h0,(void*)0,0)==JE_EP_OK);
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=7; je_ep_recv_lease lz;
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_OK);
+        assert(rl==0u);                 /* OK + len 0, NOT EMPTY */
+        assert(je_endpoint_recv_commit(&g_pool,&lz)==JE_EP_OK);
+    }
+
+    /* 19. len > MSG_MAX rejected; free-with-nonempty-queue returns to baseline. */
+    fresh(QUOTA);
+    make_pair(&h0,&h1);
+    {
+        uint8_t big[JE_EP_MSG_MAX+1];
+        assert(je_endpoint_try_send(&g_pool,&g_t,h0,big,JE_EP_MSG_MAX+1)==JE_EP_INVALID);
+        /* queue one, then close BOTH ends while a message is queued: record must
+         * still free (data is not an owning ref). */
+        uint8_t m[2]={5,6};
+        assert(je_endpoint_try_send(&g_pool,&g_t,h0,m,2)==JE_EP_OK);
+        assert(je_endpoint_handle_close(&g_pool,&g_t,h0)==JE_EP_OK);
+        assert(je_endpoint_handle_close(&g_pool,&g_t,h1)==JE_EP_OK);
+        assert(je_endpoint_pool_allocated(&g_pool)==0u);  /* freed despite queued msg */
+    }
+
+    /* 20. commit lease rejected after the record is freed/reused (generation). */
+    fresh(QUOTA);
+    make_pair(&h0,&h1);
+    {
+        uint8_t m[1]={1};
+        assert(je_endpoint_try_send(&g_pool,&g_t,h0,m,1)==JE_EP_OK);
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0; je_ep_recv_lease lz;
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_OK);
+        /* Tear down the whole channel before committing -> stale lease. */
+        assert(je_endpoint_handle_close(&g_pool,&g_t,h0)==JE_EP_OK);
+        assert(je_endpoint_handle_close(&g_pool,&g_t,h1)==JE_EP_OK);
+        assert(je_endpoint_pool_allocated(&g_pool)==0u);
+        assert(je_endpoint_recv_commit(&g_pool,&lz)==JE_EP_CORRUPT);  /* fail closed */
+    }
+
+    /* 21. Ring WRAPAROUND with distinct payloads + lengths (catches a wrong
+     * head/tail modulo that identical-payload tests would miss). Partially
+     * drain then refill so head advances past 0 and tail wraps. */
+    fresh(QUOTA);
+    make_pair(&h0,&h1);
+    {
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0; je_ep_recv_lease lz;
+        /* send 3 distinct (len i+1, bytes 0x10+i). */
+        for (uint8_t i=0;i<3;i++) {
+            uint8_t m[3]={(uint8_t)(0x10+i),(uint8_t)(0x20+i),(uint8_t)(0x30+i)};
+            assert(je_endpoint_try_send(&g_pool,&g_t,h0,m,(size_t)(i+1))==JE_EP_OK);
+        }
+        /* drain 2 (head -> 2). */
+        for (uint8_t i=0;i<2;i++) {
+            assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_OK);
+            assert(rl==(size_t)(i+1) && rb[0]==(uint8_t)(0x10+i));
+            assert(je_endpoint_recv_commit(&g_pool,&lz)==JE_EP_OK);
+        }
+        /* send 2 more (distinct, len 4) -> tail wraps past DEPTH. */
+        for (uint8_t i=3;i<5;i++) {
+            uint8_t m[4]={(uint8_t)(0x10+i),(uint8_t)(0x20+i),(uint8_t)(0x30+i),(uint8_t)(0x40+i)};
+            assert(je_endpoint_try_send(&g_pool,&g_t,h0,m,4)==JE_EP_OK);
+        }
+        /* drain remaining in FIFO: msg2 (len3), msg3 (len4), msg4 (len4). */
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_OK);
+        assert(rl==3u && rb[0]==0x12);
+        assert(je_endpoint_recv_commit(&g_pool,&lz)==JE_EP_OK);
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_OK);
+        assert(rl==4u && rb[0]==0x13);
+        assert(je_endpoint_recv_commit(&g_pool,&lz)==JE_EP_OK);
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_OK);
+        assert(rl==4u && rb[0]==0x14);
+        assert(je_endpoint_recv_commit(&g_pool,&lz)==JE_EP_OK);
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_EMPTY);
+    }
+
     printf("endpoint: PASS (create, split-ref close/destruction, dup "
            "acquire-before-commit, REFOVERFLOW, DENIED/WRONGTYPE, inflight keep-"
-           "alive, pool-exhaustion + create-unwind, release-walk)\n");
+           "alive, pool-exhaustion + create-unwind, release-walk, data IPC "
+           "send/recv/FIFO/QUEUE_FULL/SHORT_BUFFER/PEER_CLOSED/rights/zero-len)\n");
     return 0;
 }

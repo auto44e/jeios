@@ -36,12 +36,22 @@ typedef enum {
                               * via handle_dup attenuation since the M3b dup PR) */
     JE_ABI_H_QUOTA     = 7,  /* allocate: live-slot count at the process quota */
     JE_ABI_H_NOSLOTS   = 8,  /* allocate: no FREE slot remains */
-    JE_ABI_H_REFOVERFLOW = 9 /* M3c (ADR 0009 D4): acquiring an owning reference
+    JE_ABI_H_REFOVERFLOW = 9, /* M3c (ADR 0009 D4): acquiring an owning reference
                               * past the configured JE_EP_REF_MAX policy bound;
                               * acquires nothing, object unchanged. RESERVED here
                               * (no ring-3 endpoint op yet) — first surfaced by a
                               * later M3c syscall; pinned now so the number is
                               * frozen in the v0 ABI. */
+    JE_ABI_H_QUEUE_FULL  = 10, /* M3c D6: try_send on an end whose peer inbound
+                              * queue is at JE_EP_QUEUE_DEPTH; nothing enqueued. */
+    JE_ABI_H_SHORT_BUFFER = 11, /* M3c D6: try_recv with a buffer smaller than the
+                              * head message; RDX = required length, NOT dequeued. */
+    JE_ABI_H_PEER_CLOSED = 12, /* M3c D6: try_send to a peer-closed end, or try_recv
+                              * on a peer-closed end whose inbound is now drained
+                              * (EOF). */
+    JE_ABI_H_EMPTY       = 13  /* M3c D6: non-blocking try_recv on an OPEN end with
+                              * an empty inbound queue (would block; blocking is
+                              * step 6). Distinct from PEER_CLOSED (peer gone). */
 } je_abi_status;
 _Static_assert(JE_ABI_OK == 0, "abi ok");
 _Static_assert(JE_ABI_UNSUPPORTED == 1, "abi unsupported");
@@ -55,6 +65,10 @@ _Static_assert(JE_ABI_H_DENIED == 6, "abi h_denied");
 _Static_assert(JE_ABI_H_QUOTA == 7, "abi h_quota");
 _Static_assert(JE_ABI_H_NOSLOTS == 8, "abi h_noslots");
 _Static_assert(JE_ABI_H_REFOVERFLOW == 9, "abi h_refoverflow");
+_Static_assert(JE_ABI_H_QUEUE_FULL == 10, "abi h_queue_full");
+_Static_assert(JE_ABI_H_SHORT_BUFFER == 11, "abi h_short_buffer");
+_Static_assert(JE_ABI_H_PEER_CLOSED == 12, "abi h_peer_closed");
+_Static_assert(JE_ABI_H_EMPTY == 13, "abi h_empty");
 
 /* Operation numbers (full 64-bit RAX; any value not listed is UNSUPPORTED). */
 typedef enum {
@@ -85,6 +99,30 @@ typedef enum {
                               * is UNDEFINED on failure. UNSUPPORTED on a VM with
                               * no teardown hook (so an endpoint can only exist in
                               * a table whose death path reclaims it). */
+    , JE_SYS_TRY_SEND = 11   /* M3c D6: try_send(h=RDI, ubuf=RSI, len=RDX,
+                              * meta=R10, R8, R9). Non-blocking: copies len bytes
+                              * from ubuf into the peer's inbound queue. len must
+                              * be <= JE_EP_MSG_MAX. The handle needs the SEND right.
+                              * R10 layout: R10[7:0] = cap_count (MUST be 0 until
+                              * step 5; any nonzero -> INVALID), R10[63:8] reserved
+                              * (must be 0). R8 reserved for step 5 cap-array ptr
+                              * (must be 0). R9 reserved (must be 0).
+                              * Status precedence (frozen): decode INVALID
+                              * (meta/reserved/len/wide-handle, before any user
+                              * access) > BADINDEX/STALE/WRONGTYPE > DENIED >
+                              * PEER_CLOSED > QUEUE_FULL > copy-fault INVALID (the
+                              * copy runs only after a clean preflight, so a bad
+                              * ubuf ranks LAST, never masking a handle/queue
+                              * status). RDX = 0 on success. */
+    , JE_SYS_TRY_RECV = 12   /* M3c D6: try_recv(h=RDI, ubuf=RSI, cap=RDX,
+                              * R10/R8/R9 reserved must be 0). Non-blocking: copies
+                              * the head message into ubuf (up to cap bytes). The
+                              * handle needs the RECV right. -> RAX status;
+                              * RDX[31:0] = bytes delivered (OK), or required length
+                              * (SHORT_BUFFER, no dequeue), or 0 (all other).
+                              * RDX[63:32] reserved as 0 (step 5 will carry received
+                              * cap count — step 5 MUST use a new op or out-register
+                              * extension, NOT overload this op). */
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYS_COPY_FIXUP_INJECT = 4  /* dev-only: raw-copy an unmapped page to test the fixup */
 #endif
@@ -97,12 +135,18 @@ typedef enum {
 /* M3c endpoint object type (ADR 0009). Pinned equal to the table-side
  * JE_ENDPOINT_OBJ_TYPE in the syscall glue via _Static_assert. */
 #define JE_ABI_OBJ_ENDPOINT 2u
+/* M3c D6 (step 4): max message payload bytes a try_send accepts. ABI-visible
+ * (ring 3 must know the cap); pinned equal to the table-side JE_EP_MSG_MAX in the
+ * syscall glue. */
+#define JE_ABI_MSG_MAX 64u
 _Static_assert(JE_SYS_HANDLE_SELF == 5, "abi op handle_self");
 _Static_assert(JE_SYS_HANDLE_CLOSE == 6, "abi op handle_close");
 _Static_assert(JE_SYS_HANDLE_QUERY == 7, "abi op handle_query");
 _Static_assert(JE_SYS_HANDLE_RIGHTS == 8, "abi op handle_rights");
 _Static_assert(JE_SYS_HANDLE_DUP == 9, "abi op handle_dup");
 _Static_assert(JE_SYS_ENDPOINT_CREATE == 10, "abi op endpoint_create");
+_Static_assert(JE_SYS_TRY_SEND == 11, "abi op try_send");
+_Static_assert(JE_SYS_TRY_RECV == 12, "abi op try_recv");
 
 /* M3b rights ABI (ADR 0008 revisit, frozen here). Rights are a fixed uint32_t
  * bitmask. handle_rights masks its output to JE_ABI_RIGHTS_KNOWN so no internal

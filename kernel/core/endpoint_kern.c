@@ -72,6 +72,41 @@ je_ep_status je_endpoint_kern_close(je_vm *vm, uint32_t index, je_handle h)
     return je_endpoint_handle_close(&g_kep, &vm->procs[index].htable, h);
 }
 
+/* Data IPC forwarders (M3c step 4): resolve the caller's table and run the pure
+ * send/peek/commit against the kernel pool. The glue (syscall.c) does the
+ * copy_from/to_user around these, honoring D6 ordering. */
+je_ep_status je_endpoint_kern_send(je_vm *vm, uint32_t index, je_handle h,
+                                   const void *kbuf, size_t len)
+{
+    if (!vm || index >= JE_VM_MAX_PROCESSES) return JE_EP_BADINDEX;
+    kep_init_once();
+    return je_endpoint_try_send(&g_kep, &vm->procs[index].htable, h, kbuf, len);
+}
+
+je_ep_status je_endpoint_kern_send_preflight(je_vm *vm, uint32_t index,
+                                             je_handle h, size_t len)
+{
+    if (!vm || index >= JE_VM_MAX_PROCESSES) return JE_EP_BADINDEX;
+    kep_init_once();
+    return je_endpoint_send_preflight(&g_kep, &vm->procs[index].htable, h, len);
+}
+
+je_ep_status je_endpoint_kern_recv_peek(je_vm *vm, uint32_t index, je_handle h,
+                                        void *out_kbuf, size_t cap,
+                                        size_t *out_len, je_ep_recv_lease *lease)
+{
+    if (!vm || index >= JE_VM_MAX_PROCESSES) return JE_EP_BADINDEX;
+    kep_init_once();
+    return je_endpoint_recv_peek(&g_kep, &vm->procs[index].htable, h,
+                                 out_kbuf, cap, out_len, lease);
+}
+
+je_ep_status je_endpoint_kern_recv_commit(const je_ep_recv_lease *lease)
+{
+    kep_init_once();
+    return je_endpoint_recv_commit(&g_kep, lease);
+}
+
 uint32_t je_endpoint_kernel_allocated(void)
 {
     return g_kep_inited ? je_endpoint_pool_allocated(&g_kep) : 0u;
