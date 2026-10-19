@@ -21,6 +21,8 @@ SECTIONS
     _text = .;
 
     .text.boot : { KEEP(*(.text.boot)) }
+    . = ALIGN(0x800);                       /* VBAR_EL1 requires 2 KiB alignment */
+    .text.vectors : { KEEP(*(.text.vectors)) }
     .text      : { *(.text*) }
     .rodata    : { *(.rodata*) }
     .data      : { *(.data*) }

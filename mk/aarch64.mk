@@ -17,6 +17,13 @@ ARM_ARCH    := kernel/arch/aarch64
 ifeq ($(ARM_BSS_CHECK),1)
 ARM_BUILD   := build/aarch64-bsscheck
 endif
+# Optional deliberate-exception build (MP1 vectors): plants a BRK #0xA55A after
+# installing vectors and asserts the exact syndrome in the handler.
+# `make aarch64 ARM_VECTOR_TEST=1`. Separate build dir so the toggle never reuses
+# stale objects.
+ifeq ($(ARM_VECTOR_TEST),1)
+ARM_BUILD   := build/aarch64-vectest
+endif
 
 # Freestanding, no PIC/stack-protector, STRICT alignment (pre-MMU RAM is
 # Device-nGnRnE so unaligned accesses fault), and general-regs-only (a stray
@@ -36,16 +43,24 @@ ifeq ($(ARM_BSS_CHECK),1)
 ARM_CFLAGS  += -DJE_ARM_BSS_CHECK
 ARM_ASFLAGS += -DJE_ARM_BSS_CHECK
 endif
+ifeq ($(ARM_VECTOR_TEST),1)
+ARM_CFLAGS  += -DJE_ARM_VECTOR_TEST
+ARM_ASFLAGS += -DJE_ARM_VECTOR_TEST
+endif
 
-ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o
+ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/vectors.o
 
 $(ARM_BUILD)/boot.o: $(ARM_ARCH)/boot.S $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(ARM_CC) $(ARM_ASFLAGS) -c $< -o $@
 
-$(ARM_BUILD)/main.o: $(ARM_ARCH)/main.c $(wildcard include/jeios/*.h)
+$(ARM_BUILD)/vectors.o: $(ARM_ARCH)/vectors.S $(ARM_ARCH)/trapframe.h
 	@mkdir -p $(@D)
-	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
+	$(ARM_CC) $(ARM_ASFLAGS) -I$(ARM_ARCH) -c $< -o $@
+
+$(ARM_BUILD)/main.o: $(ARM_ARCH)/main.c $(ARM_ARCH)/trapframe.h $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
 
 $(ARM_BUILD)/jeios-arm.elf: $(ARM_OBJS) $(ARM_ARCH)/linker.ld
 	$(ARM_LD) $(ARM_LDFLAGS) -T $(ARM_ARCH)/linker.ld -o $@ $(ARM_OBJS)
@@ -63,4 +78,4 @@ aarch64: $(ARM_BUILD)/Image
 # versions + the exact command, and SKIPs (never PASSes) if the toolchain or
 # qemu-system-aarch64 is absent. Not wired into `make check`.
 smoke-aarch64: $(ARM_BUILD)/Image
-	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,)
+	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,)

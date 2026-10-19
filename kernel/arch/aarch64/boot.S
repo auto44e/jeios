@@ -10,7 +10,9 @@
  *   - select SPSel=1 and set SP_EL1 to the top of a reserved in-image stack;
  *   - initialize TCR_EL1 to a complete known interim value with TBI0=0
  *     (ADR 0002 D5 interim: tagged user pointers rejected once the MMU is on;
- *     this only sets the field — behavioral enforcement is the MMU/vectors PR);
+ *     this only sets the field — behavioral enforcement is the MMU PR);
+ *   - write SCTLR_EL1 to a DEFINED value (MMU/caches off, SP-alignment SA=1,
+ *     RES1 bits preserved) so SP-alignment faulting is deterministic;
  *   - clear BSS with plain aligned stores (NO DC ZVA: pre-MMU RAM is
  *     Device-nGnRnE, so unaligned / cache-maintenance ops fault);
  *   - stash the DTB pointer into .data (survives, unlike a .bss slot);
@@ -81,12 +83,32 @@ real_start:
     add     x0, x0, #:lo12:__stack_top
     mov     sp, x0
 
-    /* ---- TCR_EL1 interim init (ADR 0002 D5): complete known value, TBI0=0.
-     * MMU stays OFF (SCTLR_EL1.M untouched). bit31 is RES1 on cortex-a72, so we
-     * write 0x80000000 (RES1 set, TBI0=0, everything else 0) — a defined interim,
-     * NOT a behavioral TBI claim. The MMU PR replaces this with a full config. */
-    movz    x0, #0x8000, lsl #16    /* 0x80000000: bit31 RES1, TBI0=0 */
+    /* ---- TCR_EL1 interim init (ADR 0002 D5): a complete known value with
+     * TBI0=0. MMU stays OFF (SCTLR_EL1.M stays 0; SCTLR is written explicitly
+     * below). Value 0x80000000: this sets TCR_EL1[31]=TG1[1] (a defined TTBR1
+     * granule selector) with TBI0=0 and everything else 0 — a defined interim,
+     * NOT a behavioral TBI/translation claim (no TTBR/MAIR, MMU off). The MMU PR
+     * (MP2) replaces this with the full MAIR/TCR/TTBR/SCTLR.M config. ---- */
+    movz    x0, #0x8000, lsl #16    /* 0x80000000: TBI0=0, interim TG1 bits */
     msr     TCR_EL1, x0
+    isb
+
+    /* ---- SCTLR_EL1 explicit init (MP1 review gap): several SCTLR_EL1 bits reset
+     * to an architecturally UNKNOWN value, notably SA (bit3, SP-alignment check)
+     * and A (bit1, alignment check). With the MMU off we need a DEFINED value so
+     * whether a misaligned stp faults is deterministic, not luck. Write a known
+     * value: M=0 (MMU off), C=0 (D-cache off), I=0 (I-cache off), A=0 (no strict
+     * element alignment — we rely on -mstrict-align + aligned code, and A=1 would
+     * also fault legitimate Device accesses), SA=1 (SP must be 16-aligned at EL1),
+     * SA0 irrelevant (no EL0 yet). Preserve the architecturally RES1 bits for
+     * ARMv8.0 SCTLR_EL1 (bits 11, 20, 22, 23, 28, 29) so we don't write a
+     * reserved-0 into a reserved-1 field. Value = RES1 mask | SA.
+     *   RES1 bits: (1<<11)|(1<<20)|(1<<22)|(1<<23)|(1<<28)|(1<<29) = 0x30D00800
+     *   SA       : (1<<3)                                         = 0x00000008
+     *   total                                                     = 0x30D00808 */
+    movz    x0, #0x0808
+    movk    x0, #0x30D0, lsl #16
+    msr     SCTLR_EL1, x0
     isb
 
     /* ---- Clear BSS with plain aligned 16-byte stores. __bss_start/__bss_end
