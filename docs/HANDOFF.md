@@ -1,6 +1,41 @@
 # Agent handoff: M1/M2 kernel foundation
 
-## Current status — observed 2026-10-18 (read this first)
+## Current status — observed 2026-10-19 (read this first; supersedes earlier status blocks)
+
+**M3c is COMPLETE and issue #8 is CLOSED** — the full D-SEQ (steps 1–7) is merged
+on `main` at `bac8c3b`. M3b (#7) is likewise complete (its remaining refcount /
+destruction / instance-vs-slot acceptance was delivered as M3c's endpoint lifetime
+— the first destroyable object), and should be closed. The ARM64 MP track reached
+MP1 exception vectors. Full sweep (`make check` / `smoke` incl `M3c-s3a..s7` /
+`integration` / 3 CI NX incl 16M / `make aarch64`) is green.
+
+This session's merged work: M3c D-SEQ (PRs #40–#48), ADR 0000 decision-record
+policy + part-4 attached-correspondence (#44, #46), the retroactive sweep (#50),
+ARM64 MP1 vectors + D5-3 trap frame (#49), and the single-agent-verbosity
+contributor norm (AGENTS.md + CONTRIBUTING.md). The M3c retrospective + exact
+qualification evidence is in [M3C_RETRO.md](M3C_RETRO.md).
+
+### PICKUP ITEMS for the next session (owner paused here)
+1. **MP1 DTB parse (finishes MP1).** The ARM64 `je_arm_dtb_phys` pointer is
+   RECORDED but never parsed. ARM64.md MP1 requires a *bounded, copied, defensively
+   validated* DTB parse: RAM / reserved ranges / kernel image / DTB / init
+   reservations; reject malformed structure/string-offsets/overflows/overlaps;
+   bound node depth + property counts; trusted-bootloader output parsed defensively.
+   Copy the DTB into a kernel-reserved region before the MMU (ADR 0002 D3). This is
+   a fresh MP1 sub-step in `kernel/arch/aarch64/` (not owner-gated; new ARM64 code).
+2. **Wire the ARM QEMU boot into remote CI.** Today remote CI runs x86 bootstrap +
+   the ARM *compile*; the ARM vector-test *boot* (`make smoke-aarch64
+   ARM_VECTOR_TEST=1`) is verified locally only. Honest gap flagged in PR #49.
+3. **Board hygiene:** confirm #7 and #8 closed (done this session); keep the
+   project board in sync.
+4. **Then the roadmap gates beyond M3** (core: the next core kernel gate; mobile:
+   MP2 MMU/timer/scheduling, which now has MP1 vectors beneath it) per ROADMAP.md,
+   and the longstanding open contracts (#13–#16 storage/F2FS/POSIX/LDAP, #18/#19
+   CI-enforcement + coding-profile assurance).
+
+---
+
+## Earlier status — observed 2026-10-18
 
 Implemented and merged beyond M3a: **M3b** (typed handle table, ADR 0008) is in
 progress on x86-64, and a second architecture, **ARM64 (MP1)**, now boots.
