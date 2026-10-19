@@ -687,3 +687,378 @@ bootstrap fixture subsumes this or wants a cooperative-yield primitive first.
 v0 choices; a future ABI revision (or the step-7 real bootstrap replacing the
 seeded fixture) may restate them. K (caps per message) is a policy bound like the
 others and may grow.
+
+## AMENDMENT (2026-10-19, owner-approved) — step-6 blocking-recv (waits) decisions
+
+This amendment finalizes the **D7** wait contract for the (owner-gated) waits PR
+that edits `sched.c`. It composes with D7's already-frozen frame (state machine
+`WAITING→WOKEN|TIMED_OUT|CANCELLED|PEER_CLOSED`, mandatory bounded deadline, timer
+ISR performs the terminal transition, receiver-only blocking, process-death
+unlinks waiters, re-validate the user buffer at copy time after wake). It does not
+reopen those; it decides the six open questions the step-6 design pass raised.
+
+**Attached correspondence (ADR 0000 part 4).** Design driven by an
+implementor↔adversarial `peer-debate.sh` run (claude=implementor,
+codex=adversarial-reviewer, 2 rounds), then an adversarial review of THIS
+amendment's text (which caught ten contract-text defects — ABI mapping, the
+single-CAS-vs-priority wording, the copy-fault re-arm, teardown resurrecting a
+DYING thread, the zero-timeout short-circuit, caps composition — all fixed in the
+text below before owner sign-off). Full transcript:
+[`docs/adr/debates/m3c-step6-waits.md`](debates/m3c-step6-waits.md). The reviewer
+sharpened the design materially (separate waiter vs scheduler state machines, one
+arbitration CAS, no copy-out from the scheduler) and surfaced the A6-1 contract
+conflict below as a genuine owner escalation, not a clarification.
+
+### A6-STRUCT. Two separate state machines + one arbitration CAS
+
+**Decision + why.** The **waiter** state (`WAITING→WOKEN|TIMED_OUT|CANCELLED|
+PEER_CLOSED`) is kept **distinct** from the **scheduler** state
+(`THREAD_BLOCKED_IPC → READY`); they are NOT collapsed into one enum. A single
+pure helper **`je_ipc_wait_arbitrate(waiter, cause)`** performs the terminal
+transition as **one compare-and-set** under IF=0: the first eligible cause wins,
+later causes are no-ops. Every path that creates eligibility calls it in the SAME
+IF=0 critical section as the endpoint/clock mutation that caused it — sender
+enqueue → `WOKEN`, peer close → `PEER_CLOSED`, timer ISR deadline → `TIMED_OUT`,
+internal cancel → `CANCELLED`. The parked **syscall continuation** then *validates
+the already-selected result and performs the owned-record copy-out + commit*; it
+is **not** a second authority and never rewrites the CAS result. (Rationale: the
+adversarial review showed "ISR stamps TIMED_OUT, syscall re-checks and may upgrade
+to WOKEN" would make the syscall a second authority — not the single-terminal-CAS
+D7 requires. Making enqueue/close do their own CAS in their own critical section
+is what keeps it single.)
+
+**Single-CPU linearization (replaces the literal "priority" reading).** On one CPU
+with IF=0, the four causes NEVER become eligible simultaneously — each runs its CAS
+in its own critical section, so they are strictly ordered in time. **The first
+critical section to fire the CAS wins; every later one is a no-op** (the waiter is
+already terminal). D7's written priority `PEER_CLOSED > WOKEN > CANCELLED >
+TIMED_OUT` therefore does NOT mean "a later higher-priority cause supersedes an
+earlier terminal state" (that would be a second transition, forbidden); it means
+**the recv entry re-check evaluates the currently-eligible causes in ONE snapshot
+before parking** — at entry only WOKEN (a queued/deliverable message) and
+PEER_CLOSED (empty + peer gone) can be jointly relevant, and A6-1 drain-first
+decides between them: a non-empty queue picks WOKEN and the thread never parks,
+an empty closed end picks PEER_CLOSED. Once parked, there is only one snapshot per CAS and
+first-wins holds. (This is a D7 *clarification*, flagged for the owner: the frozen
+"ISR delivers the result" is reconciled as "the ISR's CAS stamp **is** the result;
+the continuation only transcribes the stamped cause into the user frame," see
+A6-5.)
+
+**`je_ipc_wait_arbitrate(waiter, cause)` returns a won/lost flag.** The caller uses
+it: a sender's enqueue path learns whether it won the CAS (and therefore owns the
+head reservation it must install); teardown learns whether it still owes a
+reservation/reference release. A "lost" return means the waiter was already
+terminal — the caller performs no wake and installs no reservation. The helper
+performs NO re-arm: a terminal waiter stays terminal (see A6-5 for the copy-fault
+path, which releases the reservation but does NOT re-arm the same waiter).
+
+**Predictions if other choices were made.** *Waiter state IN the scheduler enum
+(my first lean):* conflates "why the block ended" with "is it runnable," and makes
+every scheduler state check also reason about IPC causes — more tested-code
+coupling, the opposite of the owner gate's intent. *Syscall re-check as the
+authority:* two authorities for one terminal state → the exact double-transition
+race D7 forbids; a timeout and a late enqueue could both "win." *Waiter registry
+in endpoint.c instead of the thread:* thinner `sched.c` but endpoint code reaches
+into scheduler internals to wake — worse coupling across the tested boundary.
+
+**Flex options to consider in future.** **FLEX (planning review).** Blocking
+*send* (deferred in v1) will add a sender-side waiter + a staging-buffer lifetime;
+the arbitrate helper is meant to generalize to it. If a third blocking op appears,
+revisit whether the waiter fields belong in the thread struct or a side table.
+
+### A6-1. Queued-message-plus-peer-close → DRAIN-FIRST wins (A1)
+
+**Decision + why.** When a message is queued **and** the peer has closed, the
+queued message is **delivered** (`WOKEN`); `PEER_CLOSED` is returned only when the
+queue is **empty**. The literal D7 priority `PEER_CLOSED > WOKEN` is read as
+ordering **block-ending triggers**, NOT as overriding already-queued data. This
+was a genuine frozen-contract conflict (owner-escalated, not a clarification): the
+**merged step-4 `try_recv` is already drain-first** (CLOSED is "dead" only on an
+empty queue), so A1 makes blocking `recv` behave **identically** to non-blocking
+`try_recv` on the same endpoint state — "closing a peer never eats bytes already
+delivered to you." **Owner-approved A1.**
+
+**Predictions if other choices were made.** *A2 (literal PEER_CLOSED > a queued
+message):* blocking `recv` and non-blocking `try_recv` would return *different*
+results on the identical state (one drains, one reports closed) — a surprising
+split a caller could not predict from the op alone, and a divergence from already-
+tested step-4 behavior that would need its own justification. It would also strand
+a legitimately-sent final message on peer close.
+
+**Flex options to consider in future.** Firm for M3c. If a future "urgent close"
+semantic is ever wanted (peer close *preempts* pending data), that is a new op or
+an explicit flag, not a reinterpretation of this priority — a new ADR.
+
+### A6-ABI. Op, timeout register, and terminal-cause → status mapping
+
+**Decision + why.** Blocking recv **reuses the merged `try_recv` op**
+(`JE_SYS_TRY_RECV`=12), with the **timeout (relative duration in ticks) in R10**
+(reserved=0 today). Backward-compatible: every existing non-blocking caller passes
+**R10=0**, and **zero timeout = the exact current non-blocking semantics** — check
+once, never park, and on an OPEN end with nothing deliverable return **`EMPTY`=13**,
+identical to today. A nonzero R10 opts into blocking. The four terminal causes (plus the post-WOKEN fault row) map to the
+user frame as:
+
+| Terminal cause | status (AL/RAX) | RDX / R8 / R9 |
+|---|---|---|
+| `WOKEN` | `JE_ABI_OK`=0 | merged step-4/step-5 recv success layout: RDX[31:0]=byte len, RDX[63:32]=cap count; R8/R9 handle-out per A5-4 |
+| `TIMED_OUT` | **`JE_ABI_H_TIMED_OUT`=14** (new, `_Static_assert`) | RDX=0, no handles |
+| `PEER_CLOSED` | `JE_ABI_H_PEER_CLOSED`=12 (existing) | RDX=0, no handles |
+| `CANCELLED` | **`JE_ABI_H_CANCELLED`=15** (new, `_Static_assert`; ABI-unreachable in v1 per A6-2, but the continuation still writes a defined status) | RDX=0, no handles |
+| copy/mint fault after WOKEN | `JE_ABI_INVALID`=2 (existing) | message stays queued (A6-5) |
+
+Two new codes (14, 15) extend the 10–13 block; no existing code changes meaning.
+**Caps compose:** a blocking recv is a full recv — on `WOKEN` it runs the **same
+step-5 staged-mint path** (R8/R9 handle-out, dead-cap→handle 0, mint-failure
+rollback → `JE_ABI_INVALID` with the message left queued). A zero-timeout (poll)
+recv that finds a cap-bearing message behaves exactly as merged `try_recv`
+(SHORT_BUFFER if the handle buffer is too small). **Owner-approved** (reuse-op +
+zero=EMPTY was the design-pass recommendation; the two new codes follow from
+pinning the mapping).
+
+**Entry snapshot goes through the plain `try_recv` path — no waiter registered when
+a result is available at entry.** Both the zero-timeout poll AND the first check of
+a nonzero-timeout recv evaluate the end **once via the existing merged `try_recv`
+logic** before any waiter/`wake`/reservation exists. If that check yields ANY
+immediate result — `WOKEN`-equiv delivery, **`SHORT_BUFFER`** (buffer or handle-out
+too small), or `PEER_CLOSED` — it is returned straight away and **no waiter is
+registered, no head reserved, the A6-4 occupied-slot check is not consulted**. A
+waiter is registered (and A6-4 applies) **only** when the entry check would
+otherwise return `EMPTY` on an OPEN end *and* the timeout is nonzero. Consequently a
+too-small buffer is **`SHORT_BUFFER` whether polling or blocking** (identical to
+merged `try_recv`, satisfying A6-1's "behave identically"), and is **never** swept
+into the post-WOKEN `JE_ABI_INVALID` fault bucket. The post-WOKEN `JE_ABI_INVALID`
+path (A6-5) is strictly for a **copy/mint fault on a message that was already
+reserved** (e.g. the user buffer became unmapped between park and resume), not for
+a known-short buffer — a short buffer is detected at the entry/peek check before
+any reservation, leaves the message queued, and reserves nothing.
+
+**Predictions if other choices were made.** *A new `JE_SYS_RECV` op:* a
+near-duplicate recv path + op-space growth for no behavioral gain (R10 was already
+reserved=0 for this). *Zero-timeout = immediate TIMED_OUT:* every existing R10=0
+`try_recv` caller flips `EMPTY`→`TIMED_OUT` — a silent breaking change to merged,
+tested behavior; rejected. *Leaving TIMED_OUT/CANCELLED unmapped (the text defect
+the review caught):* the continuation would write an undefined status and a caller
+could not tell a timeout from a corrupt result — the mapping is load-bearing.
+
+**Flex options to consider in future.** **FLEX (planning review).** If blocking
+*send* is added it will want a timeout; whether it reuses R10 on `try_send` by the
+same rule is a future call. Code values 14/15 are fixed once asserted.
+
+### A6-2. CANCELLED is internal-only in v1 (B1)
+
+**Decision + why.** The `CANCELLED` terminal state is reachable in v1 **only via
+an internal kernel helper** (`je_ipc_wait_cancel(waiter)`), exercised by a
+deterministic kernel test; there is **no ABI path** to it yet (no signal / kill /
+async-cancel mechanism exists in M3c). It is implemented and tested now so the
+arbitration CAS and all four terminal causes are proven (first-critical-section-
+wins, losers no-ops), and so a
+future signal mechanism wires to a ready terminal state. Documented as
+**ABI-unreachable in v1**. **Owner-approved B1.**
+
+**Predictions if other choices were made.** *B2 (defer CANCELLED entirely — state
+exists, no path, no test):* the arbitration helper would ship with one of its four
+terminal causes unexercised, so the first real canceller (a future signals
+milestone) would be adding an *untested* transition into tested scheduler code —
+exactly the risk the owner gate exists to avoid. Testing it now with an internal
+trigger is cheap and front-loads that proof.
+
+**Flex options to consider in future.** **FLEX (planning review).** The ABI
+trigger for cancellation (a signal syscall, a deadline-update that cancels, a
+process-level cancel) is a future-milestone decision; A6-2 only fixes that the
+mechanism exists and is internally reachable now.
+
+### A6-3. Deadline encoding: zero = poll, bounded max, overflow-checked (C)
+
+**Decision + why.** The timeout is a **relative duration in timer ticks** (the
+existing M2 clock; inclusive `wake <= ticks` as the current sleep path uses).
+**Zero timeout = a non-blocking poll** matching merged `try_recv` exactly (check
+the entry snapshot once; deliver `WOKEN`-equiv / `PEER_CLOSED` / **`EMPTY`** per
+A6-ABI — NOT `TIMED_OUT`). **Zero short-circuits BEFORE any waiter registration:**
+it NEVER computes `wake`, NEVER registers a waiter, NEVER enters
+`THREAD_BLOCKED_IPC`, and does NOT `yield` — so the inclusive `wake <= ticks` ISR
+rule can never apply to it, and a 0-tick and a 1-tick request are not confusable (a
+1-tick request sets `wake = ticks+1` and parks, firing on the next `++ticks`; "one
+tick" means "up to one tick," no minimum). A **bounded maximum** `JE_IPC_MAX_WAIT`
+is enforced: a nonzero duration is rejected (`JE_ABI_INVALID`) if
+`duration > JE_IPC_MAX_WAIT` or if `ticks + duration` would overflow `uint64` —
+mirroring the existing `je_thread_sleep` overflow guard. No unbounded block, ever.
+**Owner-approved.**
+
+**Predictions if other choices were made.** *Zero = block forever:* violates D7's
+"no unbounded block" outright. *No max / no overflow check:* a caller passing a
+near-`UINT64_MAX` duration wraps the deadline below `ticks`, making the ISR fire an
+*immediate* spurious `TIMED_OUT` (or, worse, never) — a silent correctness bug the
+existing sleep path already guards against, so not guarding here would be an
+inconsistency.
+
+**Flex options to consider in future.** `JE_IPC_MAX_WAIT`'s exact value is a
+policy bound like the other `JE_*` caps and may change; the *rule* (zero=poll,
+bounded, overflow-checked) is firm.
+
+### A6-4. Waiter-capacity exhaustion reuses the non-blocking path (D)
+
+**Decision + why.** Waiter slots are bounded **per endpoint end**
+(`JE_EP_MAX_WAITERS` = 1 blocked receiver per end; an endpoint has two ends). A
+receiver blocks on **one specific end** (the one its handle names). A second waiter
+on the same end **is reachable via the ABI**, NOT structurally impossible: process
+A blocks on end E (nonzero timeout) and the scheduler switches to process B, which
+holds a **transferred duplicate** handle to E and also calls blocking recv on it.
+So the bound is enforced as a **runtime fail-closed branch, never a panicking
+assert** (a panicking assert on an ABI-reachable path would be a user-triggerable
+kernel DoS): a blocking recv that finds the end's single waiter slot already
+occupied does **not** park — it **returns `EMPTY`** (A6-ABI) immediately, exactly as
+a zero-timeout poll on an OPEN empty end would. This is a legitimate, testable
+outcome (the second concurrent blocker is told "nothing for you right now"), not an
+error status. **Owner-approved** (per-end bound + runtime fail-closed to EMPTY).
+
+**Predictions if other choices were made.** *A new `JE_ABI_WAITERS_FULL` status:*
+adds ABI surface for what is really just "no message available to you right now" —
+`EMPTY` already means exactly that, so a new code would be redundant and a permanent
+ABI commitment. *A panicking `assert` on the occupied-slot path:* since the path is
+ABI-reachable (the transferred-dup case above), any user could halt the kernel —
+the DoS this fail-closed branch exists to prevent. *Making the bound per-process
+instead of per-end:* mis-models the thing blocked-on (a thread waits on an END, not
+on "its process"); the transferred-dup case is precisely two *different* processes
+contending for one end, which a per-end bound models correctly and a per-process
+bound does not. *A multi-slot waiter queue per end:* unnecessary for v1 (the second
+blocker is correctly served `EMPTY` and can retry); revisit with blocking-send or
+multi-threaded processes.
+
+**Flex options to consider in future.** **FLEX (planning review).** When
+multi-threaded processes or blocking *send* arrive, `JE_EP_MAX_WAITERS` grows and
+exhaustion may become reachable; *then* a real status (or a queue-of-waiters) is
+revisited. v1 fails closed because it cannot happen.
+
+### A6-5. No user copy-out from the scheduler; parked syscall continuation copies
+
+**Decision + why.** The wake path (arbitrate CAS + reserve the queue head for a
+`WOKEN`) runs in the scheduler/ISR, but the **user copy-out and commit happen in
+the resumed syscall continuation**, never inside `je_sched_interrupt` after a
+`cr3_load`. The scheduler flip is **guarded**: `THREAD_BLOCKED_IPC → READY` **only**
+— never from `DYING`, `ZOMBIE`, `EMPTY`, or any other state (so a torn-down thread
+can never be made runnable by a late wake, see A6-PEERWAKE).
+
+**Head reservation lifecycle (one outstanding reservation per end, pinned).** When
+the arbitrate CAS stamps `WOKEN`, the winning path (a sender's enqueue, or the
+entry-snapshot drain) **reserves exactly the current queue head** for that waiter —
+a single reservation marker on the end, so no other receiver can take that message
+and FIFO is preserved. The reservation is resolved by exactly one of:
+- **successful commit** in the continuation → dequeue the reserved head (+ release
+  any transferred-cap inflight per step 5), clear the reservation;
+- **copy/mint fault** in the continuation → return `JE_ABI_INVALID`, **leave the
+  message queued**, and **release the reservation** so a *future* recv on that end
+  can take it. This does **NOT re-arbitrate the already-terminal waiter** (that
+  would be a second transition, forbidden by A6-STRUCT): the faulting recv's waiter
+  is done (terminal `WOKEN`, result `JE_ABI_INVALID`); the released reservation
+  simply makes the still-queued head available to the *next* recv call;
+- **waiter teardown** (process death, A6-PEERWAKE) → release the reservation before
+  the slot is reused.
+There is never more than one outstanding reservation per end (A6-4 bounds waiters
+to one per end), so "reserve the head" is unambiguous. **A reserved head is not
+available to any other receiver:** a concurrent zero-timeout poll (or entry-snapshot
+check) from a process holding a transferred-dup handle to the same end sees the
+reserved head as **not deliverable** and returns `EMPTY` — it does NOT take the
+reserved message (that would break the reservation and FIFO) and does NOT itself
+register a waiter. The reserved message is delivered only to the waiter that
+reserved it, or returns to the free pool when that waiter's reservation is released
+(copy fault / teardown). The continuation does **not** re-resolve the original
+handle (D3 owned-reference rule) — it uses the reserved owned record.
+**Owner-approved design.**
+
+**Predictions if other choices were made.** *Copy-out inside the scheduler after
+the address-space switch:* introduces a brand-new page-fault context in scheduler
+assembly; the only exact-RIP user-copy-fault recovery proven so far is the M3a
+*syscall* path, so copying post-`cr3_load` in the ISR would be *untested* fault
+machinery in the most safety-critical file — precisely what the owner gate guards.
+*Re-running the handle-based recv on wake:* re-resolves a capability the owned-
+reference rule says must not be re-resolved after blocking (the handle could have
+changed), and double-counts the drain. *Re-arming the faulting waiter instead of
+releasing-and-leaving-queued:* would be a second terminal transition on a waiter
+that already won `WOKEN` — the double-transition A6-STRUCT forbids; releasing the
+reservation (message stays queued for the next call) achieves recovery without it.
+*An unguarded scheduler flip:* a late wake could set a `DYING`/`ZOMBIE` thread
+`READY` and resurrect a torn-down frame — the stale-slot write D3.3 names.
+
+**Flex options to consider in future.** Firm. A blocking-send milestone will add a
+symmetric copy-*in* on the sender continuation under the same rule.
+
+### A6-PEERWAKE. Peer death actively wakes blocked receivers
+
+**Decision + why.** `je_vm_destroy`'s existing endpoint release walk (step-3,
+owner-signed) tears down the dying process's handles. When removing the dying
+process's last handle to an end transitions **that end to `CLOSED`**, the end's
+**peer end becomes `PEER_CLOSED`** (the merged step-3/4 state rule — the dying side
+goes CLOSED, the surviving side goes PEER_CLOSED). The walk now, in the SAME
+IRQ-critical section, also **calls the arbitrate CAS on a receiver blocked on that
+PEER (surviving) end** — i.e. a receiver in the *other*, still-living process —
+waking it `PEER_CLOSED` **immediately** rather than letting it wait out its
+deadline. Note per A6-1 (drain-first): if the peer end still has a queued message,
+the blocked receiver was already woken `WOKEN` when that message was enqueued and
+is not blocked anymore; `PEER_CLOSED` wake applies to a receiver blocked on an
+**empty** peer end.
+
+**Teardown ordering (pinned, three steps, in order).** For the dying process's
+**own** waiter (a thread of the dying VM that was itself blocked in `recv`):
+1. **FIRST**, before the release walk runs, **unlink/tombstone the dying process's
+   own waiter** (clear its waiter fields, release any head reservation it holds)
+   and leave its thread `DYING` — the walk and the ISR must never `arbitrate` or
+   wake it. `je_ipc_wait_arbitrate` **skips a tombstoned/non-`WAITING` waiter**
+   (returns "lost").
+2. **THEN** run the release walk, which wakes only **surviving peer-owned**
+   waiters (step above) — never the dying process's own (already tombstoned).
+3. The guarded scheduler flip (A6-5: `THREAD_BLOCKED_IPC → READY` only) means even
+   a stray stamp on the dying thread could not make it `READY` from `DYING`.
+This ordering guarantees no wake writes a frame slot that teardown is reusing
+(D3.3). **Owner-approved design.**
+
+**Predictions if other choices were made.** *Rely on the receiver's own deadline /
+next schedule to notice the close:* a receiver blocked with a far deadline on an
+endpoint whose peer just died would sleep uselessly until timeout — a latency bug
+and a semantic one (it should learn `PEER_CLOSED` now, not `TIMED_OUT` later).
+*Unlink the dying process's own waiter AFTER the release walk (or not at all):*
+the walk could arbitrate-and-flip the dying thread, racing slot reuse — the exact
+resurrection the review flagged; unlinking FIRST + the guarded flip + arbitrate-
+skips-tombstoned closes all three. *Waking the dying (CLOSED) end's waiter instead
+of the surviving (PEER_CLOSED) end's:* names the wrong end — the thread to wake is
+in the living process, on the end that just became PEER_CLOSED.
+
+**Flex options to consider in future.** Firm; symmetric with the step-3 release
+walk it extends. Also covers an ordinary last-handle `endpoint_close` (no process
+death) that transitions a peer end to PEER_CLOSED: the same arbitrate-the-peer's-
+waiter call applies on that close path, not only in `je_vm_destroy`.
+
+### Proof plan (deterministic, single-CPU — avoids the step-5 spin race)
+
+Each terminal cause gets a deterministic kernel/hosted proof that does **not**
+rely on two spin-looping user stubs (the step-5 hang lesson). All blocking triggers
+in v1 are driven by **kernel-side helpers / explicit yields / stepping
+`je_timer_ticks` / stepping the bootstrap reaper** — there is no ABI self-trigger
+(no signals, no async kill), so every proof is a deterministic sequence, not a
+race:
+- **queued-before-recv:** message already present → immediate `WOKEN`, no park.
+- **WOKEN:** thread X parks on recv; thread Y sends then *explicitly yields* →
+  X resumes, exactly one `WOKEN`, FIFO delivery.
+- **zero-timeout poll:** R10=0 on an OPEN empty end → `EMPTY` (13), X never parks
+  (asserts the A6-3 short-circuit: no waiter registered, no yield).
+- **TIMED_OUT:** X parks (nonzero R10); advance `je_timer_ticks` to the inclusive
+  deadline → ISR arbitrates `TIMED_OUT` (status 14), X resumes with it.
+- **PEER_CLOSED:** X (in process A) parks on an empty end whose peer is held by
+  process B; **step the bootstrap reaper to run `je_vm_destroy(B)`** → the release
+  walk arbitrates `PEER_CLOSED` (12) on A's surviving end *before* A's deadline.
+- **CANCELLED:** the internal `je_ipc_wait_cancel(waiter)` helper (A6-2, no ABI
+  path) → exactly one `CANCELLED` (15).
+- **copy-out fault after WOKEN:** `JE_ABI_INVALID` (2), message stays queued,
+  reservation released; a *subsequent* recv on the end takes the still-queued head
+  (NOT a re-arm of the faulted waiter).
+- **teardown while blocked:** X (in B) parks, then **step the reaper to destroy B**
+  → B's own waiter is unlinked/tombstoned FIRST, reservation released, before the
+  thread/frame slot is reused; the guarded flip never makes the `DYING` thread
+  `READY`.
+- **ordered serialization (not a "tie"):** on one CPU two causes are never
+  simultaneous — prove the two orderings explicitly: (a) enqueue's CAS fires, THEN
+  a timer tick → X gets `WOKEN`, the later timeout CAS is a no-op, message
+  delivered; (b) timeout CAS fires, THEN a late enqueue → X gets `TIMED_OUT`, the
+  message remains queued for a future recv. Assert exactly one terminal result in
+  each; the entry-snapshot (non-empty queue + peer closed) separately asserts the
+  A6-1 drain-first pick.
