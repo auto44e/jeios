@@ -30,21 +30,24 @@ M0 stubs do not count as completing future modules.
 M0, M1a, M1b and the scoped M2 BSP foundation are implemented on
 main (foundation PR #1 merged 2026-10-13); see IMPLEMENTATION.md and HANDOFF.md for exact evidence.
 M1 has validated maps/reservations, fatal exceptions and hardware permission tests.
-**Update 2026-10-18:** M3a (the userspace boundary) is complete and qualified
-(see `docs/M3A_RETRO.md`). **M3b** (typed handles, ADR 0008) is complete and
-merged — the handle table, the handle syscalls, the rights ABI, and attenuation
-(which made rights enforcement genuinely ring-3-observable) all shipped. A second
-architecture, **ARM64 MP1 step 1** (ADR 0002), now boots on QEMU virt-8.2.
-**M3c** (capability IPC + waits + init, **ADR 0009** accepted) is in progress: its
-contract is frozen and **D-SEQ step 2 (endpoint lifecycle — pool + split refcount
-+ destruction + retain-on-dup, create kernel-only)** is implemented; the remaining
-steps are the owner-signed death-path + ring-3 create, non-blocking data IPC,
-capability transfer, waits, and the bootstrap fixture.
+**Update 2026-10-19:** M3a, M3b and **M3c are all complete and merged** — the full
+M3 user-address-spaces / handles / IPC / syscalls / minimal-init gate is met.
+M3a (userspace boundary) is qualified (`docs/M3A_RETRO.md`); M3b (typed handles +
+rights attenuation, ADR 0008); **M3c** (bounded capability IPC, blocking waits, and
+the two-process bootstrap fixture, **ADR 0009**, issue #8 CLOSED) — full D-SEQ
+(steps 1–7) merged on `main` at `bac8c3b`; retro + exact evidence in
+`docs/M3C_RETRO.md`. A second architecture, **ARM64**, reached **MP1 step 2**
+(ADR 0002 D5-3): entry/console (step 1) + EL1 exception vectors + the D5-3 trap
+frame (step 2), proven on real QEMU; the bounded DTB parse finishes MP1 (next
+session — see HANDOFF pickup items).
 M2 has bounded page/heap allocation, timer preemption, guarded kernel threads,
 yield/sleep/exit and deferred stack reclamation. This is not a general scheduler,
-SMP implementation, userspace sandbox, or complete hardening milestone.
+SMP implementation, hardened sandbox, or complete hardening milestone — M3's claim
+remains "experimental single-CPU userspace + capability IPC in qualified emulator
+profiles, proven by test," not a release qualification.
 
-Next is M3, split into independently reviewable subgates:
+M3 is complete; next are M4+ (core) and the MP2+ ARM64 track (MMU/timer/scheduling,
+now atop MP1 vectors), per the gate table above and the HANDOFF.
 
 - **M3a:** private user address spaces, ring-3 entry/return, user-copy fault
   containment and a bounded user program loader. Prove two actual CPL3 tasks
