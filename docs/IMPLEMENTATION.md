@@ -887,6 +887,46 @@ post-copy commit (a fallible commit would double-deliver); no inflight lease;
 zero exactly `len` bytes out (no stack leak). AI-assisted review; not independent
 human qualification.
 
+## M3c bootstrap fixture (D-SEQ step 7) — 2026-10-19
+
+ADR 0009 **D-SEQ step 7**, the final step; closes #8. The kernel injects a seeded
+endpoint pair into two ring-3 processes and runs a bounded two-process protocol —
+"fixture, not supervisor." It **discharges the two honest deferrals** carried from
+steps 5 and 6 **end-to-end in one run**, which blocking recv (step 6) is what makes
+possible: a receiver with nothing queued PARKS and yields the CPU to the peer, so
+there is no cooperative-scheduler spin deadlock (the reason steps 5/6 deferred), and
+the lost-wakeup is closed by the entry-probe snapshot being in the same IF=0 syscall
+path as the park.
+
+**`M3c-s7`** (kernel self-test, two real ring-3 processes A=pinger + B=ponger over a
+kernel-seeded channel S):
+- **Two-process WOKEN handshake (step-6 deferral):** B is created first and **confirmed
+  parked** on a blocking recv (its progress marker holds at the pre-recv value across
+  ticks far below its timeout) **before A is created** — so A's send is a
+  **causally-forced WOKEN**, not a race. B resumes with the real message (status 0,
+  never 14).
+- **Two-process capability transfer over the WOKEN continuation (step-5 deferral):**
+  A creates channel C and sends `c1` as a **capability** in that first message; B
+  mints the transferred end **on wake** (the cap-bearing mint-on-wake continuation
+  path — never exercised end-to-end before: s5 used the kernel forwarders, s6 only
+  TIMED_OUT). **Retained-ownership (copy, not move) is proven** by A closing `c1`
+  **before** B uses the minted handle (a MINTED/GO handshake): B's **post-close send**
+  on the minted handle reaches A's `c0` with the expected payload.
+- A bounded **4-round ping-pong** on S (functional progress + no timeout), then an
+  explicit **DONE ack teardown** (closure never races a queued message); both
+  processes `exit(0)`, are reaped, and the channel pool **reclaims to 0**.
+Any nonzero-timeout recv returning ABI EMPTY, a TIMED_OUT where a WOKEN was due, a
+stub assertion failure, or the watchdog tripping (a hang = a real lost-wakeup/deadlock
+bug) **fails** the fixture. Honest scope: only the staged first recv and the
+cap-transfer recv are independently *causally-forced* WOKEN; later ping-pong receives
+prove progress + timeout-absence (they may be immediate deliveries). No new kernel
+surface — the handles are injected via the fixture's arena write; not owner-gated.
+
+`make check` / `smoke` (s3a/s3b/s4/s5/s6/s7) / `integration` / 3 CI NX (incl 16M) /
+ARM64 all green. Design + review transcript:
+`docs/adr/debates/m3c-step7-bootstrap-fixture.md` (ADR 0000 part 4). AI-assisted
+review; not independent human qualification. **M3c (#8) is functionally complete.**
+
 ## M3c blocking-recv waits (D7 / A6) — 2026-10-19
 
 ADR 0009 **D-SEQ step 6** (owner-gated — edits `sched.c`; contract frozen by A6 +

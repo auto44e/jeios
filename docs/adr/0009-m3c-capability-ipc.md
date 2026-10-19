@@ -267,6 +267,38 @@ capability can never be queued before D9's invariant and the transfer transactio
 7. **Bootstrap fixture:** kernel injects an endpoint pair into the two processes,
    bounded ping-pong + closure, honest "fixture not supervisor."
 
+**Step-7 design annotation (2026-10-19).** Transcript:
+[`docs/adr/debates/m3c-step7-bootstrap-fixture.md`](debates/m3c-step7-bootstrap-fixture.md)
+(ADR 0000 part 4). **Decision + why:** step 7 discharges the two honest ring-3
+deferrals (step-5 two-process capability transfer, step-6 two-process WOKEN
+handshake) in one fixture, because **blocking recv (step 6) is what makes the
+two-process ping-pong deterministic** — a receiver that would spin now PARKS and
+yields the CPU to the sender, and the lost-wakeup is closed by the entry-probe
+snapshot being in the same IF=0 syscall path as the park (a send either shows up
+in the probe, so the receiver does not park, or wins the WOKEN arbitrate on an
+already-parked receiver). Fixture mechanism: `je_endpoint_kern_seed` creates the
+S channel across A and B, and the bootstrap writes each seeded handle into the
+process's arena (the reserved `vm_s3_scratch_write`) **before** `je_thread_create_user`
+— fixture-only ABI, no new kernel surface, not owner-gated. Evidence tactics
+(review-sharpened): (1) **causally-forced WOKEN** — create B first, confirm it
+parked (status slot stays unwritten for K ticks ≪ timeout), *then* create A, so
+the first delivery is provably a wake not a race; (2) the **capability transfer
+rides the WOKEN continuation** (the cap-bearing mint-on-wake path that never ran
+end-to-end before — s5 used forwarders, s6 only TIMED_OUT); (3) **retained
+ownership proven by closing `c1` BEFORE B uses the minted handle** (a MINTED/GO
+handshake; the post-close send succeeding is the proof — copy not move semantics,
+since pool-count and handle-value inequality are weak); (4) a bounded ping-pong
+then an explicit **DONE ack** teardown so closure never races a queued message.
+A nonzero-timeout recv returning ABI EMPTY, or a 14 (TIMED_OUT) on a path that
+should WOKEN, or hitting the watchdog, **fails** the fixture. **Prediction if
+other choices were made:** a spin-based two-stub (the step-5/6 attempt) deadlocks
+the cooperative single CPU; a small-timeout ping-pong that "passes via timeout"
+would mask a lost-wakeup bug — so the fixture asserts WOKEN, not mere progress, on
+the staged receives. **If the cap-bearing WOKEN continuation fails, that is a
+step-6 tested-path (sched.c/continuation) defect → escalate to the owner, never a
+fixture workaround.** **Flex (planning review):** whether a future cooperative-
+yield primitive or a 3rd process would simplify the fixture.
+
 (Codex's ordering: transfer before waits, so the lifetime/cancellation state space
 isn't multiplied before transfer's semantics are frozen. Note the two owner-gated,
 tested-path PRs — step 3 death path and step 6 `sched.c` block state — are each

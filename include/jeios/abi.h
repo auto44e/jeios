@@ -127,15 +127,22 @@ typedef enum {
                               * copy runs only after a clean preflight, so a bad
                               * ubuf ranks LAST, never masking a handle/queue
                               * status). RDX = 0 on success. */
-    , JE_SYS_TRY_RECV = 12   /* M3c D6: try_recv(h=RDI, ubuf=RSI, cap=RDX,
-                              * R10/R8/R9 reserved must be 0). Non-blocking: copies
-                              * the head message into ubuf (up to cap bytes). The
-                              * handle needs the RECV right. -> RAX status;
-                              * RDX[31:0] = bytes delivered (OK), or required length
-                              * (SHORT_BUFFER, no dequeue), or 0 (all other).
-                              * RDX[63:32] reserved as 0 (step 5 will carry received
-                              * cap count — step 5 MUST use a new op or out-register
-                              * extension, NOT overload this op). */
+    , JE_SYS_TRY_RECV = 12   /* M3c try_recv(h=RDI, ubuf=RSI, cap=RDX, hbuf=R8,
+                              * hcap=R9, timeout=R10). Receives the head message
+                              * (RECV right). D6 bytes + A5 capabilities + A6
+                              * blocking:
+                              *  - R8 = user u32[] to receive minted cap handles;
+                              *    R9 = its slot capacity (0..JE_ABI_MSG_CAPS_MAX;
+                              *    larger rejected). R8!=0 iff R9!=0 (A5-4).
+                              *  - R10 = relative-tick timeout (A6): 0 = non-blocking
+                              *    poll (today's behavior); nonzero = block up to
+                              *    JE_IPC_MAX_WAIT (bound+overflow checked) until
+                              *    WOKEN / PEER_CLOSED / TIMED_OUT(14) / CANCELLED(15).
+                              *  -> RAX status; RDX[31:0] = bytes delivered (OK) or
+                              *    required length (SHORT_BUFFER); RDX[63:32] = caps
+                              *    delivered (OK) or required cap count
+                              *    (SHORT_BUFFER); both 0 on other statuses. A
+                              *    nonzero-timeout recv never returns EMPTY. */
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYS_COPY_FIXUP_INJECT = 4  /* dev-only: raw-copy an unmapped page to test the fixup */
 #endif

@@ -18,3 +18,4 @@ Older M3b/M3c debate transcripts (`m3b4`, `m3c`, `m3c-lifecycle`, `m3c-step3/4/5
 are back-filled by the ADR 0000 retroactive-sweep PR and linked from their
 respective decisions at that time.
 | `m3c-step6-mechanism.md` | ADR 0009 A6-CLARIFY-1/2 (park/resume mechanism) |
+| `m3c-step7-bootstrap-fixture.md` | ADR 0009 D-SEQ step 7 (bootstrap fixture + deferred ring-3 two-process proofs) |

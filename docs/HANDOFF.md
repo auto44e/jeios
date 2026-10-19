@@ -92,7 +92,17 @@ progress on x86-64, and a second architecture, **ARM64 (MP1)**, now boots.
   CAS, reserved-head, release). **Deferred to step 7:** the full two-process ring-3
   WOKEN handshake (the wake bridges are wired; step 7 schedules two cooperating
   user processes) — honest, same as the step-5 ring-3 deferral.
-  **Remaining D-SEQ:** step 7 only.
+  **Step 7 (bootstrap fixture) is now done — M3c (#8) is functionally complete.**
+  `M3c-s7` injects a kernel-seeded channel into two ring-3 processes and discharges
+  BOTH deferrals end-to-end: the two-process WOKEN handshake (B confirmed parked
+  before A exists -> A's send is a causally-forced wake) AND the two-process
+  capability transfer over the WOKEN continuation (A sends c1 as a cap, B mints it
+  on wake, A closes c1 BEFORE B uses the mint -> retained-ownership proof via the
+  post-close send reaching A's c0), then a bounded ping-pong + DONE teardown, both
+  exit 0, pool reclaims to 0. Blocking recv (step 6) is what made the two-process
+  ping-pong deterministic (a parked receiver yields; no spin deadlock). No new
+  kernel surface. **D-SEQ steps 1-7 all complete.**
+  **Remaining D-SEQ:** none.
 
 Full qualification evidence for M3a is in `docs/M3A_RETRO.md`; the per-PR ledger is
 `docs/IMPLEMENTATION.md`. Everything above is QEMU/hosted-verified and
