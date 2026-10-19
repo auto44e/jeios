@@ -2,7 +2,7 @@
 
 Owner direction: 2026-10-16T20:01:26-04:00, reaffirmed
 2026-10-16T20:08:52-04:00. Apply the spirit of NASA/JPL engineering throughout
-JeiOS. This is a tailored project policy proposed in PR #17, not NASA certification,
+JeiOS. This is a tailored project policy adopted through merged PR #17, not NASA certification,
 literal Power of Ten conformance, or evidence that existing code has been audited.
 Automated enforcement and baseline assessment are tracked in
 [core #19](https://github.com/auto44e/jeios/issues/19), alongside
@@ -90,8 +90,8 @@ local rules. Any critical dependency needs evidence suitable for its actual role
 
 ## Delivery stages and enforcement status
 
-1. Now: publish this policy in core and reference it from mobile contributor
-   instructions. Preserve M3a and MP0 as next gates. Documentation is not enforcement.
+1. Policy published in core and referenced by mobile. M3 and MP0 are complete;
+   NEXT_PHASE.md records current sequencing. Documentation is not enforcement.
 2. Near term (#19 with #18): classify current components, audit critical baseline,
    map each rule to a checker or manual review, and add bounded CI checks. Record
    tool versions and prove a representative violation fails each new gate.

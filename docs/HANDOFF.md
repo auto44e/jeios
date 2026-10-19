@@ -1,5 +1,38 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Current phase refresh — observed 2026-10-19T10:44:37+00:00
+
+Inspected `auto44e/jeios` main at `11a02adf744874328371b7f9f3bc801623995980` and mobile main at
+`c7b42cd8a575fafc67c7a8e7742218dee3981e83`. Core PR #51 and mobile PR #9 are merged; no open PRs at
+initial inspection. Core #2–#8 and mobile #1 are closed and Done on the board.
+Implemented/tested: M3a/b/c scoped AMD64 userspace and IPC; ARM entry/console/vectors.
+Not implemented: general init/service supervisor, filesystem, full ARM userspace.
+
+Observed remote CI: core run 39237040923 success at the inspected SHA; mobile
+run 39072964571 success at its inspected SHA (planning validation only).
+ARM execution evidence remains the earlier local QEMU record, not remote boot CI.
+This documentation update does not rerun or expand that execution qualification.
+
+Planned next: [NEXT_PHASE.md](NEXT_PHASE.md), core #52 MP1 DTB/boot CI, #53 M4
+services/devices, #54 read-only M5a, and mobile #2 MP2/MP3 parity. #13–#16 and
+#18/#19 remain open. Two-process capacity and process-loader/lifecycle extensions
+need review before the supervisor/service/survivor demonstration. Frozen ADRs and
+tested-path owner gates remain unchanged. No new runtime behavior is claimed.
+
+Historical status and exact earlier test environments follow. This block supersedes
+their next-task/open/closed wording, without rewriting the original evidence.
+
+
+Local verification for this docs-only refresh: plain `make check` built the kernel but stopped because LeakSanitizer could
+not inspect /proc tasks in this environment. `ASAN_OPTIONS=detect_leaks=0 make
+check` then passed hosted suites, ELF and ABI checks; local leak detection was
+disabled. Remote baseline success above is separate. No emulator rerun.
+Changed Markdown links and `git diff --check` passed. A broad link scan also
+found a pre-existing relative AGENT_START.md reference in the raw historical
+transcript docs/adr/debates/m3c-step6-mechanism.md; transcript text is preserved.
+Project board verified core #52/#53/#54 and #18/#19 as Todo; mobile #2 as
+In Progress. Current overview updated while preserving its earlier history.
+
 ## Current status — observed 2026-10-19 (read this first; supersedes earlier status blocks)
 
 **M3c is COMPLETE and issue #8 is CLOSED** — the full D-SEQ (steps 1–7) is merged

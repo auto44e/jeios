@@ -11,8 +11,9 @@ owner requirements and task sequence. This file governs the whole repository.
    architecture operations. Do not introduce another core language by accident.
 2. Read the implementation before claiming a design feature exists. Update the
    implementation-status table and handoff in the same change as new behavior.
-3. Work on one roadmap gate at a time. Continue with M3a userspace boundaries after reviewing the completed M1/M2
-   implementation ledger. A desktop mockup does not advance kernel readiness.
+3. Work on one roadmap gate at a time. M3 is complete; follow the dated current
+   HANDOFF and docs/NEXT_PHASE.md for MP1 completion, M4 and bounded M5a planning.
+   A desktop mockup does not advance kernel readiness.
 4. Document contracts: ownership, lifetime, locking, caller context, bounds,
    privilege, error states, rollback, hardware prerequisites, and tests. Explain
    the reason for subtle register/assembly operations and cite architecture docs.

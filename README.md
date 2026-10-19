@@ -5,14 +5,15 @@ combines Unix interoperability, an NT-inspired object/service model, and an
 integrated, deeply customizable desktop. Privacy, explicit authority, recoverable
 operations and qualified hardware support are long-term goals.
 
-**Current stage: M1/M2 single-CPU kernel foundation.** The AMD64 BIOS prototype
-boots, handles fatal CPU exceptions, validates Multiboot2 memory information,
-enforces read-only/NX mappings where supported, allocates RAM, and preemptively
-runs seven guarded kernel threads. Its diagnostic workload verifies registers,
-sleep/wakeup, heap contents and resource reclamation, then halts.
+**Current stage: M3 complete on AMD64; ARM64 MP1 partially implemented.**
+The experimental single-CPU kernel has isolated userspace, checked syscalls,
+typed rights-bearing handles, bounded capability IPC, blocking receive and a
+kernel-seeded two-process bootstrap fixture. ARM64 entry, console and EL1 vectors
+run in QEMU; bounded DTB parsing remains before MP1 completion.
 
-There is no userspace, application sandbox, SMP, filesystem, graphics, networking,
-dynamic module loader or ARM implementation. This is not a daily-use or hardened OS.
+There is no general service supervisor, SMP, filesystem, desktop, networking or
+Android runtime. This is not a daily-use or hardened OS. See the
+[M3 evidence](docs/M3C_RETRO.md) and [next phase](docs/NEXT_PHASE.md).
 
 ## Start here
 
@@ -29,7 +30,7 @@ baseline, all owner requirements, issue dependencies and checkpoint rules.
 - [Domains and centralized policy](docs/DOMAINS.md): native joining and separate AD/GPO compatibility targets.
 - [Multitouch input](docs/INPUT.md) and [hardware security keys](docs/SECURITY_KEYS.md): planned OS-wide integration.
 - [Fresh-kernel mobile project](docs/MOBILE.md): shared core, capability parity and future Android app layer.
-- [Implementation ledger](docs/IMPLEMENTATION.md): current M1/M2 mechanisms, evidence and limits.
+- [Implementation ledger](docs/IMPLEMENTATION.md): mechanisms, evidence and limits.
 - [Hardware policy](docs/HARDWARE.md) and [security model](docs/SECURITY.md).
 - [Development](docs/DEVELOPMENT.md): build, emulator tests and fault modes.
 - [Roadmap](docs/ROADMAP.md): gated milestones and dependency order.
@@ -53,8 +54,9 @@ make smoke integration
 Normal outputs are in `build/0/`; each fault mode uses a separate directory.
 See DEVELOPMENT.md for sanitizer requirements, CPU/memory profiles and limitations.
 
-The OS core uses C11 with small architecture-specific assembly bridges. Early
-AMD64 is the first compatibility target; AArch64 requires a separate port.
+The OS core uses C11 with small architecture-specific assembly bridges.
+AMD64 is the first compatibility target; the AArch64 port has reached
+early QEMU boot and exception handling, with MMU/scheduling/userspace still ahead.
 Modern features are enabled only after their OS prerequisites are implemented.
 The desktop, native SDK, privacy controls and mobile/IoT ecosystem remain planned.
 

@@ -1,6 +1,6 @@
 # Coding-agent starting guide
 
-Updated 2026-10-16. Read this with ../AGENTS.md, HANDOFF.md and IMPLEMENTATION.md.
+Updated 2026-10-19. Read this with ../AGENTS.md, HANDOFF.md and IMPLEMENTATION.md.
 Owner requested a sustained coding-agent handoff. This guide records requirements
 and continuation order; it does not claim later milestones are implemented.
 
@@ -19,39 +19,28 @@ features. Keep interface complexity separate from actual authority and capabilit
 
 ## Establish the correct baseline
 
-Foundation PR: https://github.com/auto44e/jeios/pull/1
-PR #1 merged into main at `03aa2f380d8e49262abd1720a3b8db37517cbb31`.
-Start new implementation branches from updated main; check for newer concurrent
-work before editing. The additional multitouch/security-key requirements are
-proposed documentation only. Verify CI for the exact implementation head used.
+Inspected `main` at `11a02adf744874328371b7f9f3bc801623995980`. M1/M2 and M3a/b/c are merged;
+issues #2–#8 are closed. AMD64 qualifies experimental single-CPU userspace,
+typed handles, capability IPC and a two-process bootstrap fixture. ARM64 MP0 is
+accepted; MP1 entry/console/vectors are implemented with local QEMU evidence.
+DTB parsing remains. See M3A_RETRO.md, M3C_RETRO.md and HANDOFF.md for scope.
 
-Implemented: M1 exceptions, validated memory discovery/protected mappings, and M2
-bounded allocation plus seven trusted preemptible kernel workers on one AMD64 CPU.
-Not implemented: userspace, capabilities/IPC, SIMD context, SMP, filesystem,
-networking, GPU/NPU/media runtime, login, sync, encryption or domains.
+Not implemented: general service supervisor, SMP, filesystem, networking,
+desktop/media runtime, login/sync/encryption or Android runtime. M3's bounded
+fixture is not a general init or hardened sandbox. Start from updated main and
+check concurrent work/CI before edits.
 
 ## Work sequence and project-ready tasks
 
-| Order | Issue | Dependency | Completion evidence |
-| --- | --- | --- | --- |
-| 1 | [#2: boundary contracts](https://github.com/auto44e/jeios/issues/2) | M1/M2 baseline | Reviewed ADR, register/state/VM/ABI contracts |
-| 2 | [#3: private VM and bounded images](https://github.com/auto44e/jeios/issues/3) | #2 | Ownership, zeroing, permissions and rollback tests |
-| 3 | [#4: CPL3 scheduling and local faults](https://github.com/auto44e/jeios/issues/4) | #2, #3 | Actual CPL3 execution, timer preemption, survivor progress |
-| 4 | [#5: syscalls and user copies](https://github.com/auto44e/jeios/issues/5) | #3, #4 | Pointer/arithmetic failure tests and narrow fault recovery |
-| 5 | [#6: qualify M3a](https://github.com/auto44e/jeios/issues/6) | #2–#5 | Adversarial QEMU and regression evidence on exact head |
-| 6 | [#7: M3b handles](https://github.com/auto44e/jeios/issues/7) | #6 | Type/generation/rights/lifetime tests |
-| 7 | [#8: M3c IPC and init](https://github.com/auto44e/jeios/issues/8) | #7 | Bounded transfer/wait/close/cancel semantics |
-| Backlog | [#9: later owner requirements](https://github.com/auto44e/jeios/issues/9) | Relevant roadmap gates | Split into bounded tasks when prerequisites exist |
+Follow [NEXT_PHASE.md](NEXT_PHASE.md): core #52 finishes MP1 and remote ARM boot
+CI; #53 defines and implements M4 service/device lifecycle; #54 follows relevant
+M4 gates with read-only initfs, service loading and a diagnostic console.
+Mobile #2 tracks MP2/MP3 parity. Existing #13–#16 and #18/#19 remain open.
+No assignee or calendar deadline is implied. The board is
+https://github.com/users/auto44e/projects/1/views/1 .
 
-All eight issues start planned/open, not in progress or done. No assignee or
-calendar deadline was invented. Project destination:
-https://github.com/users/auto44e/projects/1/views/1
-Issue creation does not imply membership in the project board.
-
-Read [M3A.md](M3A.md) for the concrete proposal. Its temporary 2 MiB user arena,
-limits, ABI numbers, interrupt entry and NX-required launch policy are proposed
-engineering choices, not previously implemented interfaces or a frozen owner ABI.
-Resolve these in the first ADR. Keep M3a/M3b/M3c distinct and reviewable.
+M3A.md is the historical proposal; accepted ADRs 0007–0009 and the implementation
+ledger govern actual contracts. Preserve owner gates for frozen/tested paths.
 
 ## Owner requirements and authoritative design locations
 
@@ -108,6 +97,12 @@ resource/accounting invariants and next step. Do not merge/release, assign revie
 change credentials, contact vendors or import restricted source without applicable
 authorization. The owner asked to approve PR #1; that is not an instruction to
 invent an independent reviewer or silently bypass self-review restrictions.
+
+## Historical requirement additions
+
+The dated records below preserve earlier priorities and status wording. Current
+status and task ordering above and in NEXT_PHASE.md supersede that wording; the
+owner requirements remain active.
 
 ## Cryptographic relock requirement — 2026-10-14
 
