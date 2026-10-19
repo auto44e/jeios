@@ -71,6 +71,16 @@ Full qualification evidence for M3a is in `docs/M3A_RETRO.md`; the per-PR ledger
 peer-cross-reviewed (AI-assisted, not independent human qualification); the owner is
 the merge gate.
 
+**Decision-record policy (active 2026-10-19, `docs/adr/0000-decision-record-policy.md`):**
+every recorded decision from now on carries three parts — (1) the decision + why,
+(2) predictions if other choices had been made, (3) flex options to revisit (tag
+`FLEX (planning review)` for ones to take to the main planning agent at the
+pause). A one-time **retroactive sweep** PR brings ADRs 0001–0009 + prior
+owner-gated calls into this format; it is scheduled right **before** the final
+doc-sync + retro at the M3c/MP2 pause. ADR 0009's A5 amendment (step-5 transfer:
+D9 reclamation invariant, stale-cap S1 null-marker, the `maybe_free_record` guard,
+the R8/R9 transfer ABI) is the first decision written in the new format.
+
 ## M3a #5 step (b): recoverable user copies + exception fixup — observed 2026-10-17T19:50:00+00:00
 
 Branch `feat/m3a-5b-user-copy`. The FINAL M3a piece. `kernel/core/usercopy.c` +

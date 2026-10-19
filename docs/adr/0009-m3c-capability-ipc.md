@@ -438,3 +438,230 @@ repeated-fault-no-exhaustion**; the *survivor observes PEER_CLOSED* case is prov
 in a **kernel-only self-test** (two tables via `je_endpoint_channel_create`), since
 a cross-process surviving peer needs transfer (D-SEQ step 5). The ring-3 proof is
 labelled reclaim-only and does not claim the survivor case.
+
+## AMENDMENT (2026-10-19, owner-approved) — step-5 capability-transfer decisions
+
+D-SEQ step 5 (capability transfer) needs three decisions the frozen D8/D9 left
+open or under-specified. All three were raised by an implementor-vs-adversarial
+peer debate and decided by the owner. Recorded per the ADR 0000 decision-record
+policy (decision + why / predictions if other choices / flex options).
+
+Capability transfer, concretely: a `try_send` may carry 0..K **capabilities** —
+endpoint handles from the sender's table — alongside the byte payload. Each cap
+is enqueued in the peer's inbound as a **descriptor** `{rec_index, side,
+generation, rights}` (never a raw handle; handles are per-table), which **retains
+an inflight reference** on the referenced end (D3.2). The receiver's `try_recv`
+delivers the bytes AND **mints fresh, independently-closable, equal-or-weaker
+handles** in the receiver's table (destination-side mint, D8), releasing the
+inflight refs. The sender keeps its handle (mint/copy, not move). A cap may only
+be sent if the handle holds the `TRANSFER` right and the requested rights are a
+subset (else DENIED).
+
+### A5-1. D9 cycle invariant = bounded RECLAMATION (cycles allowed; released on last-handle removal)
+
+**Decision + why.** D9 is stated as: *queued-cap edges MAY form cycles; every
+edge is owned by whichever end's inbound holds the cap; the edge's inflight ref is
+released when that end's **final handle_ref is removed** (its inbound is then
+discarded, per D2) — NOT merely when one owner process dies.* (D2 lets two
+processes hold the same end, so a process dying removes only *its* handle_refs; the
+inbound is discarded only when the **last** holder across all processes closes or
+dies. A still-live co-holder is a legitimate reference, not a leak.) No new
+nesting/ordering restriction is imposed. This follows directly from the
+already-frozen D2/D3 rule ("a closing end's inbound is discarded on last handle
+close, releasing any capabilities in it"): the peer debate proved that rule alone
+makes every queued-cap cycle **reclaimable** — an A↔B cycle is released once each
+end's last handle is gone, and the death release-walk removes a dead process's
+contribution to that count. The alternative invariants (a per-end depth-1
+bipartite rule, or an index-ordering acyclic rule) were considered and **rejected
+as unnecessary** given D2, and as costly (they forbid legitimate forwarding of a
+received end and add per-end graph counters that need their own proofs). The
+honest scope limit, stated plainly: this guarantees **reclamation when an end's
+last handle is removed**, **not** that every queued cap is eventually *deliverable*
+— a live process holding the last handle to a queue end can retain its queued caps
+indefinitely (a legitimate reference); and A5-2 handles a cap whose *target* dies.
+With `JE_EP_POOL_CAP = 4` and two processes, the blast radius of any retention is
+bounded and recoverable, acceptable for M3c's single-machine/2-process scope.
+
+**Predictions if other choices were made.**
+- *Per-end depth-1 bipartite rule (Codex's I2 variant):* would make cycles
+  structurally impossible rather than merely reclaimable, but would **reject a
+  valid forward** (a process receiving an end whose inbound already carries caps
+  could not re-send it), and would add two per-end counters + their invariants.
+  Net: more code, a real usability loss, no reclamation benefit over A5-1 given
+  D2. Reopen only if D2 is amended (see A5-2 prediction).
+- *Index-ordering acyclic rule (I3):* cheapest to check and provably acyclic, but
+  asymmetric/surprising (you may send end X→Y but not Y→X purely by pool index) —
+  a confusing ABI contract for no gain here.
+- *Pure I4 with no stated bound (first suggestion):* rejected — "bounds nothing"
+  contradicts D9's "MUST bound nesting", and read naively it either mints dead
+  caps or pins cycles forever. A5-1 is I4 *corrected* by grounding it in D2's
+  discard rule and stating the reclamation bound explicitly.
+
+**Flex options to consider in future.** **FLEX (planning review).** If a later
+milestone wants true **move** semantics or wants every queued cap guaranteed
+deliverable (not just reclaimable), that requires amending D2 so an inflight cap
+keeps its target end OPEN — which *reintroduces real cycles* and then makes a
+nesting restriction (the rejected depth-1 or index-ordering rule) **mandatory**.
+That is a larger contract change deferred to an SMP/supervisor-era ADR. Flagged
+for the pause review with the planning agent.
+
+### A5-2. Stale queued cap = deliver a NULL marker (S1), siblings still mint
+
+**Decision + why.** Because D2 lets a sender close the target end after queuing
+the cap but before the receiver dequeues it, a queued descriptor can point at a
+**since-CLOSED** end. Decision (**S1**): on `try_recv`, a cap whose target is no
+longer live (end CLOSED, or — defence-in-depth — generation stale) is
+**consumed** — the receiver gets **handle value `0`** (the by-construction invalid
+handle, `handle.h`; NOT a status code — there is no `JE_ABI_H_INVALID` symbol) in
+that cap's output slot, its inflight ref is released, and the message **dequeues
+normally**; any live sibling caps in the same message still mint. A
+**PEER_CLOSED** target is still LIVE and **does** mint (only CLOSED is dead). This
+amends D8 on **two** points: its "successful receive delivers a fresh
+equal-or-weaker handle" becomes "…or handle `0` for a since-dead cap", **and** its
+rollback-case list is corrected — "target not live" moves OUT of the
+roll-back-and-requeue set and INTO this consume-with-`0` set (the other rollback
+cases — destination QUOTA/NOSLOTS, rights superset, REFOVERFLOW — remain
+roll-back). The driving reason is a **stale-cap head-of-line wedge** the peer
+debate found: a dead cap that instead rolled back and left the message queued (the
+naive D6 "nothing delivered on failure" reading) would sit at the queue head
+forever and make every later message unreachable — a permanent liveness bug. S1
+removes **that specific permanent wedge** (it does NOT remove *transient*
+head-of-line blocking: a short byte/handle buffer, destination QUOTA/NOSLOTS,
+REFOVERFLOW, or a copy fault still intentionally leave the head message queued for
+a retry, per D6 — those are recoverable by the receiver, the stale-cap case is
+not). S1 matches how real capability systems treat a transferred cap to a
+since-destroyed object (a dead/null marker, not a stuck channel). The
+transient-vs-permanent split: transient → roll back fully, leave queued (D6
+preserved); permanently dead target → consume with handle `0`. A copy-out fault is
+surfaced as `JE_ABI_INVALID` (the recovered-copy-fault status — there is **no
+`EFAULT`** in this ABI, per D6), and is transient (rolls back, message stays).
+
+**Predictions if other choices were made.**
+- *S2 — amend D2 so an inflight cap keeps the target end OPEN:* no dead caps ever,
+  send-then-close fully safe, but **real cycles become reachable**, forcing a
+  mandatory nesting restriction (A5-1's rejected rules) and changing the frozen
+  close/PEER_CLOSED semantics. Biggest blast radius; deferred (see A5-1 flex).
+- *S3 — forbid closing a transferred-target handle while a cap to it is queued:*
+  sidesteps dead caps, but needs a per-end "is-queued-somewhere" predicate at
+  close time, restricts a legitimate API action, and is surprising (close
+  silently refused/deferred). More enforcement machinery than S1 for a narrower
+  outcome.
+- *Naive rollback-and-requeue (no S-choice):* the rejected baseline — the
+  head-of-line wedge above. Not viable.
+
+**Flex options to consider in future.** **FLEX (planning review).** S1's null
+marker is the minimal honest contract; if the planning agent later prefers an
+explicit *stale-cap status* surfaced per-slot (rather than overloading handle
+value 0) or adopts S2's move semantics, that is a clean future amendment. The
+per-slot output encoding (0 = dead) needs no extra ABI surface now.
+
+### A5-3. `maybe_free_record` gains an `allocated` guard (tested-lifecycle touch)
+
+**Decision + why.** The cap-release path can call `maybe_free_record` for the same
+record more than once in one discard (the closing end settles, then a detached cap
+pointing into the same record is released). The existing `maybe_free_record` has
+no idempotence guard, so a second call on an already-freed record would
+double-decrement `allocated_count` and double-bump the generation. Decision: add
+`if (!rec->allocated) return;` at the top, plus an assertion that both inbound
+queues are cap-free when it frees. The safe discard ordering is frozen too:
+**detach all descriptors into a bounded local array → clear queue metadata →
+settle the closing end → release each detached inflight ref (each may invoke the
+now-guarded `maybe_free_record`); freeing never recurses into a queue still being
+discarded.** This touches M3c-tested lifecycle code (release_handle /
+maybe_free_record), so it is owner-gated (approved 2026-10-19).
+
+**Predictions if other choices were made.**
+- *No guard, rely on ordering alone:* works only while every future caller
+  preserves the exact detach-before-release ordering — a fragile invariant a later
+  edit could silently break into a double-free. The guard makes the function
+  idempotent regardless of caller ordering; strictly safer for ~2 lines.
+- *A separate "freed" flag instead of reusing `allocated`:* redundant — `allocated`
+  already is that flag; a second would be one more thing to keep in sync.
+
+**Flex options to consider in future.** Firm; a change needs a new ADR. (Pure
+defense-in-depth, no contract surface to flex.)
+
+### A5-4. Transfer ABI (the pre-reserved R8/R9 path) and the cross-process proof
+
+**Decision + why.** Uses option (b), the path step-4 pre-reserved. **This A5-4
+explicitly AMENDS the step-4 note** ("step 5 MUST add a new op or an out-register
+extension, NOT overload `try_recv`'s RDX"): step-4 reserved R8/R9 and RDX[63:32]
+**for exactly this extension**, so the chosen reading of "out-register extension"
+is to extend `try_recv` via those reserved registers rather than add a duplicate
+op. The step-4 "not overload RDX" caution is honoured in spirit — RDX[31:0] keeps
+its byte-length meaning unchanged; RDX[63:32] takes its *pre-reserved* cap-count
+meaning (it was reserved-zero, never a usable field, so no step-4 caller can
+observe a change there). **send** reads caps via `R8` = user pointer to a
+`u64[cap_count]` array, each element `{ low32 = handle, high32 = requested
+rights }`, with `R10[7:0] = cap_count` (≤ K); unknown rights bits → INVALID;
+`R8 == 0` legal iff `cap_count == 0`. **recv** returns minted handles via `R8` =
+user `u32[]` output buffer, `R9` = its slot capacity; `RDX[31:0]` = byte length
+(or required byte length on a short *byte* buffer), `RDX[63:32]` = received-cap
+count — which **counts consumed slots including a handle-`0` dead-cap slot** (a
+dead cap is delivered, so it occupies an output slot) — or the required slot count
+on a short *handle* buffer → `SHORT_BUFFER`, no dequeue. When BOTH buffers are
+short, `SHORT_BUFFER` is returned with RDX[31:0] = required bytes and RDX[63:32] =
+required slots. **Behaviour-change note (frozen):** a step-4-style caller passing
+`R8 == 0, R9 == 0` that receives a message carrying ≥1 cap now gets `SHORT_BUFFER`
+(required slot count in RDX[63:32]) **even if its byte buffer would have fit** —
+it must supply a handle buffer to drain that message; a naive
+retry-without-a-handle-buffer loops. This is the price of delivering caps and is
+documented so a data-only caller knows to size a handle buffer once caps are in
+use.
+
+**Send transaction (frozen, all-or-nothing).** The send side is transactional
+per D3: (1) copy the whole `u64[cap_count]` cap array into kernel staging and
+validate EVERY element first (each resolves to an endpoint in the sender's table
+holding `TRANSFER`, requested rights ⊆ source rights, `rec(target) != ` the
+destination queue's own end is NOT required under A5-1, but each must be a live
+endpoint); (2) only then retain the inflight ref on each target in order; (3) on
+ANY failure at any element — cap-array copy fault (`JE_ABI_INVALID`), not an
+endpoint (BADINDEX/STALE/WRONGTYPE), missing TRANSFER or rights superset (DENIED),
+or REFOVERFLOW — **unwind every inflight ref already retained for this batch** and
+enqueue nothing (D6: nothing enqueued on failure). The byte payload and the caps
+commit together or not at all. These new send-side statuses slot into the frozen
+step-4 precedence AFTER the main-handle resolution: decode INVALID (incl. cap-array
+shape) → main-handle BADINDEX/STALE/WRONGTYPE → main-handle DENIED (no SEND) →
+PEER_CLOSED → per-cap DENIED (no TRANSFER / rights superset) → per-cap
+REFOVERFLOW → QUEUE_FULL → cap-array copy-fault INVALID (last, after a clean
+preflight).
+
+**Recv transaction (frozen, all-or-nothing).** Mirroring send and honouring D6:
+preflight (classify each queued cap live-vs-dead per A5-2, check byte and handle
+capacity), then **stage all live mints in kernel memory** — retain the target
+handle_ref (REFOVERFLOW) and allocate the destination slot (QUOTA/NOSLOTS) for
+each live cap, with handle `0` staged for each dead cap — then copy the bytes out,
+then copy the handle array out, and **only then** dequeue the message and release
+the consumed caps' inflight refs. Any transient failure (short buffer, QUOTA,
+NOSLOTS, REFOVERFLOW, or a copy-out fault surfaced as `JE_ABI_INVALID` — **not**
+`EFAULT`, which does not exist in this ABI) rolls back every staged mint (no
+minted handle left live) and leaves the message queued; user output buffers may
+hold partial bytes on a copy-out fault (documented, D6). A dead-target cap is
+consumed-with-`0` (A5-2), not a rollback.
+
+**The cross-process proof** is a kernel-seeded channel (one end minted into
+process A's table, one into B's via the existing `je_endpoint_channel_create`) —
+explicitly a **test fixture, not a bootstrap ABI**. The fixture MUST install the
+teardown hook on **both** VMs (`je_endpoint_kern_install`) before seeding, so
+A5-1's "last handle / death discards" reclamation holds for the seeded ends too
+(the raw `je_endpoint_channel_create` bypasses op-10's A3-2 hook check, so the
+fixture asserts the hook explicitly). Over the seeded channel A transfers a
+*second* channel's end to B; B mints it and uses it. This is the first genuine
+cross-address-space transfer proof (self-loopback is ruled out).
+
+**Predictions if other choices were made.**
+- *Option (a) — a new `try_recv_caps` op instead of extending `try_recv` via
+  R8/R9:* a cleaner signature but a new op number and a near-duplicate recv path;
+  step-4 already reserved R8/R9 + RDX[63:32] for (b), so (b) avoids op-space growth
+  and keeps one recv path.
+- *Caps in the byte buffer (inline wire header):* reintroduces the
+  header-copy/parse + fault-rollback surface step-4's D6 analysis rejected; keeps
+  data and caps entangled.
+- *Self-loopback "proof":* would not prove cross-address-space transfer at all
+  (one table), and is forbidden by the invariant anyway.
+
+**Flex options to consider in future.** **FLEX (planning review).** The
+`{handle, rights}` u64 send-element layout and the 0-means-dead recv encoding are
+v0 choices; a future ABI revision (or the step-7 real bootstrap replacing the
+seeded fixture) may restate them. K (caps per message) is a policy bound like the
+others and may grow.
