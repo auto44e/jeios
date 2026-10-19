@@ -33,6 +33,19 @@ recording convention, not a gate):
    alternative then. A decision with no sensible flex says so ("firm; a change
    needs a new ADR").
 
+Plus, when a peer-agent exchange informed the decision:
+
+4. **Attached correspondence.** When a decision (human or agent) was informed by
+   a multi-agent exchange — a `peer-debate.sh` run, a parallel consult, an
+   adversarial review — the **raw transcript `.md` is committed to the repo** and
+   **linked from the decision record** (part 1's "why"). Transcripts live under
+   **`docs/adr/debates/`** (durable, versioned with the code), NOT left in `/tmp`
+   (ephemeral, lost on reboot). The link is the primary artifact; the decision
+   prose quotes only what it needs. A decision reached with no agent exchange has
+   nothing to attach and says so implicitly (no link). This makes the reasoning
+   that produced a decision auditable and re-readable by a future session, not a
+   paraphrase trapped in one agent's memory.
+
 **Bonus convention:** a decision that is *provisional pending the planning agent*
 (the cross-project agent consulted at each pause) is tagged **`FLEX (planning
 review)`** in its flex section, so the pause review has a ready worklist. The
@@ -59,6 +72,14 @@ peer-agent toolkit (which surfaces the alternatives this policy then records).
 - **If we tracked flex options in a separate file instead of inline:** the
   counterfactual would drift from the decision it qualifies. Inline keeps them
   co-located and reviewed together.
+- **If we left transcripts in `/tmp` and only paraphrased them (the prior
+  practice):** the correspondence that actually drove a decision would be lost on
+  the next reboot, leaving only one agent's summary — which the AGENTS.md history
+  rule warns is where after-the-fact fabrication creeps in. A future reversal
+  could not re-read the real back-and-forth. Committing the `.md` costs a few KB
+  per decision and makes the reasoning auditable; the alternative (a transcript
+  store outside the repo) would drift from the code it justifies, same failure as
+  separate flex files.
 
 ## Flex options to consider in future
 
@@ -66,6 +87,11 @@ peer-agent toolkit (which surfaces the alternatives this policy then records).
   "Flex options…") and whether the policy should also cover non-owner routine
   decisions, are revisitable with the main planning agent at a pause. The *intent*
   (three parts) is firm; the formatting is not.
+- **FLEX (planning review):** whether `docs/adr/debates/` is the right home (vs a
+  per-ADR `debates/` subdir, or git-LFS for very large transcripts), and whether
+  transcripts should be redacted/trimmed before commit, are revisitable. The
+  *intent* (commit the raw correspondence, link it from the decision, never leave
+  it only in `/tmp`) is firm; the location and trimming are not.
 - If a decision-record tool or lint is ever added, this policy is its spec.
 
 ## Retroactive sweep
@@ -82,3 +108,12 @@ counterfactual it is marked **"unknown — not in the record"** rather than inve
 reconstructed parts are **appended annotations**, not edits inside the original
 frozen decision text. The sweep re-decides nothing and changes no executable
 behavior.
+
+The sweep ALSO applies part 4 (attached correspondence): the peer-debate
+transcripts for prior decisions that currently live only in `/tmp` are committed
+under `docs/adr/debates/` and linked from the decisions they informed (the M3b/M3c
+debates: `m3b4`, `m3c`, `m3c-lifecycle`, `m3c-step3`, `m3c-step4`, `m3c-step5`,
+`m3c-step6`, …). A prior decision whose transcript was genuinely not saved is
+marked **"transcript not retained"** rather than reconstructed — never fabricate a
+transcript. Transcripts committed during normal (non-sweep) work from this point
+on need no label; the sweep label is only for back-filled history.
