@@ -704,7 +704,10 @@ amendment's text (which caught ten contract-text defects — ABI mapping, the
 single-CAS-vs-priority wording, the copy-fault re-arm, teardown resurrecting a
 DYING thread, the zero-timeout short-circuit, caps composition — all fixed in the
 text below before owner sign-off). Full transcript:
-[`docs/adr/debates/m3c-step6-waits.md`](debates/m3c-step6-waits.md). The reviewer
+[`docs/adr/debates/m3c-step6-waits.md`](debates/m3c-step6-waits.md). A follow-up
+**mechanism** debate (the park/resume x86 mechanism behind A6-CLARIFY-1/2) is at
+[`docs/adr/debates/m3c-step6-mechanism.md`](debates/m3c-step6-mechanism.md). The
+reviewer
 sharpened the design materially (separate waiter vs scheduler state machines, one
 arbitration CAS, no copy-out from the scheduler) and surfaced the A6-1 contract
 conflict below as a genuine owner escalation, not a clarification.
@@ -961,8 +964,10 @@ check) from a process holding a transferred-dup handle to the same end sees the
 reserved head as **not deliverable** and returns `EMPTY` — it does NOT take the
 reserved message (that would break the reservation and FIFO) and does NOT itself
 register a waiter. The reserved message is delivered only to the waiter that
-reserved it, or returns to the free pool when that waiter's reservation is released
-(copy fault / teardown). The continuation does **not** re-resolve the original
+reserved it, or **becomes deliverable again at its queue head** (it is never
+dequeued by the reservation) when that waiter's reservation is released via the
+single idempotent `je_ipc_waiter_release` (copy fault / teardown, A6-CLARIFY-2).
+The continuation does **not** re-resolve the original
 handle (D3 owned-reference rule) — it uses the reserved owned record.
 **Owner-approved design.**
 
@@ -983,7 +988,71 @@ reservation (message stays queued for the next call) achieves recovery without i
 **Flex options to consider in future.** Firm. A blocking-send milestone will add a
 symmetric copy-*in* on the sender continuation under the same rule.
 
-### A6-PEERWAKE. Peer death actively wakes blocked receivers
+### A6-CLARIFY-1. The park/resume mechanism + its gated prerequisite (owner-approved 2026-10-19)
+
+**Decision + why.** A6-5 fixed *that* the parked syscall continuation (not the
+scheduler) copies out, but not the concrete x86 mechanism. The implementation
+uses **constrained restartable-syscall resume**, decided by a mechanism design
+debate ([`docs/adr/debates/m3c-step6-mechanism.md`](debates/m3c-step6-mechanism.md),
+claude=implementor/codex=adversarial-reviewer) and verified against the tree:
+- **Park:** the recv handler, when it would return `EMPTY` on an OPEN end with a
+  nonzero timeout, returns a **BLOCK action** to dispatch (NOT a nested `int
+  0x81`). A new **`je_sched_block_current(f)`** — modeled on the existing
+  `je_sched_exit_current` (same frame-identity checks) **plus a pre-park
+  `je_uframe_check(f)`** (a deliberate, stated deviation from that model: a thread
+  that would park MUST have a valid return frame, so a user-corrupted RSP/RFLAGS is
+  rejected as `DEATH_BAD_RETURN` at park time rather than discovered at wake while
+  it holds a reservation — see A6-CLARIFY-2) — saves the recv args + the **owned
+  endpoint reference** + the post-`int` RIP into the thread's waiter fields (the
+  `wait` sub-struct: `pending`, `end_ref`, `side`, saved `rdi/rsi/rdx/r8/r9`,
+  `deadline`, `saved_post_int_rip`, `cause`), sets `state = THREAD_BLOCKED_IPC`,
+  **rewinds `f->rip` by a named `JE_INT80_LEN == 2`** (the fixed `CD 80` encoding;
+  the only DPL3 gate, and the PIC is remapped off 0x80, so `rip-2` provably points
+  at the `int 0x80` site), and returns `select_and_install_next()`.
+- **Wake:** a cause-stamping path (`je_sched_wake_ipc`, a **guarded wrapper around
+  the single A6 `je_ipc_wait_arbitrate` CAS** — never an independent
+  `BLOCKED_IPC→READY` transition) flips the thread READY. When the scheduler next
+  installs it, CR3/RSP0 are already switched (`select_and_install_next`), the
+  thread re-executes `int 0x80`, and a **pending-continuation prologue at the top
+  of `je_syscall_dispatch`** (keyed on `threads[current].wait.pending`, **not** on
+  RAX) finishes the recv **from the saved args + the owned reference, NEVER
+  re-resolving `f->rdi`** (the A6-5 owned-reference rule — a plain restartable
+  syscall that re-resolved the handle would violate it; "constrained" = it does
+  not). The prologue also asserts `f->rip == saved_post_int_rip`; a mismatch is a
+  kernel-invariant abort, not a user error. Copy-out thus happens in a fresh
+  dispatch on the woken thread, **after** the context switch — satisfying A6-5's
+  "no copy from the scheduler." **No trap-entry assembly change.**
+
+**Gated prerequisite (the honest dependency).** Re-executing the restart site is
+sound **only** under two invariants true on main today, now recorded so a future
+change cannot silently invalidate the mechanism:
+1. **User code text is immutable** — `USER_CODE` is mapped R/X with no writable
+   alias surviving publish, and the ABI exposes no `mmap`/`mprotect`/`unmap`
+   (the syscall ops are 0–12), so nothing can rewrite or unmap the `CD 80` site
+   while parked.
+2. **One thread per process** — `threads[slot]` is built from a single `p->root`,
+   so no sibling thread shares the address space to race the restart site.
+**This prerequisite MUST be re-gated** when `mmap`/`mprotect` or multi-threaded
+processes land (a `FLEX (planning review)` item): at that milestone the restart
+mechanism is re-reviewed, and if either invariant is lost it is replaced by a
+kernel-side continuation that resumes without re-executing `int 0x80`.
+
+**Predictions if other choices were made.** *A heavier kernel-continuation now
+(re-enter the recv in kernel mode without re-executing `int 0x80`):* avoids the
+prerequisite but adds scheduler/context-switch surface and a second copy-out entry
+point — more untested machinery in the highest-blast-radius file, the opposite of
+what the owner gate wants, for a dependency that is honestly recordable instead.
+*Plain (unconstrained) restartable syscall that re-resolves `rdi` on re-entry:*
+re-resolves a capability A6-5 forbids re-resolving after blocking — a handle-reuse
+hole (the slot could now name a different object); rejected. *Hard-coding the
+rewind length without a named constant + encoding comment:* a latent landmine if
+the gate vector ever changes; the named `JE_INT80_LEN` + SDM citation makes it
+auditable.
+
+**Flex options to consider in future.** **FLEX (planning review).** The gated
+prerequisite above is the explicit revisit trigger (mmap/mprotect/multithread).
+The constant `JE_INT80_LEN` is fixed by the `CD 80` ABI and only changes if the
+syscall gate itself is redesigned (a new ADR).
 
 **Decision + why.** `je_vm_destroy`'s existing endpoint release walk (step-3,
 owner-signed) tears down the dying process's handles. When removing the dying
@@ -1028,7 +1097,61 @@ walk it extends. Also covers an ordinary last-handle `endpoint_close` (no proces
 death) that transitions a peer end to PEER_CLOSED: the same arbitrate-the-peer's-
 waiter call applies on that close path, not only in `je_vm_destroy`.
 
-### Proof plan (deterministic, single-CPU — avoids the step-5 spin race)
+### A6-CLARIFY-2. Death/reap releases a held WOKEN reservation (owner-approved 2026-10-19)
+
+**Decision + why.** A6-5 reserves the queue head for a receiver stamped `WOKEN`,
+delivered when its continuation resumes. There is a window — the woken thread is
+READY but not yet re-entered (from "READY, not yet installed" through the `iretq`
+to the `int 0x80` restart site; `je_uframe_check` sets IF=1, so a timer tick — and,
+in a future milestone, a kill/cancel — can land there) — in which the reservation
+is **held by a thread that has not yet consumed it**. If that thread is destroyed
+in the window, the reserved head would be stranded (marked reserved, no live waiter
+→ a permanent per-end denial of delivery). So teardown MUST release it. To avoid a
+double-release across the three candidate sites (`mark_dying`, the reaper, and
+A6-PEERWAKE step 1), there is **exactly one idempotent cleanup routine**,
+`je_ipc_waiter_release(slot)`, that **checks whether THIS waiter holds the
+reservation and clears it only then** (clearing the waiter state + returning the
+head to deliverable). **`mark_dying` calls it; the reaper only asserts it is
+already clear; A6-PEERWAKE step 1 is the same routine.** CLARIFY-2 is simply the
+`READY`/`WOKEN` case of that one routine. It runs in the IRQ-critical teardown
+**before the release walk** (the A6-PEERWAKE ordering — if the walk ran first it
+could close an end or discard queued messages that are still reserved). The
+released head **becomes deliverable at its queue front** — it was never dequeued
+(the reservation is only a "claimed-by" marker on the still-enqueued head), so it
+stays FIFO-first for the next receiver. **The waiter slot stays occupied from
+`WOKEN`-stamp until consume-or-release**, so A6-4 gives any concurrent second
+receiver `EMPTY` (nobody can park behind a reserved head and then sleep to its
+timeout — the latency bug A6-PEERWAKE exists to prevent); release frees the slot
+and the head together.
+
+**Reachability, honestly.** There is **no user/ABI-triggered *production* death
+path** into this window in v1 — there is no kill/cancel op, and the pre-park
+`je_uframe_check` (A6-CLARIFY-1) rejects the corrupt-return-frame case at park time
+rather than letting it die at wake. The only way to reach it in v1 is a
+**test-only forced-kill hook** (named + gated exactly like the existing dev-only
+`JE_DEV_COPY_INJECT`, never in the production ABI) that marks a READY thread
+`DYING` so the reaper can reclaim it — used solely by the CLARIFY-2 proof. So this
+closes a hole that is currently reachable **only under the test hook**, and that a
+future real cancel/kill (the A6-2 signal milestone) would otherwise expose.
+**Owner-approved.**
+
+**Predictions if other choices were made.** *Leave it unspecified (the A6 gap as
+drafted):* the first future kill/cancel path strands the reserved head
+permanently — a silent per-end denial of delivery; cheaper to close now. *Two
+release sites instead of one idempotent owner:* a double-release / double-free of
+the reservation when `mark_dying` and the reaper (or PEERWAKE) both fire — the bug
+the exactly-once holder-checked routine removes. *Freeing the waiter slot at
+`WOKEN`-stamp instead of at consume/release:* a second receiver could park behind
+the reserved head and sleep to timeout — the latency bug; keeping the slot occupied
+makes A6-4 return `EMPTY` instead. *Dropping the reserved message rather than
+returning it to the queue front:* loses a legitimately-sent message on an unrelated
+death; it was never dequeued, so returning it is correct and trivial.
+
+**Flex options to consider in future.** Firm for v1. When a real cancel/kill path
+arrives (the A6-2 signal milestone), this release is the cleanup it must call —
+the test added now (wake → destroy the holder before re-entry → the head is
+delivered to another receiver) already exercises the path via the reaper, so the
+future canceller inherits a tested cleanup.
 
 Each terminal cause gets a deterministic kernel/hosted proof that does **not**
 rely on two spin-looping user stubs (the step-5 hang lesson). All blocking triggers
@@ -1051,10 +1174,20 @@ race:
 - **copy-out fault after WOKEN:** `JE_ABI_INVALID` (2), message stays queued,
   reservation released; a *subsequent* recv on the end takes the still-queued head
   (NOT a re-arm of the faulted waiter).
-- **teardown while blocked:** X (in B) parks, then **step the reaper to destroy B**
-  → B's own waiter is unlinked/tombstoned FIRST, reservation released, before the
-  thread/frame slot is reused; the guarded flip never makes the `DYING` thread
+- **teardown while blocked:** X (in B) parks, then a **test-only forced-kill hook**
+  (dev-gated like `JE_DEV_COPY_INJECT`, never production ABI) marks B's READY/parked
+  thread `DYING` and the **reaper is stepped** → B's own waiter is released via the
+  single idempotent `je_ipc_waiter_release` FIRST (before the release walk), before
+  the thread/frame slot is reused; the guarded flip never makes the `DYING` thread
   `READY`.
+- **reservation release on death-before-re-entry (A6-CLARIFY-2):** X is woken
+  `WOKEN` and its head reserved; the **test-only forced-kill hook** marks X `DYING`
+  and the reaper is stepped **before** X's continuation re-enters → the single
+  idempotent release returns the reserved head to its queue front, and a *second*
+  receiver (holding a transferred dup of the end, the A6-4 reachable case) then
+  calls recv **after** the release and takes it — proving the reservation was
+  released, not stranded, and that the slot freed so the second receiver no longer
+  gets `EMPTY`.
 - **ordered serialization (not a "tie"):** on one CPU two causes are never
   simultaneous — prove the two orderings explicitly: (a) enqueue's CAS fires, THEN
   a timer tick → X gets `WOKEN`, the later timeout CAS is a no-op, message
@@ -1062,3 +1195,25 @@ race:
   message remains queued for a future recv. Assert exactly one terminal result in
   each; the entry-snapshot (non-empty queue + peer closed) separately asserts the
   A6-1 drain-first pick.
+
+**What is actually proven in the step-6 PR (honest status).** The **end-to-end
+ring-3 path** is proven by the kernel self-test **`M3c-s6`** for the **TIMED_OUT**
+cause: a single ring-3 thread calls `recv(timeout)` on an end nobody sends to, it
+genuinely parks (`BLOCKED_IPC`), the timer ISR advances `je_timer_ticks` past the
+deadline and performs the terminal CAS, the continuation prologue re-enters at the
+restart site and returns status 14, the waiter is released, and the channel
+reclaims to 0. This exercises the whole mechanism — park, the ISR terminal
+transition, the 2-byte restart resume, the continuation delivery, waiter release —
+with ONE ring-3 thread and the natural timer tick (no second spinning process; the
+step-5 cooperative-scheduler spin-hang lesson). The **WOKEN / PEER_CLOSED /
+CANCELLED** causes, the **single-terminal-CAS / first-wins**, the **reserved-head
+masking**, **A6-4 WAITERS_BUSY**, and **A6-CLARIFY-2 release-returns-head** are
+proven **deterministically in the hosted pure tests** (`test_endpoint` 27–28) plus
+the decode matrix (`test_syscall`). The **full two-process ring-3 WOKEN handshake**
+(thread X blocks, a *second* ring-3 process sends and yields, X wakes) is **deferred
+to step 7's bootstrap fixture** — the same honest deferral as the step-5 ring-3
+two-process transfer, for the same reason (multi-process ring-3 choreography is
+step 7's subject; a spin-based two-stub proof races the single-CPU cooperative
+scheduler). The wake-on-send and wake-on-peer-close *kernel bridges* are wired and
+compiled; what step 7 adds is the ring-3 *scheduling* of two cooperating user
+processes to drive them end-to-end.

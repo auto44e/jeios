@@ -111,3 +111,35 @@ rules govern that mode and are themselves subject to the guiding star below.
   signal and must be recorded as AI-assisted review. It does not by itself satisfy
   the independent human review that the critical profile requires before a
   hardened/release qualification claim; that remains a human gate.
+
+## Single-agent contributions (verbose decision/logic/workflow in the PR)
+
+Owner direction 2026-10-19. When a contribution is carried out by a **single
+agent** (no peer agents to externalize the reasoning into a debate transcript),
+the PR itself MUST carry that reasoning. The obvious code diff is necessary but
+NOT sufficient: a single agent's decision-making, logic, and workflow otherwise
+live only in that agent's transient context and are lost to reviewers and future
+sessions. So a single-agent PR description MUST be **as verbose as possible** about:
+
+- **Decision-making** — every non-obvious choice made while implementing, the
+  alternatives weighed, and why this one won (the ADR 0000 three parts — decision
+  + why, predictions if other choices were made, flex to revisit — applied at PR
+  granularity, not only at ADR granularity). If a choice touches a frozen
+  contract/ADR/tested path it is escalated to the owner, exactly as in the
+  multi-agent model.
+- **Logic** — the actual algorithm/invariant reasoning: why the code is correct,
+  which invariants it preserves, the edge cases considered and how each is handled,
+  and the failure modes. Not a restatement of the diff — the reasoning the diff
+  does not show.
+- **Workflow** — the path taken to the result: what was investigated, what was
+  tried and rejected, the order of operations, and the verification actually run
+  (exact `make check`/`smoke`/`integration`/CI-profile/ARM results, honest about
+  local vs remote CI). A dead end that was ruled out is useful signal; record it.
+
+This is the single-agent analogue of the multi-agent debate transcript + the
+`docs/adr/debates/` attachment rule (ADR 0000 part 4): where peers would have
+produced a transcript, the lone agent produces a verbose narrative in the PR. The
+honesty rules above apply unchanged (implemented/tested/planned/blocked;
+AI-assisted review is not human qualification; no invented reviewers). Verbosity
+never licenses overclaiming — more words, all of them accurate. CONTRIBUTING.md
+restates this as a PR requirement; the two are one norm.

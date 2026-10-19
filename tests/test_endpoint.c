@@ -629,10 +629,106 @@ int main(void)
         assert(je_endpoint_pool_allocated(&g_pool)==0u);  /* self-edge reclaimed */
     }
 
+    /* 27. Blocking-recv waiter primitives (A6, pure layer): register, the single
+     * terminal CAS, entry-probe reserved-head masking, release idempotence. */
+    fresh(QUOTA);
+    {
+        je_handle a0=0,a1=0;  /* a0 = sender end, a1 = receiver end */
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&a0,&a1)==JE_EP_OK);
+        je_ep_channel *rr; uint8_t rs;   /* a1's end */
+        assert(je_endpoint_resolve(&g_pool,&g_t,a1,&rr,&rs)==JE_EP_OK);
+        /* entry probe on empty OPEN end -> EMPTY (would block). */
+        assert(je_endpoint_recv_entry_probe(&g_pool,&g_t,a1)==JE_EP_EMPTY);
+        /* register a waiter (id 3) on a1. */
+        je_ep_channel *wr; uint8_t ws;
+        assert(je_endpoint_wait_register(&g_pool,&g_t,a1,3u,&wr,&ws)==JE_EP_OK);
+        assert(wr==rr && ws==rs);
+        assert(je_endpoint_wait_cause(rr,rs)==JE_EP_WAIT_WAITING);
+        /* A6-4: a second register on the same end -> WAITERS_BUSY. */
+        assert(je_endpoint_wait_register(&g_pool,&g_t,a1,4u,&wr,&ws)==JE_EP_WAITERS_BUSY);
+        /* a sender puts a message in a1's inbound (send on a0 -> peer a1). */
+        uint8_t msg[3]={7,8,9};
+        assert(je_endpoint_try_send(&g_pool,&g_t,a0,msg,3)==JE_EP_OK);
+        /* arbitrate WOKEN -> WON, reserves the head, reports waiter id 3. */
+        uint32_t woke=0u;
+        assert(je_endpoint_wait_arbitrate(rr,rs,JE_EP_WAIT_WOKEN,&woke)==JE_EP_ARB_WON && woke==3u);
+        assert(je_endpoint_wait_cause(rr,rs)==JE_EP_WAIT_WOKEN);
+        /* single terminal CAS: a second arbitrate (e.g. TIMED_OUT) -> LOST, cause unchanged. */
+        uint32_t x=0u;
+        assert(je_endpoint_wait_arbitrate(rr,rs,JE_EP_WAIT_TIMED_OUT,&x)==JE_EP_ARB_LOST);
+        assert(je_endpoint_wait_cause(rr,rs)==JE_EP_WAIT_WOKEN);
+        /* the reserved head is NOT deliverable to a concurrent handle-based peek. */
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0;
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,a1,rb,sizeof rb,&rl,(je_ep_recv_lease*)0)==JE_EP_EMPTY);
+        /* but the OWNED-end peek (the reserving waiter) sees it. */
+        uint8_t ncaps=0u; je_ep_capdesc cd[JE_EP_MSG_CAPS_MAX]; je_ep_recv_lease lz;
+        assert(je_endpoint_recv_peek_owned_caps(&g_pool,rr,rs,rb,sizeof rb,&rl,JE_EP_MSG_CAPS_MAX,cd,&ncaps,&lz)==JE_EP_OK);
+        assert(rl==3u && rb[0]==7 && rb[2]==9 && ncaps==0u);
+        /* commit + release the waiter. */
+        assert(je_endpoint_recv_commit_caps(&g_pool,&lz)==JE_EP_OK);
+        assert(je_endpoint_wait_release(&g_pool,rr,rs,3u)==true);
+        assert(je_endpoint_wait_cause(rr,rs)==JE_EP_WAIT_NONE);
+        /* release idempotence: releasing again (or a wrong id) is a safe no-op. */
+        assert(je_endpoint_wait_release(&g_pool,rr,rs,3u)==false);
+    }
+
+    /* 28. A6-CLARIFY-2: release-by-id returns a reserved head to deliverable. */
+    fresh(QUOTA);
+    {
+        je_handle b0=0,b1=0;
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&b0,&b1)==JE_EP_OK);
+        je_ep_channel *rr; uint8_t rs;
+        assert(je_endpoint_resolve(&g_pool,&g_t,b1,&rr,&rs)==JE_EP_OK);
+        je_ep_channel *wr; uint8_t ws;
+        assert(je_endpoint_wait_register(&g_pool,&g_t,b1,5u,&wr,&ws)==JE_EP_OK);
+        uint8_t msg[1]={42};
+        assert(je_endpoint_try_send(&g_pool,&g_t,b0,msg,1)==JE_EP_OK);
+        uint32_t w=0u;
+        assert(je_endpoint_wait_arbitrate(rr,rs,JE_EP_WAIT_WOKEN,&w)==JE_EP_ARB_WON);
+        /* head reserved -> concurrent peek EMPTY. */
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0;
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,b1,rb,sizeof rb,&rl,(je_ep_recv_lease*)0)==JE_EP_EMPTY);
+        /* the waiter "dies before re-entry": release by id (as mark_dying would). */
+        assert(je_endpoint_wait_release_by_id(&g_pool,5u)==true);
+        assert(je_endpoint_wait_cause(rr,rs)==JE_EP_WAIT_NONE);
+        /* head is deliverable again at the front (A6-CLARIFY-2). */
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,b1,rb,sizeof rb,&rl,(je_ep_recv_lease*)0)==JE_EP_OK);
+        assert(rl==1u && rb[0]==42);
+    }
+
+    /* 29. Reserved-head-with-peer-closed looks EMPTY, not PEER_CLOSED, to another
+     * reader (review finding: a reserved head means a message exists, never EOF).
+     * And a release after peer-close lets the message drain. */
+    fresh(QUOTA);
+    {
+        je_handle c0=0,c1=0;
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&c0,&c1)==JE_EP_OK);
+        je_ep_channel *rr; uint8_t rs;
+        assert(je_endpoint_resolve(&g_pool,&g_t,c1,&rr,&rs)==JE_EP_OK);
+        je_ep_channel *wr; uint8_t ws;
+        assert(je_endpoint_wait_register(&g_pool,&g_t,c1,9u,&wr,&ws)==JE_EP_OK);
+        uint8_t msg[2]={1,2};
+        assert(je_endpoint_try_send(&g_pool,&g_t,c0,msg,2)==JE_EP_OK);
+        uint32_t w=0u;
+        assert(je_endpoint_wait_arbitrate(rr,rs,JE_EP_WAIT_WOKEN,&w)==JE_EP_ARB_WON);
+        /* close the sender end -> c1 (receiver) becomes PEER_CLOSED, but its head
+         * is reserved: a concurrent peek must see EMPTY (message exists), NOT EOF. */
+        assert(je_endpoint_handle_close(&g_pool,&g_t,c0)==JE_EP_OK);
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0;
+        assert(je_endpoint_end_state(rr,rs)==JE_EP_END_PEER_CLOSED);
+        assert(je_endpoint_recv_entry_probe(&g_pool,&g_t,c1)==JE_EP_EMPTY);  /* not PEER_CLOSED */
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,c1,rb,sizeof rb,&rl,(je_ep_recv_lease*)0)==JE_EP_EMPTY);
+        /* release the waiter -> head deliverable; now peer-closed + a real message. */
+        assert(je_endpoint_wait_release(&g_pool,rr,rs,9u)==true);
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,c1,rb,sizeof rb,&rl,(je_ep_recv_lease*)0)==JE_EP_OK);
+        assert(rl==2u && rb[0]==1 && rb[1]==2);
+    }
+
     printf("endpoint: PASS (create, split-ref close/destruction, dup "
            "acquire-before-commit, REFOVERFLOW, DENIED/WRONGTYPE, inflight keep-"
            "alive, pool-exhaustion + create-unwind, release-walk, data IPC "
            "send/recv/FIFO/QUEUE_FULL/SHORT_BUFFER/PEER_CLOSED/rights/zero-len, "
-           "cap-transfer mint/dead-cap/cycle-reclaim)\n");
+           "cap-transfer mint/dead-cap/cycle-reclaim, "
+           "waits register/arbitrate-CAS/reserved-head/release/release-by-id/peer-close-EMPTY)\n");
     return 0;
 }

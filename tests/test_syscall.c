@@ -114,12 +114,15 @@ int main(void)
     assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 8, 0,0,1,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R9 reserved */
     assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 65, 0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* len > MSG_MAX */
     assert(dec(JE_SYS_TRY_SEND, UINT64_C(0x100000000), 0x40002000, 8, 0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* wide handle */
-    /* try_recv (op 12): h,ubuf,cap,hbuf=R8,hcap=R9; R8!=0 iff R9!=0; R10 reserved. */
+    /* try_recv (op 12): h,ubuf,cap,hbuf=R8,hcap=R9,timeout=R10; R8!=0 iff R9!=0. */
     assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 0,0,0,&st,&res)==JE_SYSCALL_TRY_RECV && st==JE_ABI_OK);
     assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 0,0x40003000,2,&st,&res)==JE_SYSCALL_TRY_RECV && st==JE_ABI_OK); /* handle buf + cap */
     assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 0,0x40003000,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R8!=0 R9=0 */
     assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 0,0,2,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R8=0 R9!=0 */
-    assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 1,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R10 reserved */
+    /* A6-ABI: R10 is now the timeout (0=poll, nonzero=block). Any value is a legal
+     * decode (the bound/overflow check is in the glue, not the decode). */
+    assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 1,0,0,&st,&res)==JE_SYSCALL_TRY_RECV && st==JE_ABI_OK); /* nonzero timeout OK */
+    assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, UINT64_C(0xffffffffffffffff),0,0,&st,&res)==JE_SYSCALL_TRY_RECV && st==JE_ABI_OK); /* huge timeout decodes; glue rejects */
     assert(dec(JE_SYS_TRY_RECV, UINT64_C(0x100000000), 0x40002000, 64, 0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* wide handle */
     /* op 13 and up unknown. */
     assert(dec(13, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);

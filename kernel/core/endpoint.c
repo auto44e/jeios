@@ -66,6 +66,10 @@ void je_endpoint_pool_init(je_endpoint_pool *pool)
             r->end[s].handle_refs = 0u;
             r->end[s].inflight_refs = 0u;
             r->end[s].side = s;
+            r->end[s].waiter.present = false;
+            r->end[s].waiter.waiter_id = 0u;
+            r->end[s].waiter.cause = JE_EP_WAIT_NONE;
+            r->end[s].waiter.head_reserved = false;
             queue_reset(&r->end[s].inbound);
         }
     }
@@ -239,6 +243,139 @@ static bool rec_in_pool(const je_endpoint_pool *pool, const je_ep_channel *rec)
     uintptr_t p    = (uintptr_t)rec;
     if (p < base || p >= top) return false;
     return ((p - base) % sizeof(pool->rec[0])) == 0u;         /* slot-aligned */
+}
+
+/* ---- M3c D7/A6 blocking-recv waiter primitives (PURE) ---- */
+
+/* True iff this end's inbound head is reserved (claimed by a WOKEN waiter). A
+ * reserved head is NOT deliverable to any other receiver (A6-5). */
+static bool head_reserved(const je_ep_end *e)
+{
+    return e->waiter.present && e->waiter.head_reserved;
+}
+
+je_ep_status je_endpoint_recv_entry_probe(je_endpoint_pool *pool, je_handle_table *t,
+                                          je_handle h)
+{
+    je_ep_channel *rec = (je_ep_channel *)0; uint8_t side = 0u;
+    je_ep_status rs = je_endpoint_resolve(pool, t, h, &rec, &side);
+    if (rs != JE_EP_OK) return rs;
+    uint32_t rights = 0u;
+    je_handle_status gr = je_handle_rights_of(t, h, JE_ENDPOINT_OBJ_TYPE,
+                                              JE_EP_RIGHT_RECV, &rights);
+    if (gr != JE_HANDLE_OK) return hstat(gr);
+    je_ep_end *e = &rec->end[side];
+    /* A head reserved by an EXISTING waiter is not available to this probe: it is
+     * delivered only through that waiter's continuation (A6-5). */
+    if (e->inbound.count > 0u) {
+        if (!head_reserved(e)) return JE_EP_OK;   /* deliverable: real peek next */
+        return JE_EP_EMPTY;   /* reserved: a message exists but is claimed -> EMPTY, not EOF */
+    }
+    /* Truly empty: EOF if the peer is gone, else would-block. */
+    return (e->state == JE_EP_END_PEER_CLOSED) ? JE_EP_PEER_CLOSED : JE_EP_EMPTY;
+}
+
+je_ep_status je_endpoint_wait_register(je_endpoint_pool *pool, je_handle_table *t,
+                                       je_handle h, uint32_t waiter_id,
+                                       je_ep_channel **out_rec, uint8_t *out_side)
+{
+    je_ep_channel *rec = (je_ep_channel *)0; uint8_t side = 0u;
+    je_ep_status rs = je_endpoint_resolve(pool, t, h, &rec, &side);
+    if (rs != JE_EP_OK) return rs;
+    uint32_t rights = 0u;
+    je_handle_status gr = je_handle_rights_of(t, h, JE_ENDPOINT_OBJ_TYPE,
+                                              JE_EP_RIGHT_RECV, &rights);
+    if (gr != JE_HANDLE_OK) return hstat(gr);
+    je_ep_end *e = &rec->end[side];
+    if (e->waiter.present) return JE_EP_WAITERS_BUSY;   /* A6-4 per-end bound */
+    /* A waiter holds one inflight ref on its own end (keeps the record from
+     * freeing while parked; released by wait_release). Bounds-checked. */
+    if (e->inflight_refs >= JE_EP_REF_MAX) return JE_EP_REFOVERFLOW;
+    e->inflight_refs++;
+    e->waiter.present = true;
+    e->waiter.waiter_id = waiter_id;
+    e->waiter.cause = JE_EP_WAIT_WAITING;
+    e->waiter.head_reserved = false;
+    if (out_rec) *out_rec = rec;
+    if (out_side) *out_side = side;
+    return JE_EP_OK;
+}
+
+je_ep_arb_result je_endpoint_wait_arbitrate(je_ep_channel *rec, uint8_t side,
+                                            je_ep_wait_cause cause,
+                                            uint32_t *out_waiter_id)
+{
+    if (!rec || side > 1u) return JE_EP_ARB_LOST;
+    je_ep_end *e = &rec->end[side];
+    /* The single terminal CAS: only a present WAITING waiter transitions, once. */
+    if (!e->waiter.present || e->waiter.cause != JE_EP_WAIT_WAITING)
+        return JE_EP_ARB_LOST;
+    if (cause == JE_EP_WAIT_WAITING || cause == JE_EP_WAIT_NONE)
+        return JE_EP_ARB_LOST;   /* not a terminal cause */
+    e->waiter.cause = cause;
+    if (cause == JE_EP_WAIT_WOKEN) {
+        /* Reserve the current inbound head for this waiter (A6-5). There must be a
+         * message to reserve — the caller (enqueue / entry drain) only arbitrates
+         * WOKEN when one is queued. */
+        e->waiter.head_reserved = (e->inbound.count > 0u);
+    }
+    if (out_waiter_id) *out_waiter_id = e->waiter.waiter_id;
+    return JE_EP_ARB_WON;
+}
+
+je_ep_wait_cause je_endpoint_wait_cause(const je_ep_channel *rec, uint8_t side)
+{
+    if (!rec || side > 1u) return JE_EP_WAIT_NONE;
+    const je_ep_end *e = &rec->end[side];
+    return e->waiter.present ? e->waiter.cause : JE_EP_WAIT_NONE;
+}
+
+/* True iff end (rec,side) has a present WAITING waiter; reports its waiter_id. */
+bool je_endpoint_wait_id(const je_ep_channel *rec, uint8_t side, uint32_t *out_id)
+{
+    if (!rec || side > 1u) return false;
+    const je_ep_end *e = &rec->end[side];
+    if (!e->waiter.present || e->waiter.cause != JE_EP_WAIT_WAITING) return false;
+    if (out_id) *out_id = e->waiter.waiter_id;
+    return true;
+}
+
+/* Internal: clear a present waiter on end (rec,side) owned by `who`, releasing its
+ * inflight ref and un-reserving any held head. Idempotent via the ownership check.
+ * Routes the inflight decrement through maybe_free_record so a waiter that held the
+ * LAST ref frees the record (A6-CLARIFY-2 / review finding). */
+static bool waiter_release_end(je_endpoint_pool *pool, je_ep_channel *rec, uint8_t side,
+                               uint32_t who)
+{
+    je_ep_end *e = &rec->end[side];
+    if (!e->waiter.present || e->waiter.waiter_id != who) return false;
+    e->waiter.present = false;
+    e->waiter.cause = JE_EP_WAIT_NONE;
+    e->waiter.head_reserved = false;   /* head stays enqueued, deliverable again */
+    e->waiter.waiter_id = 0u;
+    if (e->inflight_refs != 0u) {
+        e->inflight_refs--;            /* the waiter's own ref */
+        if (e->inflight_refs == 0u) maybe_free_record(pool, rec);
+    }
+    return true;
+}
+
+bool je_endpoint_wait_release(je_endpoint_pool *pool, je_ep_channel *rec, uint8_t side,
+                             uint32_t who)
+{
+    if (!pool || !rec || side > 1u || !rec_in_pool(pool, rec)) return false;
+    return waiter_release_end(pool, rec, side, who);
+}
+
+bool je_endpoint_wait_release_by_id(je_endpoint_pool *pool, uint32_t who)
+{
+    if (!pool) return false;
+    for (uint16_t i = 0; i < JE_EP_POOL_CAP; ++i) {
+        if (!pool->rec[i].allocated) continue;
+        for (uint8_t s = 0; s < 2u; ++s)
+            if (waiter_release_end(pool, &pool->rec[i], s, who)) return true;
+    }
+    return false;
 }
 
 je_ep_status je_endpoint_retain_inflight(je_endpoint_pool *pool,
@@ -514,9 +651,12 @@ je_ep_status je_endpoint_recv_peek(je_endpoint_pool *pool, je_handle_table *t,
     if (gr != JE_HANDLE_OK) return hstat(gr);   /* DENIED if RECV not held */
 
     je_ep_queue *q = &rec->end[side].inbound;    /* this end's own inbound */
-    if (q->count == 0u) {
-        /* Empty: EOF if the peer is gone, else would-block EMPTY. */
-        return (rec->end[side].state == JE_EP_END_PEER_CLOSED)
+    /* A head reserved by a blocking waiter is delivered only through that waiter's
+     * continuation (A6-5); a concurrent handle-based poll must NOT take it. Treat
+     * it as empty for this caller. */
+    if (q->count == 0u || head_reserved(&rec->end[side])) {
+        /* Empty (or head reserved): EOF if the peer is gone, else would-block. */
+        return (rec->end[side].state == JE_EP_END_PEER_CLOSED && q->count == 0u)
                ? JE_EP_PEER_CLOSED : JE_EP_EMPTY;
     }
     uint8_t mlen = q->len[q->head];
@@ -670,6 +810,34 @@ je_ep_status je_endpoint_try_send_caps(je_endpoint_pool *pool, je_handle_table *
     return JE_EP_OK;
 }
 
+/* Core peek-with-caps on a resolved end (rec,side), no handle/rights/reserved-head
+ * checks — the callers apply those. Copies head bytes+caps into the out buffers or
+ * returns SHORT_BUFFER (nothing copied, not dequeued). */
+static je_ep_status peek_caps_at(je_ep_channel *rec, uint8_t side,
+                                 void *out_kbuf, size_t cap, size_t *out_len,
+                                 uint8_t hcap, je_ep_capdesc *out_caps,
+                                 uint8_t *out_ncaps, je_ep_recv_lease *lease)
+{
+    je_ep_queue *q = &rec->end[side].inbound;
+    if (q->count == 0u)
+        return (rec->end[side].state == JE_EP_END_PEER_CLOSED)
+               ? JE_EP_PEER_CLOSED : JE_EP_EMPTY;
+    uint8_t mlen = q->len[q->head];
+    uint8_t mcaps = q->cap_count[q->head];
+    *out_len = mlen;
+    *out_ncaps = mcaps;
+    if (cap < mlen || hcap < mcaps) return JE_EP_SHORT_BUFFER;
+    if (mlen != 0u && !out_kbuf) return JE_EP_INVALID;
+    if (mcaps != 0u && !out_caps) return JE_EP_INVALID;
+    for (uint8_t b = 0; b < mlen; ++b) ((uint8_t *)out_kbuf)[b] = q->buf[q->head][b];
+    for (uint8_t c = 0; c < mcaps; ++c) out_caps[c] = q->cap[q->head][c];
+    if (lease) {
+        lease->rec = rec; lease->side = side;
+        lease->generation = rec->generation; lease->head = q->head; lease->len = mlen;
+    }
+    return JE_EP_OK;
+}
+
 je_ep_status je_endpoint_recv_peek_caps(je_endpoint_pool *pool, je_handle_table *t,
                                         je_handle h, void *out_kbuf, size_t cap,
                                         size_t *out_len, uint8_t hcap,
@@ -687,28 +855,31 @@ je_ep_status je_endpoint_recv_peek_caps(je_endpoint_pool *pool, je_handle_table 
     je_handle_status gr = je_handle_rights_of(t, h, JE_ENDPOINT_OBJ_TYPE,
                                               JE_EP_RIGHT_RECV, &rights);
     if (gr != JE_HANDLE_OK) return hstat(gr);
+    /* A head reserved by a blocking waiter is not available to a handle-based
+     * peek (A6-5): a reserved head means a message EXISTS (claimed by the waiter),
+     * so this reader sees EMPTY — never PEER_CLOSED/EOF (there is undelivered data). */
+    if (head_reserved(&rec->end[side]) && rec->end[side].inbound.count > 0u)
+        return JE_EP_EMPTY;
+    return peek_caps_at(rec, side, out_kbuf, cap, out_len, hcap, out_caps, out_ncaps, lease);
+}
 
-    je_ep_queue *q = &rec->end[side].inbound;
-    if (q->count == 0u)
-        return (rec->end[side].state == JE_EP_END_PEER_CLOSED)
-               ? JE_EP_PEER_CLOSED : JE_EP_EMPTY;
-
-    uint8_t mlen = q->len[q->head];
-    uint8_t mcaps = q->cap_count[q->head];
-    *out_len = mlen;
-    *out_ncaps = mcaps;
-    /* Short EITHER buffer -> SHORT_BUFFER, copy nothing, no dequeue (report both
-     * required sizes via out_len / out_ncaps). */
-    if (cap < mlen || hcap < mcaps) return JE_EP_SHORT_BUFFER;
-    if (mlen != 0u && !out_kbuf) return JE_EP_INVALID;
-    if (mcaps != 0u && !out_caps) return JE_EP_INVALID;
-    for (uint8_t b = 0; b < mlen; ++b) ((uint8_t *)out_kbuf)[b] = q->buf[q->head][b];
-    for (uint8_t c = 0; c < mcaps; ++c) out_caps[c] = q->cap[q->head][c];
-    if (lease) {
-        lease->rec = rec; lease->side = side;
-        lease->generation = rec->generation; lease->head = q->head; lease->len = mlen;
-    }
-    return JE_EP_OK;
+/* Owned-end peek-with-caps for a resumed WOKEN waiter (A6-5): by rec/side, no
+ * handle resolution, bypasses the reserved-head guard (this IS the reserver).
+ * CORRUPT if there is no reserved head. */
+je_ep_status je_endpoint_recv_peek_owned_caps(je_endpoint_pool *pool, je_ep_channel *rec,
+                                              uint8_t side, void *out_kbuf, size_t cap,
+                                              size_t *out_len, uint8_t hcap,
+                                              je_ep_capdesc *out_caps, uint8_t *out_ncaps,
+                                              je_ep_recv_lease *lease)
+{
+    if (!out_len || !out_ncaps) return JE_EP_INVALID;
+    *out_len = 0u; *out_ncaps = 0u;
+    if (!pool || !rec || side > 1u || !rec_in_pool(pool, rec) || !rec->allocated)
+        return JE_EP_CORRUPT;
+    je_ep_end *e = &rec->end[side];
+    if (!e->waiter.present || !e->waiter.head_reserved || e->inbound.count == 0u)
+        return JE_EP_CORRUPT;
+    return peek_caps_at(rec, side, out_kbuf, cap, out_len, hcap, out_caps, out_ncaps, lease);
 }
 
 je_ep_status je_endpoint_recv_commit_caps(je_endpoint_pool *pool,

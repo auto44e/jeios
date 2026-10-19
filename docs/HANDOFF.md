@@ -77,6 +77,22 @@ progress on x86-64, and a second architecture, **ARM64 (MP1)**, now boots.
   7 (bootstrap fixture + the deferred ring-3 two-process transfer proof). #8 closes
   when the sequence completes; #7's deferred refcount/overflow is already
   discharged (endpoints are genuinely destroyed + reclaimed on process death).
+  **Step 6 (blocking recv waits) is now done** (owner-gated; frozen by ADR 0009 A6
+  + A6-CLARIFY-1/2). `try_recv` with a nonzero R10 timeout blocks until WOKEN /
+  PEER_CLOSED / TIMED_OUT / CANCELLED (A6-2 internal-only in v1); R10==0 is the
+  unchanged non-blocking poll. Mechanism: a per-end waiter + one
+  `je_endpoint_wait_arbitrate` CAS, `je_sched_block_current` (pre-park
+  `je_uframe_check` + 2-byte `int 0x80` rewind), a `wait_pending` continuation
+  prologue in `je_syscall_dispatch` that finishes from the owned reference (no
+  handle re-resolve, copy-out after the context switch), guarded
+  `BLOCKED_IPC→READY` wake, one idempotent `je_endpoint_wait_release` owner (called
+  by `mark_dying`). New ABI statuses `TIMED_OUT=14`/`CANCELLED=15`; R10 timeout
+  bounded by `JE_IPC_MAX_WAIT`. Proven: `M3c-s6` (TIMED_OUT end-to-end, ring 3) +
+  hosted `test_endpoint` 27–28 (the pure waiter layer, all four causes via the
+  CAS, reserved-head, release). **Deferred to step 7:** the full two-process ring-3
+  WOKEN handshake (the wake bridges are wired; step 7 schedules two cooperating
+  user processes) — honest, same as the step-5 ring-3 deferral.
+  **Remaining D-SEQ:** step 7 only.
 
 Full qualification evidence for M3a is in `docs/M3A_RETRO.md`; the per-PR ledger is
 `docs/IMPLEMENTATION.md`. Everything above is QEMU/hosted-verified and

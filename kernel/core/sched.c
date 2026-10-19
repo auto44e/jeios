@@ -5,8 +5,15 @@
 #include <jeios/sched.h>
 #include <jeios/uframe.h>
 #include <jeios/vm.h>
+#include <jeios/endpoint.h>
+#include <jeios/endpoint_kern.h>   /* je_endpoint_kern_waiter_release_by_id */
 #define STACK_PAGES 5u
-typedef enum { EMPTY, RUNNING, READY, SLEEPING, ZOMBIE, DYING } state;
+/* M3c A6-CLARIFY-1: the fixed length of the `int 0x80` syscall gate instruction
+ * (`CD 80`), rewound on park so the woken thread re-executes it. Architecturally
+ * fixed by the ABI (Intel SDM: INT imm8 = CD ib). The only DPL3 IDT gate, and the
+ * PIC is remapped off 0x80, so rip-JE_INT80_LEN provably points at the site. */
+#define JE_INT80_LEN 2u
+typedef enum { EMPTY, RUNNING, READY, SLEEPING, ZOMBIE, DYING, BLOCKED_IPC } state;
 typedef enum { THREAD_KERNEL = 0, THREAD_USER = 1 } thread_kind;
 typedef struct {
     state state;
@@ -27,6 +34,19 @@ typedef struct {
      * return state (read by the bootstrap reaper and the proofs). */
     uint64_t death_vector, death_error, death_rip, death_cs, death_cr2;
     uint64_t death_reason, exit_code;
+    /* M3c D7/A6: blocking-recv continuation ("constrained restartable syscall",
+     * A6-CLARIFY-1). `pending` gates the continuation prologue in dispatch. When a
+     * recv parks: pending=1, the recv ARGS (rdi..r9) are saved, the OWNED endpoint
+     * record+side are saved (so resume never re-resolves the handle — A6-5), the
+     * deadline (absolute ticks; 0 = none) is set, and the post-int RIP is saved to
+     * assert the restart landed where expected. Cleared on continuation completion
+     * or on wait release. */
+    bool     wait_pending;
+    je_ep_channel *wait_rec;
+    uint8_t  wait_side;
+    uint64_t wait_rdi, wait_rsi, wait_rdx, wait_r8, wait_r9;
+    uint64_t wait_deadline;      /* absolute tick; 0 = no deadline (shouldn't park) */
+    uint64_t wait_post_int_rip;  /* f->rip at park (the instruction after int 0x80) */
 } thread;
 /* Death reasons (M3a #5). FAULT: synchronous user fault. EXIT: clean exit(code).
  * BAD_RETURN: a user frame failed je_uframe_check (invalid return state). */
@@ -73,7 +93,8 @@ je_status je_thread_create(void (*entry)(void *),void *arg)
     *(uintptr_t *)rsp=(uintptr_t)je_thread_exit;
     je_trap_frame *f=(void *)(rsp-sizeof(*f));
     *f=(je_trap_frame){.rip=(uintptr_t)trampoline,.cs=8,.rflags=0x202,.rsp=rsp,.ss=16};
-    threads[slot]=(thread){READY,f,entry,arg,base,0,0,THREAD_KERNEL,0,0,0,0,0,0,0,0,0,0,0};
+    threads[slot]=(thread){READY,f,entry,arg,base,0,0,THREAD_KERNEL,0,0,0,0,0,0,0,0,0,0,0,
+                           false,0,0,0,0,0,0,0,0,0};
     return JE_OK;
 }
 
@@ -108,7 +129,8 @@ je_status je_thread_create_user(je_vm *vm, uint32_t index)
     f->rip = JE_VM_ARENA_BASE + p->entry;
     f->rsp = JE_VM_ARENA_BASE + JE_VM_ARENA_SIZE;
     f->rflags = 0x202u; /* IF=1, bit1; validator re-sanitizes on every dispatch */
-    threads[slot]=(thread){READY,f,0,0,0,0,0,THREAD_USER,p->root,rsp0_top,vm,index,0,0,0,0,0,0,0};
+    threads[slot]=(thread){READY,f,0,0,0,0,0,THREAD_USER,p->root,rsp0_top,vm,index,0,0,0,0,0,0,0,
+                           false,0,0,0,0,0,0,0,0,0};
     return JE_OK;
 }
 /* M3a #4 step 4: mark a user thread DYING with a death record (never requeued;
@@ -117,6 +139,12 @@ je_status je_thread_create_user(je_vm *vm, uint32_t index)
 static void mark_dying(unsigned slot, death_reason reason, uint64_t code,
                        uint64_t vec, uint64_t err, uint64_t rip, uint64_t cs, uint64_t cr2)
 {
+    /* M3c A6-CLARIFY-2: release any blocking-recv waiter/reservation this thread
+     * holds BEFORE its slot is torn down, via the single idempotent release owner
+     * (keyed on the thread slot = waiter_id). Safe no-op if the thread held none.
+     * This is the one site that RELEASES; the reaper only asserts it is clear. */
+    (void)je_endpoint_kern_waiter_release_by_id((uint32_t)slot);
+    threads[slot].wait_pending=false;
     threads[slot].state=DYING;
     threads[slot].frame=0;
     threads[slot].death_reason=(uint64_t)reason; threads[slot].exit_code=code;
@@ -182,6 +210,29 @@ je_trap_frame *je_sched_interrupt(je_trap_frame *f,bool timer)
     }
     for (unsigned i=1;i<JE_THREAD_MAX;++i)
         if (threads[i].state==SLEEPING && threads[i].wake<=je_timer_ticks) threads[i].state=READY;
+    /* M3c D7/A6: on a timer tick, stamp TIMED_OUT on any blocked-IPC waiter whose
+     * absolute deadline has elapsed, through the SINGLE endpoint arbitrate CAS
+     * (first-critical-section-wins: if a sender/close already stamped it WOKEN/
+     * PEER_CLOSED this is a no-op), then make it READY so its continuation returns
+     * the cause. Inclusive deadline (wake<=ticks), matching the SLEEPING sweep. */
+    if (timer)
+        for (unsigned i=1;i<JE_THREAD_MAX;++i)
+            if (threads[i].state==BLOCKED_IPC && threads[i].wait_deadline!=0u &&
+                threads[i].wait_deadline<=je_timer_ticks) {
+                uint32_t id=0u;
+                je_ep_arb_result r=je_endpoint_wait_arbitrate(threads[i].wait_rec,
+                                                              threads[i].wait_side,
+                                                              JE_EP_WAIT_TIMED_OUT, &id);
+                /* Whether this CAS won (TIMED_OUT) or lost (already WOKEN/closed by
+                 * an earlier same-tick send/close), the waiter is now terminal:
+                 * make the thread runnable. A resume with NO terminal cause is a
+                 * kernel-invariant break (would halt later in the continuation's
+                 * default case); assert it here so it surfaces at the source. */
+                (void)r;
+                if (je_endpoint_wait_cause(threads[i].wait_rec, threads[i].wait_side)
+                    == JE_EP_WAIT_WAITING) abort_scheduler();
+                threads[i].state=READY;
+            }
     if (threads[current].state==RUNNING) threads[current].state=READY;
     unsigned before=current;
     je_trap_frame *nf=select_and_install_next();
@@ -217,6 +268,97 @@ je_trap_frame *je_sched_exit_current(je_trap_frame *f, uint64_t code)
         (uintptr_t)f != (uintptr_t)(threads[current].rsp0_top - sizeof(*f))) abort_scheduler();
     mark_dying(current, DEATH_EXIT, code, 0, 0, f->rip, f->cs, 0);
     return select_and_install_next();
+}
+
+/* M3c D7/A6-CLARIFY-1: park the CURRENT user thread as a blocking-recv waiter and
+ * switch to a live successor. Modeled on je_sched_exit_current (same frame-identity
+ * checks) PLUS a deliberate pre-park je_uframe_check: a thread that would park MUST
+ * have a valid return frame, so a user-corrupted RSP/RFLAGS is rejected as
+ * DEATH_BAD_RETURN at park time rather than discovered at wake while it holds a
+ * reservation (A6-CLARIFY-2 window). The endpoint-side waiter was already
+ * registered by the caller (je_endpoint_kern_*); here we only save the continuation
+ * state, rewind f->rip to the int 0x80 site, set BLOCKED_IPC, and switch. The saved
+ * rec/side is the OWNED reference the continuation resumes from (never re-resolves
+ * the handle, A6-5). `deadline` is absolute ticks (0 would be a poll, which never
+ * parks — a caller passing 0 here is a bug). Returns a live successor's frame. */
+je_trap_frame *je_sched_block_current(je_trap_frame *f, je_ep_channel *rec,
+                                      uint8_t side, uint64_t deadline)
+{
+    if (!ready || threads[current].kind!=THREAD_USER) abort_scheduler();
+    if (f->cs != JE_UFRAME_USER_CS || f->ss != JE_UFRAME_USER_SS ||
+        (uintptr_t)f != (uintptr_t)(threads[current].rsp0_top - sizeof(*f))) abort_scheduler();
+    uint64_t sane;
+    if (!je_uframe_check(f, JE_VM_ARENA_BASE, JE_VM_ARENA_SIZE, &sane)) {
+        /* Corrupt return frame: do NOT park (it would hold a reservation it could
+         * never consume). Terminate now; the caller's endpoint waiter is released
+         * by mark_dying's teardown hook. */
+        mark_dying(current, DEATH_BAD_RETURN, 0, 0, 0, f->rip, f->cs, 0);
+        return select_and_install_next();
+    }
+    f->rflags = sane;
+    thread *t = &threads[current];
+    t->wait_pending = true;
+    t->wait_rec = rec; t->wait_side = side;
+    t->wait_rdi = f->rdi; t->wait_rsi = f->rsi; t->wait_rdx = f->rdx;
+    t->wait_r8 = f->r8; t->wait_r9 = f->r9;
+    t->wait_deadline = deadline;
+    t->wait_post_int_rip = f->rip;      /* instruction after int 0x80 */
+    f->rip -= JE_INT80_LEN;             /* re-execute int 0x80 on resume */
+    t->frame = f;
+    t->state = BLOCKED_IPC;
+    return select_and_install_next();
+}
+
+/* M3c D7/A6-STRUCT: wake a blocked-IPC waiter by thread slot (the opaque
+ * waiter_id the endpoint layer stored). This is a GUARDED wrapper: it flips
+ * BLOCKED_IPC -> READY ONLY (never from any other state), so it can never
+ * resurrect a DYING/ZOMBIE thread (A6-5) and never races an independent
+ * transition. The terminal cause was already set by the single endpoint
+ * arbitrate CAS BEFORE this is called; this only makes the thread runnable so its
+ * continuation can read that cause. MUST run under IF=0. */
+void je_sched_wake_ipc(uint32_t slot)
+{
+    if (slot == 0u || slot >= JE_THREAD_MAX) return;
+    if (threads[slot].state == BLOCKED_IPC) threads[slot].state = READY;
+}
+
+/* M3c A6: the continuation prologue (syscall.c) queries whether the CURRENT thread
+ * resumed from a blocking-recv park, and reads back the saved continuation state
+ * (owned rec/side + the recv args + the terminal RIP to assert). Returns false if
+ * no continuation is pending. Does NOT clear pending (the glue clears it via
+ * je_sched_wait_finish once the result is delivered). */
+bool je_sched_wait_pending(je_ep_channel **rec, uint8_t *side, uint64_t *rdi,
+                           uint64_t *rsi, uint64_t *rdx, uint64_t *r8, uint64_t *r9,
+                           uint64_t *post_int_rip)
+{
+    thread *t = &threads[current];
+    if (!t->wait_pending) return false;
+    if (rec) *rec = t->wait_rec;
+    if (side) *side = t->wait_side;
+    if (rdi) *rdi = t->wait_rdi;
+    if (rsi) *rsi = t->wait_rsi;
+    if (rdx) *rdx = t->wait_rdx;
+    if (r8)  *r8  = t->wait_r8;
+    if (r9)  *r9  = t->wait_r9;
+    if (post_int_rip) *post_int_rip = t->wait_post_int_rip;
+    return true;
+}
+
+/* Clear the current thread's pending continuation (called by the glue after it has
+ * written the result into the frame). */
+void je_sched_wait_finish(void)
+{
+    threads[current].wait_pending = false;
+    threads[current].wait_rec = (je_ep_channel *)0;
+}
+
+/* The current thread's slot index (= the opaque waiter_id used by the endpoint
+ * waiter + the release owner). */
+je_status je_sched_current_slot(uint32_t *out_slot)
+{
+    if (!ready || !out_slot) return JE_ERR_INVALID;
+    *out_slot = (uint32_t)current;
+    return JE_OK;
 }
 
 /* M3a #5: return path for a syscall that resumes the CURRENT user task (no
@@ -294,6 +436,11 @@ je_status je_sched_drop_user(je_vm *vm, uint32_t index)
     for (unsigned i=1;i<JE_THREAD_MAX;++i)
         if (threads[i].kind==THREAD_USER && threads[i].vm==vm && threads[i].vm_index==index) {
             if (i==current) return JE_ERR_BUSY;
+            /* M3c A6: if this thread was a blocking-recv waiter (BLOCKED_IPC, or a
+             * DYING thread whose waiter mark_dying already released — idempotent),
+             * release its waiter/reservation before wiping the slot, so the record
+             * doesn't leak and a reused slot can't inherit a stale waiter. */
+            (void)je_endpoint_kern_waiter_release_by_id((uint32_t)i);
             if (threads[i].rsp0_top) { /* restore the kstack guard before the process frees the run */
                 uint64_t kbase=threads[i].rsp0_top-(uint64_t)STACK_PAGES*4096u;
                 je_status s=je_arch_page_restore((uintptr_t)kbase);
