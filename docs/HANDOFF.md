@@ -20,9 +20,17 @@ progress on x86-64, and a second architecture, **ARM64 (MP1)**, now boots.
   `cortex-a72` (direct `-kernel`, no firmware) — entry EL1, stack, TCR_EL1 interim,
   BSS clear, DTB pointer recorded, bounded PL011 console, ordered markers. Separate
   `kernel/arch/aarch64/` + `mk/aarch64.mk` (`make aarch64`, `make smoke-aarch64`);
-  the x86-64 flow is untouched. **Not yet enforced (deferred to MP2+):** VBAR
-  vectors + the D5 trap frame (ESR/FAR/ELR/SPSR) + the deliberate-fault test, the
-  TBI behavioral test, DTB *validation*, and the MMU.
+  the x86-64 flow is untouched.
+- **ARM64 MP1 step 2** (ADR 0002 D5-3): VBAR_EL1 exception vectors + the
+  owner-approved 304-byte D5-3 trap frame (`gpr[31]`, sp, elr, spsr, esr, far,
+  vector) now installed in `kernel/arch/aarch64/` (`vectors.S`, `trapframe.h`). A
+  deliberate `brk #0xA55A` is proven on real QEMU to vector to the EL1h sync slot
+  with the exact syndrome (ESR=0xf200a55a); `make smoke-aarch64 ARM_VECTOR_TEST=1`
+  asserts the raw ESR/SPSR on the wire. `boot.S` now writes SCTLR_EL1 explicitly
+  (SA=1 + RES1 set) — a found step-1 gap (SA reset is UNKNOWN). Non-reentrant,
+  non-returning handlers; nested fault → pure-asm bounded `je_arm_double_fault`.
+  **Remaining MP1:** the bounded DTB *parse*/validation. **Deferred to MP2+:** the
+  MMU, timer, scheduling; the TBI behavioral test.
 - **M3c** (issue #8, **ADR 0009 accepted**): in progress. The contract is frozen
   (endpoint/channel object, split refcount + destruction, bounded data-only
   messages, waits, transactional attenuated transfer, bootstrap fixture; two

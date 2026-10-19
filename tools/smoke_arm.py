@@ -36,7 +36,23 @@ BASE_MARKERS = [
     b"JeiOS/aarch64: tcr_el1 initialized (tbi0=0)",
     None,  # bss line, filled below
     b"JeiOS/aarch64: dtb pointer recorded",
-    b"JeiOS/aarch64: initialization complete; halted",
+    b"JeiOS/aarch64: vectors installed",
+]
+# Default build terminal marker (no vector test).
+TERM_DEFAULT = b"JeiOS/aarch64: initialization complete; halted"
+# Vector-test build: the planted BRK must vector to the EL1h sync slot and the
+# handler must assert the exact syndrome. These ordered markers replace the
+# default terminal and prove the deliberate exception end-to-end.
+VECTOR_TEST_MARKERS = [
+    b"JeiOS/aarch64: triggering deliberate BRK",
+    b"JeiOS/aarch64: EXCEPTION vector=0x0000000000000004 ec=0x000000000000003c",
+    # Assert the RAW syndrome line independently (not just the in-kernel PASS), so
+    # a bug in the kernel's own comparator cannot produce a false PASS: exact
+    # ESR/ELR-shape/SPSR observed on the wire.
+    b"esr=0x00000000f200a55a",
+    b"spsr=0x00000000800003c5",
+    b"JeiOS/aarch64: vector self-test PASS",
+    b"JeiOS/aarch64: exception handled; halted",
 ]
 
 
@@ -52,6 +68,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=15)
     ap.add_argument("--bss-verified", action="store_true",
                     help="expect the patterned-BSS 'bss clear verified' marker")
+    ap.add_argument("--vector-test", action="store_true",
+                    help="expect the deliberate-BRK vector self-test markers")
     args = ap.parse_args()
 
     if shutil.which(QEMU) is None:
@@ -62,6 +80,10 @@ def main():
     markers = list(BASE_MARKERS)
     markers[3] = (b"JeiOS/aarch64: bss clear verified" if args.bss_verified
                   else b"JeiOS/aarch64: bss cleared")
+    if args.vector_test:
+        markers += VECTOR_TEST_MARKERS
+    else:
+        markers.append(TERM_DEFAULT)
 
     # Evidence: image hash + tool versions.
     with open(args.image, "rb") as f:

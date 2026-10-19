@@ -508,6 +508,54 @@ re-stale-after-reuse assertion, the measured quota count, the softened per-proce
 wording, the ADR wide-handle amendment, and the pinned ABI static-asserts).
 AI-assisted review only; not independent human qualification.
 
+## MP1 step 2 — ARM64 EL1 exception vectors + trap frame (QEMU virt-8.2) — 2026-10-19
+
+ADR 0002 D5-3 + ARM64.md MP1, owner-approved trap-frame ABI. Installs VBAR_EL1
+exception vectors in `kernel/arch/aarch64/` (`vectors.S`, `trapframe.h`, extending
+`boot.S`/`main.c`). Not owner-gated (new ARM64 arch code, no x86 tested-path
+change); the D5-3-constrained trap-frame layout was escalated and approved.
+
+**Trap frame (frozen ABI, `trapframe.h`):** 304 bytes, 16-aligned; `gpr[31]` =
+x0..x30, then `sp@248, elr@256, spsr@264, esr@272, far@280, vector@288, pad@296`
+(`_Static_assert(offsetof)` pins asm↔C agreement). D5-3 saves ESR/FAR/ELR/SPSR;
+ELR is the fixup key for MP3. **Known deviation (documented in the ABI):**
+gpr[16..18] hold stub scratch (vector index / guard ptr / guard value), not the
+interrupted x16-x18 — harmless for the fatal, non-returning MP1 handler; a future
+returning handler must preserve them.
+
+**Vectors (`vectors.S`):** a 2 KiB-aligned 16-slot table (VBAR_EL1[10:0] RES0);
+every slot an index-bearing stub (`mov w16,#idx; b common`) so the vector index
+reaches C. All 16 installed though MP1 only reaches "Current EL SP_ELx Sync"
+(slot 4; no EL0, IRQ/FIQ masked); the rest are defined bounded halts. The common
+saver builds the frame on the EL1 stack and calls `je_arm_exception`. Reentrancy:
+single stack, non-reentrant, non-returning; a plain `je_arm_in_handler` guard (set
+before any faulting access; no atomics, no clear) routes a nested sync fault to a
+**pure-asm** `je_arm_double_fault` (stack-free, bounded TXFF poll). No allocating
+handler. The non-group-1 slots' `sp+304` interrupted-SP is correct only for SP_ELx
+(the reachable group), documented.
+
+**Diagnostic + boot gap fix:** the C handler prints a bounded redacted syndrome
+(vector, EC, IL, ISS, ESR, ELR, SPSR, FAR-if-valid-incl-FnV-check) + a VBAR
+readback (evidence the table installed), then halts. `boot.S` now writes
+**SCTLR_EL1 = 0x30D00808** explicitly (SA=1 SP-alignment check + the ARMv8.0 RES1
+set; M/A/C/I = 0) — a review-found step-1 gap, since SA resets architecturally
+UNKNOWN so misaligned-SP faulting was non-deterministic.
+
+**Proof (ARM64.md "exact expected class/status, not timeout"):** a
+`JE_ARM_VECTOR_TEST` build plants `brk #0xA55A`; on real `qemu-system-aarch64` it
+vectors to slot 4 with observed **ESR_EL1=0xf200a55a** (EC=0x3c BRK, IL=1,
+ISS=0xa55a), ELR==the brk site, SPSR=0x800003c5 (EL1h + DAIF masked), FAR=n/a. The
+in-kernel comparator asserts the exact syndrome AND `smoke_arm.py` independently
+asserts the raw `esr=`/`spsr=` serial lines (so a comparator bug can't false-PASS).
+`make smoke-aarch64` (default + `ARM_VECTOR_TEST=1` + `ARM_BSS_CHECK=1`) all PASS;
+`make aarch64` clean under `-Werror -Wconversion -mstrict-align
+-mgeneral-regs-only`; x86 check/smoke/integration unaffected.
+
+Design + adversarial review (which verified the SCTLR value, vector-table offsets
+via objdump, and the guard against the ARM ARM, and drove the FnV/double-fault-asm/
+raw-assert/doc fixes): `docs/adr/debates/mp1-vectors.md`. AI-assisted review; not
+independent human qualification. Remaining MP1: the bounded DTB parse.
+
 ## MP1 step 1 — ARM64 entry + bounded console (QEMU virt-8.2) — 2026-10-17
 
 First *executable* ARM64 work (ADR 0002, jeios-mobile). The shared kernel core
