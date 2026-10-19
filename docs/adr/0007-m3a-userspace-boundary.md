@@ -349,3 +349,40 @@ alias-protection step.
 - Intel SDM Vol. 3A (paging/protection, IA-32e interrupts/TSS, IRET, control
   registers, extended state); pair with current AMD architectural documentation
   before any hardware qualification. Pin the exact revision during implementation.
+
+## Decision-record annotation (reconstructed — sweep 2026-10-19)
+
+Per ADR 0000; reconstructed from this ADR's own text (Decision/Consequences/Status
+of claims) only. Part 4: this contract predates the transcript-retention policy and
+no peer-debate transcript was kept — "transcript not retained." (The analogous
+later contract ADR 0009 does carry its transcripts.)
+
+**Decision + why (as recorded).** Freeze the M3a user/kernel boundary: two CPL3
+processes with distinct roots + physical backing, NX-gated launch (D2), the D3
+per-process layout + alias/ownership discipline (owned-extents, frame *kind*,
+`je_user_alias_set` CAS, no-W+X, demote-before-install), checked copy with an
+exact-RIP fault fixup, task-local fault containment, full reclamation. "Smallest
+demonstrable boundary, isolation proven by test," not feature-maximal.
+
+**Predictions if other choices were made (reconstructed).**
+- *Keep `paging.c`'s single static root + writable identity map (don't add
+  per-process roots / don't demote aliases):* the Consequences name this "the main
+  integration hazard" — a writable alias coexisting with a user-visible mapping is
+  exactly the W+X/escape hole D3's demote-before-install order closes.
+- *Isolate on a leaf U-bit alone:* D3 explicitly rejects it — "a leaf U bit does
+  not override an ancestor"; isolation of the first GiB depends on the kernel
+  PDPT[0] carrying U=0, not a leaf bit.
+- *Accept a timeout or a lone success string as acceptance:* the Consequences
+  forbid it — acceptance is the proof-by-test matrix (isolation, fault-locality,
+  malicious return, adversarial copy pointers, poisoned reuse, rollback,
+  reclaim-with-survivor), the same evidence bar every later milestone inherited.
+- *Launch user code on NX-absent CPUs:* D2 refuses with UNSUPPORTED; doing it would
+  conflate hardware support with a security guarantee (ADR 0003's warning).
+
+**Flex options to consider in future (reconstructed).** The M3a *scope limits*
+(one CPU, first-GiB, 4 KiB pages, no mmap/fork/threads/ELF) are explicit
+`FLEX (planning review)` items for later milestones. The *security shape* (D3
+ownership/alias/no-W+X, the exact-site fixup) is **firm** — it is the tested
+contract later ports must reproduce, not relax. Notably the D-level fixup design
+(exact-RIP keyed) is referenced by the ARM64 MP1 D5-3 trap frame (ELR-keyed), so a
+change here ripples cross-arch and needs a new ADR + owner sign-off.

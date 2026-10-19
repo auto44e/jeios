@@ -117,3 +117,30 @@ debates: `m3b4`, `m3c`, `m3c-lifecycle`, `m3c-step3`, `m3c-step4`, `m3c-step5`,
 marked **"transcript not retained"** rather than reconstructed — never fabricate a
 transcript. Transcripts committed during normal (non-sweep) work from this point
 on need no label; the sweep label is only for back-filled history.
+
+### Sweep completion record (2026-10-19)
+
+The one-time sweep PR was executed on 2026-10-19 (`main` after the MP1-vectors
+merge). Honest scope of what it did:
+- **ADRs 0001–0008:** each gained an appended "Decision-record annotation
+  (reconstructed — sweep 2026-10-19)" with Predictions + Flex reconstructed **from
+  that ADR's own text only** (Status / Consequences / open-item lines + any in-text
+  alternatives, e.g. 0008's recorded Option A vs B). Nothing invented; unsupported
+  items are "unknown — not in the record." Original frozen decision text was not
+  edited — the parts are appended annotations.
+- **ADR 0009:** already authored under this policy (Predictions + Flex throughout,
+  A1–A6 amendments) — already conformant, not re-annotated.
+- **Part 4:** ADRs 0001–0008 and the M3b debate predate transcript retention; their
+  transcripts were `/tmp`-only and **not retained**, so each annotation says
+  "transcript not retained" rather than fabricating one. The retained transcripts
+  (M3c step-6/step-7, MP1 vectors) are under `docs/adr/debates/` and linked from
+  their decisions. (Correction to the list above: of the enumerated `m3b4` /
+  `m3c` / `m3c-lifecycle` / `m3c-step3..5` debates, NONE were retained — only
+  step-6 onward survived in-repo; the earlier names are recorded for history, not
+  as present files.)
+- **Standalone owner-gated calls in HANDOFF.md** not in an ADR (F2FS provisional
+  mobile default; POSIX.1-2024 / LDAPv3 core; the 2026-10-14 owner decisions)
+  remain in the append-only timestamped HANDOFF history with their reasoning
+  inline, recorded here as pre-policy calls whose transcripts were not retained,
+  rather than rewritten in place. Future such calls use the 3-part + part-4 format
+  at decision time.
