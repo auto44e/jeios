@@ -102,22 +102,25 @@ int main(void)
     assert(dec(JE_SYS_ENDPOINT_CREATE, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_ENDPOINT_CREATE && st==JE_ABI_OK);
     assert(dec(JE_SYS_ENDPOINT_CREATE, 1,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
     assert(dec(JE_SYS_ENDPOINT_CREATE, 0,0,0,0,0,9,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
-    /* try_send (op 11): h,ubuf,len -> TRY_SEND; R10 cap_count/reserved nonzero,
-     * R8/R9 nonzero, len>MSG_MAX, wide handle -> INVALID. */
+    /* try_send (op 11): h,ubuf,len -> TRY_SEND; cap_count in R10[7:0] with R8 the
+     * cap-array ptr (R8!=0 iff cap_count>0). Reserved R10[63:8]/R9, len>MSG_MAX,
+     * cap_count>K, R8/cap_count pairing mismatch, wide handle -> INVALID. */
     assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 8, 0,0,0,&st,&res)==JE_SYSCALL_TRY_SEND && st==JE_ABI_OK);
-    assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 8, 1,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R10 cap_count=1 */
+    assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 8, 1,0x40003000,0,&st,&res)==JE_SYSCALL_TRY_SEND && st==JE_ABI_OK); /* 1 cap + array ptr */
+    assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 8, 1,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* cap_count=1 but R8=0 */
+    assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 8, 0,0x40003000,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R8!=0 but cap_count=0 */
+    assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 8, 3,0x40003000,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* cap_count > K=2 */
     assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 8, 0x100,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R10 reserved bit */
-    assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 8, 0,1,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R8 reserved */
     assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 8, 0,0,1,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R9 reserved */
     assert(dec(JE_SYS_TRY_SEND, 0x00010000, 0x40002000, 65, 0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* len > MSG_MAX */
     assert(dec(JE_SYS_TRY_SEND, UINT64_C(0x100000000), 0x40002000, 8, 0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* wide handle */
-    /* try_recv (op 12): h,ubuf,cap -> TRY_RECV; reserved R10/R8/R9 nonzero,
-     * wide handle -> INVALID. */
+    /* try_recv (op 12): h,ubuf,cap,hbuf=R8,hcap=R9; R8!=0 iff R9!=0; R10 reserved. */
     assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 0,0,0,&st,&res)==JE_SYSCALL_TRY_RECV && st==JE_ABI_OK);
-    assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 1,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
-    assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 0,1,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
-    assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 0,0,1,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
-    assert(dec(JE_SYS_TRY_RECV, UINT64_C(0x100000000), 0x40002000, 64, 0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 0,0x40003000,2,&st,&res)==JE_SYSCALL_TRY_RECV && st==JE_ABI_OK); /* handle buf + cap */
+    assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 0,0x40003000,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R8!=0 R9=0 */
+    assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 0,0,2,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R8=0 R9!=0 */
+    assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 1,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R10 reserved */
+    assert(dec(JE_SYS_TRY_RECV, UINT64_C(0x100000000), 0x40002000, 64, 0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* wide handle */
     /* op 13 and up unknown. */
     assert(dec(13, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
 

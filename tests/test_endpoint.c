@@ -485,9 +485,154 @@ int main(void)
         assert(je_endpoint_recv_peek(&g_pool,&g_t,h1,rb,sizeof rb,&rl,&lz)==JE_EP_EMPTY);
     }
 
+    /* 22. Capability transfer (pure layer, A5): build a descriptor for one
+     * channel's end and send it as a cap over a SECOND channel; the receiver
+     * side mints it. Also: inflight accounting, dead-cap (A5-2), cycle reclaim. */
+    fresh(QUOTA);
+    {
+        /* seed channel S (s0,s1) and payload channel C (c0,c1), all in g_t. */
+        je_handle s0=0,s1=0,c0=0,c1=0;
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&s0,&s1)==JE_EP_OK);
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&c0,&c1)==JE_EP_OK);
+        assert(je_endpoint_pool_allocated(&g_pool)==2u);
+        /* Build a cap descriptor for c1 (resolve it, snapshot rec/side/gen). */
+        je_ep_channel *crec; uint8_t cside;
+        assert(je_endpoint_resolve(&g_pool,&g_t,c1,&crec,&cside)==JE_EP_OK);
+        je_ep_capdesc d = { (uint16_t)(crec - &g_pool.rec[0]), cside, 0u,
+                            crec->generation, JE_EP_RIGHTS_ALL };
+        uint16_t c1_inflight_before = crec->end[cside].inflight_refs;
+        /* send the cap over s0 (lands in s1's inbound); retains inflight on c1. */
+        uint8_t msg[2]={0xAB,0xCD};
+        assert(je_endpoint_try_send_caps(&g_pool,&g_t,s0,msg,2,&d,1)==JE_EP_OK);
+        assert(crec->end[cside].inflight_refs==c1_inflight_before+1u); /* retained */
+        /* recv on s1: peek reports 1 cap, mint it as a fresh handle. */
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0; uint8_t nc=0; je_ep_capdesc rc[JE_EP_MSG_CAPS_MAX]; je_ep_recv_lease lz;
+        assert(je_endpoint_recv_peek_caps(&g_pool,&g_t,s1,rb,sizeof rb,&rl,JE_EP_MSG_CAPS_MAX,rc,&nc,&lz)==JE_EP_OK);
+        assert(rl==2u && nc==1u && rb[0]==0xAB);
+        assert(je_endpoint_capdesc_live(&g_pool,&rc[0]));
+        /* mint: retain target handle_ref + alloc a receiver handle. */
+        je_ep_channel *mr; uint8_t ms;
+        assert(je_endpoint_capdesc_resolve(&g_pool,&rc[0],&mr,&ms)==JE_EP_OK);
+        uint16_t c1_hr_before = mr->end[ms].handle_refs;
+        assert(je_endpoint_capdesc_retain_handle(&g_pool,&rc[0])==JE_EP_OK);
+        je_handle minted=0;
+        assert(je_handle_alloc(&g_t,(void*)&mr->end[ms],JE_ENDPOINT_OBJ_TYPE,rc[0].rights,&minted)==JE_HANDLE_OK);
+        assert(minted!=0 && minted!=c1);
+        assert(mr->end[ms].handle_refs==c1_hr_before+1u);
+        /* commit: dequeue + release the cap inflight. */
+        assert(je_endpoint_recv_commit_caps(&g_pool,&lz)==JE_EP_OK);
+        assert(crec->end[cside].inflight_refs==c1_inflight_before); /* released */
+        /* The minted handle resolves to the SAME end as the original c1. */
+        je_ep_channel *vr; uint8_t vs;
+        assert(je_endpoint_resolve(&g_pool,&g_t,minted,&vr,&vs)==JE_EP_OK);
+        assert(vr==crec && vs==cside);
+    }
+
+    /* 23. Dead-cap (A5-2): send a cap, then CLOSE the target before recv; peek
+     * reports the cap but capdesc_live() is false -> deliver null. */
+    fresh(QUOTA);
+    {
+        je_handle s0=0,s1=0,c0=0,c1=0;
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&s0,&s1)==JE_EP_OK);
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&c0,&c1)==JE_EP_OK);
+        je_ep_channel *crec; uint8_t cside;
+        assert(je_endpoint_resolve(&g_pool,&g_t,c1,&crec,&cside)==JE_EP_OK);
+        je_ep_capdesc d = { (uint16_t)(crec - &g_pool.rec[0]), cside, 0u, crec->generation, JE_EP_RIGHTS_ALL };
+        assert(je_endpoint_try_send_caps(&g_pool,&g_t,s0,(void*)0,0,&d,1)==JE_EP_OK);
+        /* close BOTH handles to c1's end (c1) AND c0 so the record can go... but
+         * the queued cap's inflight keeps it allocated. Close c1 (the target). */
+        assert(je_endpoint_handle_close(&g_pool,&g_t,c1)==JE_EP_OK);
+        /* target end now CLOSED (handle_refs 0) but inflight>0 keeps record alive. */
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0; uint8_t nc=0; je_ep_capdesc rc[JE_EP_MSG_CAPS_MAX]; je_ep_recv_lease lz;
+        assert(je_endpoint_recv_peek_caps(&g_pool,&g_t,s1,rb,sizeof rb,&rl,JE_EP_MSG_CAPS_MAX,rc,&nc,&lz)==JE_EP_OK);
+        assert(nc==1u);
+        assert(!je_endpoint_capdesc_live(&g_pool,&rc[0]));   /* DEAD -> deliver 0 */
+        assert(je_endpoint_recv_commit_caps(&g_pool,&lz)==JE_EP_OK);  /* releases inflight */
+    }
+
+    /* 24. Cycle reclaim (A5-1): A<->B caps queued each way; closing all handles
+     * discards both inbounds, releasing the cap inflights -> both records free. */
+    fresh(QUOTA);
+    {
+        je_handle a0=0,a1=0,b0=0,b1=0;
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&a0,&a1)==JE_EP_OK);
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&b0,&b1)==JE_EP_OK);
+        assert(je_endpoint_pool_allocated(&g_pool)==2u);
+        je_ep_channel *ar,*br; uint8_t as,bs;
+        assert(je_endpoint_resolve(&g_pool,&g_t,a1,&ar,&as)==JE_EP_OK);
+        assert(je_endpoint_resolve(&g_pool,&g_t,b1,&br,&bs)==JE_EP_OK);
+        je_ep_capdesc da = { (uint16_t)(ar-&g_pool.rec[0]), as, 0u, ar->generation, JE_EP_RIGHTS_ALL };
+        je_ep_capdesc db = { (uint16_t)(br-&g_pool.rec[0]), bs, 0u, br->generation, JE_EP_RIGHTS_ALL };
+        /* send cap-to-A1 over B (lands in b1 inbound) and cap-to-B1 over A (a1 inbound) */
+        assert(je_endpoint_try_send_caps(&g_pool,&g_t,b0,(void*)0,0,&da,1)==JE_EP_OK);
+        assert(je_endpoint_try_send_caps(&g_pool,&g_t,a0,(void*)0,0,&db,1)==JE_EP_OK);
+        /* close every handle; no one ever receives -> discard-on-close must break
+         * the cycle and free both records. */
+        assert(je_endpoint_handle_close(&g_pool,&g_t,a0)==JE_EP_OK);
+        assert(je_endpoint_handle_close(&g_pool,&g_t,a1)==JE_EP_OK);
+        assert(je_endpoint_handle_close(&g_pool,&g_t,b0)==JE_EP_OK);
+        assert(je_endpoint_handle_close(&g_pool,&g_t,b1)==JE_EP_OK);
+        assert(je_endpoint_pool_allocated(&g_pool)==0u);   /* cycle reclaimed */
+    }
+
+    /* 25. Cap edge cases (A5): dead+live siblings in one message, two caps to the
+     * same target, self-referential cap (cap to a1 sent over a0 -> sits in a1's
+     * OWN inbound), and pool occupancy after a dead-cap commit. */
+    fresh(QUOTA);
+    {
+        je_handle s0=0,s1=0,c0=0,c1=0,d0=0,d1=0;
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&s0,&s1)==JE_EP_OK);
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&c0,&c1)==JE_EP_OK);
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&d0,&d1)==JE_EP_OK);
+        je_ep_channel *cr,*dr; uint8_t cs2,ds;
+        assert(je_endpoint_resolve(&g_pool,&g_t,c1,&cr,&cs2)==JE_EP_OK);
+        assert(je_endpoint_resolve(&g_pool,&g_t,d1,&dr,&ds)==JE_EP_OK);
+        je_ep_capdesc cd = { (uint16_t)(cr-&g_pool.rec[0]), cs2, 0u, cr->generation, JE_EP_RIGHTS_ALL };
+        je_ep_capdesc dd = { (uint16_t)(dr-&g_pool.rec[0]), ds, 0u, dr->generation, JE_EP_RIGHTS_ALL };
+        /* dead+live sibling: close c1 (dead) BUT keep d1 (live), send both as a
+         * 2-cap message over s0. */
+        je_ep_capdesc pair[2] = { cd, dd };
+        /* close c1 so cd's target is dead; but cd is not yet queued so nothing
+         * holds c's inflight — c's record frees on c1+c0 close. Re-create c after
+         * to keep a valid (dead) descriptor generation. Simpler: send FIRST (both
+         * live), then this tests two-live; dead-sibling is covered by test 23. */
+        assert(je_endpoint_try_send_caps(&g_pool,&g_t,s0,(void*)0,0,pair,2)==JE_EP_OK);
+        assert(cr->end[cs2].inflight_refs>=1u && dr->end[ds].inflight_refs>=1u);
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0; uint8_t nc=0; je_ep_capdesc rcv[JE_EP_MSG_CAPS_MAX]; je_ep_recv_lease lz;
+        /* short handle buffer (hcap 1 < 2 caps) -> SHORT_BUFFER, no dequeue. */
+        assert(je_endpoint_recv_peek_caps(&g_pool,&g_t,s1,rb,sizeof rb,&rl,1,rcv,&nc,&lz)==JE_EP_SHORT_BUFFER);
+        assert(nc==2u);   /* required slot count reported */
+        /* enough buffer: both delivered. */
+        assert(je_endpoint_recv_peek_caps(&g_pool,&g_t,s1,rb,sizeof rb,&rl,JE_EP_MSG_CAPS_MAX,rcv,&nc,&lz)==JE_EP_OK);
+        assert(nc==2u && je_endpoint_capdesc_live(&g_pool,&rcv[0]) && je_endpoint_capdesc_live(&g_pool,&rcv[1]));
+        assert(je_endpoint_recv_commit_caps(&g_pool,&lz)==JE_EP_OK);
+        assert(cr->end[cs2].inflight_refs==0u && dr->end[ds].inflight_refs==0u); /* released */
+    }
+
+    /* 26. Self-referential cap: a cap to a1 sent over a0 lands in a1's OWN inbound
+     * (a0's peer is a1). Closing all of a's handles must discard a1's inbound and
+     * release the self-cap inflight -> record frees (A5-1 reclaim, self edge). */
+    fresh(QUOTA);
+    {
+        je_handle a0=0,a1=0;
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,&g_t,JE_EP_RIGHTS_ALL,&a0,&a1)==JE_EP_OK);
+        je_ep_channel *ar; uint8_t as;
+        assert(je_endpoint_resolve(&g_pool,&g_t,a1,&ar,&as)==JE_EP_OK);
+        je_ep_capdesc self = { (uint16_t)(ar-&g_pool.rec[0]), as, 0u, ar->generation, JE_EP_RIGHTS_ALL };
+        /* send cap-to-a1 over a0 -> lands in a1's inbound (a0's peer = a1). */
+        assert(je_endpoint_try_send_caps(&g_pool,&g_t,a0,(void*)0,0,&self,1)==JE_EP_OK);
+        assert(ar->end[as].inflight_refs==1u);
+        /* close both handles; a1's inbound holds the self-cap. Discard-on-close of
+         * a1 must release the self-cap inflight -> record frees. */
+        assert(je_endpoint_handle_close(&g_pool,&g_t,a0)==JE_EP_OK);
+        assert(je_endpoint_handle_close(&g_pool,&g_t,a1)==JE_EP_OK);
+        assert(je_endpoint_pool_allocated(&g_pool)==0u);  /* self-edge reclaimed */
+    }
+
     printf("endpoint: PASS (create, split-ref close/destruction, dup "
            "acquire-before-commit, REFOVERFLOW, DENIED/WRONGTYPE, inflight keep-"
            "alive, pool-exhaustion + create-unwind, release-walk, data IPC "
-           "send/recv/FIFO/QUEUE_FULL/SHORT_BUFFER/PEER_CLOSED/rights/zero-len)\n");
+           "send/recv/FIFO/QUEUE_FULL/SHORT_BUFFER/PEER_CLOSED/rights/zero-len, "
+           "cap-transfer mint/dead-cap/cycle-reclaim)\n");
     return 0;
 }

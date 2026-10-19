@@ -88,7 +88,10 @@ je_ep_status je_endpoint_kern_send_preflight(je_vm *vm, uint32_t index,
 {
     if (!vm || index >= JE_VM_MAX_PROCESSES) return JE_EP_BADINDEX;
     kep_init_once();
-    return je_endpoint_send_preflight(&g_kep, &vm->procs[index].htable, h, len);
+    /* Main-handle preflight only (no QUEUE_FULL) so per-cap errors outrank
+     * QUEUE_FULL in the cap-send glue (A5-4). The final try_send_caps re-checks
+     * QUEUE_FULL atomically at enqueue. */
+    return je_endpoint_send_preflight_main(&g_kep, &vm->procs[index].htable, h, len);
 }
 
 je_ep_status je_endpoint_kern_recv_peek(je_vm *vm, uint32_t index, je_handle h,
@@ -104,7 +107,128 @@ je_ep_status je_endpoint_kern_recv_peek(je_vm *vm, uint32_t index, je_handle h,
 je_ep_status je_endpoint_kern_recv_commit(const je_ep_recv_lease *lease)
 {
     kep_init_once();
-    return je_endpoint_recv_commit(&g_kep, lease);
+    return je_endpoint_recv_commit_caps(&g_kep, lease);
+}
+
+/* ---- capability transfer forwarders (M3c step 5) ------------------------- */
+
+je_ep_status je_endpoint_kern_send_caps(je_vm *vm, uint32_t index, je_handle h,
+                                        const void *kbuf, size_t len,
+                                        const je_ep_capdesc *caps, uint8_t ncaps)
+{
+    if (!vm || index >= JE_VM_MAX_PROCESSES) return JE_EP_BADINDEX;
+    kep_init_once();
+    return je_endpoint_try_send_caps(&g_kep, &vm->procs[index].htable, h,
+                                     kbuf, len, caps, ncaps);
+}
+
+je_ep_status je_endpoint_kern_resolve_send_cap(je_vm *vm, uint32_t index,
+                                               je_handle h, uint32_t req_rights,
+                                               je_ep_capdesc *out)
+{
+    if (!vm || index >= JE_VM_MAX_PROCESSES || !out) return JE_EP_BADINDEX;
+    kep_init_once();
+    je_handle_table *tbl = &vm->procs[index].htable;
+    /* The handle must be an endpoint holding TRANSFER. */
+    je_ep_channel *rec; uint8_t side;
+    je_ep_status rs = je_endpoint_resolve(&g_kep, tbl, h, &rec, &side);
+    if (rs != JE_EP_OK) return rs;
+    uint32_t rights = 0u;
+    je_handle_status gr = je_handle_rights_of(tbl, h, JE_ENDPOINT_OBJ_TYPE,
+                                              JE_EP_RIGHT_TRANSFER, &rights);
+    if (gr != JE_HANDLE_OK) {
+        /* map DENIED/etc via the same table mapping the pure layer uses */
+        switch (gr) {
+        case JE_HANDLE_BADINDEX:  return JE_EP_BADINDEX;
+        case JE_HANDLE_STALE:     return JE_EP_STALE;
+        case JE_HANDLE_WRONGTYPE: return JE_EP_WRONGTYPE;
+        case JE_HANDLE_DENIED:    return JE_EP_DENIED;
+        default:                  return JE_EP_CORRUPT;
+        }
+    }
+    /* Attenuation: the requested rights must be a subset of what the handle holds. */
+    if (req_rights & ~rights) return JE_EP_DENIED;
+    /* Build the descriptor: the target end is the handle's OWN end (the receiver
+     * will get a handle to the same end the sender named). rec_index via pointer
+     * arithmetic into the kernel pool. */
+    out->rec_index = (uint16_t)(rec - &g_kep.rec[0]);
+    out->side = side;
+    out->cap_count_pad = 0u;
+    out->generation = rec->generation;
+    out->rights = req_rights;
+    return JE_EP_OK;
+}
+
+je_ep_status je_endpoint_kern_recv_peek_caps(je_vm *vm, uint32_t index, je_handle h,
+                                             void *out_kbuf, size_t cap,
+                                             size_t *out_len, uint8_t hcap,
+                                             je_ep_capdesc *out_caps,
+                                             uint8_t *out_ncaps,
+                                             je_ep_recv_lease *lease)
+{
+    if (!vm || index >= JE_VM_MAX_PROCESSES) return JE_EP_BADINDEX;
+    kep_init_once();
+    return je_endpoint_recv_peek_caps(&g_kep, &vm->procs[index].htable, h,
+                                      out_kbuf, cap, out_len, hcap,
+                                      out_caps, out_ncaps, lease);
+}
+
+je_ep_status je_endpoint_kern_mint_recv_cap(je_vm *vm, uint32_t index,
+                                            const je_ep_capdesc *d, je_handle *out)
+{
+    if (out) *out = 0u;
+    if (!vm || index >= JE_VM_MAX_PROCESSES || !d || !out) return JE_EP_BADINDEX;
+    kep_init_once();
+    je_handle_table *tbl = &vm->procs[index].htable;
+    je_ep_channel *tr; uint8_t ts;
+    je_ep_status s = je_endpoint_capdesc_resolve(&g_kep, d, &tr, &ts);
+    if (s != JE_EP_OK) return s;                 /* dead target -> STALE (A5-2) */
+    /* Retain-before-commit: retain a handle_ref on the target, then alloc the
+     * receiver handle; roll back the retain on alloc failure. */
+    je_ep_status rr = je_endpoint_capdesc_retain_handle(&g_kep, d);
+    if (rr != JE_EP_OK) return rr;               /* REFOVERFLOW */
+    je_handle nh = 0u;
+    je_handle_status a = je_handle_alloc(tbl, (void *)&tr->end[ts],
+                                         JE_ENDPOINT_OBJ_TYPE, d->rights, &nh);
+    if (a != JE_HANDLE_OK) {
+        je_endpoint_capdesc_release_handle(&g_kep, d);   /* undo retain */
+        switch (a) {
+        case JE_HANDLE_QUOTA:   return JE_EP_QUOTA;
+        case JE_HANDLE_NOSLOTS: return JE_EP_NOSLOTS;
+        default:                return JE_EP_CORRUPT;
+        }
+    }
+    *out = nh;
+    return JE_EP_OK;
+}
+
+bool je_endpoint_kern_capdesc_live(const je_ep_capdesc *d)
+{
+    return je_endpoint_capdesc_live(&g_kep, d);
+}
+
+void je_endpoint_kern_capdesc_release_handle(const je_ep_capdesc *d)
+{
+    je_endpoint_capdesc_release_handle(&g_kep, d);
+}
+
+je_ep_status je_endpoint_kern_seed(je_vm *vm, uint32_t idxA, uint32_t idxB,
+                                   je_handle *outA, je_handle *outB)
+{
+    if (outA) *outA = 0u;
+    if (outB) *outB = 0u;
+    if (!vm || idxA >= JE_VM_MAX_PROCESSES || idxB >= JE_VM_MAX_PROCESSES
+        || idxA == idxB || !outA || !outB) return JE_EP_BADINDEX;
+    /* A5-4: both VMs must be hooked so the seeded ends are on a reclaiming death
+     * path (the raw channel_create bypasses op-10's A3-2 hook check). */
+    if (vm->teardown != kep_teardown || vm->teardown_ctx != &g_kep
+        || vm->irq_save == (uint64_t (*)(void))0
+        || vm->irq_restore == (void (*)(uint64_t))0) return JE_EP_CORRUPT;
+    kep_init_once();
+    return je_endpoint_channel_create(&g_kep, &vm->procs[idxA].htable,
+                                      JE_EP_RIGHTS_ALL,
+                                      &vm->procs[idxB].htable, JE_EP_RIGHTS_ALL,
+                                      outA, outB);
 }
 
 uint32_t je_endpoint_kernel_allocated(void)

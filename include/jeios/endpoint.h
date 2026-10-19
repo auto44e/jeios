@@ -54,10 +54,15 @@
 #define JE_EP_POOL_CAP      4u    /* channel records in a pool */
 #define JE_EP_QUEUE_DEPTH   4u    /* messages per end inbound queue */
 #define JE_EP_MAX_WAITERS   2u    /* waiters per end (unused this PR) */
-/* M3c step 4: max payload BYTES per message (a policy bound, newly chosen here —
+/* M3c step 5: max payload BYTES per message (a policy bound, newly chosen here —
  * ADR 0009 said the message max is pinned in an M3c PR; the lifecycle PR did not,
  * so this is it). <= 255 so a per-slot length fits a uint8_t. */
 #define JE_EP_MSG_MAX       64u
+/* M3c step 5 (ADR 0009 A5): max CAPABILITIES a single message may carry. A policy
+ * bound (K); 2 so the recv/send rollback is exercised (a 2nd mint can hit QUOTA).
+ * DEPTH*K <= JE_EP_REF_MAX so a full queue of cap-carrying messages cannot
+ * overflow an end's inflight count. */
+#define JE_EP_MSG_CAPS_MAX  2u
 /* Each ref counter must admit every non-handle owning ref the design can force
  * (queued caps + waiters) without spuriously overflowing a legitimate acquire,
  * AND be small enough to hit in a test. handle_refs is bounded by table slots;
@@ -103,14 +108,29 @@ typedef enum {
                          * (should be impossible; fail closed, never deref) */
 } je_ep_status;
 
-/* One inbound message queue (a ring buffer of fixed-max-size messages). Holds
- * DATA ONLY (ADR 0009 D9): payload bytes, never capabilities, until step 5. The
- * queue owns no references — data never affects handle_refs/inflight_refs. */
+/* A queued capability descriptor (ADR 0009 A5): a direct reference to a
+ * transferred endpoint END (by pool index + side + generation) plus the
+ * attenuated rights the receiver will mint. NOT a handle (handles are per-table).
+ * Each queued descriptor holds ONE inflight ref on rec[rec_index].end[side].
+ * `generation` is a defence-in-depth tripwire; it matches while the inflight ref
+ * keeps the record allocated, and distinguishes a since-reused record. */
 typedef struct {
-    uint8_t  buf[JE_EP_QUEUE_DEPTH][JE_EP_MSG_MAX];
-    uint8_t  len[JE_EP_QUEUE_DEPTH];  /* valid payload bytes per slot (<= MSG_MAX) */
-    uint8_t  head;                    /* index of the oldest message */
-    uint8_t  count;                   /* number queued (0..JE_EP_QUEUE_DEPTH) */
+    uint16_t rec_index;    /* index into the owning pool's rec[] */
+    uint8_t  side;         /* which end of that record (0/1) */
+    uint8_t  cap_count_pad;/* reserved/alignment */
+    uint32_t generation;   /* rec->generation when queued */
+    uint32_t rights;       /* attenuated rights to mint (subset of source) */
+} je_ep_capdesc;
+
+/* One inbound message queue (a ring buffer of fixed-max-size messages). Each slot
+ * carries payload bytes AND 0..JE_EP_MSG_CAPS_MAX capability descriptors (A5). */
+typedef struct {
+    uint8_t       buf[JE_EP_QUEUE_DEPTH][JE_EP_MSG_MAX];
+    uint8_t       len[JE_EP_QUEUE_DEPTH];       /* payload bytes per slot */
+    je_ep_capdesc cap[JE_EP_QUEUE_DEPTH][JE_EP_MSG_CAPS_MAX];
+    uint8_t       cap_count[JE_EP_QUEUE_DEPTH];  /* caps per slot (0..CAPS_MAX) */
+    uint8_t       head;                          /* index of the oldest message */
+    uint8_t       count;                         /* number queued (0..DEPTH) */
 } je_ep_queue;
 
 /* An end's lifecycle state (ADR 0009 D2). */
@@ -231,6 +251,14 @@ je_ep_status je_endpoint_release_inflight(je_endpoint_pool *pool,
 je_ep_status je_endpoint_send_preflight(je_endpoint_pool *pool, je_handle_table *t,
                                         je_handle h, size_t len);
 
+/* Send preflight WITHOUT the QUEUE_FULL check (main handle + SEND + self-end
+ * PEER_CLOSED only). The cap-send glue runs this first, then resolves/validates
+ * caps, so per-cap DENIED/STALE outrank QUEUE_FULL (A5-4 precedence); the final
+ * try_send_caps enforces QUEUE_FULL atomically. */
+je_ep_status je_endpoint_send_preflight_main(je_endpoint_pool *pool,
+                                             je_handle_table *t, je_handle h,
+                                             size_t len);
+
 /* try_send: enqueue a COPY of kbuf[0..len) (kernel memory) into the PEER end's
  * inbound queue. len must be <= JE_EP_MSG_MAX (else JE_EP_INVALID). Resolves the
  * handle as an endpoint requiring the SEND right. Status precedence:
@@ -269,6 +297,70 @@ je_ep_status je_endpoint_recv_peek(je_endpoint_pool *pool, je_handle_table *t,
  * fatal (a retry would double-deliver). Zeroes the vacated slot. */
 je_ep_status je_endpoint_recv_commit(je_endpoint_pool *pool,
                                      const je_ep_recv_lease *lease);
+
+/* ---- Capability transfer (M3c step 5, ADR 0009 A5) ------------------------
+ * These extend send/recv to carry capabilities. The data-only forms above are
+ * the caps==0 case and remain valid. The glue resolves user handles to
+ * descriptors (send) and mints handles from descriptors (recv); the pure layer
+ * manages the queued-cap inflight refs and the queue storage. */
+
+/* send PREFLIGHT with caps: as je_endpoint_send_preflight, plus it validates that
+ * ncaps <= JE_EP_MSG_CAPS_MAX and each descriptor's target is a live endpoint in
+ * THIS pool with only known rights bits. Does NOT retain or mutate. (The GLUE
+ * attenuates each cap against the SENDER's handle rights — requiring TRANSFER and
+ * a subset — when it builds the descriptors; ends carry no rights, so the pure
+ * layer only checks liveness + known-bits.) Returns the first failing status. */
+je_ep_status je_endpoint_send_preflight_caps(je_endpoint_pool *pool,
+                                             je_handle_table *t, je_handle h,
+                                             size_t len,
+                                             const je_ep_capdesc *caps,
+                                             uint8_t ncaps);
+
+/* try_send with caps: preflight (re-check), RETAIN one inflight ref per cap on
+ * each target (REFOVERFLOW rolls back all retained-so-far), then enqueue the
+ * message carrying the byte payload AND the cap descriptors into the peer inbound.
+ * All-or-nothing: on any failure nothing is enqueued and no inflight ref is left
+ * retained. `caps`/`ncaps` may be 0 (the data-only case). */
+je_ep_status je_endpoint_try_send_caps(je_endpoint_pool *pool, je_handle_table *t,
+                                       je_handle h, const void *kbuf, size_t len,
+                                       const je_ep_capdesc *caps, uint8_t ncaps);
+
+/* recv PEEK with caps: as je_endpoint_recv_peek, plus it reports the head
+ * message's cap_count via *out_ncaps and copies the cap descriptors into
+ * out_caps[0..CAPS_MAX) (kernel memory). If the caller's handle-slot capacity
+ * (hcap) < cap_count, returns JE_EP_SHORT_BUFFER with *out_ncaps = required
+ * (alongside the byte-length rule). No dequeue, no mint. */
+je_ep_status je_endpoint_recv_peek_caps(je_endpoint_pool *pool, je_handle_table *t,
+                                        je_handle h, void *out_kbuf, size_t cap,
+                                        size_t *out_len, uint8_t hcap,
+                                        je_ep_capdesc *out_caps, uint8_t *out_ncaps,
+                                        je_ep_recv_lease *lease);
+
+/* Classify a peeked cap descriptor: is its target still LIVE (mintable) or dead
+ * (CLOSED / generation-stale -> deliver handle 0, A5-2)? Pure, read-only. */
+bool je_endpoint_capdesc_live(const je_endpoint_pool *pool,
+                              const je_ep_capdesc *d);
+
+/* Resolve a LIVE cap descriptor to its (rec, side) for the glue's mint. Returns
+ * JE_EP_OK + the end, or JE_EP_STALE/CORRUPT for a dead/invalid descriptor. */
+je_ep_status je_endpoint_capdesc_resolve(je_endpoint_pool *pool,
+                                         const je_ep_capdesc *d,
+                                         je_ep_channel **out_rec, uint8_t *out_side);
+
+/* Retain one handle_ref on a cap descriptor's target (the glue's destination mint
+ * uses this before alloc'ing the receiver handle; REFOVERFLOW if at the bound). */
+je_ep_status je_endpoint_capdesc_retain_handle(je_endpoint_pool *pool,
+                                               const je_ep_capdesc *d);
+/* Undo a capdesc_retain_handle (mint rollback). Infallible for a valid retain. */
+void je_endpoint_capdesc_release_handle(je_endpoint_pool *pool,
+                                        const je_ep_capdesc *d);
+
+/* recv COMMIT with caps: dequeue the leased head message AND release the inflight
+ * ref each of its queued caps held. Called by the glue ONLY after the byte + the
+ * handle outputs have been copied out (or the dead-cap zeros staged). Infallible
+ * for a valid lease (mismatch -> CORRUPT, fatal). */
+je_ep_status je_endpoint_recv_commit_caps(je_endpoint_pool *pool,
+                                          const je_ep_recv_lease *lease);
 
 /* Read-only accessors for tests/assertions (never mutate). */
 je_ep_end_state je_endpoint_end_state(const je_ep_channel *rec, uint8_t side);
