@@ -94,6 +94,8 @@ extern unsigned char je_user_handle_start[], je_user_handle_end[];
 extern unsigned char je_user_epfault_start[], je_user_epfault_end[];
 extern unsigned char je_user_epipc_start[], je_user_epipc_end[];
 extern unsigned char je_user_eprecv_to_start[], je_user_eprecv_to_end[];
+extern unsigned char je_user_ping_start[], je_user_ping_end[];
+extern unsigned char je_user_pong_start[], je_user_pong_end[];
 #ifdef JE_DEV_COPY_INJECT
 extern unsigned char je_user_inject_start[], je_user_inject_end[];
 #endif
@@ -103,7 +105,8 @@ static unsigned char vm_blob_s3[1024];
 typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_EXIT=3,
                PROG_SYSCALL=4, PROG_UNKNOWNOP=5, PROG_BADRSP=6, PROG_BADRET=7,
                PROG_COPYPROBE=8, PROG_INJECT=9, PROG_HANDLE=10,
-               PROG_EPFAULT=11, PROG_EPIPC=12, PROG_EPRECV_TO=13 } user_prog;
+               PROG_EPFAULT=11, PROG_EPIPC=12, PROG_EPRECV_TO=13,
+               PROG_PING=14, PROG_PONG=15 } user_prog;
 static int vm_s3_inited;
 /* Initialize the shared step-3/4 vm once (it holds up to JE_VM_MAX_PROCESSES
  * processes — A and B share it, matching the 2-process admission quota). */
@@ -138,6 +141,8 @@ static uint32_t vm_s3_build(user_prog prog)
     case PROG_EPFAULT:   start=je_user_epfault_start;   end=je_user_epfault_end;   break;
     case PROG_EPIPC:     start=je_user_epipc_start;     end=je_user_epipc_end;     break;
     case PROG_EPRECV_TO: start=je_user_eprecv_to_start; end=je_user_eprecv_to_end; break;
+    case PROG_PING:      start=je_user_ping_start;      end=je_user_ping_end;      break;
+    case PROG_PONG:      start=je_user_pong_start;      end=je_user_pong_end;      break;
 #ifdef JE_DEV_COPY_INJECT
     case PROG_INJECT:    start=je_user_inject_start;    end=je_user_inject_end;    break;
 #endif
@@ -188,8 +193,8 @@ static uint64_t vm_s3_scratch(uint32_t idx, uint64_t off)
 }
 /* Write a 64-bit word into proc idx's arena at offset off (CPL0, its CR3).
  * (Currently unused — kept for a future ring-3 fixture that hands a seeded
- * handle to a stub; marked to avoid an unused-function warning.) */
-__attribute__((unused))
+ * handle to a stub.) First used by the M3c-s7 bootstrap fixture to inject each
+ * process's seeded endpoint handle into its arena before the thread starts. */
 static void vm_s3_scratch_write(uint32_t idx, uint64_t off, uint64_t val)
 {
     uint64_t flags=je_arch_irq_save();
@@ -914,6 +919,119 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (je_vm_destroy(&vm_s3, R)!=JE_OK) fail("JeiOS fatal: s6 destroy\r\n");
             if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s6 pool leak after teardown\r\n");
             je_arch_console_write("M3c-s6: blocking recv TIMED_OUT end-to-end (ring-3 thread parked, timer ISR stamped the terminal transition, continuation resumed with status 14, waiter released, channel reclaimed). [WOKEN/PEER_CLOSED/CANCELLED proven in the pure hosted tests + arbitrate CAS; the full two-process ring-3 WOKEN handshake rides on step 7's bootstrap fixture]\r\n");
+        }
+
+        /* --- M3c step 7 (ADR 0009 D-SEQ step 7): the bootstrap fixture. Two ring-3
+         * processes A(PINGER)+B(PONGER) share a kernel-SEEDED channel S; the kernel
+         * injects each process's S handle into its arena before its thread starts
+         * ("fixture not supervisor"). Discharges the two honest deferrals in ONE
+         * end-to-end run: (1) the two-process blocking WOKEN handshake (B parks on
+         * recv, A's send wakes it — causally forced: B is created + confirmed
+         * parked BEFORE A exists), and (2) the two-process CAPABILITY TRANSFER over
+         * the WOKEN continuation (A creates C, sends c1 as a cap; B mints it on
+         * wake; A closes c1 BEFORE B uses the minted handle — proving retained/copy
+         * ownership; B's post-close send on the minted handle reaches A's c0). Then
+         * a bounded 4-round ping-pong and an explicit DONE teardown; both exit 0;
+         * the pool reclaims to 0. Deterministic because blocking recv YIELDS (no
+         * spin) and the entry-probe+park is one IF=0 path (no lost wakeup). */
+        {
+            uint32_t pPing=vm_s3_build(PROG_PING);
+            uint32_t pPong=vm_s3_build(PROG_PONG);
+            if (vm_s3.procs[pPing].root==vm_s3.procs[pPong].root) fail("JeiOS fatal: s7 roots not distinct\r\n");
+            /* Seed S across A and B; inject each end's handle at arena 0x2000. */
+            je_handle hA=0u, hB=0u;
+            if (je_endpoint_kern_seed(&vm_s3, pPing, pPong, &hA, &hB)!=JE_EP_OK)
+                fail("JeiOS fatal: s7 seed\r\n");
+            if (hA==0u || hB==0u) fail("JeiOS fatal: s7 seed zero handle\r\n");
+            if (je_endpoint_kernel_allocated()!=1u) fail("JeiOS fatal: s7 seed pool != 1\r\n");
+            vm_s3_scratch_write(pPing, 0x1500, hA);
+            vm_s3_scratch_write(pPong, 0x1500, hB);
+            /* Create B FIRST and confirm it PARKED on its blocking recv (progress
+             * reaches 1 = pre-recv marker, and the final-status slot stays unwritten
+             * across K ticks far below the 0x4000 timeout). A non-parking return
+             * would write progress>=2 immediately. This makes A's later send a
+             * CAUSALLY-FORCED WOKEN (B was blocked before A ever ran). */
+            if (je_thread_create_user(&vm_s3, pPong)!=JE_OK) fail("JeiOS fatal: s7 B thread\r\n");
+            je_arch_console_write("M3c-s7: B(ponger) created; confirming it parks on blocking recv...\r\n");
+            uint64_t t0=je_sched_ticks(); uint64_t sp=0;
+            for (;;) {
+                (void)je_arch_irq_save();
+                if (vm_s3_scratch(pPong, 0x1508)>=1u) break;   /* reached the pre-recv marker */
+                if (++sp>200000000ull) fail("JeiOS fatal: s7 B never started\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            /* let >=0x40 ticks pass; B must still be parked (progress stays 1).
+             * 0x40 is 32x below the 0x4000 recv timeout and ample (B runs ~3
+             * instructions between progress=1 and int 0x80) while staying well
+             * inside the smoke time budget. */
+            for (;;) {
+                (void)je_arch_irq_save();
+                if (je_sched_ticks()-t0>=0x40ull) break;
+                if (vm_s3_scratch(pPong, 0x1508)!=1u) break;   /* advanced early? checked below */
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            (void)je_arch_irq_save();
+            if (vm_s3_scratch(pPong, 0x1508)!=1u) fail("JeiOS fatal: s7 B did not park (progress advanced pre-A)\r\n");
+            /* B is at the pre-recv marker AND still alive (not DYING): it is parked
+             * in the blocking recv, not dead-at-progress-1. (je_sched_has_dying is
+             * read-only; this is the kernel-state check the review asked for so a
+             * faulted B can't masquerade as "parked".) */
+            if (je_sched_has_dying()) fail("JeiOS fatal: s7 B died before A (not parked)\r\n");
+            je_arch_console_write("M3c-s7: B is parked + alive (progress==1 held, not DYING); creating A(pinger) -> its send is a causally-forced WOKEN\r\n");
+            if (je_thread_create_user(&vm_s3, pPing)!=JE_OK) fail("JeiOS fatal: s7 A thread\r\n");
+            /* Run until BOTH reach progress 6 (done), or one fails (progress 99), or
+             * the watchdog trips (a hang = a real lost-wakeup/deadlock bug -> fail). */
+            uint64_t s7t0=je_sched_ticks();
+            for (;;) {
+                (void)je_arch_irq_save();
+                uint64_t pa=vm_s3_scratch(pPing, 0x1508), pb=vm_s3_scratch(pPong, 0x1508);
+                if (pa==99u || pb==99u) {
+                    uint64_t sa=vm_s3_scratch(pPing, 0x1510), sb=vm_s3_scratch(pPong, 0x1510);
+                    je_arch_console_write("JeiOS fatal: s7 stub failed; A.status="); je_arch_console_hex(sa);
+                    je_arch_console_write(" B.status="); je_arch_console_hex(sb); je_arch_console_write("\r\n");
+                    je_arch_halt();
+                }
+                if (pa>=6u && pb>=6u) break;
+                if (je_sched_ticks()-s7t0>4000u) fail("JeiOS fatal: s7 watchdog (hang: lost wakeup or deadlock)\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            (void)je_arch_irq_save();
+            if (vm_s3_scratch(pPing, 0x1510)!=0u) fail("JeiOS fatal: s7 A final status != 0\r\n");
+            if (vm_s3_scratch(pPong, 0x1510)!=0u) fail("JeiOS fatal: s7 B final status != 0\r\n");
+            /* Both must have reached progress EXACTLY 6 (done), not a stub that
+             * fell through past its exit into a hang loop. */
+            if (vm_s3_scratch(pPing, 0x1508)!=6u) fail("JeiOS fatal: s7 A progress != 6\r\n");
+            if (vm_s3_scratch(pPong, 0x1508)!=6u) fail("JeiOS fatal: s7 B progress != 6\r\n");
+            /* progress==6 is written just BEFORE exit(0); let both actually execute
+             * the exit syscall (-> DYING) before checking the death record. */
+            for (uint64_t ew0=je_sched_ticks(); ; ) {
+                (void)je_arch_irq_save();
+                uint64_t ra0=99u, ca0=99u, rb0=99u, cb0=99u;
+                bool ad = (je_sched_death_reason(&vm_s3, pPing, &ra0, &ca0)==JE_OK);
+                bool bd = (je_sched_death_reason(&vm_s3, pPong, &rb0, &cb0)==JE_OK);
+                if (ad && bd) break;
+                if (je_sched_ticks()-ew0>4000u) fail("JeiOS fatal: s7 processes did not exit\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            /* Both exited cleanly via exit(0): DYING with DEATH_EXIT, code 0 (not a
+             * fault or bad-return). Confirms the clean teardown, not a crash. */
+            (void)je_arch_irq_save();
+            uint64_t ra=99u, ca=99u, rb=99u, cb=99u;
+            if (je_sched_death_reason(&vm_s3, pPing, &ra, &ca)!=JE_OK || ra!=JE_DEATH_EXIT || ca!=0u)
+                fail("JeiOS fatal: s7 A not a clean exit(0)\r\n");
+            if (je_sched_death_reason(&vm_s3, pPong, &rb, &cb)!=JE_OK || rb!=JE_DEATH_EXIT || cb!=0u)
+                fail("JeiOS fatal: s7 B not a clean exit(0)\r\n");
+            /* Both exited 0. Reap the DYING processes; pool must return to 0. */
+            for (uint64_t r=0; je_sched_has_dying(); ) {
+                (void)je_arch_irq_save();
+                if (je_sched_reap_dead()<0) fail("JeiOS fatal: s7 reap\r\n");
+                if (++r>1000000ull) fail("JeiOS fatal: s7 reap stuck\r\n");
+                if (!je_sched_has_dying()) break;
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            (void)je_arch_irq_save();
+            if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s7 pool leak after teardown\r\n");
+            je_arch_console_write("M3c-s7: bootstrap fixture OK (two ring-3 processes, kernel-seeded channel; B parked -> A's cap-carrying send WOKE it via the continuation; B minted the transferred end; A closed c1 BEFORE B used the mint; B's post-close send reached A's c0 (retained ownership); 4-round ping-pong; DONE teardown; both exited 0; pool reclaimed). The step-5 two-process transfer AND step-6 two-process WOKEN deferrals are now discharged end-to-end.\r\n");
         }
     }
 

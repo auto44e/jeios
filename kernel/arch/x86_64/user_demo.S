@@ -676,4 +676,288 @@ je_user_eprecv_to_start:
     jmp 50b
 je_user_eprecv_to_end:
 
+/* M3c step 7 (ADR 0009 D-SEQ step 7) — the bootstrap fixture's two ring-3 stubs.
+ * A (PINGER) and B (PONGER) share a kernel-seeded channel S; the bootstrap injects
+ * each process's S handle at arena 0x40001500 BEFORE the thread starts (fixture
+ * ABI, not process ABI). Blocking recv (step 6) is what makes this deterministic:
+ * a receiver with nothing queued PARKS and yields to the peer, so there is no
+ * cooperative-scheduler deadlock. Each stub writes a monotonic progress word at
+ * 0x40001508 (the bootstrap polls it) and a final status at 0x40001510 (0 = all
+ * asserts held; nonzero = the failing step). Timeout on every blocking recv is a
+ * large hang-breaker; the asserts require WOKEN delivery (status 0), never 14.
+ *
+ * Scratch (per-process, same offsets — distinct address spaces):
+ *   0x2000 seeded S handle (injected)      0x2008 progress word
+ *   0x2010 final status (0 ok)             0x2040 recv byte buffer
+ *   0x2048 recv handle-out (u32)           0x2050 send payload scratch
+ * Message tags: MINTED=0x4d GO=0x60 DONE=0xd0 PINGv=0xaa PONGv=0xbb XFERv=0xcc
+ * Timeout ticks = 0x4000 (large; a WOKEN path never reaches it). */
+
+/* ---- A / PINGER ---- holds S handle hS; creates C, transfers c1 to B. */
+.globl je_user_ping_start
+.globl je_user_ping_end
+je_user_ping_start:
+    movq 0x40001500, %r15         /* hS = seeded S handle (injected) */
+    movq $1, 0x40001508           /* progress = 1: started */
+    /* create C -> RDX packs {c0 low32, c1 high32} */
+    movq $10, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne  Aerr_create
+    movq %rdx, %r14               /* c0 = low32 */
+    movl %r14d, %r14d
+    movq %rdx, %r13
+    shrq $32, %r13                /* c1 = high32 */
+    /* send a cap-carrying message over S: 1 byte XFERv + cap[0] = {c1 handle,
+     * rights=0xe (SEND|RECV|TRANSFER)}. R10[7:0]=cap_count=1, R8=cap array ptr. */
+    movq %r13, 0x40001550         /* u64[0] low32 = c1 handle */
+    movl $0xe, %eax
+    shlq $32, %rax
+    orq  %rax, 0x40001550         /* high32 = rights 0xe */
+    movb $0xcc, 0x40001558        /* 1 payload byte XFERv */
+    movq $11, %rax                /* try_send */
+    movq %r15, %rdi               /* hS */
+    movq $0x40001558, %rsi        /* ubuf (1 byte) */
+    movq $1, %rdx                 /* len = 1 */
+    movq $1, %r10                 /* cap_count = 1 */
+    movq $0x40001550, %r8         /* cap array */
+    xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne  Aerr_xfer
+    movq $2, 0x40001508           /* progress = 2: cap sent */
+    /* recv MINTED ack on S (blocks until B mints + replies -> WOKEN). */
+    call A_blockrecv_S
+    cmpb $0x4d, 0x40001540        /* expect MINTED tag */
+    jne  Aerr_minted
+    /* close c1 BEFORE B uses the transferred handle (prove retained ownership). */
+    movq $6, %rax                 /* handle_close */
+    movq %r13, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne  Aerr_close
+    movq $3, 0x40001508           /* progress = 3: c1 closed */
+    /* send GO on S. */
+    movb $0x60, 0x40001558
+    call A_send1_S
+    /* recv on c0 the transferred-channel reply B sends on its minted handle. */
+    movq $12, %rax                /* try_recv */
+    movq %r14, %rdi               /* c0 */
+    movq $0x40001540, %rsi
+    movq $64, %rdx
+    movq $0x4000, %r10            /* block */
+    xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax                 /* expect OK (WOKEN) */
+    jne  Aerr_c0recv
+    movl %edx, %ebx               /* byte len (low32, zero-extended) must be 1 */
+    cmpq $1, %rbx
+    jne  Aerr_c0len
+    cmpb $0xcc, 0x40001540        /* expect XFERv echoed on the transferred channel */
+    jne  Aerr_c0val
+    movq $4, 0x40001508           /* progress = 4: transfer round-trip OK */
+    /* ping-pong on S: 4 rounds. A sends PING, blocks for PONG. */
+    movq $4, %rcx
+Aloop:
+    movb $0xaa, 0x40001558
+    call A_send1_S
+    call A_blockrecv_S
+    cmpb $0xbb, 0x40001540        /* expect PONG */
+    jne  Aerr_pong
+    decq %rcx
+    jnz  Aloop
+    movq $5, 0x40001508           /* progress = 5: ping-pong done */
+    /* DONE ack teardown: A sends DONE, closes c0 + hS, exits. */
+    movb $0xd0, 0x40001558
+    call A_send1_S
+    movq $6, %rax                 /* close c0 */
+    movq %r14, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne  Aerr_closec0
+    movq $6, %rax                 /* close hS */
+    movq %r15, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne  Aerr_closehs
+    movq $0, 0x40001510           /* final status = 0 OK */
+    movq $6, 0x40001508           /* progress = 6: done */
+    movq $2, %rax                 /* exit(0) */
+    xorq %rdi,%rdi
+    int $0x80
+A_hang: jmp A_hang
+
+/* helper: send the 1 byte at 0x2058 on hS (r15). clobbers rax/rdi/rsi/rdx/r10/r8/r9. */
+A_send1_S:
+    movq $11, %rax
+    movq %r15, %rdi
+    movq $0x40001558, %rsi
+    movq $1, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne  Aerr_send
+    ret
+/* helper: blocking recv 1+ bytes on hS into 0x2040. */
+A_blockrecv_S:
+    movq $12, %rax
+    movq %r15, %rdi
+    movq $0x40001540, %rsi
+    movq $64, %rdx
+    movq $0x4000, %r10            /* block */
+    xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax                 /* must be OK (WOKEN); 13/14 -> fail */
+    jne  Aerr_recv
+    movl %edx, %ebx               /* RDX low32 = byte len (zero-extended); must be 1 */
+    cmpq $1, %rbx
+    jne  Aerr_rlen                /* zero-length delivery would pass a stale-byte tag check */
+    ret
+Aerr_create:  movq $11, 0x40001510; jmp Afail
+Aerr_xfer:    movq $12, 0x40001510; jmp Afail
+Aerr_minted:  movq $13, 0x40001510; jmp Afail
+Aerr_close:   movq $14, 0x40001510; jmp Afail
+Aerr_c0recv:  movq $15, 0x40001510; jmp Afail
+Aerr_c0val:   movq $16, 0x40001510; jmp Afail
+Aerr_pong:    movq $17, 0x40001510; jmp Afail
+Aerr_send:    movq $18, 0x40001510; jmp Afail
+Aerr_recv:    movq $19, 0x40001510; jmp Afail
+Aerr_rlen:    movq $20, 0x40001510; jmp Afail
+Aerr_c0len:   movq $31, 0x40001510; jmp Afail
+Aerr_closec0: movq $32, 0x40001510; jmp Afail
+Aerr_closehs: movq $33, 0x40001510; jmp Afail
+Afail:
+    movq $99, 0x40001508          /* progress = 99: failed (status slot has which) */
+    movq $2, %rax; movq $1, %rdi; int $0x80   /* exit(1) */
+Afail_hang: jmp Afail_hang
+je_user_ping_end:
+
+/* ---- B / PONGER ---- holds S handle hS; receives the cap, mints, uses it. */
+.globl je_user_pong_start
+.globl je_user_pong_end
+je_user_pong_start:
+    movq 0x40001500, %r15         /* hS */
+    movq $1, 0x40001508           /* progress = 1: started (pre-recv marker) */
+    /* blocking recv the cap-carrying message on S (B parks here until A sends;
+     * this is the CAUSALLY-FORCED WOKEN — the bootstrap confirms B parked before
+     * creating A). R8 = handle-out (u32), R9 = slot cap = 1. */
+    movq $12, %rax
+    movq %r15, %rdi
+    movq $0x40001540, %rsi        /* byte buf */
+    movq $64, %rdx
+    movq $0x4000, %r10            /* block */
+    movq $0x40001548, %r8         /* handle-out array */
+    movq $1, %r9                  /* 1 slot */
+    int $0x80
+    cmpq $0, %rax                 /* OK (WOKEN) */
+    jne  Berr_recv
+    /* RDX high32 must report 1 cap delivered; byte payload XFERv. */
+    movq %rdx, %rbx
+    shrq $32, %rbx
+    cmpq $1, %rbx
+    jne  Berr_ncaps
+    cmpb $0xcc, 0x40001540
+    jne  Berr_xval
+    movl 0x40001548, %r14d        /* cB = minted transferred handle (u32) */
+    testl %r14d, %r14d
+    jz   Berr_mint                /* 0 = dead cap -> fail */
+    movq $2, 0x40001508           /* progress = 2: cap minted */
+    /* send MINTED ack on S, then block for GO (so A can close c1 before we use cB). */
+    movb $0x4d, 0x40001558
+    call B_send1_S
+    call B_blockrecv_S
+    cmpb $0x60, 0x40001540        /* expect GO */
+    jne  Berr_go
+    movq $3, 0x40001508           /* progress = 3: GO received (A has closed c1) */
+    /* use the transferred handle cB AFTER A closed c1: send XFERv on it -> lands
+     * on A's c0. This is the retained-ownership proof (post-close send succeeds). */
+    movb $0xcc, 0x40001558
+    movq $11, %rax
+    movl %r14d, %edi              /* cB */
+    movq $0x40001558, %rsi
+    movq $1, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne  Berr_cbsend
+    movq $4, 0x40001508           /* progress = 4: used transferred handle post-close */
+    /* ping-pong: 4 rounds. B blocks for PING, replies PONG. */
+    movq $4, %rcx
+Bloop:
+    call B_blockrecv_S
+    cmpb $0xaa, 0x40001540        /* expect PING */
+    jne  Berr_ping
+    movb $0xbb, 0x40001558        /* PONG */
+    call B_send1_S
+    decq %rcx
+    jnz  Bloop
+    movq $5, 0x40001508
+    /* DONE: B blocks for DONE, then closes cB + hS, exits. */
+    call B_blockrecv_S
+    cmpb $0xd0, 0x40001540        /* expect DONE */
+    jne  Berr_done
+    movq $6, %rax                 /* close cB */
+    movl %r14d, %edi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne  Berr_closecb
+    movq $6, %rax                 /* close hS */
+    movq %r15, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne  Berr_closehs
+    movq $0, 0x40001510           /* final status = 0 OK */
+    movq $6, 0x40001508
+    movq $2, %rax; xorq %rdi,%rdi; int $0x80   /* exit(0) */
+B_hang: jmp B_hang
+
+B_send1_S:
+    movq $11, %rax
+    movq %r15, %rdi
+    movq $0x40001558, %rsi
+    movq $1, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne  Berr_send
+    ret
+B_blockrecv_S:
+    movq $12, %rax
+    movq %r15, %rdi
+    movq $0x40001540, %rsi
+    movq $64, %rdx
+    movq $0x4000, %r10
+    xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne  Berr_brecv
+    movl %edx, %ebx               /* byte len (low32, zero-extended) must be 1 */
+    cmpq $1, %rbx
+    jne  Berr_brlen
+    ret
+Berr_recv:   movq $21, 0x40001510; jmp Bfail
+Berr_ncaps:  movq $22, 0x40001510; jmp Bfail
+Berr_xval:   movq $23, 0x40001510; jmp Bfail
+Berr_mint:   movq $24, 0x40001510; jmp Bfail
+Berr_go:     movq $25, 0x40001510; jmp Bfail
+Berr_cbsend: movq $26, 0x40001510; jmp Bfail
+Berr_ping:   movq $27, 0x40001510; jmp Bfail
+Berr_done:   movq $28, 0x40001510; jmp Bfail
+Berr_send:   movq $29, 0x40001510; jmp Bfail
+Berr_brecv:  movq $30, 0x40001510; jmp Bfail
+Berr_brlen:  movq $34, 0x40001510; jmp Bfail
+Berr_closecb: movq $35, 0x40001510; jmp Bfail
+Berr_closehs: movq $36, 0x40001510; jmp Bfail
+Bfail:
+    movq $99, 0x40001508
+    movq $2, %rax; movq $1, %rdi; int $0x80
+Bfail_hang: jmp Bfail_hang
+je_user_pong_end:
+
 .section .note.GNU-stack,"",@progbits
