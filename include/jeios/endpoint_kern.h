@@ -82,4 +82,25 @@ je_ep_status je_endpoint_kern_seed(je_vm *vm, uint32_t idxA, uint32_t idxB,
 /* Pool occupancy (live channel records). Kernel-internal / self-test only. */
 uint32_t je_endpoint_kernel_allocated(void);
 
+/* ---- M3c D7/A6 blocking-recv bridge ---- */
+/* Release owner (A6-CLARIFY-2), called by sched.c mark_dying with the dying slot. */
+bool je_endpoint_kern_waiter_release_by_id(uint32_t slot);
+/* Recv glue: entry probe (deliverable? empty? closed?) and waiter registration. */
+je_ep_status je_endpoint_kern_recv_entry_probe(je_vm *vm, uint32_t index, je_handle h);
+je_ep_status je_endpoint_kern_wait_register(je_vm *vm, uint32_t index, je_handle h,
+                                            uint32_t waiter_id,
+                                            je_ep_channel **out_rec, uint8_t *out_side);
+/* Wake a receiver blocked on the peer of the sender's end after a successful send. */
+void je_endpoint_kern_send_wake(je_vm *vm, uint32_t index, je_handle h);
+/* Internal cancel (A6-2; dev/test only). */
+bool je_endpoint_kern_wait_cancel(uint32_t slot);
+/* Continuation read of a WOKEN waiter's reserved head (bytes+caps) from the owned
+ * rec/side; and the post-commit waiter release. */
+je_ep_status je_endpoint_kern_recv_peek_owned(je_ep_channel *rec, uint8_t side,
+                                              void *out_kbuf, size_t cap,
+                                              size_t *out_len, uint8_t hcap,
+                                              je_ep_capdesc *out_caps, uint8_t *out_ncaps,
+                                              je_ep_recv_lease *lease);
+void je_endpoint_kern_wait_release(je_ep_channel *rec, uint8_t side, uint32_t who);
+
 #endif /* JEIOS_ENDPOINT_KERN_H */

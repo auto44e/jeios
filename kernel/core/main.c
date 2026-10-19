@@ -93,6 +93,7 @@ extern unsigned char je_user_copyprobe_start[], je_user_copyprobe_end[];
 extern unsigned char je_user_handle_start[], je_user_handle_end[];
 extern unsigned char je_user_epfault_start[], je_user_epfault_end[];
 extern unsigned char je_user_epipc_start[], je_user_epipc_end[];
+extern unsigned char je_user_eprecv_to_start[], je_user_eprecv_to_end[];
 #ifdef JE_DEV_COPY_INJECT
 extern unsigned char je_user_inject_start[], je_user_inject_end[];
 #endif
@@ -102,7 +103,7 @@ static unsigned char vm_blob_s3[1024];
 typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_EXIT=3,
                PROG_SYSCALL=4, PROG_UNKNOWNOP=5, PROG_BADRSP=6, PROG_BADRET=7,
                PROG_COPYPROBE=8, PROG_INJECT=9, PROG_HANDLE=10,
-               PROG_EPFAULT=11, PROG_EPIPC=12 } user_prog;
+               PROG_EPFAULT=11, PROG_EPIPC=12, PROG_EPRECV_TO=13 } user_prog;
 static int vm_s3_inited;
 /* Initialize the shared step-3/4 vm once (it holds up to JE_VM_MAX_PROCESSES
  * processes — A and B share it, matching the 2-process admission quota). */
@@ -136,6 +137,7 @@ static uint32_t vm_s3_build(user_prog prog)
     case PROG_HANDLE:    start=je_user_handle_start;    end=je_user_handle_end;    break;
     case PROG_EPFAULT:   start=je_user_epfault_start;   end=je_user_epfault_end;   break;
     case PROG_EPIPC:     start=je_user_epipc_start;     end=je_user_epipc_end;     break;
+    case PROG_EPRECV_TO: start=je_user_eprecv_to_start; end=je_user_eprecv_to_end; break;
 #ifdef JE_DEV_COPY_INJECT
     case PROG_INJECT:    start=je_user_inject_start;    end=je_user_inject_end;    break;
 #endif
@@ -877,6 +879,41 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (je_vm_destroy(&vm_s3, XB)!=JE_OK) fail("JeiOS fatal: s5 XB destroy\r\n");
             if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s5 pool leak after teardown\r\n");
             je_arch_console_write("M3c-s5: cross-table capability transfer OK (XA mints C, transfers C.e1 to XB via the kernel send/recv cap FORWARDERS over seeded S; XB mints it in its OWN table and messages XA on c0 across tables); S+C reclaimed. [syscall-decode/copy layer exercised by test_syscall decode + hosted tests; ring-3 two-process transfer deferred to step 7]\r\n");
+        }
+
+        /* --- M3c step 6 (ADR 0009 A6): blocking recv that TIMES OUT (end-to-end
+         * through the real scheduler, ring 3). A single user thread calls
+         * recv(h0, timeout) on an end nobody sends to -> it PARKS (BLOCKED_IPC);
+         * the timer naturally advances je_timer_ticks past the deadline; the ISR
+         * stamps TIMED_OUT via the single arbitrate CAS and makes it READY; the
+         * continuation prologue re-enters the recv and returns 14. Deterministic
+         * with ONE ring-3 thread + the natural timer tick (no second spinning
+         * process — the step-5 spin-hang lesson). Proves: park, timer-ISR terminal
+         * transition, restart-site resume, continuation delivery, waiter release. */
+        {
+            uint32_t R=vm_s3_build(PROG_EPRECV_TO);
+            if (je_thread_create_user(&vm_s3, R)!=JE_OK) fail("JeiOS fatal: s6 recv thread\r\n");
+            je_arch_console_write("M3c-s6: ring-3 thread blocks on recv(timeout); waiting for timer-driven TIMED_OUT...\r\n");
+            /* Run until the thread has written its post-wake recv status (0x1388)
+             * AND advanced its liveness counter (0x1390) — i.e. it parked, the
+             * timer woke it TIMED_OUT, and the continuation resumed it. */
+            uint64_t sp=0;
+            for (;;) {
+                (void)je_arch_irq_save();
+                uint64_t beat=vm_s3_scratch(R, 0x1390);
+                if (beat>=2u) break;    /* resumed and looping past the recv */
+                if (++sp>200000000ull) fail("JeiOS fatal: s6 no TIMED_OUT wake\r\n");
+                __asm__ volatile("sti; hlt":::"memory");
+            }
+            (void)je_arch_irq_save();
+            uint64_t cstat=vm_s3_scratch(R, 0x1380);
+            uint64_t rstat=vm_s3_scratch(R, 0x1388);
+            if (cstat!=0u) fail("JeiOS fatal: s6 create status != 0\r\n");
+            if (rstat!=14u) fail("JeiOS fatal: s6 recv status != TIMED_OUT(14)\r\n");
+            if (je_sched_drop_user(&vm_s3, R)!=JE_OK) fail("JeiOS fatal: s6 drop_user\r\n");
+            if (je_vm_destroy(&vm_s3, R)!=JE_OK) fail("JeiOS fatal: s6 destroy\r\n");
+            if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s6 pool leak after teardown\r\n");
+            je_arch_console_write("M3c-s6: blocking recv TIMED_OUT end-to-end (ring-3 thread parked, timer ISR stamped the terminal transition, continuation resumed with status 14, waiter released, channel reclaimed). [WOKEN/PEER_CLOSED/CANCELLED proven in the pure hosted tests + arbitrate CAS; the full two-process ring-3 WOKEN handshake rides on step 7's bootstrap fixture]\r\n");
         }
     }
 

@@ -49,9 +49,20 @@ typedef enum {
     JE_ABI_H_PEER_CLOSED = 12, /* M3c D6: try_send to a peer-closed end, or try_recv
                               * on a peer-closed end whose inbound is now drained
                               * (EOF). */
-    JE_ABI_H_EMPTY       = 13  /* M3c D6: non-blocking try_recv on an OPEN end with
+    JE_ABI_H_EMPTY       = 13, /* M3c D6: non-blocking try_recv on an OPEN end with
                               * an empty inbound queue (would block; blocking is
                               * step 6). Distinct from PEER_CLOSED (peer gone). */
+    JE_ABI_H_TIMED_OUT   = 14, /* M3c D7/A6: a BLOCKING try_recv (nonzero R10
+                              * timeout) whose deadline elapsed before any message,
+                              * peer close, or cancel. The timer ISR performs this
+                              * terminal transition. A zero timeout never yields
+                              * this — it polls and returns EMPTY (A6-3/A6-ABI). */
+    JE_ABI_H_CANCELLED   = 15  /* M3c D7/A6: a blocking wait ended by an internal
+                              * cancellation. ABI-UNREACHABLE in v1 (no signal/kill
+                              * op exists); pinned now so the arbitration CAS has a
+                              * defined status for all four terminal causes and a
+                              * future signal mechanism wires to a frozen number
+                              * (A6-2). */
 } je_abi_status;
 _Static_assert(JE_ABI_OK == 0, "abi ok");
 _Static_assert(JE_ABI_UNSUPPORTED == 1, "abi unsupported");
@@ -69,6 +80,8 @@ _Static_assert(JE_ABI_H_QUEUE_FULL == 10, "abi h_queue_full");
 _Static_assert(JE_ABI_H_SHORT_BUFFER == 11, "abi h_short_buffer");
 _Static_assert(JE_ABI_H_PEER_CLOSED == 12, "abi h_peer_closed");
 _Static_assert(JE_ABI_H_EMPTY == 13, "abi h_empty");
+_Static_assert(JE_ABI_H_TIMED_OUT == 14, "abi h_timed_out");
+_Static_assert(JE_ABI_H_CANCELLED == 15, "abi h_cancelled");
 
 /* Operation numbers (full 64-bit RAX; any value not listed is UNSUPPORTED). */
 typedef enum {
@@ -143,6 +156,11 @@ typedef enum {
  * ABI-visible (ring 3 sizes its cap/handle arrays by it); pinned equal to the
  * table-side JE_EP_MSG_CAPS_MAX in the glue. */
 #define JE_ABI_MSG_CAPS_MAX 2u
+/* M3c step 6 (ADR 0009 A6-3): max blocking-recv timeout, a relative duration in
+ * timer ticks. A nonzero R10 timeout above this (or one that would overflow the
+ * absolute deadline) is rejected JE_ABI_INVALID — no unbounded block. A policy
+ * bound like the other JE_* caps; the rule (bounded + overflow-checked) is firm. */
+#define JE_IPC_MAX_WAIT 0x100000000ull  /* 2^32 ticks */
 _Static_assert(JE_SYS_HANDLE_SELF == 5, "abi op handle_self");
 _Static_assert(JE_SYS_HANDLE_CLOSE == 6, "abi op handle_close");
 _Static_assert(JE_SYS_HANDLE_QUERY == 7, "abi op handle_query");

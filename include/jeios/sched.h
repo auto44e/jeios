@@ -5,6 +5,7 @@
 #include <jeios/trap.h>
 #include <jeios/status.h>
 #include <jeios/vm.h>
+#include <jeios/endpoint.h>   /* je_ep_channel, for the blocking-recv waiter API */
 #define JE_THREAD_MAX 8u
 /* Single CPU. Bootstrap slot 0 is the idle/monitor task; other slots are kernel
  * threads or (M3a #4) ring-3 user threads bound to a vm process (own CR3 +
@@ -33,6 +34,20 @@ je_trap_frame *je_sched_fault_terminate(je_trap_frame *frame, uint64_t cr2);
  * and resume it, or terminate (DEATH_BAD_RETURN) if the frame is invalid. */
 je_trap_frame *je_sched_exit_current(je_trap_frame *frame, uint64_t code);
 je_trap_frame *je_sched_return_to_user(je_trap_frame *frame);
+/* M3c D7/A6: block the current user thread as a blocking-recv waiter (park +
+ * switch; the endpoint waiter must already be registered) and wake one by slot
+ * (guarded BLOCKED_IPC->READY). See ADR 0009 A6-CLARIFY-1/STRUCT. */
+je_trap_frame *je_sched_block_current(je_trap_frame *frame, je_ep_channel *rec,
+                                      uint8_t side, uint64_t deadline);
+void je_sched_wake_ipc(uint32_t slot);
+/* M3c A6: continuation-prologue accessors (syscall.c). wait_pending reads back the
+ * parked recv's owned rec/side + args + terminal RIP; wait_finish clears it once
+ * the result is delivered. */
+bool je_sched_wait_pending(je_ep_channel **rec, uint8_t *side, uint64_t *rdi,
+                           uint64_t *rsi, uint64_t *rdx, uint64_t *r8, uint64_t *r9,
+                           uint64_t *post_int_rip);
+void je_sched_wait_finish(void);
+je_status je_sched_current_slot(uint32_t *out_slot);
 /* Public death-reason numbering (matches the scheduler's internal record). */
 enum { JE_DEATH_FAULT = 0, JE_DEATH_EXIT = 1, JE_DEATH_BAD_RETURN = 2 };
 /* M3a #4 step 4: reap DYING user processes from bootstrap (slot 0, irq off)

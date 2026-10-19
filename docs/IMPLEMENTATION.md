@@ -887,6 +887,71 @@ post-copy commit (a fallible commit would double-deliver); no inflight lease;
 zero exactly `len` bytes out (no stack leak). AI-assisted review; not independent
 human qualification.
 
+## M3c blocking-recv waits (D7 / A6) — 2026-10-19
+
+ADR 0009 **D-SEQ step 6** (owner-gated — edits `sched.c`; contract frozen by A6 +
+A6-CLARIFY-1/2). `try_recv` can now **block**: a nonzero R10 timeout parks the
+receiver until a message arrives (WOKEN), the peer closes (PEER_CLOSED), the
+deadline elapses (TIMED_OUT), or an internal cancel fires (CANCELLED, A6-2
+ABI-unreachable in v1). R10==0 is the unchanged non-blocking poll (returns EMPTY).
+
+**State machines (A6-STRUCT).** Two separate: the **waiter** (`WAITING →
+WOKEN|TIMED_OUT|PEER_CLOSED|CANCELLED`, on the endpoint end) and the **scheduler**
+(`THREAD_BLOCKED_IPC → READY`). One pure `je_endpoint_wait_arbitrate` CAS is the
+ONLY path out of WAITING; on single-CPU IF=0 the first critical section wins and
+later causes are no-ops (the written D7 priority applies only to the one entry
+snapshot). The kern bridge calls arbitrate on sender-enqueue (WOKEN, on the peer
+end), peer-close (PEER_CLOSED, drain-first: only on an empty end), the timer ISR
+(TIMED_OUT), and internal cancel; on WON it `je_sched_wake_ipc(id)` (guarded
+`BLOCKED_IPC→READY` only — never resurrects DYING/ZOMBIE).
+
+**Park/resume mechanism (A6-CLARIFY-1, constrained restartable syscall).** The
+recv handler, on EMPTY + nonzero timeout, registers a per-end waiter
+(`je_endpoint_wait_register`, A6-4 one-per-end → `WAITERS_BUSY` maps to a
+non-blocking EMPTY) and calls `je_sched_block_current`: a deliberate **pre-park
+`je_uframe_check`** (rejects a corrupt return frame at park, not at wake holding a
+reservation), save the recv args + the **owned rec/side** + the post-`int` RIP,
+**rewind `f->rip` by `JE_INT80_LEN=2`** (`CD 80`), set `BLOCKED_IPC`, switch. On
+wake the thread re-executes `int 0x80`; a **pending-continuation prologue** at the
+top of `je_syscall_dispatch` (keyed on `wait_pending`, asserts the restart RIP)
+finishes the recv **from the owned reference, never re-resolving the handle**
+(A6-5), copies out **after** the context switch (no copy in the scheduler). No
+trap-entry assembly change.
+
+**Reservation + release (A6-5 / A6-CLARIFY-2).** A WOKEN waiter reserves the
+inbound head (not dequeued, just not deliverable to a concurrent poll — `recv_peek`
+and `recv_peek_caps` mask a reserved head → EMPTY). Exactly one idempotent release
+owner, `je_endpoint_wait_release[_by_id]`: a successful commit (consume), a
+copy/mint-fault rollback (message stays queued, head returns to deliverable WITHOUT
+re-arming the terminal waiter), and thread teardown (`mark_dying` releases;
+`je_vm_destroy`/reaper inherit it). `mark_dying` calls it; the slot's waiter is
+released before the slot is reused (closes the death-before-re-entry window).
+
+**ABI (A6-ABI).** Reuses the `try_recv` op (12) with R10 = relative-tick timeout
+(bounded by `JE_IPC_MAX_WAIT=2^32`, overflow-checked). New statuses
+`JE_ABI_H_TIMED_OUT=14`, `JE_ABI_H_CANCELLED=15`. Caps compose: a WOKEN delivery
+runs the same step-5 staged-mint path from the owned reserved head
+(`recv_peek_owned_caps`). A short buffer is SHORT_BUFFER whether polling or
+blocking (detected at the entry/owned peek, never swept into INVALID).
+
+**Proofs.** **`M3c-s6`** kernel self-test proves the **TIMED_OUT** cause
+end-to-end through the real scheduler + ring 3 (a single thread parks on
+`recv(timeout)`, the timer ISR stamps the terminal transition, the continuation
+resumes with 14, waiter released, channel reclaimed — deterministic, one thread +
+the natural tick, no spin race). Hosted `test_endpoint` 27–28 prove the pure
+waiter layer (register, the single terminal CAS + first-wins, reserved-head
+masking, A6-4 WAITERS_BUSY, release idempotence, A6-CLARIFY-2 release-returns-head).
+`test_syscall` covers the R10-timeout decode. The **full two-process ring-3 WOKEN
+handshake is deferred to step 7** (bootstrap fixture) — honest, same as the step-5
+ring-3 deferral; the wake bridges are wired and compiled, step 7 adds the ring-3
+scheduling of two cooperating user processes. `make check`/`smoke`
+(s3a/s3b/s4/s5/s6)/`integration`/3 CI NX (incl 16M)/ARM64 all green.
+
+Design + both review rounds (contract text, then the park/resume mechanism) in
+`docs/adr/debates/m3c-step6-waits.md` + `m3c-step6-mechanism.md` (ADR 0000 part 4).
+Owner-signed A6 + CLARIFY-1/2. AI-assisted implementation review; not independent
+human qualification.
+
 ## M3c capability transfer (try_send/try_recv with caps) — 2026-10-19
 
 ADR 0009 **D-SEQ step 5** (contract frozen by the A5 amendment). Endpoints can now

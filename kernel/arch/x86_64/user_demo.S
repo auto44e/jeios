@@ -642,4 +642,38 @@ je_user_epipc_start:
     jmp 33b
 je_user_epipc_end:
 
+/* M3c step 6 (ADR 0009 A6): blocking recv that TIMES OUT. Create a channel, then
+ * recv(h0, timeout=R10) on an end nobody ever sends to -> the thread PARKS; the
+ * timer advances past the deadline; the ISR stamps TIMED_OUT; the continuation
+ * resumes the recv, returning status 14. A single ring-3 thread + the natural
+ * timer tick — fully deterministic, no second process (the step-5 spin-hang
+ * lesson). Scratch layout (arena 0x40001xxx): 0x1380 create status, 0x1388 recv
+ * status (expect 14), 0x1390 a liveness counter the bootstrap polls. */
+.globl je_user_eprecv_to_start
+.globl je_user_eprecv_to_end
+je_user_eprecv_to_start:
+    /* create() -> RDX packs {h0 low32, h1 high32} */
+    movq $10, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001380       /* create status (expect 0) */
+    movq %rdx, %r14
+    movl %r14d, %r14d           /* h0 = low32 */
+    /* recv(h0, dst, cap=64, timeout=0x40 ticks). Nothing is ever sent to h0's
+     * inbound, so this blocks; after ~0x40 ticks the ISR stamps TIMED_OUT and the
+     * continuation returns 14 here. */
+    movq $12, %rax
+    movq %r14, %rdi
+    movq $0x40001340, %rsi
+    movq $64, %rdx
+    movq $0x40, %r10           /* nonzero timeout -> block */
+    xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001388      /* recv status after wake (expect TIMED_OUT = 14) */
+    /* liveness heartbeat so the bootstrap can confirm the thread resumed. */
+50:
+    incq 0x40001390
+    jmp 50b
+je_user_eprecv_to_end:
+
 .section .note.GNU-stack,"",@progbits

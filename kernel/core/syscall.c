@@ -108,11 +108,13 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
         if (rdx > (uint64_t)JE_ABI_MSG_MAX) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_TRY_SEND;
     case JE_SYS_TRY_RECV:
-        /* try_recv(h=RDI, ubuf=RSI, cap=RDX, hbuf=R8, hcap=R9, R10 reserved=0).
+        /* try_recv(h=RDI, ubuf=RSI, cap=RDX, hbuf=R8, hcap=R9, timeout=R10).
          * R8 = user u32[] to receive minted handles; R9 = its slot capacity
          * (0..JE_ABI_MSG_CAPS_MAX; a larger value is rejected so it can't be
-         * truncated to a smaller capacity in the glue). R8 must be 0 iff R9==0. */
-        if (r10) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+         * truncated to a smaller capacity in the glue). R8 must be 0 iff R9==0.
+         * R10 = A6-ABI relative tick timeout: 0 = non-blocking poll (today's
+         * behavior), nonzero = block up to JE_IPC_MAX_WAIT (bound+overflow checked
+         * in the glue). Any R10 value is a legal arg now (no reserved-0 rule). */
         if (r9 > (uint64_t)JE_ABI_MSG_CAPS_MAX) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if ((r8 == 0u) != (r9 == 0u)) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
@@ -210,10 +212,110 @@ static je_abi_status ep_status_to_abi(je_ep_status s)
     case JE_EP_SHORT_BUFFER: return JE_ABI_H_SHORT_BUFFER;
     case JE_EP_PEER_CLOSED: return JE_ABI_H_PEER_CLOSED;
     case JE_EP_EMPTY:       return JE_ABI_H_EMPTY;
+    case JE_EP_WAITERS_BUSY: return JE_ABI_H_EMPTY; /* A6-4: occupied slot -> non-blocking EMPTY */
     case JE_EP_INVALID:     return JE_ABI_INVALID;
     case JE_EP_CORRUPT:     return JE_ABI_UNSUPPORTED; /* unwired vm / invariant */
     }
     return JE_ABI_INVALID;
+}
+
+/* M3c A6: finish a resumed blocking recv. The thread parked on (wrec,wside) with
+ * out-args ubuf=rsi, cap=rdx, hbuf=r8, hcap=r9. Read the terminal cause the single
+ * arbitrate CAS stamped and deliver into f. WOKEN: peek the reserved head (bytes +
+ * caps) from the OWNED end (no handle re-resolve, A6-5), stage mints, copy out,
+ * commit, release the waiter. TIMED_OUT/PEER_CLOSED/CANCELLED: write the status.
+ * A copy/mint fault on WOKEN -> JE_ABI_INVALID, message stays queued, mints rolled
+ * back, reservation released (the head returns to deliverable). */
+static void je_syscall_finish_blocked_recv(je_trap_frame *f, je_ep_channel *rec,
+                                           uint8_t side, uint64_t ubuf, uint64_t cap,
+                                           uint64_t hbuf, uint64_t hcap)
+{
+    je_vm *vm; uint32_t index;
+    if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return; }
+    je_ep_wait_cause cause = je_endpoint_wait_cause(rec, side);
+    uint32_t slot = 0u; (void)je_sched_current_slot(&slot);
+    switch (cause) {
+    case JE_EP_WAIT_TIMED_OUT:
+        je_endpoint_kern_wait_release(rec, side, slot);
+        f->rax=(uint64_t)JE_ABI_H_TIMED_OUT; f->rdx=0; return;
+    case JE_EP_WAIT_PEER_CLOSED:
+        je_endpoint_kern_wait_release(rec, side, slot);
+        f->rax=(uint64_t)JE_ABI_H_PEER_CLOSED; f->rdx=0; return;
+    case JE_EP_WAIT_CANCELLED:
+        je_endpoint_kern_wait_release(rec, side, slot);
+        f->rax=(uint64_t)JE_ABI_H_CANCELLED; f->rdx=0; return;
+    case JE_EP_WAIT_WOKEN: break;    /* deliver below */
+    default:
+        /* No terminal cause on a resumed thread = kernel-invariant break. */
+        je_arch_console_write("JeiOS fatal: recv resume without terminal cause\r\n");
+        je_arch_halt(); return;
+    }
+    /* WOKEN delivery from the owned reserved head. */
+    uint8_t staging[JE_EP_MSG_MAX];
+    je_ep_capdesc caps[JE_ABI_MSG_CAPS_MAX];
+    size_t mlen = 0u; uint8_t mcaps = 0u;
+    je_ep_recv_lease lease;
+    je_ep_status s = je_endpoint_kern_recv_peek_owned(rec, side, staging, (size_t)cap,
+                                                      &mlen, (uint8_t)hcap, caps, &mcaps,
+                                                      &lease);
+    if (s == JE_EP_SHORT_BUFFER) {
+        /* Buffer too small: leave the message QUEUED but RELEASE the waiter (the
+         * head returns to deliverable), so a re-issued recv with a bigger buffer
+         * takes the normal path. NOT releasing here would wedge the end forever —
+         * the continuation only runs while wait_pending is set, which we clear on
+         * return. Report the required sizes. */
+        je_endpoint_kern_wait_release(rec, side, slot);
+        f->rax=(uint64_t)JE_ABI_H_SHORT_BUFFER;
+        f->rdx=(uint64_t)mlen | ((uint64_t)mcaps << 32); return;
+    }
+    if (s != JE_EP_OK) { je_endpoint_kern_wait_release(rec, side, slot);
+                         f->rax=(uint64_t)ep_status_to_abi(s); f->rdx=0; return; }
+    /* Stage mints (dead cap -> handle 0; roll back all on transient fault). */
+    je_handle minted[JE_ABI_MSG_CAPS_MAX]; bool was_live[JE_ABI_MSG_CAPS_MAX];
+    for (uint8_t c = 0; c < mcaps; ++c) { minted[c]=0u; was_live[c]=false; }
+    je_abi_status fail = JE_ABI_OK; uint8_t done = 0u;
+    for (uint8_t c = 0; c < mcaps; ++c) {
+        if (!je_endpoint_kern_capdesc_live(&caps[c])) { minted[c]=0u; continue; }
+        je_handle nh = 0u;
+        je_ep_status mc = je_endpoint_kern_mint_recv_cap(vm, index, &caps[c], &nh);
+        if (mc != JE_EP_OK) { fail = ep_status_to_abi(mc); break; }
+        minted[c]=nh; was_live[c]=true; done=(uint8_t)(c+1u);
+    }
+    if (fail != JE_ABI_OK) {
+        for (uint8_t c = 0; c < done; ++c)
+            if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
+        /* Message stays queued+reserved; A6-5 says a fault does NOT consume. But a
+         * transient mint fault must not wedge the waiter forever: release it so a
+         * re-issue can retry (the head returns to deliverable). */
+        je_endpoint_kern_wait_release(rec, side, slot);
+        f->rax=(uint64_t)fail; f->rdx=0; return;
+    }
+    if (mlen != 0u) {
+        je_abi_status cs = je_copy_to_user(ubuf, staging, (uint64_t)mlen);
+        if (cs != JE_ABI_OK) {
+            for (uint8_t c = 0; c < mcaps; ++c)
+                if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
+            je_endpoint_kern_wait_release(rec, side, slot);
+            f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return;
+        }
+    }
+    if (mcaps != 0u) {
+        uint32_t hout[JE_ABI_MSG_CAPS_MAX];
+        for (uint8_t c = 0; c < mcaps; ++c) hout[c]=(uint32_t)minted[c];
+        je_abi_status cs = je_copy_to_user(hbuf, hout, (uint64_t)mcaps*sizeof(uint32_t));
+        if (cs != JE_ABI_OK) {
+            for (uint8_t c = 0; c < mcaps; ++c)
+                if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
+            je_endpoint_kern_wait_release(rec, side, slot);
+            f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return;
+        }
+    }
+    /* Infallible commit (dequeue + release inflight), then free the waiter. */
+    je_ep_status cm = je_endpoint_kern_recv_commit(&lease);
+    if (cm != JE_EP_OK) { je_arch_console_write("JeiOS fatal: blocked recv commit mismatch\r\n"); je_arch_halt(); }
+    je_endpoint_kern_wait_release(rec, side, slot);
+    f->rax=(uint64_t)JE_ABI_OK;
+    f->rdx=(uint64_t)mlen | ((uint64_t)mcaps << 32);
 }
 
 /* Kernel glue. Returns the frame to iretq to (the caller for RETURN/invalid, a
@@ -222,6 +324,24 @@ static je_abi_status ep_status_to_abi(je_ep_status s)
  * frame identity). */
 je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
 {
+    /* M3c A6-CLARIFY-1: pending-continuation prologue. If the CURRENT thread
+     * resumed from a blocking-recv park, FINISH that recv here — keyed on the
+     * waiter state, NOT on RAX — before any op decode. The thread re-executed its
+     * int 0x80, so RAX/args are intact, but we complete from the SAVED owned
+     * rec/side + args (never re-resolving the handle, A6-5). The terminal cause
+     * stamped by the single arbitrate CAS decides the result. */
+    {
+        je_ep_channel *wrec = (je_ep_channel *)0; uint8_t wside = 0u;
+        uint64_t wrdi, wrsi, wrdx, wr8, wr9, wprip;
+        if (je_sched_wait_pending(&wrec, &wside, &wrdi, &wrsi, &wrdx, &wr8, &wr9, &wprip)) {
+            /* The restart must have landed exactly on the saved post-int RIP; any
+             * mismatch is a kernel-invariant break, not a user error. */
+            if (f->rip != wprip) { je_arch_console_write("JeiOS fatal: recv continuation RIP\r\n"); je_arch_halt(); }
+            je_syscall_finish_blocked_recv(f, wrec, wside, wrsi, wrdx, wr8, wr9);
+            je_sched_wait_finish();
+            return je_sched_return_to_user(f);
+        }
+    }
     uint64_t args[6] = { f->rdi, f->rsi, f->rdx, f->r10, f->r8, f->r9 };
     je_abi_status status; uint64_t result;
     je_syscall_action action = je_syscall_decode(f->rax, args, &status, &result);
@@ -408,6 +528,42 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
         je_handle h = (je_handle)f->rdi;
         uint64_t ubuf = f->rsi, cap = f->rdx, hbuf = f->r8, hcap = f->r9;
+        uint64_t timeout = f->r10;   /* A6-ABI: relative tick duration; 0 = poll */
+        /* A6-3: bound + overflow-check a nonzero timeout BEFORE anything else, so
+         * the rejection does not depend on queue state (a huge R10 is INVALID
+         * whether or not a message happens to be queued). JE_IPC_MAX_WAIT keeps
+         * the absolute deadline well below the UINT64_MAX tick the ISR aborts on. */
+        uint64_t now = je_sched_ticks();
+        if (timeout != 0u && (timeout > JE_IPC_MAX_WAIT || timeout > (UINT64_MAX - now))) {
+            f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f);
+        }
+        /* A6-ABI entry snapshot: evaluate the end once via the plain try_recv path
+         * BEFORE registering any waiter. If it is EMPTY (would block) and a nonzero
+         * timeout was given, register a per-end waiter and PARK (constrained
+         * restartable syscall); on resume the continuation prologue delivers. A
+         * zero timeout, or a non-EMPTY probe, falls through to the normal recv. */
+        if (timeout != 0u) {
+            je_ep_status probe = je_endpoint_kern_recv_entry_probe(vm, index, h);
+            if (probe == JE_EP_EMPTY) {
+                uint32_t slot = 0u;
+                if (je_sched_current_slot(&slot) != JE_OK) {
+                    f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f);
+                }
+                je_ep_channel *wrec = (je_ep_channel *)0; uint8_t wside = 0u;
+                je_ep_status reg = je_endpoint_kern_wait_register(vm, index, h, slot, &wrec, &wside);
+                if (reg == JE_EP_WAITERS_BUSY) {   /* A6-4: slot occupied -> non-blocking EMPTY */
+                    f->rax=(uint64_t)JE_ABI_H_EMPTY; f->rdx=0; return je_sched_return_to_user(f);
+                }
+                if (reg != JE_EP_OK) {
+                    f->rax=(uint64_t)ep_status_to_abi(reg); f->rdx=0; return je_sched_return_to_user(f);
+                }
+                /* Park: saves args + owned rec/side, rewinds int 0x80, switches. */
+                return je_sched_block_current(f, wrec, wside, now + timeout);
+            }
+            /* probe != EMPTY: deliverable / SHORT_BUFFER / PEER_CLOSED / error ->
+             * fall through to the normal recv below (which re-derives the exact
+             * result and, for a deliverable message, does the full mint/copy). */
+        }
         uint8_t staging[JE_EP_MSG_MAX];
         je_ep_capdesc caps[JE_ABI_MSG_CAPS_MAX];
         size_t mlen = 0u; uint8_t mcaps = 0u;
