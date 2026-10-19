@@ -641,4 +641,5 @@ je_user_epipc_start:
     incq 0x40001000
     jmp 33b
 je_user_epipc_end:
+
 .section .note.GNU-stack,"",@progbits

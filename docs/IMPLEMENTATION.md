@@ -887,6 +887,75 @@ post-copy commit (a fallible commit would double-deliver); no inflight lease;
 zero exactly `len` bytes out (no stack leak). AI-assisted review; not independent
 human qualification.
 
+## M3c capability transfer (try_send/try_recv with caps) — 2026-10-19
+
+ADR 0009 **D-SEQ step 5** (contract frozen by the A5 amendment). Endpoints can now
+be **transferred** between processes: a `try_send` carries 0..`JE_EP_MSG_CAPS_MAX`=2
+capabilities, each a descriptor `{rec_index, side, generation, rights}` queued in
+the peer inbound and holding one **inflight ref** on its target end (D3.2). The
+receiver's `try_recv` delivers the bytes AND mints fresh, independently-closable,
+equal-or-weaker handles in the receiver's own table (destination-side mint, D8).
+Data-only sends (`cap_count==0`) are unchanged.
+
+**D9 cycle reclamation (A5-1).** No nesting restriction: a queued-cap edge's
+inflight ref releases when the holding end's LAST handle is removed (D2 discard
+rule) — not on mere death (D2 co-holders). An A↔B cap cycle is reclaimed once each
+end's last handle goes; proven by hosted test 24 (queue caps both ways, close all
+handles, both records free). `maybe_free_record` gained an `allocated` idempotence
+guard + a cap-free assertion (A5-3); `release_handle` detaches a closing end's
+queued cap descriptors into a bounded local array → resets the queue → settles
+THIS record → then releases each detached inflight ref (which may free OTHER
+records via the guarded free). This detach-before-release order is what prevents
+a double-free / recursion into a queue being discarded.
+
+**Stale cap A5-2.** A cap whose target end is CLOSED is consumed-with-handle-`0`
+(not a status symbol), siblings still mint, the message dequeues — removing the
+stale-cap head-of-line wedge. PEER_CLOSED still mints (only CLOSED is dead).
+`je_endpoint_capdesc_live` classifies; the recv glue stages `0` for a dead cap.
+
+**Transactions.** Send is all-or-nothing: resolve+validate every cap, then retain
+each target's inflight (rolling back all on REFOVERFLOW), then enqueue bytes+caps;
+nothing enqueued on any failure. Recv stages ALL mints in the receiver table
+(retain-before-commit per cap, dead caps → 0), copies bytes then the handle array
+out, then the **infallible** commit dequeues + releases each cap's inflight; any
+transient fault (QUOTA/NOSLOTS/REFOVERFLOW/copy-fault `JE_ABI_INVALID`) closes the
+staged mints and leaves the message queued.
+
+**ABI (A5-4).** The pre-reserved R8/R9 path: send R8 = user `u64[cap_count]` of
+`{low32 handle, high32 rights}`, R10[7:0]=cap_count (≤K), R8≠0 iff cap_count>0;
+recv R8 = user `u32[]` handle output, R9 = slot capacity, R8≠0 iff R9≠0; recv
+RDX[31:0]=byte len, RDX[63:32]=cap count (or required counts on SHORT_BUFFER, no
+dequeue). `JE_ABI_MSG_CAPS_MAX=2` pinned to the table bound. A data-only caller
+(R8=R9=0) receiving a cap-carrying message now gets SHORT_BUFFER (must supply a
+handle buffer) — documented behaviour change.
+
+**Transfer sequencing (frozen, review-driven).** Under D2, closing the last handle
+to a transferred end makes an in-flight cap to it dead (A5-2), so the sender MUST
+retain its handle until the receiver has minted (A sends → B mints → then A
+closes). "Close before B receives" is the dead-cap path.
+
+**Proofs.** Hosted `test_endpoint` tests 22–24: cap mint across a seeded channel
+(inflight retained on send, released on commit, minted handle resolves to the same
+end), dead-cap A5-2, and A↔B cycle reclaim. `test_syscall` covers the op-11/12 cap
+decode (cap_count/R8 pairing, R9 pairing, K bound, reserved bits). The ring-3
+**`M3c-s5`** marker is a **kernel self-test** across two distinct process tables
+(the kernel send/recv cap FORWARDERS — the real pure + kern logic: seed S, mint C
+in table A, transfer C.e1 to table B, B messages A on c0 across tables, S+C
+reclaimed). **Honest coverage note:** s5 drives the `je_endpoint_kern_*`
+forwarders, not `je_syscall_dispatch`, so the syscall-layer cap-array copy-in,
+unknown-rights rejection, staged-mint copy-out rollback, and RDX packing are
+covered by `test_syscall` (decode) + the hosted pure tests + inspection, NOT by a
+ring-3 end-to-end run; the full ring-3 two-process transfer (which would exercise
+them) is deferred to step 7. A full **ring-3 two-process**
+transfer is deferred to step 7 (recorded decision — ADR A5-4 proof-status;
+multi-process choreography is step 7's subject and the spin-based two-stub version
+raced the single-CPU cooperative scheduler). `make check` / `smoke` (s3a/s3b/s4/s5)
+/ `integration` / 3 CI NX (incl. 16M) / ARM64 all green; the ~3KB pool growth from
+cap descriptors fits the 16M profile.
+
+Design frozen by the A5 amendment (owner-approved); implementation cross-review to
+follow in the PR. AI-assisted; not independent human qualification.
+
 ## Standards status — 2026-10-16
 
 | Capability | Status | Next evidence |

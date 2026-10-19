@@ -184,6 +184,20 @@ static uint64_t vm_s3_scratch(uint32_t idx, uint64_t off)
     je_arch_irq_restore(flags);
     return v;
 }
+/* Write a 64-bit word into proc idx's arena at offset off (CPL0, its CR3).
+ * (Currently unused — kept for a future ring-3 fixture that hands a seeded
+ * handle to a stub; marked to avoid an unused-function warning.) */
+__attribute__((unused))
+static void vm_s3_scratch_write(uint32_t idx, uint64_t off, uint64_t val)
+{
+    uint64_t flags=je_arch_irq_save();
+    uint64_t kroot=je_arch_kernel_root_phys();
+    je_arch_cr3_load(vm_s3.procs[idx].root);
+    volatile uint64_t *p=(volatile uint64_t *)(uintptr_t)(JE_VM_ARENA_BASE+off);
+    *p=val;
+    je_arch_cr3_load(kroot);
+    je_arch_irq_restore(flags);
+}
 _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
 {
     (void)je_arch_console_init();
@@ -790,6 +804,80 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
         if (je_vm_destroy(&vm_s3, B)!=JE_OK) fail("JeiOS fatal: s4 destroy B\r\n");
         if (je_kernel_pages.free_count!=s3_free_before) fail("JeiOS fatal: s4 page leak\r\n");
         je_arch_console_write("M3a-s4: peer B torn down; page accounting restored\r\n");
+
+        /* --- M3c s5: cross-TABLE capability transfer (ADR 0009 A5), proven as a
+         * KERNEL self-test over two distinct process tables. A full ring-3
+         * two-process transfer needs cooperative scheduling of two user tasks
+         * exchanging over a seeded channel; that multi-process choreography is the
+         * explicit subject of step 7 (the bootstrap fixture), so the ring-3
+         * cross-process proof is deferred there (recorded decision — see the s5
+         * ledger note / ADR A5-4 flex). Here we prove the transfer MECHANISM
+         * deterministically: seed S across procs[XA] and procs[XB]'s tables, mint
+         * a second channel C in XA, transfer C.e1 as a cap over S, and mint it
+         * into XB's OWN table via the real send/recv cap path — asserting the
+         * minted handle lives in the DISTINCT XB table and names C.e1. */
+        {
+            uint32_t XA=vm_s3_build(PROG_HEARTBEAT);   /* just need the two tables */
+            uint32_t XB=vm_s3_build(PROG_HEARTBEAT);
+            je_handle sA=0, sB=0;
+            if (je_endpoint_kern_seed(&vm_s3, XA, XB, &sA, &sB)!=JE_EP_OK)
+                fail("JeiOS fatal: s5 seed\r\n");
+            if (sA==0u || sB==0u) fail("JeiOS fatal: s5 seed zero handle\r\n");
+            if (je_endpoint_kernel_allocated()!=1u) fail("JeiOS fatal: s5 seed pool != 1\r\n");
+            /* XA mints a second channel C (both ends in XA's table). */
+            je_handle c0=0, c1=0;
+            if (je_endpoint_kern_create(&vm_s3, XA, &c0, &c1)!=JE_EP_OK)
+                fail("JeiOS fatal: s5 create C\r\n");
+            if (je_endpoint_kernel_allocated()!=2u) fail("JeiOS fatal: s5 pool != 2\r\n");
+            /* XA resolves c1 -> a send-cap descriptor (TRANSFER + full rights). */
+            je_ep_capdesc d;
+            if (je_endpoint_kern_resolve_send_cap(&vm_s3, XA, c1, JE_EP_RIGHTS_ALL, &d)!=JE_EP_OK)
+                fail("JeiOS fatal: s5 resolve send cap\r\n");
+            /* XA sends the cap over sA (into XB's inbound on sB). XA KEEPS c1 for
+             * now: under the frozen D2, closing the last handle to C.e1 would mark
+             * it CLOSED and make the queued cap dead (A5-2) — so, exactly as the
+             * review requires, the sender retains its end until the receiver has
+             * minted. (The stale-cap/dead path is proven separately in hosted test
+             * 23.) */
+            if (je_endpoint_kern_send_caps(&vm_s3, XA, sA, (void*)0, 0, &d, 1)!=JE_EP_OK)
+                fail("JeiOS fatal: s5 send cap\r\n");
+            /* XB receives on sB: peek the cap, mint it into XB's table. */
+            je_ep_capdesc rc[JE_EP_MSG_CAPS_MAX]; uint8_t nc=0; size_t rl=0;
+            je_ep_recv_lease lz;
+            if (je_endpoint_kern_recv_peek_caps(&vm_s3, XB, sB, (void*)0, 0, &rl,
+                                                JE_EP_MSG_CAPS_MAX, rc, &nc, &lz)!=JE_EP_OK)
+                fail("JeiOS fatal: s5 B peek\r\n");
+            if (nc!=1u) fail("JeiOS fatal: s5 B cap count != 1\r\n");
+            if (!je_endpoint_kern_capdesc_live(&rc[0])) fail("JeiOS fatal: s5 B cap not live\r\n");
+            je_handle mintedB=0;
+            if (je_endpoint_kern_mint_recv_cap(&vm_s3, XB, &rc[0], &mintedB)!=JE_EP_OK || mintedB==0u)
+                fail("JeiOS fatal: s5 B mint\r\n");
+            if (je_endpoint_kern_recv_commit(&lz)!=JE_EP_OK) fail("JeiOS fatal: s5 B commit\r\n");
+            /* NOW XA closes its own c1 (B has minted its own handle to C.e1, so
+             * the end stays live via B's handle_ref — a legitimate co-owner). */
+            if (je_endpoint_kern_close(&vm_s3, XA, c1)!=JE_EP_OK)
+                fail("JeiOS fatal: s5 close c1\r\n");
+            /* The minted handle must resolve in XB's OWN table (cross-table!) and
+             * name the SAME end as the original c1. XB sends a byte on it; XA
+             * receives it on c0 — a genuine cross-address-space message. */
+            {
+                uint8_t msg[4]={0x42,0x42,0x42,0x42};
+                if (je_endpoint_kern_send(&vm_s3, XB, mintedB, msg, 4)!=JE_EP_OK)
+                    fail("JeiOS fatal: s5 B send on minted\r\n");
+                uint8_t rb[JE_EP_MSG_MAX]; size_t bl=0; je_ep_recv_lease lz2;
+                if (je_endpoint_kern_recv_peek(&vm_s3, XA, c0, rb, sizeof rb, &bl, &lz2)!=JE_EP_OK)
+                    fail("JeiOS fatal: s5 A recv on c0\r\n");
+                if (bl!=4u || rb[0]!=0x42) fail("JeiOS fatal: s5 A wrong payload across tables\r\n");
+                if (je_endpoint_kern_recv_commit(&lz2)!=JE_EP_OK) fail("JeiOS fatal: s5 A commit\r\n");
+            }
+            /* Tear down both procs (no user thread was created — built only for
+             * their tables). S + C must reclaim to baseline 0 via the release
+             * walk in je_vm_destroy. */
+            if (je_vm_destroy(&vm_s3, XA)!=JE_OK) fail("JeiOS fatal: s5 XA destroy\r\n");
+            if (je_vm_destroy(&vm_s3, XB)!=JE_OK) fail("JeiOS fatal: s5 XB destroy\r\n");
+            if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s5 pool leak after teardown\r\n");
+            je_arch_console_write("M3c-s5: cross-table capability transfer OK (XA mints C, transfers C.e1 to XB via the kernel send/recv cap FORWARDERS over seeded S; XB mints it in its OWN table and messages XA on c0 across tables); S+C reclaimed. [syscall-decode/copy layer exercised by test_syscall decode + hosted tests; ring-3 two-process transfer deferred to step 7]\r\n");
+        }
     }
 
     je_arch_console_write("JeiOS: initialization complete; halted\r\n");

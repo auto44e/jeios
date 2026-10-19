@@ -61,10 +61,22 @@ progress on x86-64, and a second architecture, **ARM64 (MP1)**, now boots.
   needs transfer). **ABI forward note:** the single RDX scalar can't return
   received capability handles, so **step 5 MUST add a new op / out-register
   extension, not overload `try_recv`** (R8/R9 and RDX[63:32] reserved now).
-  **Remaining D-SEQ:** step 5 (capability transfer + the D9 cycle invariant), 6
-  (waits, owner-gated — edits `sched.c`), 7 (bootstrap fixture). #8 closes when
-  the sequence completes; #7's deferred refcount/overflow is already discharged
-  (endpoints are genuinely destroyed + reclaimed on process death).
+  **Step 5 (capability transfer) is now done** (frozen by ADR 0009 A5): `try_send`
+  carries 0..2 caps (descriptors queued + inflight-retained on the target, D3.2);
+  `try_recv` mints fresh attenuated handles in the receiver's table (D8). D9 =
+  cycles allowed but reclaimed on last-handle removal (A5-1); stale cap → handle 0
+  (A5-2); `maybe_free_record` got the `allocated` guard + detach-before-release
+  discard order (A5-3); ABI uses the pre-reserved R8/R9 path (A5-4). Proven: hosted
+  cap mint/dead-cap/cycle-reclaim + the `M3c-s5` kernel self-test (cross-TABLE
+  transfer over a seeded channel, message across distinct tables, S+C reclaimed).
+  **Transfer sequencing:** the sender must retain the transferred end until the
+  receiver mints (closing first → dead cap, A5-2). **Ring-3 two-process transfer
+  deferred to step 7** (recorded decision: multi-process choreography is step 7's
+  subject; the spin-based two-stub proof raced the single-CPU cooperative
+  scheduler). **Remaining D-SEQ:** step 6 (waits, owner-gated — edits `sched.c`),
+  7 (bootstrap fixture + the deferred ring-3 two-process transfer proof). #8 closes
+  when the sequence completes; #7's deferred refcount/overflow is already
+  discharged (endpoints are genuinely destroyed + reclaimed on process death).
 
 Full qualification evidence for M3a is in `docs/M3A_RETRO.md`; the per-PR ledger is
 `docs/IMPLEMENTATION.md`. Everything above is QEMU/hosted-verified and

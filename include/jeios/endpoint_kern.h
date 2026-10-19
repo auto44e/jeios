@@ -48,6 +48,37 @@ je_ep_status je_endpoint_kern_recv_peek(je_vm *vm, uint32_t index, je_handle h,
                                         size_t *out_len, je_ep_recv_lease *lease);
 je_ep_status je_endpoint_kern_recv_commit(const je_ep_recv_lease *lease);
 
+/* Capability transfer (M3c step 5): forwarders to the pure cap API against the
+ * kernel pool + the caller's table. The glue (syscall.c) resolves user handle
+ * arrays to/from descriptors and does copy_from/to_user. */
+je_ep_status je_endpoint_kern_send_caps(je_vm *vm, uint32_t index, je_handle h,
+                                        const void *kbuf, size_t len,
+                                        const je_ep_capdesc *caps, uint8_t ncaps);
+/* Resolve one user handle (in the caller's table) to a cap descriptor to SEND:
+ * must be an endpoint holding TRANSFER; the requested rights must be a subset of
+ * the handle's rights (DENIED otherwise). Fills *out. */
+je_ep_status je_endpoint_kern_resolve_send_cap(je_vm *vm, uint32_t index,
+                                               je_handle h, uint32_t req_rights,
+                                               je_ep_capdesc *out);
+je_ep_status je_endpoint_kern_recv_peek_caps(je_vm *vm, uint32_t index, je_handle h,
+                                             void *out_kbuf, size_t cap,
+                                             size_t *out_len, uint8_t hcap,
+                                             je_ep_capdesc *out_caps,
+                                             uint8_t *out_ncaps,
+                                             je_ep_recv_lease *lease);
+/* Mint a received cap descriptor into the caller's table as a fresh handle with
+ * the descriptor's rights. Returns the handle (0 on failure) + status. */
+je_ep_status je_endpoint_kern_mint_recv_cap(je_vm *vm, uint32_t index,
+                                            const je_ep_capdesc *d, je_handle *out);
+bool je_endpoint_kern_capdesc_live(const je_ep_capdesc *d);
+void je_endpoint_kern_capdesc_release_handle(const je_ep_capdesc *d);
+/* TEST FIXTURE ONLY (A5-4): seed a channel with one end in vm->procs[idxA]'s
+ * table and the other in procs[idxB]'s — a cross-process channel that ring-3
+ * cannot bootstrap itself yet. Both procs' VM MUST be hooked (asserted). Returns
+ * the two handles. NOT a ring-3 ABI. */
+je_ep_status je_endpoint_kern_seed(je_vm *vm, uint32_t idxA, uint32_t idxB,
+                                   je_handle *outA, je_handle *outB);
+
 /* Pool occupancy (live channel records). Kernel-internal / self-test only. */
 uint32_t je_endpoint_kernel_allocated(void);
 

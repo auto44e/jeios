@@ -16,8 +16,11 @@ _Static_assert(JE_EP_REF_MAX <= 0xffffu, "ref counts are uint16_t");
 _Static_assert(JE_EP_POOL_CAP >= 1u, "pool must have at least one record");
 _Static_assert(JE_EP_MSG_MAX <= 255u, "per-slot length fits uint8_t");
 _Static_assert(JE_EP_QUEUE_DEPTH <= 255u, "head/count fit uint8_t");
-/* Keep the static kernel pool bounded: 2 inbound queues per record dominate. */
-_Static_assert(sizeof(je_ep_channel) <= 640u, "channel record size budget");
+_Static_assert(JE_EP_QUEUE_DEPTH * JE_EP_MSG_CAPS_MAX <= JE_EP_REF_MAX,
+               "a full queue of cap-carrying msgs must not overflow inflight");
+/* Keep the static kernel pool bounded: the per-slot byte buffers + cap
+ * descriptors dominate. Grew for step-5 caps; re-pinned here. */
+_Static_assert(sizeof(je_ep_channel) <= 1280u, "channel record size budget");
 
 /* ---- pool / record helpers ------------------------------------------------ */
 
@@ -30,8 +33,24 @@ static void queue_reset(je_ep_queue *q)
     q->count = 0u;
     for (uint8_t i = 0; i < JE_EP_QUEUE_DEPTH; ++i) {
         q->len[i] = 0u;
+        q->cap_count[i] = 0u;
         for (uint16_t b = 0; b < JE_EP_MSG_MAX; ++b) q->buf[i][b] = 0u;
+        for (uint8_t c = 0; c < JE_EP_MSG_CAPS_MAX; ++c) {
+            q->cap[i][c].rec_index = 0u; q->cap[i][c].side = 0u;
+            q->cap[i][c].cap_count_pad = 0u;
+            q->cap[i][c].generation = 0u; q->cap[i][c].rights = 0u;
+        }
     }
+}
+
+/* Count the capability descriptors currently queued anywhere in one inbound
+ * queue (used by the A5-3 free-time assertion: a record only frees when BOTH
+ * inbound queues are cap-free). */
+static uint32_t queue_cap_total(const je_ep_queue *q)
+{
+    uint32_t n = 0u;
+    for (uint8_t i = 0; i < JE_EP_QUEUE_DEPTH; ++i) n += q->cap_count[i];
+    return n;
 }
 
 void je_endpoint_pool_init(je_endpoint_pool *pool)
@@ -87,9 +106,22 @@ static je_ep_status object_to_end(const je_endpoint_pool *pool, const void *obj,
 /* Free a record once BOTH ends hold no references of either class. */
 static void maybe_free_record(je_endpoint_pool *pool, je_ep_channel *rec)
 {
+    /* A5-3 idempotence guard: the cap-release discard path can reach this twice
+     * for one record; a second call on an already-free record must be a no-op
+     * (never double-decrement allocated_count / double-bump generation). */
+    if (!rec->allocated) return;
     for (uint8_t s = 0; s < 2u; ++s) {
         if (rec->end[s].handle_refs != 0u || rec->end[s].inflight_refs != 0u)
             return;
+    }
+    /* A5-3: a record only frees when BOTH ends have zero refs. With zero inflight
+     * refs there can be no queued caps pointing at this record, and this record's
+     * own inbound queues must themselves be cap-free. If a residual cap is somehow
+     * present it means an inflight ref was leaked — an invariant violation; guard
+     * by NOT freeing (fail-safe: leak the record rather than free it with a live
+     * cap), which is unreachable under the detach-before-release discard order. */
+    for (uint8_t s = 0; s < 2u; ++s) {
+        if (queue_cap_total(&rec->end[s].inbound) != 0u) return; /* unreachable; fail-safe */
     }
     /* Both ends fully unreferenced: reclaim. Bump generation (never 0). */
     rec->allocated = false;
@@ -147,6 +179,22 @@ static je_ep_status retain_handle(je_ep_end *e)
 /* Drop one handle_ref on an end that definitely holds at least one (infallible
  * for a valid live ref). On reaching 0: this end CLOSED, a live peer -> PEER_CLOSED,
  * then try to reclaim the record. */
+/* Release one inflight ref on the end a queued cap descriptor points at (A5-3
+ * discard path). The target is in THIS pool; a guarded maybe_free_record may free
+ * it. Defence-in-depth: validate the descriptor resolves to an allocated,
+ * generation-matching end (it must, while the inflight ref kept it alive). */
+static void release_capdesc_inflight(je_endpoint_pool *pool,
+                                     const je_ep_capdesc *d)
+{
+    if (d->rec_index >= JE_EP_POOL_CAP || d->side > 1u) return; /* unreachable */
+    je_ep_channel *tr = &pool->rec[d->rec_index];
+    if (!tr->allocated || tr->generation != d->generation) return; /* unreachable */
+    je_ep_end *te = &tr->end[d->side];
+    if (te->inflight_refs == 0u) return;   /* underflow guard (unreachable) */
+    te->inflight_refs--;
+    if (te->inflight_refs == 0u) maybe_free_record(pool, tr);
+}
+
 static void release_handle(je_endpoint_pool *pool, je_ep_channel *rec, uint8_t side)
 {
     je_ep_end *e = &rec->end[side];
@@ -158,11 +206,24 @@ static void release_handle(je_endpoint_pool *pool, je_ep_channel *rec, uint8_t s
         e->state = JE_EP_END_CLOSED;
         je_ep_end *peer = &rec->end[side ^ 1u];
         if (peer->state == JE_EP_END_OPEN) peer->state = JE_EP_END_PEER_CLOSED;
-        /* Discard THIS (closing) end's inbound queue: no one can ever read it
-         * again. The peer's inbound is left intact so a survivor can drain it
-         * (D6). Data messages own no refs, so this never affects the free rule. */
-        queue_reset(&e->inbound);
-        maybe_free_record(pool, rec);
+        /* A5-3 discard ordering: (1) DETACH every cap descriptor still queued in
+         * this closing end's inbound into a bounded local array; (2) reset the
+         * queue (bytes + cap storage) so this record is fully settled and holds
+         * no caps; (3) maybe_free THIS record; (4) ONLY THEN release each detached
+         * inflight ref on its (other-record) target. Doing releases last means
+         * freeing a target never re-enters a queue still being discarded, and the
+         * guarded maybe_free_record is idempotent if a target is this same record
+         * via the peer end (its inbound was/will be discarded at its own close). */
+        je_ep_capdesc detached[JE_EP_QUEUE_DEPTH * JE_EP_MSG_CAPS_MAX];
+        uint32_t nd = 0u;
+        je_ep_queue *q = &e->inbound;
+        for (uint8_t i = 0; i < JE_EP_QUEUE_DEPTH; ++i)
+            for (uint8_t c = 0; c < q->cap_count[i]; ++c)
+                detached[nd++] = q->cap[i][c];
+        queue_reset(q);                  /* this end holds no caps now */
+        maybe_free_record(pool, rec);    /* settle THIS record first */
+        for (uint32_t k = 0; k < nd; ++k)
+            release_capdesc_inflight(pool, &detached[k]);  /* then other records */
     }
 }
 
@@ -406,26 +467,34 @@ je_ep_status je_endpoint_send_preflight(je_endpoint_pool *pool, je_handle_table 
     return JE_EP_OK;
 }
 
-je_ep_status je_endpoint_try_send(je_endpoint_pool *pool, je_handle_table *t,
-                                  je_handle h, const void *kbuf, size_t len)
+/* Send preflight WITHOUT the QUEUE_FULL check: main-handle resolve + SEND right +
+ * self-end PEER_CLOSED only. The glue runs this first, then resolves/validates the
+ * caps (so per-cap DENIED/STALE outrank QUEUE_FULL per A5-4's frozen precedence),
+ * and the final pure try_send_caps enforces QUEUE_FULL atomically at enqueue. */
+je_ep_status je_endpoint_send_preflight_main(je_endpoint_pool *pool,
+                                             je_handle_table *t, je_handle h,
+                                             size_t len)
 {
     je_ep_channel *rec = (je_ep_channel *)0;
     uint8_t side = 0u;
-    if (len != 0u && !kbuf) return JE_EP_INVALID;
-    /* Re-run the full preflight (the glue ran it once before the copy; this is
-     * the same pure validator, so the check+enqueue are atomic under IF=0 with
-     * no new logic). */
-    je_ep_status pf = je_endpoint_send_preflight(pool, t, h, len);
-    if (pf != JE_EP_OK) return pf;
-    (void)je_endpoint_resolve(pool, t, h, &rec, &side);   /* cannot fail now */
+    if (len > JE_EP_MSG_MAX) return JE_EP_INVALID;
+    je_ep_status rs = je_endpoint_resolve(pool, t, h, &rec, &side);
+    if (rs != JE_EP_OK) return rs;
+    uint32_t rights = 0u;
+    je_handle_status gr = je_handle_rights_of(t, h, JE_ENDPOINT_OBJ_TYPE,
+                                              JE_EP_RIGHT_SEND, &rights);
+    if (gr != JE_HANDLE_OK) return hstat(gr);
+    if (rec->end[side].state == JE_EP_END_PEER_CLOSED
+        || rec->end[side].state == JE_EP_END_CLOSED) return JE_EP_PEER_CLOSED;
+    return JE_EP_OK;   /* NO queue-full check here */
+}
 
-    je_ep_queue *q = &rec->end[side ^ 1u].inbound;   /* peer's inbound */
-    uint8_t tail = (uint8_t)((q->head + q->count) % JE_EP_QUEUE_DEPTH);
-    for (uint8_t b = 0; b < (uint8_t)len; ++b)
-        q->buf[tail][b] = ((const uint8_t *)kbuf)[b];
-    q->len[tail] = (uint8_t)len;
-    q->count++;
-    return JE_EP_OK;
+je_ep_status je_endpoint_try_send(je_endpoint_pool *pool, je_handle_table *t,
+                                  je_handle h, const void *kbuf, size_t len)
+{
+    /* Data-only send is exactly the zero-cap case. Delegate so the two paths
+     * cannot drift (and the enqueue always writes cap_count[tail]=0). */
+    return je_endpoint_try_send_caps(pool, t, h, kbuf, len, (const je_ep_capdesc *)0, 0u);
 }
 
 je_ep_status je_endpoint_recv_peek(je_endpoint_pool *pool, je_handle_table *t,
@@ -469,22 +538,208 @@ je_ep_status je_endpoint_recv_peek(je_endpoint_pool *pool, je_handle_table *t,
 je_ep_status je_endpoint_recv_commit(je_endpoint_pool *pool,
                                      const je_ep_recv_lease *lease)
 {
+    /* Delegate to the cap-aware commit (which also releases any queued-cap
+     * inflight refs and zeroes cap storage). A zero-cap message releases nothing;
+     * same behaviour as before, but the two paths cannot drift. */
+    return je_endpoint_recv_commit_caps(pool, lease);
+}
+
+/* ---- capability transfer (M3c step 5, ADR 0009 A5) ----------------------- */
+
+bool je_endpoint_capdesc_live(const je_endpoint_pool *pool, const je_ep_capdesc *d)
+{
+    if (!pool || !d || d->rec_index >= JE_EP_POOL_CAP || d->side > 1u) return false;
+    const je_ep_channel *tr = &pool->rec[d->rec_index];
+    if (!tr->allocated || tr->generation != d->generation) return false; /* stale */
+    je_ep_end_state st = tr->end[d->side].state;
+    /* OPEN and PEER_CLOSED are LIVE (mintable); only CLOSED/FREE are dead (A5-2). */
+    return st == JE_EP_END_OPEN || st == JE_EP_END_PEER_CLOSED;
+}
+
+je_ep_status je_endpoint_capdesc_resolve(je_endpoint_pool *pool,
+                                         const je_ep_capdesc *d,
+                                         je_ep_channel **out_rec, uint8_t *out_side)
+{
+    if (!pool || !d || !out_rec || !out_side) return JE_EP_CORRUPT;
+    if (!je_endpoint_capdesc_live(pool, d)) return JE_EP_STALE;
+    *out_rec = &pool->rec[d->rec_index];
+    *out_side = d->side;
+    return JE_EP_OK;
+}
+
+je_ep_status je_endpoint_capdesc_retain_handle(je_endpoint_pool *pool,
+                                               const je_ep_capdesc *d)
+{
+    je_ep_channel *tr; uint8_t ts;
+    je_ep_status s = je_endpoint_capdesc_resolve(pool, d, &tr, &ts);
+    if (s != JE_EP_OK) return s;
+    return retain_handle(&tr->end[ts]);   /* REFOVERFLOW if at the bound */
+}
+
+void je_endpoint_capdesc_release_handle(je_endpoint_pool *pool,
+                                        const je_ep_capdesc *d)
+{
+    je_ep_channel *tr; uint8_t ts;
+    if (je_endpoint_capdesc_resolve(pool, d, &tr, &ts) != JE_EP_OK) return;
+    /* Undo a mint-path retain: drop one handle_ref (may free if it was the last,
+     * but a mint rollback happens while the descriptor's inflight ref still holds
+     * the target, so this cannot reach 0). */
+    release_handle(pool, tr, ts);
+}
+
+/* Validate the batch of descriptors the glue resolved: count bound, each target
+ * live, each descriptor's rights a subset of the target's CURRENT rights. Pure. */
+static je_ep_status caps_validate(je_endpoint_pool *pool, const je_ep_capdesc *caps,
+                                  uint8_t ncaps)
+{
+    if (ncaps > JE_EP_MSG_CAPS_MAX) return JE_EP_INVALID;
+    for (uint8_t c = 0; c < ncaps; ++c) {
+        je_ep_channel *tr; uint8_t ts;
+        je_ep_status s = je_endpoint_capdesc_resolve(pool, &caps[c], &tr, &ts);
+        if (s != JE_EP_OK) return s;               /* dead target at send -> STALE */
+        /* Descriptor rights must contain only known endpoint bits (defence in
+         * depth; the GLUE attenuates against the sender's HANDLE rights before
+         * building the descriptor — ends themselves carry no rights to check). */
+        if (caps[c].rights & ~(uint32_t)JE_EP_RIGHTS_ALL) return JE_EP_INVALID;
+        (void)tr; (void)ts;
+    }
+    return JE_EP_OK;
+}
+
+je_ep_status je_endpoint_send_preflight_caps(je_endpoint_pool *pool,
+                                             je_handle_table *t, je_handle h,
+                                             size_t len, const je_ep_capdesc *caps,
+                                             uint8_t ncaps)
+{
+    je_ep_status base = je_endpoint_send_preflight(pool, t, h, len);
+    if (base != JE_EP_OK) return base;
+    if (ncaps == 0u) return JE_EP_OK;
+    if (!caps) return JE_EP_INVALID;
+    return caps_validate(pool, caps, ncaps);
+}
+
+je_ep_status je_endpoint_try_send_caps(je_endpoint_pool *pool, je_handle_table *t,
+                                       je_handle h, const void *kbuf, size_t len,
+                                       const je_ep_capdesc *caps, uint8_t ncaps)
+{
+    je_ep_channel *rec = (je_ep_channel *)0;
+    uint8_t side = 0u;
+    if (len != 0u && !kbuf) return JE_EP_INVALID;
+    /* Full preflight (byte + caps) — same validator, re-run so check+enqueue is
+     * atomic under IF=0. */
+    je_ep_status pf = je_endpoint_send_preflight_caps(pool, t, h, len, caps, ncaps);
+    if (pf != JE_EP_OK) return pf;
+    (void)je_endpoint_resolve(pool, t, h, &rec, &side);   /* cannot fail now */
+
+    /* RETAIN one inflight ref per cap on each target, rolling back all on any
+     * REFOVERFLOW (all-or-nothing). */
+    uint8_t retained = 0u;
+    for (uint8_t c = 0; c < ncaps; ++c) {
+        je_ep_channel *tr; uint8_t ts;
+        if (je_endpoint_capdesc_resolve(pool, &caps[c], &tr, &ts) != JE_EP_OK) {
+            /* target died between preflight and here — impossible under IF=0;
+             * roll back and fail closed. */
+            for (uint8_t r = 0; r < retained; ++r) {
+                je_ep_channel *rr; uint8_t rs;
+                (void)je_endpoint_capdesc_resolve(pool, &caps[r], &rr, &rs);
+                if (rr->end[rs].inflight_refs) rr->end[rs].inflight_refs--;
+            }
+            return JE_EP_STALE;
+        }
+        if (tr->end[ts].inflight_refs >= JE_EP_REF_MAX) {
+            for (uint8_t r = 0; r < retained; ++r) {
+                je_ep_channel *rr; uint8_t rs;
+                (void)je_endpoint_capdesc_resolve(pool, &caps[r], &rr, &rs);
+                if (rr->end[rs].inflight_refs) rr->end[rs].inflight_refs--;
+            }
+            return JE_EP_REFOVERFLOW;
+        }
+        tr->end[ts].inflight_refs++;
+        retained++;
+    }
+
+    /* Enqueue the message (bytes + cap descriptors) at the peer inbound tail. */
+    je_ep_queue *q = &rec->end[side ^ 1u].inbound;
+    uint8_t tail = (uint8_t)((q->head + q->count) % JE_EP_QUEUE_DEPTH);
+    for (uint8_t b = 0; b < (uint8_t)len; ++b)
+        q->buf[tail][b] = ((const uint8_t *)kbuf)[b];
+    q->len[tail] = (uint8_t)len;
+    for (uint8_t c = 0; c < ncaps; ++c) q->cap[tail][c] = caps[c];
+    q->cap_count[tail] = ncaps;
+    q->count++;
+    return JE_EP_OK;
+}
+
+je_ep_status je_endpoint_recv_peek_caps(je_endpoint_pool *pool, je_handle_table *t,
+                                        je_handle h, void *out_kbuf, size_t cap,
+                                        size_t *out_len, uint8_t hcap,
+                                        je_ep_capdesc *out_caps, uint8_t *out_ncaps,
+                                        je_ep_recv_lease *lease)
+{
+    je_ep_channel *rec = (je_ep_channel *)0;
+    uint8_t side = 0u;
+    if (!out_len || !out_ncaps) return JE_EP_INVALID;
+    *out_len = 0u; *out_ncaps = 0u;
+
+    je_ep_status rs = je_endpoint_resolve(pool, t, h, &rec, &side);
+    if (rs != JE_EP_OK) return rs;
+    uint32_t rights = 0u;
+    je_handle_status gr = je_handle_rights_of(t, h, JE_ENDPOINT_OBJ_TYPE,
+                                              JE_EP_RIGHT_RECV, &rights);
+    if (gr != JE_HANDLE_OK) return hstat(gr);
+
+    je_ep_queue *q = &rec->end[side].inbound;
+    if (q->count == 0u)
+        return (rec->end[side].state == JE_EP_END_PEER_CLOSED)
+               ? JE_EP_PEER_CLOSED : JE_EP_EMPTY;
+
+    uint8_t mlen = q->len[q->head];
+    uint8_t mcaps = q->cap_count[q->head];
+    *out_len = mlen;
+    *out_ncaps = mcaps;
+    /* Short EITHER buffer -> SHORT_BUFFER, copy nothing, no dequeue (report both
+     * required sizes via out_len / out_ncaps). */
+    if (cap < mlen || hcap < mcaps) return JE_EP_SHORT_BUFFER;
+    if (mlen != 0u && !out_kbuf) return JE_EP_INVALID;
+    if (mcaps != 0u && !out_caps) return JE_EP_INVALID;
+    for (uint8_t b = 0; b < mlen; ++b) ((uint8_t *)out_kbuf)[b] = q->buf[q->head][b];
+    for (uint8_t c = 0; c < mcaps; ++c) out_caps[c] = q->cap[q->head][c];
+    if (lease) {
+        lease->rec = rec; lease->side = side;
+        lease->generation = rec->generation; lease->head = q->head; lease->len = mlen;
+    }
+    return JE_EP_OK;
+}
+
+je_ep_status je_endpoint_recv_commit_caps(je_endpoint_pool *pool,
+                                          const je_ep_recv_lease *lease)
+{
     if (!pool || !lease || !lease->rec) return JE_EP_CORRUPT;
     je_ep_channel *rec = lease->rec;
     if (!rec_in_pool(pool, rec)) return JE_EP_CORRUPT;
-    /* The lease must still name the exact head it observed: record allocated,
-     * same generation, same side, nonempty, same head index, same length. Under
-     * IF=0 single-CPU this always holds between peek and commit (nothing can run
-     * in between); a mismatch is a kernel invariant violation, never ordinary. */
     if (!rec->allocated || rec->generation != lease->generation || lease->side > 1u)
         return JE_EP_CORRUPT;
     je_ep_queue *q = &rec->end[lease->side].inbound;
     if (q->count == 0u || q->head != lease->head || q->len[q->head] != lease->len)
         return JE_EP_CORRUPT;
-    /* Dequeue the head: zero the vacated slot, advance. */
+    /* Snapshot this head's caps BEFORE zeroing, then release each one's inflight
+     * ref (the cap has been delivered — minted or consumed-as-dead by the glue). */
+    uint8_t mcaps = q->cap_count[q->head];
+    je_ep_capdesc snap[JE_EP_MSG_CAPS_MAX];
+    for (uint8_t c = 0; c < mcaps; ++c) snap[c] = q->cap[q->head][c];
+    /* Dequeue: zero the vacated slot (bytes + caps), advance. */
     q->len[q->head] = 0u;
+    q->cap_count[q->head] = 0u;
     for (uint16_t b = 0; b < JE_EP_MSG_MAX; ++b) q->buf[q->head][b] = 0u;
+    for (uint8_t c = 0; c < JE_EP_MSG_CAPS_MAX; ++c) {
+        q->cap[q->head][c].rec_index = 0u; q->cap[q->head][c].side = 0u;
+        q->cap[q->head][c].cap_count_pad = 0u;
+        q->cap[q->head][c].generation = 0u; q->cap[q->head][c].rights = 0u;
+    }
     q->head = (uint8_t)((q->head + 1u) % JE_EP_QUEUE_DEPTH);
     q->count--;
+    /* Now release each delivered cap's inflight ref (may free the target). Done
+     * AFTER dequeue so the queue slot no longer references the target. */
+    for (uint8_t c = 0; c < mcaps; ++c) release_capdesc_inflight(pool, &snap[c]);
     return JE_EP_OK;
 }

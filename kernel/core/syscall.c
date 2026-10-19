@@ -95,18 +95,26 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
         if (rdi|rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_ENDPOINT_CREATE;
     case JE_SYS_TRY_SEND:
-        /* try_send(h=RDI, ubuf=RSI, len=RDX, meta=R10, R8, R9). Shape checks only;
-         * the copy + enqueue happen in the glue. R10[7:0]=cap_count must be 0
-         * (data-only, D9); R10[63:8] reserved must be 0; so R10 must be 0 entirely
-         * this step. R8 (step-5 cap-array ptr) and R9 reserved must be 0. len must
-         * be <= JE_EP_MSG_MAX. Handle must fit 32 bits. */
-        if (r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        /* try_send(h=RDI, ubuf=RSI, len=RDX, meta=R10, cap_array=R8, R9).
+         * R10[7:0] = cap_count (0..JE_ABI_MSG_CAPS_MAX); R10[63:8] reserved = 0.
+         * R8 = user pointer to a u64[cap_count] of {low32 handle, high32 rights}
+         * (0 iff cap_count==0). R9 reserved = 0. len <= JE_ABI_MSG_MAX. (A5-4) */
+        if (r10 >> 8) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; } /* reserved bits */
+        if (r9)       { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if ((r10 & 0xffu) > (uint64_t)JE_ABI_MSG_CAPS_MAX) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        /* R8 must be 0 iff cap_count==0 (and nonzero iff cap_count>0). */
+        if (((r10 & 0xffu) == 0u) != (r8 == 0u)) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rdx > (uint64_t)JE_ABI_MSG_MAX) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_TRY_SEND;
     case JE_SYS_TRY_RECV:
-        /* try_recv(h=RDI, ubuf=RSI, cap=RDX, R10/R8/R9 reserved must be 0). */
-        if (r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        /* try_recv(h=RDI, ubuf=RSI, cap=RDX, hbuf=R8, hcap=R9, R10 reserved=0).
+         * R8 = user u32[] to receive minted handles; R9 = its slot capacity
+         * (0..JE_ABI_MSG_CAPS_MAX; a larger value is rejected so it can't be
+         * truncated to a smaller capacity in the glue). R8 must be 0 iff R9==0. */
+        if (r10) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if (r9 > (uint64_t)JE_ABI_MSG_CAPS_MAX) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if ((r8 == 0u) != (r9 == 0u)) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_TRY_RECV;
 #ifdef JE_DEV_COPY_INJECT
@@ -183,6 +191,7 @@ _Static_assert(JE_EP_RIGHT_SEND == JE_ABI_RIGHT_SEND
                && JE_EP_RIGHT_INSPECT == JE_ABI_RIGHT_INSPECT,
                "endpoint rights: table vs ABI");
 _Static_assert(JE_EP_MSG_MAX == JE_ABI_MSG_MAX, "endpoint msg max: table vs ABI");
+_Static_assert(JE_EP_MSG_CAPS_MAX == JE_ABI_MSG_CAPS_MAX, "endpoint caps max: table vs ABI");
 
 /* Map endpoint-layer status to the v0 ABI (reuses the JE_ABI_H_* namespace; the
  * glue is the only place endpoint.h and abi.h meet). */
@@ -348,54 +357,119 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         return je_sched_return_to_user(f);
     }
     case JE_SYSCALL_TRY_SEND: {
-        /* D6 send: read-only PREFLIGHT (so a bad ubuf never masks DENIED/
-         * PEER_CLOSED/QUEUE_FULL, and user memory is not read for an
-         * unauthorized handle) -> copy_from_user into a STACK staging buffer
-         * (fault -> INVALID, nothing enqueued) -> pure try_send re-checks +
-         * enqueues. */
+        /* A5-4 send: resolve caps (if any) in the sender's table FIRST (read-only
+         * -> TRANSFER + attenuation), preflight bytes+caps, copy bytes to stack
+         * staging, then pure all-or-nothing enqueue (bytes + cap descriptors +
+         * per-cap inflight retain). Cap-array copy fault ranks last (after a clean
+         * preflight), per the frozen precedence. */
         je_vm *vm; uint32_t index;
         if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
         je_handle h = (je_handle)f->rdi;
-        uint64_t ubuf = f->rsi, len = f->rdx;   /* decode bounded len <= MSG_MAX */
-        je_ep_status pf = je_endpoint_kern_send_preflight(vm, index, h, (size_t)len);
-        if (pf != JE_EP_OK) { f->rax=(uint64_t)ep_status_to_abi(pf); f->rdx=0; return je_sched_return_to_user(f); }
+        uint64_t ubuf = f->rsi, len = f->rdx;
+        uint8_t ncaps = (uint8_t)(f->r10 & 0xffu);
+        uint64_t caparr = f->r8;
+        je_ep_capdesc caps[JE_ABI_MSG_CAPS_MAX];
+        /* Resolve each user cap entry {low32 handle, high32 rights} -> descriptor.
+         * Copy the array in first (a fault here is INVALID but only after the main
+         * handle is validated by the preflight below — so do the base preflight
+         * (len + main handle SEND/state/full) FIRST). */
+        je_ep_status bpf = je_endpoint_kern_send_preflight(vm, index, h, (size_t)len);
+        if (bpf != JE_EP_OK) { f->rax=(uint64_t)ep_status_to_abi(bpf); f->rdx=0; return je_sched_return_to_user(f); }
+        if (ncaps != 0u) {
+            uint64_t raw[JE_ABI_MSG_CAPS_MAX];
+            je_abi_status cs = je_copy_from_user(raw, caparr,
+                                                 (uint64_t)ncaps * sizeof(uint64_t));
+            if (cs != JE_ABI_OK) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+            for (uint8_t c = 0; c < ncaps; ++c) {
+                je_handle ch = (je_handle)(raw[c] & 0xffffffffu);
+                uint32_t crights = (uint32_t)(raw[c] >> 32);
+                if (crights & ~(uint32_t)JE_ABI_RIGHTS_KNOWN) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+                je_ep_status rc = je_endpoint_kern_resolve_send_cap(vm, index, ch, crights, &caps[c]);
+                if (rc != JE_EP_OK) { f->rax=(uint64_t)ep_status_to_abi(rc); f->rdx=0; return je_sched_return_to_user(f); }
+            }
+        }
         uint8_t staging[JE_EP_MSG_MAX];
         if (len != 0u) {
             je_abi_status cs = je_copy_from_user(staging, ubuf, len);
             if (cs != JE_ABI_OK) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
         }
-        je_ep_status s = je_endpoint_kern_send(vm, index, h, staging, (size_t)len);
+        je_ep_status s = je_endpoint_kern_send_caps(vm, index, h, staging,
+                                                    (size_t)len, caps, ncaps);
         f->rax = (uint64_t)ep_status_to_abi(s); f->rdx = 0;
         return je_sched_return_to_user(f);
     }
     case JE_SYSCALL_TRY_RECV: {
-        /* D6 recv: PEEK into a stack buffer (no dequeue) -> glue checks cap ->
-         * copy_to_user (fault -> INVALID, message stays queued) -> INFALLIBLE
-         * commit (dequeue). A commit mismatch halts (double-deliver hazard). */
+        /* A5-4 recv: PEEK (bytes + cap descriptors, no dequeue) -> stage all live
+         * mints in the receiver's table (dead caps -> handle 0, A5-2) -> copy bytes
+         * out -> copy handle array out -> INFALLIBLE commit (dequeue + release each
+         * cap's inflight). Any transient fault rolls back every staged mint and
+         * leaves the message queued. */
         je_vm *vm; uint32_t index;
         if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
         je_handle h = (je_handle)f->rdi;
-        uint64_t ubuf = f->rsi, cap = f->rdx;
+        uint64_t ubuf = f->rsi, cap = f->rdx, hbuf = f->r8, hcap = f->r9;
         uint8_t staging[JE_EP_MSG_MAX];
-        size_t mlen = 0u;
+        je_ep_capdesc caps[JE_ABI_MSG_CAPS_MAX];
+        size_t mlen = 0u; uint8_t mcaps = 0u;
         je_ep_recv_lease lease;
-        je_ep_status s = je_endpoint_kern_recv_peek(vm, index, h, staging,
-                                                    (size_t)cap, &mlen, &lease);
-        if (s == JE_EP_SHORT_BUFFER) { f->rax=(uint64_t)JE_ABI_H_SHORT_BUFFER; f->rdx=(uint64_t)mlen; return je_sched_return_to_user(f); }
+        je_ep_status s = je_endpoint_kern_recv_peek_caps(vm, index, h, staging,
+                                                         (size_t)cap, &mlen,
+                                                         (uint8_t)hcap, caps, &mcaps,
+                                                         &lease);
+        if (s == JE_EP_SHORT_BUFFER) {
+            f->rax=(uint64_t)JE_ABI_H_SHORT_BUFFER;
+            f->rdx=(uint64_t)mlen | ((uint64_t)mcaps << 32);
+            return je_sched_return_to_user(f);
+        }
         if (s != JE_EP_OK) { f->rax=(uint64_t)ep_status_to_abi(s); f->rdx=0; return je_sched_return_to_user(f); }
-        /* Peek OK: copy out, then commit. Zero-length delivers nothing to copy. */
+        /* Stage mints: a live cap mints a fresh handle; a dead cap stages 0 (A5-2).
+         * Roll back all minted-so-far on any transient failure (QUOTA/NOSLOTS/
+         * REFOVERFLOW). */
+        je_handle minted[JE_ABI_MSG_CAPS_MAX];
+        bool was_live[JE_ABI_MSG_CAPS_MAX];
+        for (uint8_t c = 0; c < mcaps; ++c) { minted[c] = 0u; was_live[c] = false; }
+        je_abi_status fail = JE_ABI_OK; uint8_t done = 0u;
+        for (uint8_t c = 0; c < mcaps; ++c) {
+            if (!je_endpoint_kern_capdesc_live(&caps[c])) { minted[c] = 0u; continue; }
+            je_handle nh = 0u;
+            je_ep_status mc = je_endpoint_kern_mint_recv_cap(vm, index, &caps[c], &nh);
+            if (mc != JE_EP_OK) { fail = ep_status_to_abi(mc); break; }
+            minted[c] = nh; was_live[c] = true; done = (uint8_t)(c + 1u);
+        }
+        if (fail != JE_ABI_OK) {
+            for (uint8_t c = 0; c < done; ++c)
+                if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
+            f->rax=(uint64_t)fail; f->rdx=0; return je_sched_return_to_user(f);
+        }
+        /* Copy bytes out. */
         if (mlen != 0u) {
             je_abi_status cs = je_copy_to_user(ubuf, staging, (uint64_t)mlen);
-            if (cs != JE_ABI_OK) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
+            if (cs != JE_ABI_OK) {
+                for (uint8_t c = 0; c < mcaps; ++c)
+                    if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
+                f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f);
+            }
         }
+        /* Copy minted handle array out (u32 each). */
+        if (mcaps != 0u) {
+            uint32_t hout[JE_ABI_MSG_CAPS_MAX];
+            for (uint8_t c = 0; c < mcaps; ++c) hout[c] = (uint32_t)minted[c];
+            je_abi_status cs = je_copy_to_user(hbuf, hout,
+                                               (uint64_t)mcaps * sizeof(uint32_t));
+            if (cs != JE_ABI_OK) {
+                for (uint8_t c = 0; c < mcaps; ++c)
+                    if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
+                f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f);
+            }
+        }
+        /* Infallible commit: dequeue + release each cap's inflight ref. */
         je_ep_status cm = je_endpoint_kern_recv_commit(&lease);
         if (cm != JE_EP_OK) {
-            /* Impossible under IF=0 single-CPU; a retry would double-deliver, so
-             * this is a kernel invariant violation, not a user status. */
             je_arch_console_write("JeiOS fatal: recv commit mismatch\r\n");
             je_arch_halt();
         }
-        f->rax = (uint64_t)JE_ABI_OK; f->rdx = (uint64_t)mlen;
+        f->rax = (uint64_t)JE_ABI_OK;
+        f->rdx = (uint64_t)mlen | ((uint64_t)mcaps << 32);
         return je_sched_return_to_user(f);
     }
 #ifdef JE_DEV_COPY_INJECT

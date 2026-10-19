@@ -139,6 +139,10 @@ typedef enum {
  * (ring 3 must know the cap); pinned equal to the table-side JE_EP_MSG_MAX in the
  * syscall glue. */
 #define JE_ABI_MSG_MAX 64u
+/* M3c step 5 (ADR 0009 A5): max capabilities a single message may carry (K).
+ * ABI-visible (ring 3 sizes its cap/handle arrays by it); pinned equal to the
+ * table-side JE_EP_MSG_CAPS_MAX in the glue. */
+#define JE_ABI_MSG_CAPS_MAX 2u
 _Static_assert(JE_SYS_HANDLE_SELF == 5, "abi op handle_self");
 _Static_assert(JE_SYS_HANDLE_CLOSE == 6, "abi op handle_close");
 _Static_assert(JE_SYS_HANDLE_QUERY == 7, "abi op handle_query");

@@ -646,8 +646,30 @@ teardown hook on **both** VMs (`je_endpoint_kern_install`) before seeding, so
 A5-1's "last handle / death discards" reclamation holds for the seeded ends too
 (the raw `je_endpoint_channel_create` bypasses op-10's A3-2 hook check, so the
 fixture asserts the hook explicitly). Over the seeded channel A transfers a
-*second* channel's end to B; B mints it and uses it. This is the first genuine
-cross-address-space transfer proof (self-loopback is ruled out).
+*second* channel's end to B; B mints it and uses it.
+
+**Transfer sequencing (frozen, review-driven).** Under the frozen D2, closing the
+LAST handle to a transferred end marks it CLOSED, making an in-flight queued cap
+to it *dead* (A5-2). So the sender MUST retain its handle to the transferred end
+until the receiver has minted: A sends the cap → **B peeks + mints** (B now
+co-owns the end) → only THEN A closes its copy. "Send then immediately close, then
+B receives" delivers a *dead* cap (handle 0) — the A5-2 path, not the
+successful-transfer path.
+
+**Proof status (recorded decision, 2026-10-19).** The step-5 PR proves the
+transfer MECHANISM across two **distinct process tables** deterministically as a
+**kernel self-test** (`M3c-s5`): seed S across two tables, mint C in table A,
+transfer C.e1 as a cap over S via the real send/recv cap path, mint it into table
+B, message A on C.e0 across the tables, reclaim S+C. A full **ring-3 two-process**
+transfer (two scheduled user tasks cooperatively exchanging over the seeded
+channel) is **deferred to step 7 (the bootstrap fixture)**, whose explicit subject
+is multi-process choreography. *Decision + why:* the cross-table mechanism is
+fully proven deterministically here; the cooperative-scheduling choreography is
+step 7's job, not a reason to add a race-prone two-stub test to step 5 (a
+spin-based receiver can exhaust its bounded poll before the sender runs on a
+single CPU). *Prediction if forced into step 5:* a brittle timing-dependent test
+that could flake in CI. *Flex (planning review):* step 7 revisits whether the
+bootstrap fixture subsumes this or wants a cooperative-yield primitive first.
 
 **Predictions if other choices were made.**
 - *Option (a) — a new `try_recv_caps` op instead of extending `try_recv` via
