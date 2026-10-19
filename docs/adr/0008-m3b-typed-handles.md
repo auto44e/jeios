@@ -409,3 +409,42 @@ With D-RESOLVED settled, the first PR (D9) may begin.
 AI-assisted design (including a two-round peer cross-talk debate); not independent
 human qualification. The owner is the merge gate; D-RESOLVED records the owner's
 Option-A decision, and any D7 death-path change remains owner-gated.
+
+## Decision-record annotation (reconstructed — sweep 2026-10-19)
+
+Per ADR 0000; reconstructed from this ADR's own text only. Part 4: the ADR records
+"AI-assisted design (including a two-round peer cross-talk debate)" but that
+transcript predates the retention policy and was **not retained** — "transcript
+not retained." (ADR 0009 onward commit theirs under `docs/adr/debates/`.)
+
+**Decision + why (as recorded).** Freeze the M3b typed-handle contract: the D2
+32-bit handle ABI (index + slot generation), D3 authority lifetime, D4
+generation-saturation-retires-the-slot (no wraparound), D5 compile-time generation
+width, D7 owner-gated teardown ordering, and **D-RESOLVED Option A** (owner):
+handles carry only the slot generation; a service restart is close + re-allocate +
+generation-bump, so old handles go STALE automatically.
+
+**Predictions if other choices were made.** This ADR already recorded its
+counterfactual in-line (the sweep need only point at it):
+- *Option B (instance-epoch field) instead of Option A:* explicitly weighed and
+  **not chosen** — it "widens the handle ABI (less room for index/slot-gen in 32
+  bits, or a wider handle) and adds a field to every lookup — a capability M3b does
+  not need." Its upside (survives "same slot, same slot-gen, new instance" without
+  a bump) was judged unnecessary for M3b's single-process local reuse. (The
+  scope-caveat carried the open part to M3c, where ADR 0009 resolved restart with
+  D-OWNER-1 terminal-destruction / no-incarnation-counter — consistent with A.)
+- *Generation wraparound instead of retire-on-saturation (D4):* the Consequences
+  record the accepted trade — retirement lets a close/reopen-heavy process slowly
+  shrink its own table, "defined, bounded, and far below any realistic workload …
+  preferred over any wraparound aliasing risk."
+- *Fold the death-path edit into the first PR:* rejected to keep "the M3a tested
+  fault-death path untouched until an explicit, owner-signed teardown PR" (D7
+  owner-gating — the same discipline M3c's step-3 and step-6 followed).
+
+**Flex options to consider in future (reconstructed).** In-text: ">65536 slots, a
+wider handle, SMP-safe refcounting, or a cross-process transfer ABI writes a new
+ADR and a new handle ABI version; none of those are silent changes" — i.e. the ABI
+width + refcount model are `FLEX (planning review)` at those milestones. The
+Option-A restart model is firm for M3b; the recorded "Future consideration" of a
+hybrid A+B is the explicit revisit hook. The 32-bit encoding and STALE/retire
+semantics are **firm** (owner-signed ABI).
