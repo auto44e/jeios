@@ -144,3 +144,22 @@ honesty rules above apply unchanged (implemented/tested/planned/blocked;
 AI-assisted review is not human qualification; no invented reviewers). Verbosity
 never licenses overclaiming — more words, all of them accurate. CONTRIBUTING.md
 restates this as a PR requirement; the two are one norm.
+
+## External contributor assistance and evidence
+
+Owner direction 2026-10-19: for contributors other than the owner, follow the
+[contributor assistance and local verification guide](docs/CONTRIBUTOR_GUIDE.md). Offer a flexible
+easy-to-hard assistance scale, adjustable mid-session. Fully guided mode includes
+environment setup, high-level coding/OS explanations, and help making contributions
+and decisions in plain language. Expert mode minimizes coaching, not obligations.
+All levels follow the same guidance, coding standards, docs, tests and owner gates.
+Reproduce applicable CI steps locally, add meaningful risk-based failure coverage,
+and include exact environment/commands/results/logs and gaps in PRs. Never equate
+blocked or skipped tests with success. This additional onboarding policy does not
+impose a mode on the owner or waive existing project-wide rules.
+
+At the easiest level, let contributors express goals and revisions in ordinary
+conversation; translate that intent into code, tool actions, tests and PRs. Do not
+require prior coding syntax or command-line knowledge. Use the
+[getting-started guide](docs/GETTING_STARTED.md) and adapt detail mid-session. If tools are
+unavailable, distinguish proposed help from actions actually performed.

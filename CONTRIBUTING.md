@@ -1,5 +1,8 @@
 # Contributing
 
+New contributor? Start with the [development getting-started guide](docs/GETTING_STARTED.md),
+including a plain-English conversational path with an agent.
+
 This is an experimental new OS. Read AGENTS.md and the handoff, then choose one
 bounded roadmap task. Explain behavior, ownership/lifetime, architecture-specific
 preconditions, failure cases and tests. Keep implementation-status claims exact.
@@ -31,3 +34,13 @@ verification run (honest about local vs remote CI). This is the single-agent
 counterpart to the multi-agent debate transcript; see the "Single-agent
 contributions" section of AGENTS.md. Verbosity must never become overclaiming —
 keep every implemented/tested/planned/blocked claim exact.
+
+## Assistance level and PR evidence
+
+External contributors, especially those using agents: read the
+[contributor guide](docs/CONTRIBUTOR_GUIDE.md). Choose as much or as little coaching as useful and
+change that level at any point. Easy mode guides setup and explains development
+and decisions in simple terms; hard mode retains every engineering requirement.
+Run applicable local CI commands and broader change-specific tests, and include
+result data using the PR template. Disclose blocked checks and environment
+limitations; local and remote results are separate evidence.
