@@ -1,5 +1,24 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Contributor guidance refresh — observed 2026-10-19T11:09:52+00:00
+
+Inspected jeios main at `9bb0c1cdac351e4f937c39c4431ecfd959eb14cd`. Owner requested additional
+guidance for other contributors: expansive risk-based local CI/testing, PR result
+data and an easy-to-hard assistance scale adjustable even mid-session. Added
+contributor/agent guidance and a PR evidence template; core holds the shared guide.
+Easy mode includes setup, plain-language OS/coding explanations and contribution/
+decision walkthroughs; hard mode still follows all standards, docs and gates.
+This is documentation only, not new CI enforcement, runtime support or an owner
+onboarding requirement. Existing milestone status and owner gates are unchanged.
+
+Local verification on this docs-only patch over the inspected revision:
+`make check` hit the environment LeakSanitizer /proc inspection restriction;
+`ASAN_OPTIONS=detect_leaks=0 make check` passed, with leak scanning disabled.
+Changed Markdown links and `git diff --check` checked before publication.
+No emulator rerun for docs/template changes; no new-head remote CI result claimed
+here. Next: review/merge the guidance; implementation priorities remain #52/#53/#54
+and mobile #2. CI automation/enforcement remains core #18/#19.
+
 ## Current phase refresh — observed 2026-10-19T10:44:37+00:00
 
 Inspected `auto44e/jeios` main at `11a02adf744874328371b7f9f3bc801623995980` and mobile main at
