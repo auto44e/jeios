@@ -69,8 +69,11 @@ requirement here is not a claim that the source currently implements it.
 M1 exception entry, validated boot-memory discovery and protected mappings are
 implemented. M2 adds bounded page/heap allocation, PIC/PIT interrupts, seven
 preemptible guarded kernel workers, sleep/wakeup and exit/reaping. These are
-single-CPU AMD64 mechanisms; there is no userspace or sandbox yet. The runtime
-self-test checks registers, memory and resource accounting before halting.
+single-CPU AMD64 mechanisms. M3 now adds isolated userspace, checked syscalls,
+typed handles and bounded capability IPC with a two-process bootstrap fixture.
+ARM64 entry/console/vectors are QEMU-tested; DTB parsing and MP2/MP3 remain.
+This is experimental evidence, not hardened sandbox/release qualification.
+See [NEXT_PHASE.md](NEXT_PHASE.md) for M4 and initial read-only M5a sequencing.
 
 Read [IMPLEMENTATION.md](IMPLEMENTATION.md) for exact limits and current contracts,
 and [HANDOFF.md](HANDOFF.md) for observed tests. Historical mentions of M0 describe
@@ -122,7 +125,7 @@ interrupt routing, and the minimal device primitives needed for progress.
 Higher-level policy and suitable drivers should run as isolated user services.
 
 This is a design direction, not a declaration that M0 is a complete microkernel.
-Initially all implemented C runs at ring 0. We will decide service boundaries by
+The initial M0 implementation ran at ring 0; M3 now executes bounded user tasks. We will decide service boundaries by
 measured performance, recovery behavior, driver requirements, and trust budget.
 A large hybrid core can evolve from the wrong defaults; each new privileged
 subsystem therefore needs a documented reason to be privileged.

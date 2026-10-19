@@ -46,8 +46,14 @@ SMP implementation, hardened sandbox, or complete hardening milestone — M3's c
 remains "experimental single-CPU userspace + capability IPC in qualified emulator
 profiles, proven by test," not a release qualification.
 
-M3 is complete; next are M4+ (core) and the MP2+ ARM64 track (MMU/timer/scheduling,
-now atop MP1 vectors), per the gate table above and the HANDOFF.
+M3 is complete. Follow [NEXT_PHASE.md](NEXT_PHASE.md): finish MP1 DTB/remote
+boot CI (#52), then core M4 services/devices (#53), then bounded read-only M5a
+(#54). ARM MP2/MP3 follows its own qualification gates.
+
+### Historical M3 implementation sequence
+
+The sequence below records earlier implementation staging; the completion summary
+above supersedes any present-tense work-in-progress wording.
 
 - **M3a:** private user address spaces, ring-3 entry/return, user-copy fault
   containment and a bounded user program loader. Prove two actual CPL3 tasks
@@ -92,6 +98,12 @@ Before stable ABI: specify native wire layout, rights/lifetime and concurrency.
 Before hardened profile: define exact minimum hardware and firmware/update policy.
 Before accelerated desktop: select native toolkit/compositor strategy in an ADR.
 Before foreign compatibility: scope exact ABI/application set and security mapping.
+
+## Historical requirement additions
+
+The dated records below preserve earlier priorities and status wording. Current
+status and task ordering above and in NEXT_PHASE.md supersede that wording; the
+owner requirements remain active.
 
 ## Additional owner requirements (2026-10-13)
 

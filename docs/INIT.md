@@ -1,8 +1,9 @@
 # Init and service management design
 
-Status: proposed architecture, 2026-10-13. No userspace init or service manager is
-implemented. M2's kernel worker demonstration is not init. This document defines
-M3c/M4 contracts; it does not advance those gates or freeze a public ABI.
+Status refreshed 2026-10-19: M3c completed a kernel-seeded two-process bootstrap
+fixture with IPC, waits and clean teardown. The general userspace supervisor below
+remains planned for M4 (#53); the fixture does not implement it. See
+[NEXT_PHASE.md](NEXT_PHASE.md). This design does not freeze a public ABI.
 
 ## Decision and division of responsibility
 
@@ -121,7 +122,8 @@ record compensation/outcome-unknown for external effects. Do not claim atomicity
 across arbitrary services. Keep a verified known-good recovery configuration
 independent from a broken owner override; owner trust controls who can replace it.
 
-M3c first proves init startup, reaping and IPC cancellation. M4 then tests cycles,
+M3c proved bounded bootstrap IPC/waits and teardown; cancellation is internal-only
+in its v1 ABI. M4 must qualify general supervisor lifecycle and then test cycles,
 missing optional/required services, spoofed/stale readiness, dependency loss,
 crash storms, exhausted queues, supervisor policy-service loss, user separation,
 configuration interruption and shutdown timeouts. Prove CLI/GUI authorization
