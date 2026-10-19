@@ -6,6 +6,13 @@ agents. Existing project-wide standards, review and evidence rules still apply t
 everyone; this addition does not impose an onboarding mode on the owner or exempt
 owner contributions from existing rules.
 
+Start with [GETTING_STARTED.md](GETTING_STARTED.md) for a conversational or
+hands-on first contribution. At the easiest level, contributors can code through
+plain-English conversation: the agent translates intent into implementation and
+tests, operates available tools, and explains consequential choices. Prior C,
+terminal or Git syntax knowledge is not required. This is a contribution workflow,
+not a new programming language or an exemption from review.
+
 ## One standard, a flexible assistance scale
 
 Difficulty controls how much guidance an agent provides, not the quality of the

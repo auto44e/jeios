@@ -1,5 +1,8 @@
 # JeiOS
 
+New contributor? Start with the [development getting-started guide](docs/GETTING_STARTED.md),
+including a plain-English conversational path with an agent.
+
 JeiOS is an experimental operating system with a fresh C kernel. Its design
 combines Unix interoperability, an NT-inspired object/service model, and an
 integrated, deeply customizable desktop. Privacy, explicit authority, recoverable

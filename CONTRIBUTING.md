@@ -1,5 +1,8 @@
 # Contributing
 
+New contributor? Start with the [development getting-started guide](docs/GETTING_STARTED.md),
+including a plain-English conversational path with an agent.
+
 This is an experimental new OS. Read AGENTS.md and the handoff, then choose one
 bounded roadmap task. Explain behavior, ownership/lifetime, architecture-specific
 preconditions, failure cases and tests. Keep implementation-status claims exact.

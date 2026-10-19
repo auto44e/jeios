@@ -157,3 +157,9 @@ Reproduce applicable CI steps locally, add meaningful risk-based failure coverag
 and include exact environment/commands/results/logs and gaps in PRs. Never equate
 blocked or skipped tests with success. This additional onboarding policy does not
 impose a mode on the owner or waive existing project-wide rules.
+
+At the easiest level, let contributors express goals and revisions in ordinary
+conversation; translate that intent into code, tool actions, tests and PRs. Do not
+require prior coding syntax or command-line knowledge. Use the
+[getting-started guide](docs/GETTING_STARTED.md) and adapt detail mid-session. If tools are
+unavailable, distinguish proposed help from actions actually performed.

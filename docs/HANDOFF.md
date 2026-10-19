@@ -8,6 +8,10 @@ data and an easy-to-hard assistance scale adjustable even mid-session. Added
 contributor/agent guidance and a PR evidence template; core holds the shared guide.
 Easy mode includes setup, plain-language OS/coding explanations and contribution/
 decision walkthroughs; hard mode still follows all standards, docs and gates.
+Owner clarification: fully guided contributors can work through natural
+plain-English conversation without prior code/terminal/Git syntax knowledge.
+Added a shared development getting-started guide with conversational and manual
+paths, setup/build/test/PR steps and a mobile entry point.
 This is documentation only, not new CI enforcement, runtime support or an owner
 onboarding requirement. Existing milestone status and owner gates are unchanged.
 
