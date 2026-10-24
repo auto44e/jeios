@@ -1,5 +1,13 @@
 # Coding-agent starting guide
 
+Ecosystem scope: [CPU, GPU, APU and NPU architecture support](ARCHITECTURE_SUPPORT.md)
+across kernel, drivers, runtimes, SDK, applications and product profiles. Planning
+scaffolds do not establish runtime or hardware qualification.
+
+RISC-V: [RV64 scaffold and gated port plan](RISCV.md) added 2026-10-24.
+Planning only; no RISC-V execution or hardware support claimed. Existing core
+and ARM64 implementation priorities remain unchanged.
+
 Updated 2026-10-19. Read this with ../AGENTS.md, HANDOFF.md and IMPLEMENTATION.md.
 Owner requested a sustained coding-agent handoff. This guide records requirements
 and continuation order; it does not claim later milestones are implemented.

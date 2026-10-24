@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "status": "planned",
+  "profile_id": null,
+  "product_profiles": [],
+  "host_cpu": {
+    "isa": null,
+    "extensions": [],
+    "abi": null,
+    "platform": null
+  },
+  "accelerators": [],
+  "qualification": {
+    "kernel": null,
+    "drivers": null,
+    "services_runtimes": null,
+    "sdk_toolchains": null,
+    "applications_packages": null,
+    "product_integration": null
+  },
+  "pins": {
+    "source_revisions": {},
+    "toolchain": null,
+    "firmware": []
+  },
+  "required_guarantees": [],
+  "fallback_policy": null,
+  "evidence": [],
+  "limitations": [
+    "Template only; no build or runtime consumes this manifest."
+  ]
+}

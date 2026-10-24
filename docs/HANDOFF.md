@@ -1,5 +1,29 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Ecosystem architecture scaffold — observed 2026-10-24T05:51:56+00:00
+
+Inspected auto44e/jeios main `5648a4bd129ed713756feb72d97d4011788504cd`.
+Branch: docs/riscv-scaffold-20261024. Owner clarified that RISC-V and other
+CPU/GPU/APU/NPU support covers the entire ecosystem. Added ARCHITECTURE_SUPPORT.md,
+RISCV.md, config/architecture-profile.template.json, config/riscv64.json and
+kernel/arch/riscv64/README.md; linked README, roadmap, implementation and agent entry
+points. Implemented: documentation/configuration scaffolds only, not build inputs.
+Planned: RV0–RV4 CPU foundation plus driver, service/runtime, SDK/package and
+product integration qualification. No executable port, firmware import, changed
+ABI or frozen contract. No accelerator/device or whole product qualified here.
+No mobile integration pin change. Existing MP1/M4/M5a priority remains unchanged.
+Next bounded task: reviewed RV0 pins/handoff/failure contracts; separate named
+accelerator profile proposals follow M4/M8 and cross-layer evidence gates.
+
+Verification on this patch: `make check` blocked by LeakSanitizer environment
+inspection failure. `ASAN_OPTIONS=detect_leaks=0 make check` then encountered a
+zero-byte/non-executable build/0/test_syscall artifact. Forced regeneration with
+`ASAN_OPTIONS=detect_leaks=0 make -B check` passed host tests, ELF and isolation
+checks (exit 0); leak scanning was disabled. JSON parsing, local Markdown links
+in changed files and `git diff --check` checked before publication. No RISC-V
+compiler/emulator, accelerator hardware, boot smoke or new-head remote CI run
+claimed. No independent human qualification. PR is reviewable, not merged.
+
 ## Contributor guidance refresh — observed 2026-10-19T11:09:52+00:00
 
 Inspected jeios main at `9bb0c1cdac351e4f937c39c4431ecfd959eb14cd`. Owner requested additional

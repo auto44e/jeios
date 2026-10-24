@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "architecture": "riscv64",
+  "status": "planning-scaffold",
+  "boot_qualified": false,
+  "candidate": {
+    "emulator": "qemu-system-riscv64",
+    "machine": "virt",
+    "harts": 1,
+    "kernel_privilege": "S-mode",
+    "firmware": "OpenSBI",
+    "translation": "Sv39",
+    "floating_point_vector": "disabled until context management qualified"
+  },
+  "qualification": {
+    "qemu_version": null,
+    "cpu_isa_profile": null,
+    "toolchain_version": null,
+    "firmware_sha256": null,
+    "boot_evidence": null
+  }
+}
