@@ -1,5 +1,13 @@
 # Gated roadmap
 
+Ecosystem scope: [CPU, GPU, APU and NPU architecture support](ARCHITECTURE_SUPPORT.md)
+across kernel, drivers, runtimes, SDK, applications and product profiles. Planning
+scaffolds do not establish runtime or hardware qualification.
+
+RISC-V: [RV64 scaffold and gated port plan](RISCV.md) added 2026-10-24.
+Planning only; no RISC-V execution or hardware support claimed. Existing core
+and ARM64 implementation priorities remain unchanged.
+
 Coding-agent continuation: [AGENT_START.md](AGENT_START.md) maps owner requirements,
 current baseline and linked issue dependencies. Future designs remain unimplemented.
 

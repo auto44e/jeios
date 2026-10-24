@@ -1,5 +1,13 @@
 # JeiOS
 
+Ecosystem scope: [CPU, GPU, APU and NPU architecture support](docs/ARCHITECTURE_SUPPORT.md)
+across kernel, drivers, runtimes, SDK, applications and product profiles. Planning
+scaffolds do not establish runtime or hardware qualification.
+
+RISC-V: [RV64 scaffold and gated port plan](docs/RISCV.md) added 2026-10-24.
+Planning only; no RISC-V execution or hardware support claimed. Existing core
+and ARM64 implementation priorities remain unchanged.
+
 New contributor? Start with the [development getting-started guide](docs/GETTING_STARTED.md),
 including a plain-English conversational path with an agent.
 
