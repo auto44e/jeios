@@ -1,5 +1,9 @@
 # Implementation ledger: M1 and M2
 
+Standards adopted as design requirements (2026-10-26): [standards and evidence](STANDARDS.md)
+and [organizational ISO 27001 support features](ORG_SECURITY.md). Implementation
+and formal qualification remain gated; these documents add no runtime behavior.
+
 Ecosystem scope: [CPU, GPU, APU and NPU architecture support](ARCHITECTURE_SUPPORT.md)
 across kernel, drivers, runtimes, SDK, applications and product profiles. Planning
 scaffolds do not establish runtime or hardware qualification.
