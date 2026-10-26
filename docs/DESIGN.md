@@ -1,5 +1,9 @@
 # JeiOS system design
 
+Standards adopted as design requirements (2026-10-26): [standards and evidence](STANDARDS.md)
+and [organizational ISO 27001 support features](ORG_SECURITY.md). Implementation
+and formal qualification remain gated; these documents add no runtime behavior.
+
 ## Overall product vision: approachable defaults, deep owner control
 
 Owner clarification: 2026-10-14T19:59:09-04:00. This philosophy governs the

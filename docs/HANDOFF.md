@@ -1,5 +1,28 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Standards and organizational support — observed 2026-10-26T08:28:29-04:00
+
+Inspected auto44e/jeios main `99fb5687b9c13e40bdca6253c780d2c6f0312e05`; PR #57 is merged in this
+baseline. Branch: docs/standards-org-support. Owner adopted the ISO standards
+plan and requested features supporting organizational ISO 27001 efforts.
+Implemented here: STANDARDS.md, ORG_SECURITY.md and entry-point links only.
+Planned: scoped POSIX/C, security evaluation, quality, human-centred design and
+international-text requirements; ORG-01–09 inventory/identity/policy/audit,
+patching/crypto/backup/response/evidence functionality. No runtime behavior,
+certification, normative clause-level audit or new compliance enforcement claimed.
+No tested code/frozen contracts changed. All implementation owners remain
+unassigned. Existing MP1/M4/M5a priorities and mobile pins remain unchanged.
+
+Validation: `make check` blocked by environment LeakSanitizer inspection failure;
+`ASAN_OPTIONS=detect_leaks=0 make check` passed (exit 0), leak scanning disabled.
+Changed local Markdown links and `git diff --check` checked before publication.
+No boot smoke (documentation-only), cross-architecture run or remote CI result
+claimed. Single-agent contribution; no independent human qualification.
+Next bounded task: ORG-G0 audit/evidence contracts and requirement inventory
+alongside M4, with owners, privacy/loss behavior and negative acceptance tests.
+Open issue: reviewed normative mappings and implementations remain future work.
+
+
 ## Ecosystem architecture scaffold — observed 2026-10-24T05:51:56+00:00
 
 Inspected auto44e/jeios main `5648a4bd129ed713756feb72d97d4011788504cd`.
