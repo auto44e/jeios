@@ -48,7 +48,13 @@ ARM_CFLAGS  += -DJE_ARM_VECTOR_TEST
 ARM_ASFLAGS += -DJE_ARM_VECTOR_TEST
 endif
 
-ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/vectors.o
+ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/vectors.o $(ARM_BUILD)/fdt.o
+
+# Shared arch-neutral bounded DTB parser (issue #52), compiled with the ARM
+# freestanding/strict-align flags.
+$(ARM_BUILD)/fdt.o: kernel/core/fdt.c include/jeios/fdt.h
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
 
 $(ARM_BUILD)/boot.o: $(ARM_ARCH)/boot.S $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)

@@ -31,7 +31,7 @@ $(BUILD)/%.o: %.S
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_fdt
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
@@ -41,6 +41,7 @@ test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm
 	./$(BUILD)/test_handle
 	./$(BUILD)/test_handle_rw
 	./$(BUILD)/test_endpoint
+	./$(BUILD)/test_fdt
 check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
 	@echo "ABI isolation: abi.h must not include the internal status.h or handle.h"
@@ -98,6 +99,12 @@ $(BUILD)/test_handle_rw: tests/test_handle.c kernel/core/handle.c $(wildcard inc
 $(BUILD)/test_endpoint: tests/test_endpoint.c kernel/core/endpoint.c kernel/core/handle.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_endpoint.c kernel/core/endpoint.c kernel/core/handle.c -o $@
+
+# Issue #52: hosted bounded-FDT parser suite (pure kernel/core/fdt.c, no arch
+# code), ASan+UBSan. Includes the generated real-QEMU fixture header.
+$(BUILD)/test_fdt: tests/test_fdt.c kernel/core/fdt.c include/jeios/fdt.h $(wildcard tests/fixtures/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_fdt.c kernel/core/fdt.c -o $@
 
 
 # MP1 (ADR 0002): ARM64 (QEMU virt-8.2) build + smoke, kept fully separate from
