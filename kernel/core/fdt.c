@@ -35,9 +35,8 @@ typedef struct {
     uint32_t name_len;
     uint32_t prop_count;
     uint16_t seen;
-    uint16_t duplicate;
-    uint32_t duplicate_off[PROP_COUNT];
     bool had_child;
+    bool tracked;
     bool is_memory;
     bool is_reserved_memory;
     bool is_chosen;
@@ -58,6 +57,8 @@ typedef struct {
     bool has_initrd_end;
     uint64_t initrd_start;
     uint64_t initrd_end;
+    uint32_t initrd_start_prop_off;
+    uint32_t initrd_end_prop_off;
 } fdt_node_state;
 
 typedef struct {
@@ -69,14 +70,12 @@ typedef struct {
 
 static void fdt_zero_node(fdt_node_state *node)
 {
-    uint32_t i;
-
     node->name_off = 0u;
     node->name_len = 0u;
     node->prop_count = 0u;
     node->seen = 0u;
-    node->duplicate = 0u;
     node->had_child = false;
+    node->tracked = false;
     node->is_memory = false;
     node->is_reserved_memory = false;
     node->is_chosen = false;
@@ -97,7 +96,8 @@ static void fdt_zero_node(fdt_node_state *node)
     node->has_initrd_end = false;
     node->initrd_start = 0u;
     node->initrd_end = 0u;
-    for (i = 0u; i < PROP_COUNT; ++i) node->duplicate_off[i] = 0u;
+    node->initrd_start_prop_off = 0u;
+    node->initrd_end_prop_off = 0u;
 }
 
 static void fdt_zero_context(je_boot_ctx *out)
@@ -263,6 +263,29 @@ static bool fdt_status_ok(const uint8_t *blob, uint64_t off, uint32_t length)
         || fdt_literal_equal(blob, off, length, "ok", 2u, true);
 }
 
+static bool fdt_consumed_string_valid(const uint8_t *blob, uint64_t off,
+                                      uint32_t length)
+{
+    return length != 0u && blob[(size_t)(off + (uint64_t)length - 1u)] == 0u;
+}
+
+static je_fdt_status fdt_validate_cells(const fdt_node_state *node,
+                                        uint32_t expected_addr_cells,
+                                        uint32_t expected_size_cells,
+                                        bool compare_root, uint32_t off,
+                                        uint32_t *err)
+{
+    if (!node->has_addr_cells || !node->has_size_cells
+        || (compare_root && node->addr_cells != expected_addr_cells)
+        || (compare_root && node->size_cells != expected_size_cells)
+        || (node->is_reserved_memory
+            && (!node->has_ranges || node->ranges_len != 0u))) {
+        *err = off;
+        return JE_FDT_BAD_CELLS;
+    }
+    return JE_FDT_OK;
+}
+
 static bool fdt_value_u64(const uint8_t *blob, uint64_t off, uint32_t length,
                           uint64_t *value)
 {
@@ -290,21 +313,6 @@ static bool fdt_string_at(const uint8_t *blob, uint64_t strings_off,
         if (blob[(size_t)(strings_off + i)] == 0u) {
             *string_off = strings_off + relative;
             *string_length = (uint32_t)(i - relative);
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool fdt_consumed_duplicate(const fdt_node_state *node, uint16_t mask,
-                                   uint32_t *off)
-{
-    uint32_t i;
-
-    for (i = 0u; i < PROP_COUNT; ++i) {
-        uint16_t bit = (uint16_t)(1u << i);
-        if ((mask & bit) != 0u && (node->duplicate & bit) != 0u) {
-            *off = node->duplicate_off[i];
             return true;
         }
     }
@@ -358,7 +366,9 @@ static je_fdt_status fdt_decode_reservation(const fdt_reservation *reservation,
     bool inside = false;
 
     for (i = 0u; i < out->ram_count; ++i) {
-        je_range candidate = { reservation->base, reservation->size };
+        je_range candidate;
+        candidate.base = reservation->base;
+        candidate.size = reservation->size;
         if (fdt_range_contains(out->ram[i], candidate)) {
             inside = true;
             break;
@@ -380,13 +390,6 @@ static je_fdt_status fdt_decode_reservation(const fdt_reservation *reservation,
     return JE_FDT_OK;
 }
 
-static je_fdt_status fdt_check_node_duplicates(const fdt_node_state *node,
-                                               uint16_t mask, uint32_t *err)
-{
-    if (fdt_consumed_duplicate(node, mask, err)) return JE_FDT_DUPLICATE;
-    return JE_FDT_OK;
-}
-
 static je_fdt_status fdt_finish_node(const uint8_t *blob,
                                      fdt_node_state *stack,
                                      uint32_t depth,
@@ -396,91 +399,56 @@ static je_fdt_status fdt_finish_node(const uint8_t *blob,
                                      fdt_reservation *child_rsv,
                                      uint32_t *child_rsv_count,
                                      uint32_t node_off,
-                                     uint32_t *err)
+                                     uint32_t *err,
+                                     uint32_t *initrd_error)
 {
     fdt_node_state *node = &stack[depth - 1u];
-    je_fdt_status status;
-
     if (depth == 1u) {
-        status = fdt_check_node_duplicates(node,
-                                           (uint16_t)((1u << PROP_ADDR_CELLS)
-                                                    | (1u << PROP_SIZE_CELLS)),
-                                           err);
-        if (status != JE_FDT_OK) return status;
-        if (!node->has_addr_cells || !node->has_size_cells) {
-            *err = node_off;
-            return JE_FDT_BAD_CELLS;
-        }
         return JE_FDT_OK;
     }
 
     if (depth == 2u && node->is_reserved_memory) {
-        status = fdt_check_node_duplicates(node,
-                                           (uint16_t)((1u << PROP_ADDR_CELLS)
-                                                    | (1u << PROP_SIZE_CELLS)
-                                                    | (1u << PROP_RANGES)),
-                                           err);
-        if (status != JE_FDT_OK) return status;
-        if (!node->has_addr_cells || !node->has_size_cells
-            || node->addr_cells != root_addr_cells
-            || node->size_cells != root_size_cells
-            || !node->has_ranges || node->ranges_len != 0u) {
-            *err = node_off;
-            return JE_FDT_BAD_CELLS;
-        }
         return JE_FDT_OK;
     }
 
     if (depth == 2u && node->is_chosen) {
-        status = fdt_check_node_duplicates(node,
-                                           (uint16_t)((1u << PROP_INITRD_START)
-                                                    | (1u << PROP_INITRD_END)),
-                                           err);
-        if (status != JE_FDT_OK) return status;
+        /* Missing halves are structural chosen-node errors; value errors
+         * point at the offending initrd property, including post-walk
+         * containment failures. */
         if (node->has_initrd_start != node->has_initrd_end) {
             *err = node_off;
+            *initrd_error = node_off;
             return JE_FDT_BAD_RANGE;
         }
         if (node->has_initrd_start) {
             if (node->initrd_end <= node->initrd_start) {
-                *err = node_off;
+                *err = node->initrd_end_prop_off;
+                *initrd_error = node->initrd_end_prop_off;
                 return JE_FDT_BAD_RANGE;
             }
             out->has_initrd = true;
             out->initrd.base = node->initrd_start;
             out->initrd.size = node->initrd_end - node->initrd_start;
+            *initrd_error = node->initrd_end_prop_off;
         }
         return JE_FDT_OK;
     }
 
     if (depth == 2u && node->is_memory) {
         if (!node->status_enabled) return JE_FDT_OK;
-        status = fdt_check_node_duplicates(node,
-                                           (uint16_t)((1u << PROP_REG)
-                                                    | (1u << PROP_DEVICE_TYPE)
-                                                    | (1u << PROP_STATUS)),
-                                           err);
-        if (status != JE_FDT_OK) return status;
         if (!node->has_reg) {
             *err = node_off;
             return JE_FDT_BAD_RANGE;
         }
-        status = fdt_decode_reg(blob, node->reg_off, node->reg_len,
-                                root_addr_cells, root_size_cells,
-                                node->reg_prop_off, out);
+        je_fdt_status status = fdt_decode_reg(blob, node->reg_off, node->reg_len,
+                                              root_addr_cells, root_size_cells,
+                                              node->reg_prop_off, out);
         if (status != JE_FDT_OK) *err = node->reg_prop_off;
         return status;
     }
 
     if (depth == 3u && stack[depth - 2u].is_reserved_memory) {
         if (!node->status_enabled) return JE_FDT_OK;
-        status = fdt_check_node_duplicates(node,
-                                           (uint16_t)((1u << PROP_REG)
-                                                    | (1u << PROP_STATUS)
-                                                    | (1u << PROP_NO_MAP)
-                                                    | (1u << PROP_SIZE)),
-                                           err);
-        if (status != JE_FDT_OK) return status;
         if (!node->has_reg) {
             if (node->has_size) out->rsv_dynamic++;
             return JE_FDT_OK;
@@ -506,10 +474,6 @@ static je_fdt_status fdt_finish_node(const uint8_t *blob,
                 uint64_t size = 0u;
                 uint64_t end;
 
-                if (*child_rsv_count >= JE_FDT_MAX_RSV) {
-                    *err = node->reg_prop_off;
-                    return JE_FDT_RANGE_LIMIT;
-                }
                 for (cell = 0u; cell < parent->addr_cells; ++cell) {
                     base = (base << 32) | (uint64_t)fdt_be32(blob, cursor);
                     cursor += 4u;
@@ -521,6 +485,10 @@ static je_fdt_status fdt_finish_node(const uint8_t *blob,
                 if (!fdt_range_valid(base, size, &end)) {
                     *err = node->reg_prop_off;
                     return JE_FDT_BAD_RANGE;
+                }
+                if (*child_rsv_count >= JE_FDT_MAX_RSV) {
+                    *err = node->reg_prop_off;
+                    return JE_FDT_RANGE_LIMIT;
                 }
                 child_rsv[*child_rsv_count].base = base;
                 child_rsv[*child_rsv_count].size = size;
@@ -555,6 +523,7 @@ const char *je_fdt_status_name(je_fdt_status s)
     case JE_FDT_RANGE_LIMIT: return "RANGE_LIMIT";
     case JE_FDT_BAD_RANGE: return "BAD_RANGE";
     case JE_FDT_OVERLAP: return "OVERLAP";
+    case JE_FDT_CONFLICT: return "CONFLICT";
     case JE_FDT_STATUS_COUNT: return "UNKNOWN";
     default: return "UNKNOWN";
     }
@@ -612,6 +581,7 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
     bool chosen_seen = false;
     bool reserved_memory_seen = false;
     bool ended = false;
+    uint32_t initrd_error_off = 0u;
     uint64_t pos;
     je_fdt_status status = JE_FDT_OK;
     uint32_t error = 0u;
@@ -717,23 +687,26 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
         token = fdt_be32(blob, pos);
         if (token == FDT_BEGIN_NODE) {
             uint64_t name_start;
-            uint64_t name_end;
             uint64_t name_padded;
             uint64_t scan;
-            fdt_node_state node;
-
-            fdt_zero_node(&node);
+            fdt_node_state *node;
 
             if (root_closed) {
                 error = (uint32_t)pos;
                 status = JE_FDT_BAD_TOKEN;
                 goto fail;
             }
-            if (depth == 1u
-                && (!stack[0].has_addr_cells || !stack[0].has_size_cells)) {
-                error = (uint32_t)pos;
-                status = JE_FDT_BAD_CELLS;
-                goto fail;
+            if (depth == 1u && !stack[0].had_child) {
+                status = fdt_validate_cells(&stack[0], 0u, 0u, false,
+                                            (uint32_t)pos, &error);
+                if (status != JE_FDT_OK) goto fail;
+            }
+            if (depth == 2u && stack[1].is_reserved_memory
+                && !stack[1].had_child) {
+                status = fdt_validate_cells(&stack[1], root_addr_cells,
+                                            root_size_cells, true,
+                                            (uint32_t)pos, &error);
+                if (status != JE_FDT_OK) goto fail;
             }
             if (depth >= JE_FDT_MAX_DEPTH) {
                 error = (uint32_t)pos;
@@ -746,6 +719,8 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                 goto fail;
             }
             if (depth != 0u) stack[depth - 1u].had_child = true;
+            fdt_zero_node(&stack[depth]);
+            node = &stack[depth];
             name_start = next;
             scan = name_start;
             while (scan < struct_end && blob[(size_t)scan] != 0u
@@ -758,18 +733,19 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                 status = JE_FDT_BAD_STRING;
                 goto fail;
             }
-            name_end = scan + 1u;
-            if (!fdt_align4(name_end, &name_padded)
+            if (!fdt_align4(scan + 1u, &name_padded)
                 || name_padded > struct_end) {
                 error = (uint32_t)pos;
                 status = JE_FDT_BAD_LAYOUT;
                 goto fail;
             }
-            node.name_off = name_start;
-            node.name_len = (uint32_t)(scan - name_start);
-            node.status_enabled = true;
+            node->name_off = name_start;
+            node->name_len = (uint32_t)(scan - name_start);
+            node->tracked = depth == 0u || depth == 1u
+                         || (depth == 2u && stack[depth - 1u].is_reserved_memory);
+            node->status_enabled = true;
             if (!root_seen) {
-                if (node.name_len != 0u) {
+                if (node->name_len != 0u) {
                     error = (uint32_t)pos;
                     status = JE_FDT_BAD_TOKEN;
                     goto fail;
@@ -777,10 +753,10 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                 root_seen = true;
             }
             if (depth == 1u) {
-                node.is_reserved_memory =
-                    fdt_node_name_equal(blob, &node, "reserved-memory", 15u);
-                node.is_chosen = fdt_node_name_equal(blob, &node, "chosen", 6u);
-                if (node.is_reserved_memory) {
+                node->is_reserved_memory =
+                    fdt_node_name_equal(blob, node, "reserved-memory", 15u);
+                node->is_chosen = fdt_node_name_equal(blob, node, "chosen", 6u);
+                if (node->is_reserved_memory) {
                     if (reserved_memory_seen) {
                         error = (uint32_t)pos;
                         status = JE_FDT_DUPLICATE;
@@ -788,7 +764,7 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                     }
                     reserved_memory_seen = true;
                 }
-                if (node.is_chosen) {
+                if (node->is_chosen) {
                     if (chosen_seen) {
                         error = (uint32_t)pos;
                         status = JE_FDT_DUPLICATE;
@@ -797,7 +773,6 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                     chosen_seen = true;
                 }
             }
-            stack[depth] = node;
             depth++;
             node_count++;
             if (depth > max_depth) max_depth = depth;
@@ -810,9 +785,22 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                 status = JE_FDT_BAD_TOKEN;
                 goto fail;
             }
+            if (depth == 1u && !stack[0].had_child) {
+                status = fdt_validate_cells(&stack[0], 0u, 0u, false,
+                                            (uint32_t)pos, &error);
+                if (status != JE_FDT_OK) goto fail;
+            }
+            if (depth == 2u && stack[1].is_reserved_memory
+                && !stack[1].had_child) {
+                status = fdt_validate_cells(&stack[1], root_addr_cells,
+                                            root_size_cells, true,
+                                            (uint32_t)pos, &error);
+                if (status != JE_FDT_OK) goto fail;
+            }
             status = fdt_finish_node(blob, stack, depth, root_addr_cells,
                                      root_size_cells, out, child_rsv,
-                                     &child_rsv_count, (uint32_t)pos, &error);
+                                     &child_rsv_count, (uint32_t)pos, &error,
+                                     &initrd_error_off);
             if (status != JE_FDT_OK) goto fail;
             depth--;
             if (depth == 0u) root_closed = true;
@@ -872,14 +860,21 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
             kind = fdt_property_kind(blob, name_off, name_len);
             if (kind < PROP_COUNT) {
                 uint16_t bit = (uint16_t)(1u << kind);
-                first_kind = (node->seen & bit) == 0u;
-                if ((node->seen & bit) != 0u) {
-                    node->duplicate |= bit;
-                    if (node->duplicate_off[kind] == 0u) {
-                        node->duplicate_off[kind] = (uint32_t)pos;
+                first_kind = true;
+                if (node->tracked) {
+                    if ((node->seen & bit) != 0u) {
+                        error = (uint32_t)pos;
+                        status = JE_FDT_DUPLICATE;
+                        goto fail;
                     }
+                    node->seen |= bit;
                 }
-                node->seen |= bit;
+            }
+            if ((kind == PROP_STATUS || kind == PROP_DEVICE_TYPE)
+                && !fdt_consumed_string_valid(blob, value_off, value_len)) {
+                error = (uint32_t)pos;
+                status = JE_FDT_BAD_STRING;
+                goto fail;
             }
             if (kind == PROP_ADDR_CELLS && depth == 1u && first_kind) {
                 if (value_len != 4u) {
@@ -939,6 +934,13 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                 }
             } else if (kind == PROP_DEVICE_TYPE && depth == 2u
                        && first_kind) {
+                if ((node->is_chosen || node->is_reserved_memory)
+                    && fdt_literal_equal(blob, value_off, value_len,
+                                         "memory", 6u, true)) {
+                    error = (uint32_t)pos;
+                    status = JE_FDT_CONFLICT;
+                    goto fail;
+                }
                 node->is_memory =
                     fdt_literal_equal(blob, value_off, value_len,
                                       "memory", 6u, true);
@@ -968,6 +970,7 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                     goto fail;
                 }
                 node->has_initrd_start = true;
+                node->initrd_start_prop_off = (uint32_t)pos;
             } else if (kind == PROP_INITRD_END && depth == 2u
                        && node->is_chosen && first_kind) {
                 if (!fdt_value_u64(blob, value_off, value_len,
@@ -977,6 +980,7 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                     goto fail;
                 }
                 node->has_initrd_end = true;
+                node->initrd_end_prop_off = (uint32_t)pos;
             }
             pos = property_end;
             continue;
@@ -1049,7 +1053,7 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
     }
     if (out->has_initrd) {
         if (!fdt_range_valid(out->initrd.base, out->initrd.size, &struct_end)) {
-            error = (uint32_t)off_struct;
+            error = initrd_error_off;
             status = JE_FDT_BAD_RANGE;
             goto fail;
         }
@@ -1062,7 +1066,7 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                 }
             }
             if (!contained) {
-                error = (uint32_t)off_struct;
+                error = initrd_error_off;
                 status = JE_FDT_BAD_RANGE;
                 goto fail;
             }
@@ -1086,6 +1090,11 @@ je_fdt_status je_boot_ctx_check(const je_boot_ctx *ctx, const je_boot_facts *fac
 
     if (ctx == NULL || facts == NULL || err_idx == NULL) return JE_FDT_BAD_ARG;
     *err_idx = 0u;
+    if (ctx->ram_count > JE_FDT_MAX_RAM
+        || ctx->rsv_count > JE_FDT_MAX_RSV) {
+        *err_idx = JE_BOOT_ERR_FACTS;
+        return JE_FDT_BAD_ARG;
+    }
     if (facts->pa_bits < 32u || facts->pa_bits > 52u
         || !fdt_range_valid(facts->kernel_image.base,
                             facts->kernel_image.size, &end)
