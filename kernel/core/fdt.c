@@ -41,12 +41,16 @@ typedef struct {
     bool is_reserved_memory;
     bool is_chosen;
     bool status_enabled;
+    bool status_valid;
+    uint32_t status_prop_off;
     bool has_reg;
     uint64_t reg_off;
     uint32_t reg_prop_off;
     uint32_t reg_len;
     bool has_addr_cells;
     bool has_size_cells;
+    bool addr_cells_valid;
+    bool size_cells_valid;
     uint32_t addr_cells;
     uint32_t size_cells;
     bool has_ranges;
@@ -80,12 +84,16 @@ static void fdt_zero_node(fdt_node_state *node)
     node->is_reserved_memory = false;
     node->is_chosen = false;
     node->status_enabled = false;
+    node->status_valid = true;
+    node->status_prop_off = 0u;
     node->has_reg = false;
     node->reg_off = 0u;
     node->reg_prop_off = 0u;
     node->reg_len = 0u;
     node->has_addr_cells = false;
     node->has_size_cells = false;
+    node->addr_cells_valid = false;
+    node->size_cells_valid = false;
     node->addr_cells = 0u;
     node->size_cells = 0u;
     node->has_ranges = false;
@@ -276,6 +284,7 @@ static je_fdt_status fdt_validate_cells(const fdt_node_state *node,
                                         uint32_t *err)
 {
     if (!node->has_addr_cells || !node->has_size_cells
+        || !node->addr_cells_valid || !node->size_cells_valid
         || (compare_root && node->addr_cells != expected_addr_cells)
         || (compare_root && node->size_cells != expected_size_cells)
         || (node->is_reserved_memory
@@ -785,6 +794,12 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                 status = JE_FDT_BAD_TOKEN;
                 goto fail;
             }
+            if (depth == 2u && stack[1].is_memory
+                && !stack[1].status_valid) {
+                error = stack[1].status_prop_off;
+                status = JE_FDT_BAD_STRING;
+                goto fail;
+            }
             if (depth == 1u && !stack[0].had_child) {
                 status = fdt_validate_cells(&stack[0], 0u, 0u, false,
                                             (uint32_t)pos, &error);
@@ -816,7 +831,6 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
             uint64_t name_off;
             uint32_t name_len;
             uint32_t kind;
-            bool first_kind = false;
             fdt_node_state *node;
 
             if (depth == 0u || root_closed) {
@@ -860,7 +874,6 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
             kind = fdt_property_kind(blob, name_off, name_len);
             if (kind < PROP_COUNT) {
                 uint16_t bit = (uint16_t)(1u << kind);
-                first_kind = true;
                 if (node->tracked) {
                     if ((node->seen & bit) != 0u) {
                         error = (uint32_t)pos;
@@ -870,19 +883,27 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                     node->seen |= bit;
                 }
             }
-            if ((kind == PROP_STATUS || kind == PROP_DEVICE_TYPE)
+            if (kind == PROP_DEVICE_TYPE && depth == 2u
                 && !fdt_consumed_string_valid(blob, value_off, value_len)) {
                 error = (uint32_t)pos;
                 status = JE_FDT_BAD_STRING;
                 goto fail;
             }
-            if (kind == PROP_ADDR_CELLS && depth == 1u && first_kind) {
+            if (kind == PROP_STATUS && depth == 3u
+                && stack[depth - 2u].is_reserved_memory
+                && !fdt_consumed_string_valid(blob, value_off, value_len)) {
+                error = (uint32_t)pos;
+                status = JE_FDT_BAD_STRING;
+                goto fail;
+            }
+            if (kind == PROP_ADDR_CELLS && depth == 1u) {
                 if (value_len != 4u) {
                     error = (uint32_t)pos;
                     status = JE_FDT_BAD_CELLS;
                     goto fail;
                 }
                 node->has_addr_cells = true;
+                node->addr_cells_valid = true;
                 node->addr_cells = fdt_be32(blob, value_off);
                 root_addr_cells = node->addr_cells;
                 if (node->addr_cells < 1u || node->addr_cells > 2u) {
@@ -890,13 +911,14 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                     status = JE_FDT_BAD_CELLS;
                     goto fail;
                 }
-            } else if (kind == PROP_SIZE_CELLS && depth == 1u && first_kind) {
+            } else if (kind == PROP_SIZE_CELLS && depth == 1u) {
                 if (value_len != 4u) {
                     error = (uint32_t)pos;
                     status = JE_FDT_BAD_CELLS;
                     goto fail;
                 }
                 node->has_size_cells = true;
+                node->size_cells_valid = true;
                 node->size_cells = fdt_be32(blob, value_off);
                 root_size_cells = node->size_cells;
                 if (node->size_cells < 1u || node->size_cells > 2u) {
@@ -905,35 +927,24 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                     goto fail;
                 }
             } else if (kind == PROP_ADDR_CELLS && depth == 2u
-                       && node->is_reserved_memory && first_kind) {
-                if (value_len != 4u) {
-                    error = (uint32_t)pos;
-                    status = JE_FDT_BAD_CELLS;
-                    goto fail;
-                }
+                       && node->is_reserved_memory) {
                 node->has_addr_cells = true;
-                node->addr_cells = fdt_be32(blob, value_off);
-                if (node->addr_cells < 1u || node->addr_cells > 2u) {
-                    error = (uint32_t)pos;
-                    status = JE_FDT_BAD_CELLS;
-                    goto fail;
+                node->addr_cells_valid = value_len == 4u;
+                if (node->addr_cells_valid) {
+                    node->addr_cells = fdt_be32(blob, value_off);
+                    node->addr_cells_valid =
+                        node->addr_cells >= 1u && node->addr_cells <= 2u;
                 }
             } else if (kind == PROP_SIZE_CELLS && depth == 2u
-                       && node->is_reserved_memory && first_kind) {
-                if (value_len != 4u) {
-                    error = (uint32_t)pos;
-                    status = JE_FDT_BAD_CELLS;
-                    goto fail;
-                }
+                       && node->is_reserved_memory) {
                 node->has_size_cells = true;
-                node->size_cells = fdt_be32(blob, value_off);
-                if (node->size_cells < 1u || node->size_cells > 2u) {
-                    error = (uint32_t)pos;
-                    status = JE_FDT_BAD_CELLS;
-                    goto fail;
+                node->size_cells_valid = value_len == 4u;
+                if (node->size_cells_valid) {
+                    node->size_cells = fdt_be32(blob, value_off);
+                    node->size_cells_valid =
+                        node->size_cells >= 1u && node->size_cells <= 2u;
                 }
-            } else if (kind == PROP_DEVICE_TYPE && depth == 2u
-                       && first_kind) {
+            } else if (kind == PROP_DEVICE_TYPE && depth == 2u) {
                 if ((node->is_chosen || node->is_reserved_memory)
                     && fdt_literal_equal(blob, value_off, value_len,
                                          "memory", 6u, true)) {
@@ -944,15 +955,19 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                 node->is_memory =
                     fdt_literal_equal(blob, value_off, value_len,
                                       "memory", 6u, true);
-            } else if (kind == PROP_STATUS && first_kind) {
-                node->status_enabled = fdt_status_ok(blob, value_off, value_len);
-            } else if (kind == PROP_REG && first_kind) {
+            } else if (kind == PROP_STATUS) {
+                node->status_prop_off = (uint32_t)pos;
+                node->status_valid =
+                    fdt_consumed_string_valid(blob, value_off, value_len);
+                node->status_enabled = node->status_valid
+                    && fdt_status_ok(blob, value_off, value_len);
+            } else if (kind == PROP_REG) {
                 node->has_reg = true;
                 node->reg_off = value_off;
                 node->reg_prop_off = (uint32_t)pos;
                 node->reg_len = value_len;
             } else if (kind == PROP_RANGES && depth == 2u
-                       && node->is_reserved_memory && first_kind) {
+                       && node->is_reserved_memory) {
                 node->has_ranges = true;
                 node->ranges_len = value_len;
             } else if (kind == PROP_NO_MAP && depth == 3u
@@ -962,7 +977,7 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                        && stack[depth - 2u].is_reserved_memory) {
                 node->has_size = true;
             } else if (kind == PROP_INITRD_START && depth == 2u
-                       && node->is_chosen && first_kind) {
+                       && node->is_chosen) {
                 if (!fdt_value_u64(blob, value_off, value_len,
                                    &node->initrd_start)) {
                     error = (uint32_t)pos;
@@ -972,7 +987,7 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                 node->has_initrd_start = true;
                 node->initrd_start_prop_off = (uint32_t)pos;
             } else if (kind == PROP_INITRD_END && depth == 2u
-                       && node->is_chosen && first_kind) {
+                       && node->is_chosen) {
                 if (!fdt_value_u64(blob, value_off, value_len,
                                    &node->initrd_end)) {
                     error = (uint32_t)pos;
@@ -1052,7 +1067,8 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
         }
     }
     if (out->has_initrd) {
-        if (!fdt_range_valid(out->initrd.base, out->initrd.size, &struct_end)) {
+        uint64_t initrd_end;
+        if (!fdt_range_valid(out->initrd.base, out->initrd.size, &initrd_end)) {
             error = initrd_error_off;
             status = JE_FDT_BAD_RANGE;
             goto fail;
@@ -1088,7 +1104,10 @@ je_fdt_status je_boot_ctx_check(const je_boot_ctx *ctx, const je_boot_facts *fac
     uint64_t end;
     uint32_t i;
 
-    if (ctx == NULL || facts == NULL || err_idx == NULL) return JE_FDT_BAD_ARG;
+    if (ctx == NULL || facts == NULL || err_idx == NULL) {
+        if (err_idx != NULL) *err_idx = JE_BOOT_ERR_FACTS;
+        return JE_FDT_BAD_ARG;
+    }
     *err_idx = 0u;
     if (ctx->ram_count > JE_FDT_MAX_RAM
         || ctx->rsv_count > JE_FDT_MAX_RSV) {
@@ -1104,8 +1123,7 @@ je_fdt_status je_boot_ctx_check(const je_boot_ctx *ctx, const je_boot_facts *fac
     }
     limit = UINT64_C(1) << facts->pa_bits;
     for (i = 0u; i < ctx->ram_count; ++i) {
-        if (ctx->ram[i].size == 0u
-            || !fdt_range_valid(ctx->ram[i].base, ctx->ram[i].size, &end)
+        if (!fdt_range_valid(ctx->ram[i].base, ctx->ram[i].size, &end)
             || end > limit) {
             *err_idx = JE_BOOT_ERR_RAM(i);
             return JE_FDT_BAD_RANGE;
