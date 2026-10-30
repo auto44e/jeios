@@ -229,7 +229,18 @@ je_fdt_status je_fdt_copy_plan(const uint8_t hdr[JE_FDT_HEADER_SIZE],
  *     examined (so a repeat with a malformed value is DUPLICATE).
  *   - A string VALUE is validated (BAD_STRING) only where it is consumed:
  *     device_type on every depth-2 node; status on memory nodes and
- *     /reserved-memory children. Elsewhere it is not inspected.
+ *     /reserved-memory children. Elsewhere it is not inspected. TIMING:
+ *     depth-2 device_type and /reserved-memory-child status are checked at
+ *     the PROP; a memory node's status cannot be known to be consumed until
+ *     the node is classified, so it is checked at that node's END_NODE (first
+ *     of the END_NODE checks), err_off = the status PROP.
+ *   - /reserved-memory #address-cells/#size-cells VALUES (len, 1|2, equal to
+ *     root's) are only recorded at their PROP and decided with absence at the
+ *     first child BEGIN_NODE / END_NODE (above); only the root rejects bad
+ *     cell values at the PROP.
+ *   - A /reserved-memory child's `reg` is decoded at the child's END_NODE (as
+ *     for memory nodes), so an earlier violation inside the child's subtree
+ *     wins; err_off is still the `reg` PROP.
  *   - A repeat in an UNTRACKED node is OK: nothing there is consumed.
  *   - A walk-time BAD_RANGE/BAD_CELLS from a `reg` (memory or /reserved-memory
  *     child) has err_off = that `reg` PROP token.
@@ -256,7 +267,7 @@ typedef struct {
 /*
  * Validate a successfully parsed context against arch facts. In this order:
  * NULL, ram_count > JE_FDT_MAX_RAM or rsv_count > JE_FDT_MAX_RSV -> BAD_ARG
- * (err_idx FACTS; never index past the arrays); pa_bits outside 32..52, or kernel_image/dtb_src invalid ->
+ * (err_idx FACTS when err_idx itself is non-NULL; never index past the arrays); pa_bits outside 32..52, or kernel_image/dtb_src invalid ->
  * BAD_RANGE (err_idx FACTS); any RAM/kept-reservation/initrd/kernel/dtb end
  * above 2^pa_bits -> BAD_RANGE; kernel_image not fully inside one RAM range ->
  * BAD_RANGE (KERNEL); dtb_src not fully inside one RAM range -> BAD_RANGE (DTB);
