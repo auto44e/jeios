@@ -33,7 +33,8 @@ OPEN until the remote `aarch64` job is observed passing at the PR head.
 - The MP2 allocator must honor `rsv_dynamic` and `rsv_nomap`.
 - Only the QEMU virt-8.2 DTB at 256 MiB is qualified.
 - Node names match exactly (no `chosen@0`).
-- Recorded P3 test gap: a `/reserved-memory` `#address-cells` of length 8 whose first word equals the root's (the parser is correct; there is no test).
+- The length-8 `/reserved-memory` cells test gap found in review is closed (W2r6; mutant killed).
+- The harness ELF parser rejects extended section numbering rather than handling it.
 
 **Next bounded task:** after merge, M4 / MP2 per docs/NEXT_PHASE.md. Pass/fail: the gate criteria named there.
 
