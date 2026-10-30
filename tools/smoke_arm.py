@@ -234,6 +234,8 @@ def elf_defined_symbols(data, wanted):
 
     if data[:4] != b"\x7fELF":
         raise ElfError("not an ELF file (bad magic)")
+    if len(data) < 64:  # ELF64 header; checked before indexing data[4]/[5]
+        raise ElfError(f"truncated ELF header ({len(data)} < 64 bytes)")
     if data[4] != 2 or data[5] != 1:
         raise ElfError("not ELFCLASS64 little-endian")
     (_, _, e_machine, _, _, _, e_shoff, _, _, _, _, e_shentsize, e_shnum,
