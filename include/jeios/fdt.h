@@ -221,7 +221,19 @@ je_fdt_status je_fdt_copy_plan(const uint8_t hdr[JE_FDT_HEADER_SIZE],
  *   fully inside one RAM range (else BAD_RANGE).
  * `status` matters only on memory nodes and /reserved-memory children; there a
  * disabled node is skipped for semantics (with its whole subtree) but is still
- * structurally validated, counted and duplicate-tracked.
+ * structurally validated, counted and duplicate-tracked. "Structurally
+ * validated" = tokens, names, nameoff/strings, alignment, the *_LIMITs and
+ * DUPLICATE; a disabled node's `reg` is NOT decoded (no BAD_CELLS/BAD_RANGE).
+ * Precedence and scope (round-3 lead clarifications):
+ *   - At one PROP, DUPLICATE is decided first (by name), before its value is
+ *     examined (so a repeat with a malformed value is DUPLICATE).
+ *   - A string VALUE is validated (BAD_STRING) only where it is consumed:
+ *     device_type on every depth-2 node; status on memory nodes and
+ *     /reserved-memory children. Elsewhere it is not inspected.
+ *   - A repeat in an UNTRACKED node is OK: nothing there is consumed.
+ *   - A walk-time BAD_RANGE/BAD_CELLS from a `reg` (memory or /reserved-memory
+ *     child) has err_off = that `reg` PROP token.
+ *   - A zero-size struct block cannot hold END -> BAD_LAYOUT.
  */
 je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                            je_boot_ctx *out, uint32_t *err_off);
