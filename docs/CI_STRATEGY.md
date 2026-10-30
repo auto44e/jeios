@@ -39,6 +39,15 @@ These are valuable foundations, not full fuzzing, syscall coverage or OS securit
 qualification. Current dependency installations are not a fully pinned supply chain.
 Mobile has manifest/plan validation and four schema tests, not ARM64 execution.
 
+Update 2026-10-30 (core #52 PR, branch feat/mp1-dtb-parse): ci.yml gains a second,
+independent `aarch64` job (Ubuntu 24.04, apt cross GCC/binutils + qemu-system-arm,
+QEMU version gated to 8.2.x, package versions and PR-head/merge SHAs recorded) that
+builds the ARM64 kernel and boots it on the pinned `virt-8.2` profile in four modes
+(normal + DTB parse, deliberate vector fault, malformed-DTB rejection, BSS check),
+uploading serial logs. Status: IMPLEMENTED; it counts as remote evidence only once a
+GitHub run at the exact PR head is observed — see that PR, not this paragraph. The
+x86 job above is unchanged. Before this PR no ARM job existed in any ci.yml revision.
+
 ## Staged delivery
 
 | Stage | Work | Acceptance boundary |
