@@ -8,8 +8,12 @@
  * Scope boundaries (ADR 0002 / MP1 decomposition, locked by the design pass):
  *   - VBAR_EL1 exception vectors + the D5-3 trap frame ARE now installed (this
  *     PR): a deliberate BRK is proven to vector with the exact syndrome;
- *   - NO DTB *parse* — the pointer is only RECORDED, never dereferenced (the
- *     bounded DTB parse is the remaining MP1 sub-step);
+ *   - bounded DTB intake (issue #52, ADR 0002 D3 copy model): after vectors
+ *     are installed, read the firmware header with byte loads, copy the planned
+ *     prefix ONCE into an in-image .bss buffer, parse ONLY the copy with the
+ *     shared parser (kernel/core/fdt.c, contract include/jeios/fdt.h), then
+ *     validate the result against arch facts. Any rejection is a bounded FATAL
+ *     marker + halt. Nothing consumes the parsed context yet (MP2 allocator);
  *   - NO MMU, no atomics; single CPU (MMU/timer/scheduling is MP2).
  * The handoff records that the DTB validation and the MMU/fixup paths are not
  * yet enforced.
@@ -18,7 +22,9 @@
  * compiler emits neither unaligned accesses (Device memory pre-MMU faults them)
  * nor FP/SIMD (which would trap into absent vectors and hang silently).
  */
+#include <stdbool.h>
 #include <stdint.h>
+#include <jeios/fdt.h>
 #include "trapframe.h"
 
 /* MP1 reentrancy guard (vectors.S): 0 outside a handler, 1 inside. A nested
@@ -28,7 +34,9 @@
 volatile uint8_t je_arm_in_handler __attribute__((section(".data"))) = 0u;
 
 /* DTB physical address, stashed by boot.S into .data BEFORE the BSS clear so it
- * survives (a .bss slot would have been zeroed). Recorded, not parsed. */
+ * survives (a .bss slot would have been zeroed). boot.S has already checked it
+ * is nonzero, 8-aligned and that [ptr, ptr + JE_FDT_MAX_TOTAL) is disjoint from
+ * the image; dtb_intake() below reads/copies through it. */
 uint64_t je_arm_dtb_phys __attribute__((section(".data"))) = 0;
 
 /* ---- PL011 UART @ 0x09000000 (confirmed from the QEMU virt DTB). Bounded,
@@ -78,6 +86,20 @@ static void console_hex(uint64_t v)
     for (int i = 0; i < 16; ++i) buf[2 + i] = d[(v >> ((15 - i) * 4)) & 0xf];
     buf[18] = '\0';
     console_write(buf);
+}
+
+/* Write a 64-bit value in unsigned decimal, no padding. Bounded: UINT64_MAX has
+ * 20 digits, so the loop runs at most 20 times and never underflows buf. */
+static void console_dec(uint64_t v)
+{
+    char buf[21];
+    unsigned i = 20u;
+    buf[20] = '\0';
+    do {
+        buf[--i] = (char)('0' + (int)(v % 10u));
+        v /= 10u;
+    } while (v != 0u && i > 0u);
+    console_write(&buf[i]);
 }
 
 _Noreturn static void halt(void)
@@ -230,6 +252,237 @@ static void trigger_brk(void)
 volatile uint64_t je_arm_bss_probe;   /* in .bss */
 extern uint8_t __bss_start[], __bss_end[];
 
+/* ---- Bounded DTB intake (issue #52; contract include/jeios/fdt.h). ----
+ *
+ * Ownership/lifetime: je_arm_dtb_copy is the kernel's own copy of the firmware
+ * DTB prefix. It lives in .bss (so inside [_text, _end), the kernel_image fact;
+ * linker.ld asserts placement + 16-byte alignment), is written exactly once by
+ * dtb_intake() and is never modified afterwards except by the JE_ARM_DTB_BAD
+ * test corruption. je_arm_boot_ctx is the parsed result (fixed size, no
+ * pointers into the blob). Single CPU, no concurrency, caller context = boot.
+ *
+ * CACHE NOTE: the copy is written with the MMU and D-cache OFF (non-cacheable).
+ * MP2 MUST `DC IVAC` the whole buffer (and je_arm_boot_ctx) before enabling the
+ * D-cache, or later cacheable reads may hit stale lines (mp1-dtb debate item 32).
+ */
+_Static_assert(JE_FDT_MAX_TOTAL == 0x200000u,
+               "boot.S JE_ARM_DTB_GUARD_SPAN must equal JE_FDT_MAX_TOTAL");
+_Static_assert(JE_FDT_MAX_COPY == 0x10000u,
+               "linker.ld copy-buffer ASSERT hard-codes 64 KiB");
+uint8_t je_arm_dtb_copy[JE_FDT_MAX_COPY] __attribute__((aligned(16)));
+static je_boot_ctx je_arm_boot_ctx;
+extern uint8_t _text[], _end[];   /* IMAGE extent [_text, _end), linker.ld */
+
+static inline uint64_t read_id_aa64mmfr0_el1(void)
+{
+    uint64_t v; __asm__ volatile("mrs %0, ID_AA64MMFR0_EL1" : "=r"(v)); return v;
+}
+
+/* ID_AA64MMFR0_EL1.PARange [3:0] (DDI0487 D19): 0..6 -> 32,36,40,42,44,48,52
+ * bits. Every other encoding is reserved; return 0 = "no valid width". */
+static uint32_t pa_bits_from_mmfr0(uint64_t mmfr0)
+{
+    switch (mmfr0 & 0xfu) {
+    case 0u: return 32u;
+    case 1u: return 36u;
+    case 2u: return 40u;
+    case 3u: return 42u;
+    case 4u: return 44u;
+    case 5u: return 48u;
+    case 6u: return 52u;
+    default: return 0u;
+    }
+}
+
+/* Big-endian u32 from a buffer the caller has bounds-checked (byte loads only,
+ * so alignment never matters under -mstrict-align). */
+static uint32_t be32_at(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+/* je_fdt_status_name() comes from another translation unit; never hand a NULL
+ * to console_write (it would read address 0). */
+static const char *status_name(je_fdt_status st)
+{
+    const char *n = je_fdt_status_name(st);
+    return n != NULL ? n : "UNKNOWN";
+}
+
+_Noreturn static void dtb_reject(je_fdt_status st, uint64_t off, bool window)
+{
+    console_write("JeiOS/aarch64: FATAL dtb rejected status=");
+    console_write(status_name(st));
+    console_write(" off=");
+    console_hex(off);
+    if (window) console_write(" (live data exceeds 64 KiB copy window)");
+    console_write("\r\n");
+    halt();
+}
+
+_Noreturn static void ctx_reject(je_fdt_status st, uint64_t idx)
+{
+    console_write("JeiOS/aarch64: FATAL boot context rejected status=");
+    console_write(status_name(st));
+    console_write(" idx=");
+    console_hex(idx);
+    console_write("\r\n");
+    halt();
+}
+
+/* Steps 1-2 of the fdt.h model: header read + plan + single copy. Returns
+ * copy_len (in [JE_FDT_HEADER_SIZE, JE_FDT_MAX_COPY]) and sets *totalsize; halts
+ * on any rejection. Reads at most JE_FDT_HEADER_SIZE + copy_len firmware bytes,
+ * all with volatile BYTE loads (pre-MMU RAM is Device memory; -mstrict-align;
+ * volatile also stops the compiler turning the loop into a memcpy call). A
+ * fault on the firmware range (e.g. x0 beyond RAM) vectors to the installed
+ * diagnostic handler, which is why this runs only after install_vectors(). */
+static uint32_t dtb_copy_in(uint32_t *totalsize)
+{
+    const volatile uint8_t *src =
+        (const volatile uint8_t *)(uintptr_t)je_arm_dtb_phys;
+    uint8_t hdr[JE_FDT_HEADER_SIZE];
+    for (uint32_t i = 0u; i < JE_FDT_HEADER_SIZE; ++i) hdr[i] = src[i];
+
+    uint32_t copy_len = 0u;
+    *totalsize = 0u;
+    je_fdt_status st = je_fdt_copy_plan(hdr, &copy_len, totalsize);
+    if (st != JE_FDT_OK) dtb_reject(st, 0u, false);
+    /* Do not trust the planner with our buffer bound: fail closed if it ever
+     * returns a length the buffer cannot hold or that cannot contain a header. */
+    if (copy_len < JE_FDT_HEADER_SIZE || copy_len > JE_FDT_MAX_COPY) {
+        console_write("JeiOS/aarch64: FATAL dtb copy plan out of bounds len=");
+        console_hex(copy_len);
+        console_write("\r\n");
+        halt();
+    }
+    /* The ONE copy. Everything after this reads only je_arm_dtb_copy. */
+    for (uint32_t i = 0u; i < copy_len; ++i) je_arm_dtb_copy[i] = src[i];
+    return copy_len;
+}
+
+/* Diagnostic CRC extent: the header-claimed strings-block end READ FROM THE
+ * COPY, clamped to copy_len. Under the contract's canonical block order
+ * (rsvmap < struct < strings) this is exactly the live extent `used` for any
+ * blob the parser accepts, which is what the committed fixture contains (the
+ * fixture is the live extent, not the 1 MiB zero-padded totalsize). Computed
+ * before the parse, from untrusted header fields, but only ever used as a
+ * length bounded by copy_len — never as an offset into anything else. */
+static uint32_t dtb_crc_len(uint32_t copy_len)
+{
+    uint64_t end = (uint64_t)be32_at(&je_arm_dtb_copy[12]) +   /* off_dt_strings */
+                   (uint64_t)be32_at(&je_arm_dtb_copy[32]);    /* size_dt_strings */
+    return end < copy_len ? (uint32_t)end : copy_len;
+}
+
+#ifdef JE_ARM_DTB_BAD
+/* Test-only parser fault injection (mp1-dtb debate item 30): overwrite the
+ * first struct token IN THE COPY with the unknown token 0x0000000A, after the
+ * copy and before the parse, so the PARSER (not the glue) must reject with
+ * BAD_TOKEN at off_dt_struct. The offset is read from the copy and
+ * bounds-checked so the injection itself can never write outside the buffer. */
+static void dtb_bad_inject(uint32_t copy_len)
+{
+    uint32_t off = be32_at(&je_arm_dtb_copy[8]);   /* off_dt_struct */
+    if (off > copy_len || copy_len - off < 4u) {
+        console_write("JeiOS/aarch64: FATAL dtb-bad test: off_dt_struct outside copy\r\n");
+        halt();
+    }
+    je_arm_dtb_copy[off + 0u] = 0x00u;
+    je_arm_dtb_copy[off + 1u] = 0x00u;
+    je_arm_dtb_copy[off + 2u] = 0x00u;
+    je_arm_dtb_copy[off + 3u] = 0x0au;
+    console_write("JeiOS/aarch64: dtb-bad test: wrote token 0x0000000a at off=");
+    console_hex(off);
+    console_write("\r\n");
+}
+#endif
+
+static void dtb_print_ctx(const je_boot_ctx *c)
+{
+    console_write("JeiOS/aarch64: dtb parsed ram=");
+    console_dec(c->ram_count);
+    console_write(" rsv=");
+    console_dec(c->rsv_count);
+    console_write(" ignored=");
+    console_dec(c->rsv_ignored);
+    console_write(" dynamic=");
+    console_dec(c->rsv_dynamic);
+    console_write(" initrd=");
+    console_putc(c->has_initrd ? '1' : '0');
+    console_write("\r\n");
+    /* Bound by the array capacity even if a parser bug reported more. */
+    for (uint32_t i = 0u; i < c->ram_count && i < JE_FDT_MAX_RAM; ++i) {
+        console_write("JeiOS/aarch64:   ram[");
+        console_dec(i);
+        console_write("] base=");
+        console_hex(c->ram[i].base);
+        console_write(" size=");
+        console_hex(c->ram[i].size);
+        console_write("\r\n");
+    }
+}
+
+/* Steps 1-4 of the fdt.h model. Returns only when the boot context has been
+ * parsed from the copy AND validated against the arch facts; every failure
+ * prints exactly one FATAL marker and halts. */
+static void dtb_intake(void)
+{
+    uint32_t totalsize = 0u;
+    uint32_t copy_len = dtb_copy_in(&totalsize);
+    uint32_t crc_len = dtb_crc_len(copy_len);
+
+    console_write("JeiOS/aarch64: dtb copied len=");
+    console_hex(copy_len);
+    console_write(" totalsize=");
+    console_hex(totalsize);
+    console_write(" crc32=");
+    console_hex(je_fdt_crc32(je_arm_dtb_copy, crc_len));
+    console_write(" crc_len=");
+    console_hex(crc_len);
+    console_write("\r\n");
+
+#ifdef JE_ARM_DTB_BAD
+    dtb_bad_inject(copy_len);
+#endif
+
+    uint32_t err_off = 0u;
+    je_fdt_status st = je_fdt_parse(je_arm_dtb_copy, copy_len,
+                                    &je_arm_boot_ctx, &err_off);
+    if (st != JE_FDT_OK) {
+        bool window = st == JE_FDT_TRUNCATED && copy_len == JE_FDT_MAX_COPY &&
+                      totalsize > copy_len;
+        dtb_reject(st, err_off, window);
+    }
+    dtb_print_ctx(&je_arm_boot_ctx);
+
+    uint32_t pa_bits = pa_bits_from_mmfr0(read_id_aa64mmfr0_el1());
+    if (pa_bits == 0u) {
+        /* Reserved PARange encoding: the "facts" are invalid. Refuse here rather
+         * than rely on the checker rejecting pa_bits == 0. */
+        ctx_reject(JE_FDT_BAD_RANGE, JE_BOOT_ERR_FACTS);
+    }
+    /* dtb_src: conservative FULL firmware range [x0, x0 + totalsize). Use the
+     * larger of the firmware-header totalsize (which sized the copy) and the
+     * copy's re-derived one so a header changing under us can only widen it. */
+    uint32_t src_size = totalsize > je_arm_boot_ctx.totalsize
+                            ? totalsize : je_arm_boot_ctx.totalsize;
+    je_boot_facts facts = {
+        .kernel_image = { (uint64_t)(uintptr_t)_text,
+                          (uint64_t)((uintptr_t)_end - (uintptr_t)_text) },
+        .dtb_src      = { je_arm_dtb_phys, src_size },
+        .pa_bits      = pa_bits,
+    };
+    uint32_t err_idx = 0u;
+    st = je_boot_ctx_check(&je_arm_boot_ctx, &facts, &err_idx);
+    if (st != JE_FDT_OK) ctx_reject(st, err_idx);
+
+    console_write("JeiOS/aarch64: boot context validated pa_bits=");
+    console_dec(pa_bits);
+    console_write("\r\n");
+}
+
 _Noreturn void je_arm_main(void)
 {
     uint64_t el = read_currentel();
@@ -282,6 +535,12 @@ _Noreturn void je_arm_main(void)
     console_write("JeiOS/aarch64: vectors installed vbar=");
     console_hex(read_vbar_el1());
     console_write("\r\n");
+
+    /* Issue #52: bounded DTB copy + parse + boot-context validation. Placed
+     * after install_vectors() so a fault while reading firmware memory is a
+     * diagnostic, and before the vector self-test so every build exercises it.
+     * Halts (FATAL marker) on any rejection. */
+    dtb_intake();
 #ifdef JE_ARM_VECTOR_TEST
     /* Deliberate synchronous exception: trigger the planted BRK. It vectors into
      * je_arm_exception, which asserts the exact syndrome, prints PASS, and halts

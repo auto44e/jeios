@@ -21,3 +21,4 @@ before transcript retention and were `/tmp`-only; the ADR 0000 retroactive sweep
 (plus MP1 vectors) survive here.
 | `m3c-step6-mechanism.md` | ADR 0009 A6-CLARIFY-1/2 (park/resume mechanism) |
 | `m3c-step7-bootstrap-fixture.md` | ADR 0009 D-SEQ step 7 (bootstrap fixture + deferred ring-3 two-process proofs) |
+| `mp1-dtb.md` | #52 MP1 bounded DTB parser contract (include/jeios/fdt.h) |

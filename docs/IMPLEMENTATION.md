@@ -520,6 +520,76 @@ re-stale-after-reuse assertion, the measured quota count, the softened per-proce
 wording, the ADR wide-handle amendment, and the pinned ABI static-asserts).
 AI-assisted review only; not independent human qualification.
 
+## MP1 step 3 — bounded copied DTB parse + remote ARM64 CI job (QEMU virt-8.2) — 2026-10-30
+
+Issue #52 (finishes ARM64.md MP1). Not owner-gated in substance: new
+arch-neutral `kernel/core/fdt.c` + new contract `include/jeios/fdt.h`, new ARM
+glue, a new CI job; x86 tested paths and its SOURCES list unchanged (fdt.c is
+built for ARM and for the hosted test only). The new contract is presented to
+the owner in the PR for gating like any frozen contract.
+
+**What it does.** `boot.S` guards the firmware DTB pointer before the BSS clear
+(nonzero, 8-aligned, no `x0 + 2 MiB` wrap, no overlap with the whole image
+extent incl. NOLOAD) -> bounded FATAL + halt. `main.c`, after VBAR is installed,
+byte-reads the 40-byte header, `je_fdt_copy_plan` -> ONE copy of
+`min(totalsize, 64 KiB)` into a 16-aligned `.bss` buffer, `je_fdt_parse` on the
+copy only (no pointers into the firmware blob survive), then
+`je_boot_ctx_check` against arch facts (kernel image extent, DTB source range,
+PARange -> pa_bits; reserved encodings FATAL). Markers print copy length,
+totalsize, CRC-32 of the copied prefix, RAM ranges and the validated pa_bits.
+`JE_ARM_DTB_BAD` corrupts the copy's first struct token and must produce
+exactly `FATAL dtb rejected status=BAD_TOKEN off=0x40`.
+
+**Parser contract (normative text lives in `fdt.h`).** Single pass, file order,
+first violation wins, one deterministic status + `err_off` per failure. Bounds:
+totalsize <= 2 MiB, copy <= 64 KiB, depth 16, 1024 nodes, 64 props/node, name
+255, 8 RAM ranges, 16 kept reservations, 16 memreserve entries, 16
+`/reserved-memory` candidates (walk-time). u64 arithmetic with overflow checks
+everywhere; zero-size blocks valid; struct/strings overlap rejected. Semantics:
+root cells required (1|2); memory by `device_type`; `/reserved-memory` cells
+must equal root's with empty `ranges`, decided at the first child; `status`
+honored only on memory nodes and reserved-memory children (ignored on `/chosen`
+and `/reserved-memory`, matching Linux and failing safe); DUPLICATE at the
+repeating PROP in every tracked node, before value checks; CONFLICT for a
+`/chosen`/`/reserved-memory` claiming `device_type = "memory"`; reservations
+fully outside RAM ignored+counted, partial -> BAD_RANGE; dynamic (`size`-only)
+reservations counted for MP2. Freestanding: no struct copies (verified
+`nm -u` empty at -O0/-Os/-O2, ARM and host); `je_fdt_parse` stack ~2.7 KiB.
+
+**Provenance (worker mode; AI-assisted, not human qualification).**
+
+| Part | Author | Adversarial reviewer |
+|------|--------|----------------------|
+| Contract `fdt.h` | lead, after Claude+Codex consults (`docs/adr/debates/mp1-dtb.md`) | both peers |
+| `kernel/core/fdt.c` (rounds 1–4) | Codex (W1) | Claude |
+| `tests/test_fdt.c` (rounds 1–5), written from the header only | Claude (W2) | Codex |
+| ARM glue + `tools/smoke_arm.py` + `mk/aarch64.mk` | Claude (W3) | Codex |
+| `.github/workflows/ci.yml` `aarch64` job | Codex (W4) | Claude |
+| fixture generator, build pre-wiring, integration, docs | lead | peers via review |
+
+Each worker's notes: `docs/adr/debates/mp1-dtb-workers/`. Because the parser and
+its suite were written independently against the header, a suite PASS is a
+two-implementation agreement on every pinned case, not one author checking
+itself.
+
+**Evidence (local, Ubuntu host, QEMU 8.2.2; see the PR for remote CI).** Hosted
+`test_fdt` under ASan+UBSan: fixture, per-status builder cases with exact
+err_off, copy_plan, boot_ctx_check, a full truncation sweep of the 7426-byte live
+extent, and 30000 byte-changing mutation iterations with determinism re-parse.
+ARM `make smoke-aarch64 ARM_REQUIRE=1`: default, `ARM_VECTOR_TEST=1`,
+`ARM_BSS_CHECK=1`, `ARM_DTB_BAD=1` all PASS; booted DTB CRC32 `0xcc76dc2b` ==
+committed fixture; `ram[0] 0x40000000+0x10000000`; `pa_bits=44`. x86
+check/smoke/integration and the three CI NX/memory profiles unaffected.
+
+**Not enforced yet / MP2 obligations.** MMU and caches are off; MP2 must
+`DC IVAC` the copy buffer before enabling caches, must honor `rsv_dynamic` and
+`rsv_nomap` in its allocator, and must not trust anything outside the copy.
+The 256 MiB QEMU profile is pinned (with QEMU's 128 MiB default the DTB at
+0x48000000 lies outside RAM, so the 256 MiB pin is required; that 128 MiB boot
+is not exercised as a test). Node names match exactly
+(`chosen@0` is ordinary). Only the QEMU virt-8.2 DTB is qualified; no physical
+board.
+
 ## MP1 step 2 — ARM64 EL1 exception vectors + trap frame (QEMU virt-8.2) — 2026-10-19
 
 ADR 0002 D5-3 + ARM64.md MP1, owner-approved trap-frame ABI. Installs VBAR_EL1
