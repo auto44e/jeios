@@ -2775,6 +2775,608 @@ static void test_bad_cells(void)
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* 4b. round-4 discriminating cases (contract 3a6e1f1 + 44187ac)              */
+
+/* A PROP whose nameoff is patched (after b_finish) to lie outside the strings
+ * block -> BAD_STRING. Returns the PROP's struct-relative offset; the caller
+ * must call bad_nameoff_patch() on it after b_finish(). */
+static uint32_t bad_nameoff_prop(void)
+{
+    return b_prop_off(0u, NULL, 0u);
+}
+
+static void bad_nameoff_patch(uint32_t at)
+{
+    st_patch(at + 8u, 0xfffffff0u);
+}
+
+/* BAD_STRING from a bad nameoff: the contract names "the first violation" but
+ * not which word of the PROP header err_off designates, so require it inside
+ * that PROP's 12-byte header (token, len, nameoff). Every alternative outcome
+ * these tests discriminate against lies outside that window. */
+#define EXPECT_BAD_NAMEOFF_AT(prop_rel)                                       \
+    do {                                                                      \
+        EXPECT(JE_FDT_BAD_STRING);                                            \
+        if (EO < I.off_st + (prop_rel) || EO >= I.off_st + (prop_rel) + 12u)  \
+            FAILF("err_off %u not in bad-nameoff PROP [%u,%u)", EO,           \
+                  I.off_st + (prop_rel), I.off_st + (prop_rel) + 12u);        \
+    } while (0)
+
+/* Codex test review (2): DUPLICATE is decided by NAME before the repeat's value
+ * is examined. Each repeat carries a value that would otherwise be its own
+ * error (BAD_CELLS, BAD_STRING, CONFLICT), so a value-first parser fails. */
+static void test_dup_before_value(void)
+{
+    uint32_t at;
+
+    /* root #address-cells / #size-cells repeated with len 0, value 3, len 8 */
+    for (uint32_t w = 0u; w < 2u; w++) {
+        for (uint32_t k = 0u; k < 3u; k++) {
+            static const uint8_t eight[8] = { 0, 0, 0, 0, 0, 0, 0, 2 };
+            const char *name = w == 0u ? "#address-cells" : "#size-cells";
+            b_reset();
+            root_open(2u, 2u);
+            if (k == 0u)
+                at = b_empty(name);
+            else if (k == 1u)
+                at = b_u32(name, 3u);
+            else
+                at = b_prop(name, eight, 8u);
+            mem("m", 2u, 2u, RAM_B, RAM_S);
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        }
+    }
+    /* memory status "okay" repeated with an empty / non-NUL-terminated value,
+     * with status before and after device_type */
+    {
+        static const struct { const char *v; uint32_t len; } bad[] = {
+            { "", 0u }, { "okay", 4u }, { "disabled", 8u },
+        };
+        for (uint32_t k = 0u; k < sizeof bad / sizeof bad[0]; k++) {
+            for (uint32_t w = 0u; w < 2u; w++) {
+                b_reset();
+                root_open(2u, 2u);
+                b_begin("m");
+                if (w == 1u)
+                    b_s("device_type", "memory");
+                b_s("status", "okay");
+                at = b_prop("status", bad[k].v, bad[k].len);
+                if (w == 0u)
+                    b_s("device_type", "memory");
+                b_reg1(2u, 2u, RAM_B, RAM_S);
+                b_end();
+                root_close();
+                b_finish();
+                EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+            }
+        }
+        /* first status itself malformed (empty), then a repeat: the memory
+         * node's status value is decided at END_NODE, the repeat precedes it */
+        b_reset();
+        root_open(2u, 2u);
+        b_begin("m");
+        b_s("device_type", "memory");
+        b_empty("status");
+        at = b_s("status", "okay");
+        b_reg1(2u, 2u, RAM_B, RAM_S);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+    }
+    /* rsv child status repeated with an empty value (status is checked at the
+     * PROP there, but DUPLICATE comes first) */
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    rm_open(2u, 2u);
+    b_begin("r");
+    b_s("status", "okay");
+    at = b_empty("status");
+    b_reg1(2u, 2u, RAM_B, 0x1000u);
+    b_end();
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+    /* device_type repeated with an empty value on a depth-2 node */
+    b_reset();
+    root_open(2u, 2u);
+    b_begin("m");
+    b_s("device_type", "memory");
+    at = b_empty("device_type");
+    b_reg1(2u, 2u, RAM_B, RAM_S);
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+    /* /chosen and /reserved-memory: device_type "foo" then "memory" ->
+     * DUPLICATE at the repeat, NOT CONFLICT */
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    b_begin("chosen");
+    b_s("device_type", "foo");
+    at = b_s("device_type", "memory");
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    rm_open(2u, 2u);
+    b_s("device_type", "foo");
+    at = b_s("device_type", "memory");
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+    /* /reserved-memory #address-cells=<3> then a repeat: the bad VALUE is only
+     * recorded at the PROP (decided at the first child / END_NODE), so the
+     * repeat is DUPLICATE (Claude parser review probe 2a); also len 0 */
+    for (uint32_t k = 0u; k < 2u; k++) {
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        b_begin("reserved-memory");
+        if (k == 0u)
+            b_u32("#address-cells", 3u);
+        else
+            b_empty("#address-cells");
+        b_u32("#size-cells", 2u);
+        b_empty("ranges");
+        at = b_u32("#address-cells", 2u);
+        rm_child("r", 2u, 2u, RAM_B, 0x1000u, false);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+    }
+}
+
+/* Claude parser review probes 1a-1g: a malformed status / device_type VALUE is
+ * validated only where it is consumed (device_type on depth-2 nodes; status on
+ * memory nodes and /reserved-memory children). Everywhere else -> OK. */
+static void test_unconsumed_strings(void)
+{
+    static const uint8_t nonul[4] = { 'o', 'k', 'a', 'y' };
+
+    for (uint32_t k = 0u; k < 2u; k++) {
+        const uint8_t *v = k == 0u ? NULL : nonul;
+        uint32_t vl = k == 0u ? 0u : 4u;
+        /* 1b root status; 1g root device_type */
+        b_reset();
+        root_open(2u, 2u);
+        b_prop("status", v, vl);
+        b_prop("device_type", v, vl);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        root_close();
+        b_finish();
+        EXPECT(JE_FDT_OK);
+        CHECK(C.ram_count == 1u && has_ram(&C, RAM_B, RAM_S));
+        /* 1c /chosen status (still yields the initrd) */
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        b_begin("chosen");
+        b_prop("status", v, vl);
+        b_be("linux,initrd-start", 0x44000000u, 4u);
+        b_be("linux,initrd-end", 0x44100000u, 4u);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT(JE_FDT_OK);
+        CHECK(C.has_initrd && C.initrd.base == 0x44000000u);
+        /* 1d /reserved-memory status (still yields its reservation) */
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        b_prop("status", v, vl);
+        rm_child("r", 2u, 2u, RAM_B + 0x1000u, 0x1000u, false);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT(JE_FDT_OK);
+        CHECK(C.rsv_count == 1u && C.rsv[0].base == RAM_B + 0x1000u);
+        /* 1e non-memory depth-2 nodes: no device_type, and device_type "foo"
+         * (on either side of the status) */
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        b_begin("uart@9000000");
+        b_prop("status", v, vl);
+        b_u32("reg", 0x09000000u);
+        b_end();
+        b_begin("dev1");
+        b_prop("status", v, vl);
+        b_s("device_type", "foo");
+        b_end();
+        b_begin("dev2");
+        b_s("device_type", "foo");
+        b_prop("status", v, vl);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT(JE_FDT_OK);
+        CHECK(C.ram_count == 1u);
+        /* 1a/1f depth-3 untracked nodes (under soc and under a memory node);
+         * depth-3 rsv child device_type (tracked, but device_type is consumed
+         * only at depth 2); depth-4 node under a rsv child */
+        b_reset();
+        root_open(2u, 2u);
+        b_begin("m");
+        b_s("device_type", "memory");
+        b_reg1(2u, 2u, RAM_B, RAM_S);
+        b_begin("sub");
+        b_prop("status", v, vl);
+        b_prop("device_type", v, vl);
+        b_end();
+        b_end();
+        b_begin("soc");
+        b_begin("dev@0");
+        b_prop("status", v, vl);
+        b_prop("device_type", v, vl);
+        b_end();
+        b_end();
+        rm_open(2u, 2u);
+        b_begin("r");
+        b_prop("device_type", v, vl);
+        b_reg1(2u, 2u, RAM_B + 0x1000u, 0x1000u);
+        b_begin("g");
+        b_prop("status", v, vl);
+        b_prop("device_type", v, vl);
+        b_end();
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT(JE_FDT_OK);
+        CHECK(C.ram_count == 1u && C.rsv_count == 1u);
+    }
+}
+
+/* Memory-node status VALUE timing (contract 44187ac): checked at the node's
+ * END_NODE (first of the END_NODE checks), err_off = the status PROP. A
+ * violation before that END_NODE wins; END_NODE-time semantics lose. */
+static void test_memory_status_timing(void)
+{
+    uint32_t at, st_at;
+
+    for (uint32_t w = 0u; w < 2u; w++) { /* w==0: status before device_type */
+        /* control: BAD_STRING at the status PROP */
+        b_reset();
+        root_open(2u, 2u);
+        b_begin("m");
+        if (w == 1u)
+            b_s("device_type", "memory");
+        st_at = b_empty("status");
+        if (w == 0u)
+            b_s("device_type", "memory");
+        b_reg1(2u, 2u, RAM_B, RAM_S);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_STRING, I.off_st + st_at);
+        /* a repeated reg AFTER the empty status (before END_NODE) -> DUPLICATE
+         * at the second reg */
+        b_reset();
+        root_open(2u, 2u);
+        b_begin("m");
+        if (w == 1u)
+            b_s("device_type", "memory");
+        b_empty("status");
+        if (w == 0u)
+            b_s("device_type", "memory");
+        b_reg1(2u, 2u, RAM_B, RAM_S);
+        at = b_reg1(2u, 2u, RAM_B, RAM_S);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        /* a depth-3 child of the memory node with a bad nameoff -> BAD_STRING
+         * at the child's PROP, not at the status PROP */
+        b_reset();
+        root_open(2u, 2u);
+        b_begin("m");
+        if (w == 1u)
+            b_s("device_type", "memory");
+        st_at = b_empty("status");
+        if (w == 0u)
+            b_s("device_type", "memory");
+        b_reg1(2u, 2u, RAM_B, RAM_S);
+        b_begin("sub");
+        at = bad_nameoff_prop();
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        bad_nameoff_patch(at);
+        EXPECT_BAD_NAMEOFF_AT(at);
+        CHECK(EO != I.off_st + st_at);
+        /* status is the FIRST END_NODE check: it beats reg absent (BAD_RANGE)
+         * and a malformed reg (BAD_CELLS) */
+        for (uint32_t k = 0u; k < 2u; k++) {
+            static const uint8_t z12[12];
+            b_reset();
+            root_open(2u, 2u);
+            mem("ok", 2u, 2u, 0x80000000u, 0x1000u);
+            b_begin("m");
+            if (w == 1u)
+                b_s("device_type", "memory");
+            st_at = b_prop("status", "okay", 4u);
+            if (w == 0u)
+                b_s("device_type", "memory");
+            if (k == 1u)
+                b_prop("reg", z12, 12u);
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_BAD_STRING, I.off_st + st_at);
+        }
+    }
+}
+
+/* /reserved-memory cell VALUES are recorded at the PROP and decided with
+ * absence at the first child BEGIN_NODE / END_NODE (contract 44187ac; Claude
+ * parser review probes 2b, 2c). (2a is in test_dup_before_value.) */
+static void test_rsv_cells_deferral(void)
+{
+    static const uint8_t eight[8] = { 0, 0, 0, 0, 0, 0, 0, 2 };
+    uint32_t at;
+
+    /* bad value / len 0 / len 8 for either cell, with a child -> at the child
+     * BEGIN_NODE; childless -> at the END_NODE */
+    for (uint32_t w = 0u; w < 2u; w++) {
+        for (uint32_t k = 0u; k < 4u; k++) {
+            for (uint32_t c = 0u; c < 2u; c++) {
+                const char *bad = w == 0u ? "#address-cells" : "#size-cells";
+                const char *good = w == 0u ? "#size-cells" : "#address-cells";
+                b_reset();
+                root_open(2u, 2u);
+                mem("m", 2u, 2u, RAM_B, RAM_S);
+                b_begin("reserved-memory");
+                if (k == 0u)
+                    b_u32(bad, 3u);
+                else if (k == 1u)
+                    b_u32(bad, 0u);
+                else if (k == 2u)
+                    b_empty(bad);
+                else
+                    b_prop(bad, eight, 8u);
+                b_u32(good, 2u);
+                b_empty("ranges");
+                if (c == 0u) {
+                    at = b_begin("r");
+                    b_reg1(2u, 2u, RAM_B, 0x1000u);
+                    b_end();
+                    b_end();
+                } else {
+                    at = b_end();
+                }
+                root_close();
+                b_finish();
+                EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + at);
+            }
+        }
+    }
+    /* a non-cell defect between the bad cell PROP and the decision point wins:
+     * repeated ranges -> DUPLICATE at the repeat; bad nameoff -> BAD_STRING */
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    b_begin("reserved-memory");
+    b_u32("#address-cells", 3u);
+    b_u32("#size-cells", 2u);
+    b_empty("ranges");
+    at = b_empty("ranges");
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    b_begin("reserved-memory");
+    b_prop("#size-cells", eight, 8u);
+    b_u32("#address-cells", 2u);
+    b_empty("ranges");
+    at = bad_nameoff_prop();
+    b_end();
+    root_close();
+    b_finish();
+    bad_nameoff_patch(at);
+    EXPECT_BAD_NAMEOFF_AT(at);
+}
+
+/* /reserved-memory child `reg` is decoded at the child's END_NODE, err_off the
+ * reg PROP (contract 44187ac; Claude parser review probe 3); its status VALUE
+ * is checked at the PROP. Plus Codex test review (3): a DISABLED memory node /
+ * rsv child's reg is not decoded at all. */
+static void test_reg_timing(void)
+{
+    static const uint8_t z12[12];
+    uint32_t at, reg_at;
+
+    /* rsv child zero-size reg, then a grandchild with a bad nameoff ->
+     * BAD_STRING at the grandchild; same with a 12-byte reg (BAD_CELLS lost) */
+    for (uint32_t k = 0u; k < 2u; k++) {
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        b_begin("r");
+        if (k == 0u)
+            reg_at = b_reg1(2u, 2u, RAM_B, 0u);
+        else
+            reg_at = b_prop("reg", z12, 12u);
+        b_begin("g");
+        at = bad_nameoff_prop();
+        b_end();
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        bad_nameoff_patch(at);
+        EXPECT_BAD_NAMEOFF_AT(at);
+        CHECK(EO != I.off_st + reg_at);
+        /* ... a later repeated no-map / malformed status in the same child */
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        b_begin("r");
+        if (k == 0u)
+            b_reg1(2u, 2u, RAM_B, 0u);
+        else
+            b_prop("reg", z12, 12u);
+        b_empty("no-map");
+        at = b_empty("no-map");
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        b_begin("r");
+        if (k == 0u)
+            b_reg1(2u, 2u, RAM_B, 0u);
+        else
+            b_prop("reg", z12, 12u);
+        at = b_empty("status");
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_STRING, I.off_st + at);
+    }
+
+    /* Codex test review (4): err_off = the reg PROP for walk-time reg errors.
+     * memory node BAD_CELLS (zero length, not a multiple; reg before and after
+     * device_type) and BAD_RANGE (zero size, overflow, 2nd pair zero-size) */
+    {
+        static const uint32_t lens[] = { 0u, 4u, 12u, 20u };
+        for (uint32_t k = 0u; k < sizeof lens / sizeof lens[0]; k++) {
+            for (uint32_t w = 0u; w < 2u; w++) {
+                static const uint8_t z[20];
+                b_reset();
+                root_open(2u, 2u);
+                b_begin("m");
+                if (w == 0u)
+                    b_s("device_type", "memory");
+                at = b_prop("reg", z, lens[k]);
+                if (w == 1u)
+                    b_s("device_type", "memory");
+                b_s("compatible", "x"); /* the reg PROP is not the last token */
+                b_end();
+                root_close();
+                b_finish();
+                EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + at);
+            }
+        }
+        b_reset();
+        root_open(1u, 1u);
+        b_begin("m");
+        b_s("device_type", "memory");
+        at = b_prop("reg", z12, 12u);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + at);
+    }
+    {
+        static const uint64_t cases[][4] = {
+            { RAM_B, 0u, 0u, 0u },
+            { 0xfffffffffffff000ull, 0x1000u, 0u, 0u },
+            { RAM_B, RAM_S, 0x80000000u, 0u },
+        };
+        for (uint32_t k = 0u; k < 3u; k++) {
+            b_reset();
+            root_open(2u, 2u);
+            b_begin("m");
+            at = b_reg(2u, 2u, k == 2u ? 2u : 1u, cases[k]);
+            b_s("device_type", "memory");
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + at);
+        }
+        b_reset();
+        root_open(1u, 1u);
+        b_begin("m");
+        b_s("device_type", "memory");
+        at = b_reg1(1u, 1u, RAM_B, 0u);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + at);
+    }
+    /* rsv child BAD_CELLS (zero length, 12 bytes; reg before another prop) and
+     * BAD_RANGE (zero size, overflow, 2nd pair zero-size) at the reg PROP */
+    for (uint32_t k = 0u; k < 5u; k++) {
+        static const uint64_t p2[4] = { RAM_B, 0x1000u, RAM_B + 0x2000u, 0u };
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        b_begin("r");
+        if (k == 0u)
+            at = b_prop("reg", z12, 0u);
+        else if (k == 1u)
+            at = b_prop("reg", z12, 12u);
+        else if (k == 2u)
+            at = b_reg1(2u, 2u, RAM_B, 0u);
+        else if (k == 3u)
+            at = b_reg1(2u, 2u, 0xfffffffffffff000ull, 0x1000u);
+        else
+            at = b_reg(2u, 2u, 2u, p2);
+        b_empty("no-map");
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(k < 2u ? JE_FDT_BAD_CELLS : JE_FDT_BAD_RANGE, I.off_st + at);
+    }
+
+    /* Codex test review (3): disabled memory node and disabled rsv child with
+     * a 12-byte reg under 2/2 cells -> OK (status on either side of reg) */
+    for (uint32_t w = 0u; w < 2u; w++) {
+        b_reset();
+        root_open(2u, 2u);
+        mem("ok", 2u, 2u, RAM_B, RAM_S);
+        b_begin("m");
+        b_s("device_type", "memory");
+        if (w == 0u)
+            b_s("status", "disabled");
+        b_prop("reg", z12, 12u);
+        if (w == 1u)
+            b_s("status", "disabled");
+        b_end();
+        rm_open(2u, 2u);
+        b_begin("r");
+        if (w == 0u)
+            b_s("status", "disabled");
+        b_prop("reg", z12, 12u);
+        if (w == 1u)
+            b_s("status", "disabled");
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT(JE_FDT_OK);
+        CHECK(C.ram_count == 1u && has_ram(&C, RAM_B, RAM_S));
+        CHECK(C.rsv_count == 0u && C.rsv_ignored == 0u && C.rsv_dynamic == 0u);
+        CHECK(C.node_count == 5u);
+    }
+}
+
 static void test_no_memory(void)
 {
     /* no memory node at all */
@@ -3553,6 +4155,14 @@ static void test_check(void)
     CHECK(je_boot_ctx_check(NULL, &F, &e) == JE_FDT_BAD_ARG);
     CHECK(je_boot_ctx_check(&K, NULL, &e) == JE_FDT_BAD_ARG);
     CHECK(je_boot_ctx_check(&K, &F, NULL) == JE_FDT_BAD_ARG);
+    /* NULL ctx / facts with a non-NULL err_idx -> err_idx FACTS (contract
+     * 44187ac; Claude parser review nit) */
+    e = 0x5a5a5a5au;
+    CHECK(je_boot_ctx_check(NULL, &F, &e) == JE_FDT_BAD_ARG && e == JE_BOOT_ERR_FACTS);
+    e = 0x5a5a5a5au;
+    CHECK(je_boot_ctx_check(&K, NULL, &e) == JE_FDT_BAD_ARG && e == JE_BOOT_ERR_FACTS);
+    e = 0x5a5a5a5au;
+    CHECK(je_boot_ctx_check(NULL, NULL, &e) == JE_FDT_BAD_ARG && e == JE_BOOT_ERR_FACTS);
 
     /* count clamp (contract 5a3c14b): ram_count > MAX_RAM or rsv_count >
      * MAX_RSV -> BAD_ARG, err_idx FACTS, before the pa_bits/facts checks and
@@ -3986,6 +4596,11 @@ int main(void)
     test_conflict();
     test_status_values();
     test_bad_cells();
+    test_dup_before_value();
+    test_unconsumed_strings();
+    test_memory_status_timing();
+    test_rsv_cells_deferral();
+    test_reg_timing();
     test_no_memory();
     test_range_limit();
     test_bad_range();
