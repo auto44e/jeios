@@ -129,6 +129,11 @@ qualification evidence is in [M3C_RETRO.md](M3C_RETRO.md).
 2. **Wire the ARM QEMU boot into remote CI.** Today remote CI runs x86 bootstrap +
    the ARM *compile*; the ARM vector-test *boot* (`make smoke-aarch64
    ARM_VECTOR_TEST=1`) is verified locally only. Honest gap flagged in PR #49.
+   **CORRECTION (verified 2026-10-29 against `main`'s `.github/workflows/ci.yml`
+   at `5f84ff7`):** the claim above that remote CI ran "the ARM *compile*" was
+   FALSE when written — the workflow had no ARM job at all; `make aarch64` had
+   only ever been run locally. The original sentence is preserved as history;
+   the #52 PR adds the first `aarch64` CI job.
 3. **Board hygiene:** confirm #7 and #8 closed (done this session); keep the
    project board in sync.
 4. **Then the roadmap gates beyond M3** (core: the next core kernel gate; mobile:
