@@ -50,12 +50,14 @@ typedef enum {
     JE_FDT_TOO_LARGE,    /* totalsize > JE_FDT_MAX_TOTAL */
     JE_FDT_BAD_VERSION,  /* version < 17 or last_comp_version > 17 */
     JE_FDT_BAD_LAYOUT,   /* header block offsets/sizes/alignment/order/overflow, rsvmap
-                          * terminator missing before off_dt_struct, a token/name/value
-                          * running past the struct block, END not the last word */
+                          * terminator missing before off_dt_struct, a token or PROP
+                          * value running past the struct block, END not the last word.
+                          * (A node NAME running past the block is BAD_STRING.) */
     JE_FDT_BAD_TOKEN,    /* unknown token; first node not an empty-named root; second
                           * root; PROP after a child node; END_NODE at depth 0; END with
                           * depth != 0; non-NOP/END token after the root's END_NODE */
-    JE_FDT_BAD_STRING,   /* node name unterminated / > JE_FDT_MAX_NAME; nameoff >=
+    JE_FDT_BAD_STRING,   /* node name with no NUL before the struct-block end, or >
+                          * JE_FDT_MAX_NAME bytes; nameoff >=
                           * size_dt_strings or no NUL inside the strings block */
     JE_FDT_DEPTH_LIMIT,
     JE_FDT_NODE_LIMIT,
@@ -68,7 +70,9 @@ typedef enum {
                           * not a multiple of (ac+sc)*4 */
     JE_FDT_NO_MEMORY,    /* no usable RAM range after the walk */
     JE_FDT_RANGE_LIMIT,  /* > JE_FDT_MAX_RAM RAM ranges, > JE_FDT_MAX_RSV kept
-                          * reservations, or > JE_FDT_MAX_RSVMAP memreserve entries */
+                          * reservations, > JE_FDT_MAX_RSVMAP memreserve entries, or
+                          * > JE_FDT_MAX_RSV /reserved-memory `reg` CANDIDATES during the
+                          * walk (see SEMANTICS) */
     JE_FDT_BAD_RANGE,    /* zero size, base+size overflows u64, memreserve entry with
                           * size==0 && addr!=0, memory node without reg, reservation
                           * PARTIALLY inside RAM, initrd half-present / end<=start / not
@@ -140,7 +144,8 @@ je_fdt_status je_fdt_copy_plan(const uint8_t hdr[JE_FDT_HEADER_SIZE],
  *   off_mem_rsvmap >= 40 and 8-aligned; off_dt_struct 4-aligned and
  *   size_dt_struct a multiple of 4; canonical ORDER rsvmap < struct < strings
  *   with struct start >= rsvmap terminator end and strings start >= struct end;
- *   every block end <= totalsize. Any block byte at/after len -> TRUNCATED.
+ *   every block end <= totalsize. Zero-size blocks are valid, including one that
+ *   starts exactly at totalsize. Any block byte at/after len -> TRUNCATED.
  * RSVMAP: 16-byte big-endian {u64 addr, u64 size} entries from off_mem_rsvmap,
  *   terminated by addr==0 && size==0. > JE_FDT_MAX_RSVMAP entries before the
  *   terminator -> RANGE_LIMIT; terminator not ending <= off_dt_struct ->
@@ -158,6 +163,10 @@ je_fdt_status je_fdt_copy_plan(const uint8_t hdr[JE_FDT_HEADER_SIZE],
  *   size_dt_strings and a NUL before the strings-block end.
  * SEMANTICS (cells are NOT inherited; each node's cells govern its children):
  *   - root (depth 1): #address-cells and #size-cells required, len 4, value 1|2.
+ *     Properties precede children, so absence is decided when the root's
+ *     property list ends: at its first child BEGIN_NODE (or its END_NODE if it
+ *     has no children) -> BAD_CELLS, err_off = that token. This precedes any
+ *     use of the cells by a child.
  *   - memory: any depth-2 node whose device_type is exactly "memory" (name not
  *     used); skipped if `status` present and not "okay"/"ok"; `reg` required
  *     (absent -> BAD_RANGE) using ROOT cells. A node is classified at its
@@ -165,8 +174,11 @@ je_fdt_status je_fdt_copy_plan(const uint8_t hdr[JE_FDT_HEADER_SIZE],
  *   - /reserved-memory: the depth-2 node named exactly "reserved-memory"; must
  *     have its own #address-cells/#size-cells equal to root's and an empty
  *     `ranges` (else BAD_CELLS). Depth-3 children: `reg` (using those cells)
- *     yields reservations; status-disabled children skipped; `no-map` recorded;
- *     `size` without `reg` -> rsv_dynamic++ (not an error).
+ *     yields reservation CANDIDATES, collected in walk order; the
+ *     (JE_FDT_MAX_RSV+1)-th candidate range -> RANGE_LIMIT immediately (walk-time,
+ *     err_off = that `reg` PROP), before any post-walk RAM classification — this
+ *     bounds parser scratch without a second pass. Status-disabled children
+ *     skipped; `no-map` recorded; `size` without `reg` -> rsv_dynamic++.
  *   - /chosen: the depth-2 node named exactly "chosen". linux,initrd-start/-end
  *     each 4 or 8 bytes (independently); exactly one present, end <= start, or a
  *     bad length -> BAD_RANGE.
