@@ -4495,13 +4495,22 @@ static void test_bad_range(void)
             { RAM_B - 0x1000u, RAM_B + 0x1000u },       /* partial below */
         };
         for (uint32_t k = 0u; k < sizeof se / sizeof se[0]; k++) {
+            uint32_t end_prop;
+
             b_reset();
             root_open(2u, 2u);
             mem("m", 2u, 2u, RAM_B, RAM_S);
-            chosen_initrd(se[k][0], 8u, se[k][1], 4u);
+            b_begin("chosen");
+            b_be("linux,initrd-start", se[k][0], 8u);
+            end_prop = b_be("linux,initrd-end", se[k][1], 4u);
+            b_end();
             root_close();
             b_finish();
-            EXPECT(JE_FDT_BAD_RANGE);
+            /* end<=start (k 0,1) and post-walk containment (k 2..4) both
+             * report the linux,initrd-end PROP (fdt.h err_off pins). Added by
+             * the lead after the Codex round-7 test review (mutant: initrd
+             * containment err_off -> 0 survived). */
+            EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_prop);
         }
         /* spanning two adjacent RAM ranges */
         b_reset();
