@@ -636,3 +636,318 @@ about RAM on the same blob, and we could not tell which one is right.
 
 Flex to revisit: if a real platform ships `chosen@0`, or a disabled reserved-memory child that must
 still be honored, revisit name matching and child status with that DTB as evidence.
+
+---
+
+## Rounds 3–8 cross-lineage reviews (2026-10-30, AI-assisted; not human qualification)
+
+Verbatim reviewer outputs, in order. Codex reviews of the harness that tried to run `make` read-only were rerun in scratch worktrees. The last Codex harness review (round 8) was cut off by the provider's safety filter while fuzzing malformed ELF files. Its one reported defect (a 4-byte ELF raising IndexError) was reproduced and fixed by the lead in `fe7beb1`.
+
+### Codex reviewing W3 glue (round 3, rerun)
+
+1. **P1 must-fix — smoke can false-PASS incomplete/failed boots.** `TERM_DEFAULT` and the vector terminal marker omit CRLF (`tools/smoke_arm.py:76,91`), while `run_qemu()` treats substring presence as completion (`:177`), waits only 0.5 s (`:190-199`), then kills QEMU. A log ending immediately after `...halted` without a complete line, or appending `FATAL` after 0.5 s, passes. Both cases reproduced with temporary QEMU shims; each returned `PASS`.
+
+2. **P2 should-fix — timeout does not bound the whole run.** The deadline covers only pre-terminal polling (`tools/smoke_arm.py:173-186`); settlement is added afterward. Real QEMU with `--timeout 0.1` returned PASS after ~0.68 s. This contradicts the “whole QEMU run” claim in `tools/smoke_arm.py:260-262` and `mk/aarch64.mk:111-113`.
+
+3. **P2 should-fix — non-finite timeout disables timeout enforcement.** `--timeout nan` or `inf` passes the `< 0` check (`tools/smoke_arm.py:290-291`); `deadline` becomes non-finite (`:173`), so `time.monotonic() >= deadline` never succeeds (`:183`). A hung QEMU can therefore hang CI indefinitely.
+
+4. **P3 nit — version preflight is bounded, but evidence printing is not.** `qemu_version()` has a 10-second timeout (`tools/smoke_arm.py:134-142`), but `tool_version()` calls `qemu --version` again without one (`:126-130,342`). A pathological executable can pass preflight, then hang before QEMU starts.
+
+Confirmed sound:
+
+- The round-3 wrap guard is correct. W3’s claim holds for the current image: the old addition was only reached when `x0 < _end`, so the prior wrap was unreachable; the new guard is valid defense-in-depth.
+- QEMU version gating, `--require`, toggle exclusivity, and separate build directories behave as intended.
+- `make check` passed.
+- All four local QEMU 8.2.2 smoke modes passed: default, vector-test, BSS-check, and DTB-bad.
+- No tracked files were modified; `git diff --check` passed. Remote ARM CI was not observed.
+
+### Claude reviewing W1 parser (round 3)
+
+Two contract violations in `kernel/core/fdt.c` at 3a6e1f1, one contract gap that will let the two implementations diverge, and no memory-safety findings. `make check` passes locally (rc=0). I probed with `/tmp/fdtprobe/probe.c`, which reuses the test builder against the real parser under ASan+UBSan. I also ran a 300k-iteration mutation fuzz of the QEMU fixture (random byte changes plus truncation) under ASan+UBSan: no reports, statuses always in range, success post-conditions held.
+
+## Findings
+
+**1. P1: `status` and `device_type` values are checked on every node, not only where the contract consumes them.** At `fdt.c:873-878` the BAD_STRING check runs for any `kind == PROP_STATUS || PROP_DEVICE_TYPE`, at any depth, on any node. The round-3 rule is: "device_type on every depth-2 node; status on memory nodes and /reserved-memory children. Elsewhere it is not inspected." Observed results (the contract says OK for all of these):
+
+| Probe | Input | Parser result |
+|---|---|---|
+| 1a | `status` with no NUL, depth-3 untracked node | BAD_STRING |
+| 1b | empty `status` on the root | BAD_STRING |
+| 1c | `status` with no NUL on `/chosen` (its status is IGNORED) | BAD_STRING |
+| 1d | empty `status` on `/reserved-memory` (its status is IGNORED) | BAD_STRING |
+| 1e | empty `status` on a non-memory depth-2 node | BAD_STRING |
+| 1f | empty `device_type` at depth 3 | BAD_STRING |
+| 1g | empty `device_type` on the root | BAD_STRING |
+
+- It fails closed, so it is not a security hole. It can still refuse a firmware DTB the contract accepts.
+- The test suite doesn't cover it: the W2r3 note N1 says these cases are "NOT asserted". That is why both implementations "agree" here.
+- Fixing it is not a one-line change. A depth-2 node's `status` can come before its `device_type` (probe 7 covers that order), so the check has to be recorded and decided at END_NODE. That then changes precedence: for example, empty `status` followed by a repeated `reg` in the same node becomes DUPLICATE instead of BAD_STRING. The contract doesn't specify when this check is decided or which offset it reports; that needs pinning (see 4).
+
+**2. P2: `/reserved-memory` cell values are rejected at the PROP instead of when the contract decides them.** At `fdt.c:907-934`, a bad length or a value outside {1,2} for `/reserved-memory` `#address-cells`/`#size-cells` returns BAD_CELLS immediately. The contract says these are "decided at its first child BEGIN_NODE (or its END_NODE if childless), err_off = that token". Probe results:
+- **2a:** `#address-cells=<3>` then a second `#address-cells`. Parser gives BAD_CELLS at st+0x84; the contract gives DUPLICATE at the second PROP. The status itself differs, not just the offset.
+- **2b:** the same bad cells with a child. Parser reports st+0x84; the contract expects the child BEGIN_NODE at st+0xb0.
+- **2c:** `#size-cells` with length 8 in a childless node. Parser reports st+0x84; the contract expects END_NODE at st+0xb4.
+
+The fix is to only record the value at the PROP and leave all rejection to `fdt_validate_cells`. The root's immediate length/{1,2} check at `fdt.c:879-906` is fine, because the contract defers only *absence* for the root.
+
+**3. P2 (contract gap): when a `/reserved-memory` child's `reg` is decoded.** `fdt_finish_node` (`fdt.c:450-500`) decodes it at the child's END_NODE. In probe 3, a child has `reg` with size 0 and then a grandchild with a bad nameoff: the parser returns BAD_STRING at the grandchild, not BAD_RANGE at the `reg`. The contract says "walk-time … err_off = that reg PROP" and "first violation wins", but it states END_NODE timing only for memory nodes. An implementation that decodes at the first child BEGIN_NODE (all properties are known there) is equally conformant and gives a different status. The lead should pin this (END_NODE, matching memory nodes, seems right) and the tests should add a case like probe 3.
+
+**4. P2 (contract gap that blocks fixing #1):** the contract doesn't say when or where a malformed `status` on a memory node is decided. Proposed rule: decide at END_NODE, err_off = the `status` PROP. Precedence against other errors inside the same node also needs a rule.
+
+**5. P3 nits:**
+- `first_kind` (`fdt.c:819`, `863`) is always true whenever `kind < PROP_COUNT`. Every `&& first_kind` test is dead and suggests a guard that doesn't exist. In untracked nodes the last `status`/`reg` silently wins; that's harmless today because those nodes have no semantics.
+- `je_boot_ctx_check` leaves `*err_idx` unwritten when `ctx` or `facts` is NULL but `err_idx` isn't (`fdt.c:1091`). The contract is silent; setting FACTS there would be more consistent.
+- `fdt.c:1055` reuses `struct_end` as scratch for the initrd end. It's correct but confusing.
+- `fdt.c:1107`: the `size == 0u ||` check is redundant with `fdt_range_valid`.
+
+## Confirmed sound
+- **Round-2 fixes, all verified:**
+  - status ignored on `/chosen` and `/reserved-memory` semantics (aside from the value-check scope in #1);
+  - `/reserved-memory` cells and `ranges` checked at the first child or END_NODE (`fdt.c:704`, `793`), apart from #2;
+  - DUPLICATE reported at the repeating PROP and checked before the value (probes 4 and 6);
+  - second `chosen`/`reserved-memory` gives DUPLICATE at its BEGIN_NODE;
+  - RAM overlap check and its err_off;
+  - the 17th memreserve err_off (`fdt.c:653-654`);
+  - no `memcpy` or struct-copy reads left;
+  - the `check()` count clamp (`fdt.c:1093`).
+- **Other round-3 rules, implemented exactly:** untracked repeats are OK (`fdt.c:864`); a disabled memory node or `/reserved-memory` child doesn't decode `reg` (probe 5: length-3 reg gives OK); CONFLICT is raised at the `device_type` PROP; inside a `reg`, range validity is checked before the count, with RANGE_LIMIT at the 17th valid candidate; walk-time `reg` errors report the `reg` PROP; a zero-size struct gives BAD_LAYOUT (probe 8).
+- **Memory safety:** every struct and strings read is bounded by the upfront TRUNCATED check (`fdt.c:622-631`) plus per-token bounds. Rsvmap reads check `next > blob_len` before reading. Arithmetic on PROP length and name padding is done in u64 with overflow checks. The name scan is bounded at 256 bytes.
+- **Header and rsvmap checks**, their order, and `copy_plan` match the contract.
+- **`je_boot_ctx_check`:** check order and err_idx values match the contract; the shift is safe because `pa_bits` is at most 52; `end == 2^pa_bits` is correctly allowed.
+
+All of this is AI-assisted review, not independent human qualification.
+
+### Codex reviewing W2 tests (round 3)
+
+No P1 found. `make check` passed at `3a6e1f1`; worktree and `git diff --check` are clean.
+
+1. **P2 — current parser violates string-consumption scope.**
+   `kernel/core/fdt.c:873-877` validates every `status` and `device_type` value before checking node scope. Contract says validation is limited to `device_type` on depth-2 nodes and `status` on memory nodes / reserved-memory children (`include/jeios/fdt.h:222-225`).
+
+   Trigger: valid root + memory node + `/chosen { status = <empty>; }`. Expected `OK` because `/chosen` status is ignored; current parser returns `BAD_STRING` at that PROP. Root/depth-3 malformed `status` or `device_type` similarly fail closed incorrectly. Tests only cover consumed scopes at `tests/test_fdt.c:2295-2345`.
+
+2. **P2 — duplicate-before-value lacks a discriminating test.**
+   `tests/test_fdt.c:1812-1839` repeats valid values; the malformed property is a later, non-duplicate property. A value-first parser would pass.
+
+   Missing cases:
+   - root `#address-cells` repeated with length 0 or value 3 → `DUPLICATE` at the second PROP;
+   - memory `status` repeated with an empty/non-NUL value → `DUPLICATE`;
+   - `/chosen` `device_type="foo"` followed by `"memory"` → `DUPLICATE`, not `CONFLICT` (current conflict tests use singleton properties).
+
+3. **P2 — disabled `reg` length is not tested.**
+   Disabled-node coverage uses zero-size/partial ranges (`tests/test_fdt.c:2474-2492`), while malformed tuple lengths are tested only for enabled nodes (`2657-2694`). Add disabled memory and disabled reserved-memory-child `reg` lengths such as 12 bytes under 2/2 cells; expected `OK`, with no `BAD_CELLS`/`BAD_RANGE`.
+
+4. **P2 — `reg`-derived `err_off` is incompletely pinned.**
+   Candidate reservation errors test exact offsets (`tests/test_fdt.c:2933-3000`), but memory `reg` errors and reserved-child `BAD_CELLS` only assert status (`2657-2694`, `3093-3194`). A parser reporting the node `END_NODE` or zero would pass. Add `EXPECT_AT(..., reg_prop_offset)` for both memory and reserved-child malformed lengths/ranges.
+
+Confirmed sound:
+
+- Round-2 fixes verified: exact status matching, root/reserved-memory cell timing, discriminating candidate bound, zero-size blocks, no-op mutation protection, exact-size parse buffers, and `rm_child` cell-width coverage.
+- Round-3 coverage is good for untracked repeats, conflict detection/exact names, candidate validity-before-count, disabled semantic skipping, and zero-size struct handling.
+- The current implementation appears to order duplicate detection before semantic value decoding; the suite simply does not prove the malformed-repeat cases above.
+
+### Claude reviewing W4 CI (round 3)
+
+I found no P1 defects in the `aarch64` CI job at 3a6e1f1. There is one P2 (status docs are still missing the job) and four P3s. I worked only by reading the code; no GitHub run of this job has been observed.
+
+## Findings
+
+1. **P2: the status docs still don't record the new job.** This is the second half of my round-2 P2 (AGENTS.md rules 2 and 10), and it was not applied.
+   - `docs/IMPLEMENTATION.md` has no entry for the remote `aarch64` job, not even as "implemented, remote run not observed".
+   - `docs/CI_STRATEGY.md:33` still says "a single Ubuntu 24.04 job", and `:40` still says "not ARM64 execution". Both are now stale.
+   - `docs/HANDOFF.md:136`, "the #52 PR adds the first `aarch64` CI job", is the only mention. It doesn't say the job has never run on GitHub.
+   - Fix before merge: add a status row labelled "implemented; local only until a GitHub run is observed", and update CI_STRATEGY.
+
+2. **P3: `if-no-files-found: error` makes a second red step on early failures.** If apt, the version gate or `make aarch64` fails, no `serial.log` exists, so the upload step fails too.
+   - It is loud and never hides a failure, but the extra red step can mislead someone triaging the run.
+   - It can't turn a would-be PASS into a FAIL: every smoke step passes `--log build/<dir>/serial.log`, and the harness writes that file before QEMU starts.
+   - Acceptable as is. Optionally add `if: always() && steps.<build>.outcome != 'skipped'`, or accept the noise.
+
+3. **P3: `apt-get update` returns 0 on partial index fetch failures.** It only prints `W:` warnings, so `apt-get install` can run against stale indexes.
+   - Missing packages still fail loudly at install time. Version drift is caught by the `8.2.x` gate and the `dpkg-query` record.
+   - Optional hardening: `-o APT::Update::Error-Mode=any`, which apt 2.7 on noble supports.
+
+4. **P3: round-2 nit 3 was only partly applied.** The `binutils-aarch64-linux-gnu` package version is recorded, which covers objcopy; `aarch64-linux-gnu-objcopy --version` is not printed. The Python package version is recorded via `dpkg-query`. This is fine.
+
+5. **P3 (unverified): fixed artifact name `aarch64-serial-logs`.** With `upload-artifact@v4`, re-running a job in the same workflow run may hit a name conflict (409). I haven't verified this on current GitHub. There is no matrix, so there's no conflict within a single run.
+
+6. **P3 (repo-wide, not a regression): actions are pinned by `@v4` tag, not commit SHA.** This was already recorded as a gap at `CI_STRATEGY.md:39`.
+
+## Round-2 P3s: applied?
+
+| # | Nit | Status |
+|---|---|---|
+| 2 | Record PR head SHA | Applied through `env:` (`PR_HEAD_SHA`, `WORKFLOW_SHA`), not inline `${{ }}`, so it's injection-safe. Empty on push is harmless under `set -u`, because the variable is defined but empty. The "synthetic merge" label is accurate. |
+| 3 | Package versions | Applied (`dpkg-query -W` covering all 5 packages). A missing package makes it exit non-zero, so the step fails. Only objcopy `--version` is missing (finding 4). |
+| 4 | Drop `sha256sum` globs | Applied. `smoke_arm.py` prints `image: … sha256=` for the exact image it booted. |
+| 5 | Upload settings | Applied (`retention-days: 30`, `if-no-files-found: error`). Images and ELFs are still not uploaded, which was optional. |
+| 6 | Job timeout | Applied (`timeout-minutes: 20`). |
+| 7 | Settable boot timeout | Applied (`ARM_SMOKE_TIMEOUT=30`, `?= 15` in mk). A command-line value overrides `?=`. |
+| 8 | Version gate | Unchanged; none was needed. |
+
+## Confirmed sound
+
+- **Make variable names match.** `ARM_REQUIRE`, `ARM_VECTOR_TEST`, `ARM_DTB_BAD`, `ARM_BSS_CHECK` and `ARM_SMOKE_TIMEOUT` are all consumed in `mk/aarch64.mk:121`, through `$(filter 1,…)` and `--timeout $(ARM_SMOKE_TIMEOUT)`.
+  - The mutual-exclusion `$(error)` at `mk/aarch64.mk:17-21` is never triggered, because each CI step sets at most one toggle.
+  - Each mode builds into its own directory, and `smoke-aarch64` depends on that directory's `Image`, so every variant is rebuilt with its own flags.
+- **Infra failures fail loudly:**
+  - Missing QEMU or toolchain: `shell: bash` adds `-eo pipefail` and the step has `set -eu`, so the bare `--version` calls fail the step. The harness `--require` also turns every SKIP into a FAIL (`smoke_arm.py:281-283`).
+  - Version drift: the awk `$4` field matches the format `QEMU emulator version 8.2.2 (Debian …)`. Anything other than `8.2.*` exits 1, and the harness re-checks `qv[:2]` under `--require` (`:306-309`).
+  - A missing fixture fails in every mode (`:302`).
+- **Upload glob behaviour:**
+  - `build/aarch64*/serial.log` keeps one file per variant directory. v4 uses the common ancestor `build/`, so the four files don't collide.
+  - A stale log can't be checked, because the harness unlinks it first (`:350-351`).
+  - `if: always()` can't turn a failed job green.
+- **Timeout sizing:**
+  - Worst case per smoke step is 30 s, plus about 0.5 s settle, plus up to 5 s to terminate.
+  - The harness exits early on the final marker or on the early-stop marker (any FATAL, or the "validated" marker in dtb-bad mode).
+  - Four steps plus apt and builds come to well under 20 minutes. TCG (no KVM) is ample at 30 s.
+- **Script injection and permissions:** no `${{ }}` inside `run:` bodies, and no `pull_request_target`. Workflow-level `permissions: contents: read`; there are no secrets. `${Package}` is single-quoted for dpkg, so neither bash nor Actions expands it.
+- **The HANDOFF CORRECTION (`docs/HANDOFF.md:132-136`) is accurate.**
+  - Across all refs, `ci.yml` changed only at b04b3a6, 96d4dee (2026-10-12), 64a68cf and 398b8ca (both 2026-10-30).
+  - No `aarch64` or ARM text appears anywhere in main's `ci.yml` history.
+  - The false sentence came from 87aeb39 (2026-10-19, on main), when `ci.yml` had no ARM job. So "FALSE when written" holds, and the original wording is kept as history, as AGENTS.md requires.
+  - Wording nit: the stronger evidence is "no ARM job anywhere in `ci.yml` history from 96d4dee to 64a68cf", not only main at 5f84ff7. "Had only ever been run locally" can't strictly be proven; it's fair to say only that CI never ran it.
+
+### Claude reviewing W1 parser (round 4, final)
+
+No P1 or P2 defects in the parser at a4712a8. All four round-3 findings are fixed, and I found one P3 test gap and two P3 nits. I didn't edit anything: all probes and mutants were built in `/tmp`.
+
+**What I ran (host gcc, ASan+UBSan, no-recover):**
+- **`make check`:** passes (rc=0).
+- **Round-3 probe** (`/tmp/fdtprobe/probe.c`), rebuilt against a4712a8: all cases now match the contract.
+- **New round-4 probe** (`/tmp/fdtprobe-r4f/probe.c`, cases R1–R20): all 20 match the contract.
+- **Byte-mutation fuzz of the QEMU fixture:** 300k inputs, no sanitizer reports, no broken post-conditions.
+- **Structure-aware fuzz** (`/tmp/fdtprobe-r4f/sfuzz.c`): 400k random trees built only from the consumed property names, with random good and bad values, nesting up to depth 5. Clean on every check:
+  - same result on a second parse;
+  - output zeroed on failure;
+  - for errors found during the walk, `err_off` lies inside the struct block and is 4-aligned;
+  - on OK, every kept reservation and the initrd sit inside one RAM range, and the counts stay within limits.
+  - Results covered OK, BAD_STRING, DUPLICATE, BAD_CELLS, NO_MEMORY, BAD_RANGE, OVERLAP and CONFLICT.
+- **Freestanding ARM build:** `aarch64-linux-gnu-gcc` with the `mk/aarch64.mk` `ARM_CFLAGS` (plus `-fstack-usage`) compiles at -O0, -Os and -O2. `aarch64-linux-gnu-nm -u` is empty at all three. `je_fdt_parse` uses 2832 / 2624 / 2576 bytes of stack against the 16 KiB boot stack in `kernel/arch/aarch64/linker.ld:16`.
+- **Mutation-kill check:** 14 targeted mutants of the round-4 code run against `tests/test_fdt.c`. 6 were killed; 7 of the 8 survivors behave identically to the real code (reasons below). The one real gap is finding 1.
+
+## Findings
+
+1. **P3 test gap: a 4-byte read of a wrong-length `/reserved-memory` cell goes unnoticed.** If `kernel/core/fdt.c:932` is changed from `value_len == 4u` to `value_len >= 4u`, the whole suite still passes. The suite's length-8 vector is `{0,0,0,0, 0,0,0,2}`; its first word is 0, which fails the "equal to root's" comparison anyway. The case that would catch it is `#address-cells` of length 8 whose first word equals the root's value (e.g. `<2>,<0>` under root 2/2) plus a child. It should give BAD_CELLS at the child's BEGIN_NODE. The parser is correct today; only the test is missing.
+2. **P3 nit: dead check.** The initrd validity check at `fdt.c:1069-1074` can never fail. At `/chosen` END_NODE, `end > start` already holds, so `size = end - start` is non-zero and `base + size = end` cannot overflow. Fixing the old `struct_end` reuse was correct; the check itself could become a comment or an assertion.
+3. **P3 nit: two error-order questions the contract doesn't pin.** At a `/reserved-memory` first-child BEGIN_NODE, the deferred BAD_CELLS check runs before DEPTH_LIMIT, NODE_LIMIT and the child-name BAD_STRING checks (`fdt.c:692-698`). The error offset is the same either way. Separately, the error offset for "initrd not inside RAM" (the `linux,initrd-end` PROP) is still not stated in the header.
+
+## Round-3 items, verified fixed
+
+- **#1 (value-check scope):** probes 1a–1g, R4, R16, R17 and R20 give OK. String values are only checked where the contract says (`device_type` on depth-2 nodes, `status` on memory nodes and `/reserved-memory` children). R18 shows a non-NUL-terminated `device_type "memory"` on `/chosen` gives BAD_STRING before CONFLICT.
+- **#2 (rsv cell-value deferral):** 2a gives DUPLICATE at the repeat, 2b and R5/R6 give BAD_CELLS at the child BEGIN_NODE, and 2c/R7 give BAD_CELLS at END_NODE.
+- **#3 and #4 (timing gaps):** the contract now pins END_NODE timing. Probe 3 and R2 show an earlier error deeper in the subtree wins. R1, R15 and R19 show the memory-node `status` check comes first at END_NODE, ahead of a missing or bad `reg`, with the error at the status PROP.
+- **#5 (nits):** dead `first_kind` removed, `struct_end` no longer reused, a redundant RAM size check dropped, and `err_idx` set to FACTS when ctx/facts is NULL (killed by the new test).
+
+## Regression hunt on the deferred checks: confirmed sound
+
+- **Every recorded value is reset per node** (`fdt_zero_node` resets the new status and cell-validity fields). R3 shows a bad `status` on one depth-2 node doesn't carry into the next memory node, and mutant M1 is killed.
+- **A deferred BAD_STRING can't be lost on a disabled node.** An invalid status also marks the node disabled, but the END_NODE check at `fdt.c:797` runs before `fdt_finish_node`'s disabled skip.
+- **It can't be lost on an untracked node either.** `is_memory` exists only at depth 2, where every node is tracked. A `/reserved-memory` child's status is checked at its PROP (R8).
+- **Deferred values are never read before they're set.** RM cells are only read by `fdt_finish_node` at depth 3, after the first child's BEGIN_NODE has validated them. The memory status offset is only read when the status was actually present and invalid.
+- **Removing `first_kind` is safe.** Every branch that lost the guard is on a tracked node, so a repeat is DUPLICATE before any value is used (R10, R11, 2a; mutant M9 behaves identically).
+- **Why the other survivors behave identically:**
+  - M3, M5 and M6 (dropping or weakening the cell-validity checks) are covered by the "equal to root's 1 or 2" comparison.
+  - M2 (cell-validity flag defaulting to true) is guarded by `has_*`.
+  - M9 (keeping the first status offset instead of the latest) is covered by DUPLICATE.
+  - M10 (`status` check widened to depth ≥ 3) is guarded by `is_reserved_memory` existing only at depth 2.
+  - M12 (status validity dropped from the enabled flag) is covered by the earlier BAD_STRING checks.
+- **No new memory hazards.** There's no `memcpy`/`memset` and no new stack arrays. All value reads stay within `property_end ≤ struct_end ≤ len` (ASan clean across all fuzzing).
+- **The `je_boot_ctx_check` RAM size==0 removal is safe:** `fdt_range_valid` already rejects size 0.
+- **The worker notes (`w1-parser-r4.md`) are honest:** local-only evidence, no remote CI or human-review claims, and gaps stated.
+
+Not done by me: I didn't run `make smoke-aarch64` or QEMU at this head (that's the lead's re-verify), and I saw no remote CI. This is an AI-assisted review, not the independent human review the critical profile requires.
+
+### Claude reviewing W4 CI (round 4, final)
+
+**No P1 or P2 findings. The `aarch64` job at a4712a8 is fine to merge as far as the workflow file goes.** All three round-3 P3 fixes are correct and nothing regressed. None of this has run on GitHub at this head yet, so it is not remote evidence.
+
+**Round-3 P3 fixes**
+1. **apt Error-Mode (correct):** `-o APT::Update::Error-Mode=any` applies only to the `update` call, and the `&&` means install never runs if update fails. My local apt 2.8.3 documents the option in its `configure-index` file. Ubuntu 24.04 ships apt 2.7.x/2.8.x. If the runner's apt doesn't know the option, apt skips it silently, so the worst case is no change in behaviour, not a broken job. Whether it actually enforces strict mode on the runner is not observed.
+2. **objcopy version (correct):** `aarch64-linux-gnu-objcopy --version | head -n 1` is right. Because the step sets `shell: bash`, GitHub runs it with `-eo pipefail`. In theory, `head` exiting early could kill objcopy with SIGPIPE and fail the step. In practice objcopy writes its few lines in a single flushed write before `head` can exit, so this is not a real risk. No change needed.
+3. **Per-attempt artifact name (safe):** `${{ github.run_attempt }}` sits in a `with:` input, not a `run:` script, so there's no shell-injection surface. The value is also a number set by GitHub, so it would be harmless even inside `run:`. It fixes the name clash when only failed jobs are re-run.
+
+**P3 nits (optional)**
+- P3-1: the x86 `bootstrap` job (`ci.yml:11`) still uses plain `apt-get update`. That's consistent with the doc saying "x86 job above is unchanged", but the two jobs now handle apt failures differently. Fix it in a separate PR if wanted.
+- P3-2: the QEMU check `8.2.[0-9]*` also accepts strings like `8.2.1foo`. Not exploitable, since awk takes field `$4` from QEMU's own version line.
+- P3-3: the CI_STRATEGY paragraph doesn't mention the round-4 hardening (strict apt, objcopy version, per-attempt artifact name). It isn't inaccurate, just incomplete.
+
+**Confirmed sound**
+- The four smoke modes build into separate directories (`mk/aarch64.mk:28,35,43`), and the Makefile rejects combining them (`mk/aarch64.mk:17-19`).
+- `build/aarch64*/serial.log` picks up all four logs without overwriting. Upload runs with `if: always()` and fails if no logs exist (`if-no-files-found: error`). Each mode passes `ARM_REQUIRE=1`, so a missing QEMU fails the job instead of skipping it.
+- The job records `git rev-parse HEAD` (the merge commit on PRs), the PR head SHA through `env:` (no injection) and `github.sha`, plus the package versions. `set -eu` is present, `timeout-minutes: 20` is set, and `permissions: contents: read` is still there.
+- **CI_STRATEGY "Update 2026-10-30" paragraph (accurate):**
+  - Ubuntu 24.04, apt-installed cross GCC/binutils and qemu-system-arm, QEMU gated to 8.2.x, versions and SHAs recorded: all match the workflow.
+  - The four modes, in the order listed, match the CI steps.
+  - The pinned `virt-8.2` profile matches `tools/smoke_arm.py:49`.
+  - "No ARM job existed in any ci.yml revision before this PR": checked. Both `ci.yml` revisions on main contain no `aarch64`. The commits that add it (64a68cf, 398b8ca, 7fee591) exist only on `feat/mp1-dtb-parse` and `wip/*`.
+  - It honestly says "IMPLEMENTED; remote evidence only once a GitHub run at the exact PR head is observed".
+
+### Codex reviewing W2 tests (rounds 4-5)
+
+1. **P2 — Duplicate-before-value coverage incomplete.**
+   `include/jeios/fdt.h:228-229` applies to every consumed property, but `tests/test_fdt.c:2803-2932` never combines a duplicate with a malformed initrd value; `tests/test_fdt.c:3517-3527` repeats only valid initrd values. For root + valid RAM + `/chosen` with `linux,initrd-start` valid, then repeated with length 0, expected `DUPLICATE` at the second PROP; a value-first mutant returns `BAD_RANGE`. `/tmp/mut_dup_initrd_bad.c` survived the full suite. Malformed repeated `reg` similarly survives (`/tmp/mut_dup_reg_empty.c`).
+
+2. **P2 — Value-scope coverage misses consumed `device_type` on `/chosen` and `/reserved-memory`.**
+   The contract requires `device_type` validation on every depth-2 node (`include/jeios/fdt.h:230-232`). Tests cover malformed values on ordinary depth-2 nodes and unconsumed values elsewhere, but not malformed `device_type` on the special nodes (`tests/test_fdt.c:2938-3034`). A `/chosen` or `/reserved-memory` `device_type` value of `{"o","k","a","y"}` with length 4 must return `BAD_STRING`; `/tmp/mut_scope.c`, which skips validation there, passes the full suite.
+
+Confirmed sound:
+
+- Disabled `reg` length is discriminated for memory and reserved-memory children (`tests/test_fdt.c:3194-3370`, `3556-3584`); a mutant decoding disabled reserved-memory regs fails.
+- `reg`-derived `err_off` is pinned for both memory and reserved-memory errors (`tests/test_fdt.c:3255-3338`); offset mutants fail.
+- Memory status END_NODE ordering, reserved-memory cell deferral, and deferred `reg` timing have discriminating tests (`tests/test_fdt.c:3040-3188`, `3383-3675`).
+- Original `make check` passes at `e59d58098502bd5929a04e79cad0a02fb06ccbdf`.
+- I did not count the already-recorded reserved-memory 8-byte cell-value gap.
+
+### Codex reviewing W3 harness (round 4)
+
+1. **P1 must-fix — QEMU stderr is ignored on successful runs.** `tools/smoke_arm.py:188,211-218,261-268,465-500` captures stderr but validates it only on failure. A shim emitting a valid serial log plus `FATAL qemu internal error` on stderr passed with rc=0. Inspect pre-termination stderr for fatal diagnostics.
+
+2. **P1 must-fix — non-terminal markers are substring-spoofable.** `tools/smoke_arm.py:276-284` uses `find()`; only the terminal line is whole-line checked. A shim prefixing every marker with `fake-prefix: `, while preserving CRC/`pa_bits` and the exact terminal line, passed. Validate each marker line/prefix structurally.
+
+3. **P3 nit — LF handling is internally inconsistent.** `tools/smoke_arm.py:325-333,409-417` hardcodes `\r\n`, despite `split_lines()` claiming LF/CRLF tolerance. An otherwise valid LF-only log fails on the DTB parsed marker. Normalize expected markers or compare normalized lines.
+
+Confirmed sound:
+
+- Wrong CRC and `pa_bits` fail.
+- Partial tails, late FATALs, and SIGTERM-written FATALs fail.
+- Stale logs are removed before launch.
+- Timeout includes settle: near-deadline terminal markers fail.
+- `nan`/`inf`/nonpositive timeouts reject with argparse error.
+- `--version` probes are bounded; timed-out evidence is labeled `(unknown)`.
+- All four real QEMU 8.2.2 modes pass; `make check` and `git diff --check` pass.
+- No tracked files were modified. Remote ARM CI was not observed.
+
+### Codex reviewing W3 harness (round 5)
+
+1. **P2 should-fix — vector evidence remains forgeable.** `tools/smoke_arm.py:145-148` accepts any 16-digit ELR and arbitrary parenthesized PASS text. Replacing the real vector log with `elr=0xffffffffffffffff` and `vector self-test PASS (bogus)` still exits 0/PASS. This fails to independently prove `ELR==brk site` or the claimed self-test result.
+
+Confirmed sound:
+
+- Prior P1s fixed: prefixed/mid-line/suffixed markers, partial tails, and late output fail.
+- Stderr allowlist works: real QEMU notice, no-notice, and shimmed force-kill paths pass; warnings, wrong PID, suffixes, and duplicate notices fail.
+- All four real QEMU 8.2.2 modes pass: default, vector, BSS-check, DTB-bad.
+- `ASAN_OPTIONS=detect_leaks=0 make check` passed; `git diff --check` passed; worktree remains clean at `a199412`.
+- Remote ARM CI was not independently observed.
+
+### Codex reviewing W2 tests (rounds 6-7)
+
+1. **P2 — Missing `err_off` assertion for initrd containment.**
+   Contract requires `linux,initrd-end` PROP offset when initrd is outside RAM. Mutating `kernel/core/fdt.c:1085` from `error = initrd_error_off` to `error = 0` still passes `make check`. Existing cases at `tests/test_fdt.c:4497-4505` assert only `BAD_RANGE`. Trigger: RAM `[0x40000000,0x50000000)`, initrd `[0x30000000,0x30100000)`.
+
+Confirmed sound:
+
+- Baseline `make check` passes; worktree remains clean.
+- All supplied mutants are killed:
+  - duplicate initrd: `tests/test_fdt.c:3033`
+  - duplicate empty `reg`: `:3080`
+  - special-node `device_type` scope: `:3202`
+- Four fresh valid mutants were killed: `"ok"` status matching, missing `/reserved-memory/ranges`, half-present-initrd offset, and reservation validity-before-count ordering.
+- Round-6 exact cell-length cases and round-7 duplicate-precedence/special-node cases are consistent with `include/jeios/fdt.h`; no assertions rely on unpinned behavior.
+
+### Codex reviewing W3 harness (round 6; cut off by provider safety filter)
+
+All four real QEMU 8.2.2 modes pass, including vector ELR equality and the exact PASS line. I’m doing the final adversarial pass now: synthetic section-table mutations, CLI missing-ELF behavior, and `make check`; the only confirmed defect so far is the short-ELF uncaught exception.
+ERROR: This request has been flagged for potentially high-risk cyber activity. Learn more here: https://platform.openai.com/docs/guides/safety-checks/cybersecurity
+ERROR: This request has been flagged for potentially high-risk cyber activity. Learn more here: https://platform.openai.com/docs/guides/safety-checks/cybersecurity

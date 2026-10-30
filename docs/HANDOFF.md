@@ -2,9 +2,10 @@
 
 ## MP1 completion (#52) — DTB parse + ARM64 CI job — observed 2026-10-30T02:29:52+00:00
 
-Repo auto44e/jeios, branch `feat/mp1-dtb-parse`, based on main `5f84ff7`. The
-last local verification was at `e59d580` (later commits on the branch are review
-fixes and docs; the PR records the exact head it was verified at). Issue #52 is
+Repo auto44e/jeios, branch `feat/mp1-dtb-parse`, based on main `5f84ff7`. The full
+local sweep below ran at `90693b7`. At `fe7beb1` (a harness-only ELF-header fix)
+the four ARM smoke modes were re-run and PASS. The PR records the exact head and
+its remote CI run. Issue #52 is
 OPEN until the remote `aarch64` job is observed passing at the PR head.
 
 - **Implemented:**
@@ -25,7 +26,7 @@ OPEN until the remote `aarch64` job is observed passing at the PR head.
 - **Planned:** remote CI observation on the PR. **Blocked:** nothing.
 - **Correction recorded:** the 2026-10-19 pickup item claimed remote CI ran the ARM compile. That claim was false; see the CORRECTION note under it.
 
-**Review status.** Worker mode: every component was written by one model lineage and adversarially reviewed by the other, over 4–5 rounds. Transcripts are in `docs/adr/debates/mp1-dtb.md` and the worker notes in `mp1-dtb-workers/`. This is AI-assisted review, not independent human qualification.
+**Review status.** Worker mode: every component was written by one model lineage and adversarially reviewed by the other, over 4–7 rounds. The last two small test and harness fixes were written by the lead; each one kills the mutant or reproduction the reviewer reported. Transcripts are in `docs/adr/debates/mp1-dtb.md` and the worker notes in `mp1-dtb-workers/`. This is AI-assisted review, not independent human qualification.
 
 **Open hazards and MP2 obligations:**
 - MP2 must `DC IVAC` the copy buffer before enabling caches.
