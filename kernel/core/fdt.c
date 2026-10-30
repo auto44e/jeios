@@ -507,7 +507,7 @@ static je_fdt_status fdt_finish_node(const uint8_t *blob,
                 uint64_t end;
 
                 if (*child_rsv_count >= JE_FDT_MAX_RSV) {
-                    *err = node_off;
+                    *err = node->reg_prop_off;
                     return JE_FDT_RANGE_LIMIT;
                 }
                 for (cell = 0u; cell < parent->addr_cells; ++cell) {
@@ -642,22 +642,20 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
     off_rsv = (uint64_t)off_rsv32;
     if (off_rsv < JE_FDT_HEADER_SIZE || (off_rsv & 7u) != 0u
         || (off_struct & 3u) != 0u || (struct_size & 3u) != 0u
-        || off_rsv >= off_struct || off_struct >= off_strings
+        || off_rsv >= off_struct || off_struct > off_strings
         || !fdt_add_u64(off_struct, (uint64_t)struct_size, &struct_end)
         || !fdt_add_u64(off_strings, (uint64_t)strings_size, &strings_end)
-        || struct_end > (uint64_t)total || strings_end > (uint64_t)total) {
+        || struct_end > off_strings || struct_end > (uint64_t)total
+        || strings_end > (uint64_t)total) {
         return JE_FDT_BAD_LAYOUT;
     }
-    if (off_rsv >= (uint64_t)total || off_struct >= (uint64_t)total
-        || off_strings >= (uint64_t)total) {
-        return JE_FDT_BAD_LAYOUT;
-    }
-    if (off_rsv >= blob_len || off_struct >= blob_len || off_strings >= blob_len
-        || struct_end > blob_len || strings_end > blob_len) {
+    if (off_rsv >= blob_len
+        || (struct_size != 0u && struct_end > blob_len)
+        || (strings_size != 0u && strings_end > blob_len)) {
         error = (uint32_t)blob_len;
         if (off_rsv >= blob_len) error = off_rsv32;
-        else if (off_struct >= blob_len) error = off_struct32;
-        else if (off_strings >= blob_len) error = off_strings32;
+        else if (struct_size != 0u && struct_end > blob_len) error = off_struct32;
+        else if (strings_size != 0u && strings_end > blob_len) error = off_strings32;
         *err_off = error;
         return JE_FDT_TRUNCATED;
     }
@@ -729,6 +727,12 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
             if (root_closed) {
                 error = (uint32_t)pos;
                 status = JE_FDT_BAD_TOKEN;
+                goto fail;
+            }
+            if (depth == 1u
+                && (!stack[0].has_addr_cells || !stack[0].has_size_cells)) {
+                error = (uint32_t)pos;
+                status = JE_FDT_BAD_CELLS;
                 goto fail;
             }
             if (depth >= JE_FDT_MAX_DEPTH) {
