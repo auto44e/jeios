@@ -10,6 +10,16 @@ ARM_OBJCOPY := aarch64-linux-gnu-objcopy
 ARM_BUILD   := build/aarch64
 ARM_ARCH    := kernel/arch/aarch64
 
+# The three test-build toggles below are MUTUALLY EXCLUSIVE: each selects its own
+# build dir, and with more than one set the last assignment would silently win
+# and reuse that dir for a different flag combination (stale objects / a smoke
+# run asserting the wrong markers). Refuse the combination outright.
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD))),0)
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD))),1)
+$(error ARM_BSS_CHECK, ARM_VECTOR_TEST and ARM_DTB_BAD are mutually exclusive; set at most one to 1)
+endif
+endif
+
 # Optional patterned-BSS verification build (proves the clear actually zeroes,
 # since QEMU RAM starts zero). `make aarch64 ARM_BSS_CHECK=1`. It uses a SEPARATE
 # build dir so toggling the flag never reuses stale objects from the default
@@ -98,6 +108,11 @@ aarch64: $(ARM_BUILD)/Image
 # exact command, and SKIPs (never PASSes) if the toolchain or
 # qemu-system-aarch64 is absent — unless ARM_REQUIRE=1, which turns every SKIP
 # into a FAIL (remote CI). Not wired into `make check`.
-# Variable names ARM_DTB_BAD / ARM_REQUIRE are frozen (CI uses them).
+# ARM_SMOKE_TIMEOUT (seconds, default 15) bounds the whole QEMU run; the harness
+# stops QEMU as soon as the mode's final marker is seen (plus a short settle), so
+# a PASS normally takes well under it, and expiry without that marker is a FAIL.
+# Variable names ARM_DTB_BAD / ARM_REQUIRE / ARM_SMOKE_TIMEOUT are frozen (CI
+# uses them).
+ARM_SMOKE_TIMEOUT ?= 15
 smoke-aarch64: $(ARM_BUILD)/Image
-	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --log $(ARM_BUILD)/serial.log $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_REQUIRE)),--require,)
+	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_REQUIRE)),--require,)

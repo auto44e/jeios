@@ -121,14 +121,27 @@ real_start:
      * memory here; the header read happens in C once vectors are installed):
      *   - x0 != 0                   (boot protocol: a DTB is always passed);
      *   - x0 8-byte aligned         (arm64 booting.rst requirement);
+     *   - x0 <= UINT64_MAX - JE_FDT_MAX_TOTAL: the conservative extent
+     *     [x0, x0 + MAX_TOTAL) must not wrap the 64-bit address space. Checked
+     *     BEFORE any sum is formed (see "Overflow" below);
      *   - NOT (x0 < IMAGE_END && x0 + JE_FDT_MAX_TOTAL > _text): the largest DTB
      *     the parser will ever accept (totalsize cap, 2 MiB) placed at x0 must be
      *     disjoint from the whole image extent [_text, _end) — _end covers .data,
      *     .bss (incl. the copy buffer) and the boot stack (linker.ld). Using the
      *     cap instead of the real totalsize is deliberately conservative: it
      *     rejects some valid-but-close placements, never accepts an overlap.
-     * Overflow: the addition is only evaluated when x0 < _end, and _end is a
-     * small link-time address (~0x4009xxxx), so x0 + 2 MiB cannot wrap there.
+     * Overflow (round-3 review P1): x0 + MAX_TOTAL wraps for every
+     * x0 > UINT64_MAX - MAX_TOTAL, and a wrapped sum would defeat the "> _text"
+     * half of the overlap test. The overlap branch happens to form the sum only
+     * when x0 < _end (a small link-time address), but correctness must not hang
+     * on that branch order surviving future edits, and an extent wrapping past
+     * 2^64 is never a valid DTB placement anyway (C forms ptr + off for offsets
+     * up to totalsize). So such x0 is rejected outright, same FATAL marker,
+     * before any addition. Bound = UINT64_MAX - 0x200000 = 0xFFFFFFFFFFDFFFFF
+     * = ~0x200000, a single MOVN. Test is unsigned "x0 > bound -> fatal" (b.hi):
+     * x0 == bound passes this check (its sum is exactly UINT64_MAX, no wrap).
+     * With x0 already 8-aligned, the largest x0 reaching the overlap test is
+     * 0xFFFFFFFFFFDFFFF8; 0xFFFFFFFFFFE00000 (+8) is rejected here.
      * JE_ARM_DTB_GUARD_SPAN must equal JE_FDT_MAX_TOTAL (fdt.h is C-only, so it
      * is duplicated here; main.c _Static_asserts the C side of that equality).
      * On violation: bounded DR-only FATAL marker + halt (el_fatal pattern). ---- */
@@ -136,6 +149,9 @@ real_start:
     cbz     x19, dtb_fatal
     tst     x19, #7
     b.ne    dtb_fatal
+    movn    x0, #(JE_ARM_DTB_GUARD_SPAN >> 16), lsl #16  /* UINT64_MAX - SPAN */
+    cmp     x19, x0
+    b.hi    dtb_fatal                    /* extent would wrap 2^64: reject */
     adrp    x0, _end
     add     x0, x0, #:lo12:_end          /* IMAGE_END (exclusive) */
     cmp     x19, x0
@@ -143,7 +159,7 @@ real_start:
     adrp    x1, _text
     add     x1, x1, #:lo12:_text
     movz    x2, #(JE_ARM_DTB_GUARD_SPAN >> 16), lsl #16
-    add     x2, x19, x2                  /* x0 + MAX_TOTAL (no wrap, see above) */
+    add     x2, x19, x2                  /* x0 + MAX_TOTAL (cannot wrap: bounded above) */
     cmp     x2, x1
     b.hi    dtb_fatal                    /* x0 + MAX_TOTAL > _text: overlap */
 9:
