@@ -506,6 +506,10 @@ static void want_(je_fdt_status got, je_fdt_status want, int line)
                   I.off_st + I.size_st);                                      \
     } while (0)
 
+/* BAD_STRING from a bad nameoff: err_off is EXACTLY that PROP token (contract
+ * a4712a8 "err_off pins (round-4)"), not its len or nameoff word. */
+#define EXPECT_BAD_NAMEOFF_AT(prop_rel) EXPECT_AT(JE_FDT_BAD_STRING, I.off_st + (prop_rel))
+
 static bool has_ram(const je_boot_ctx *c, uint64_t base, uint64_t size)
 {
     for (uint32_t i = 0u; i < c->ram_count && i < JE_FDT_MAX_RAM; i++)
@@ -1178,12 +1182,12 @@ static void test_zero_size_strings(void)
      * BAD_STRING, reached only if the layout was accepted */
     b_reset();
     b_begin("");
-    b_prop_off(0u, "\0\0\0\2", 4u);
+    child_at = b_prop_off(0u, "\0\0\0\2", 4u);
     b_end();
     b_endtok();
     b_finish();
     CHECK(I.size_str == 0u && I.off_str == I.len);
-    EXPECT_IN_ST(JE_FDT_BAD_STRING);
+    EXPECT_BAD_NAMEOFF_AT(child_at);
 
     /* Struct side (Codex P2 round 2): a zero-size STRUCT block is layout-valid
      * and, starting exactly at `len`, is not TRUNCATED (it has no byte at/after
@@ -1596,37 +1600,39 @@ static void test_strings(void)
         root_close();
         b_finish();
         st_patch(at + 8u, I.size_str);
-        EXPECT(JE_FDT_BAD_STRING);
+        EXPECT_BAD_NAMEOFF_AT(at);
         st_patch(at + 8u, 0xffffffffu);
-        EXPECT(JE_FDT_BAD_STRING);
+        EXPECT_BAD_NAMEOFF_AT(at);
         st_patch(at + 8u, I.size_str - 1u); /* the final NUL: empty name, valid */
         EXPECT(JE_FDT_OK);
     }
-    /* no NUL before the end of the strings block */
+    /* no NUL before the end of the strings block (a bad nameoff too: err_off
+     * is the PROP whose name runs off the block; all earlier names are fine) */
     {
+        uint32_t at;
         b_reset();
         root_open(2u, 2u);
         mem("m", 2u, 2u, RAM_B, RAM_S);
         b_begin("leaf");
-        b_prop_off(b_str_new("zzunterminated"), NULL, 0u);
+        at = b_prop_off(b_str_new("zzunterminated"), NULL, 0u);
         b_end();
         root_close();
         b_finish();
         EXPECT(JE_FDT_OK);                          /* control */
         I.buf[I.off_str + I.size_str - 1u] = 'z';  /* kill the final NUL */
-        EXPECT(JE_FDT_BAD_STRING);
+        EXPECT_BAD_NAMEOFF_AT(at);
         /* ... even though a NUL exists in the bytes just after the block */
         b_reset();
         B.str_gap = 0u;
         root_open(2u, 2u);
         mem("m", 2u, 2u, RAM_B, RAM_S);
         b_begin("leaf");
-        b_prop_off(b_str_new("zzunterminated"), NULL, 0u);
+        at = b_prop_off(b_str_new("zzunterminated"), NULL, 0u);
         b_end();
         root_close();
         b_finish();
         h_set(H_SZ_STR, I.size_str - 1u);          /* block excludes the NUL */
-        EXPECT(JE_FDT_BAD_STRING);
+        EXPECT_BAD_NAMEOFF_AT(at);
     }
 }
 
@@ -2791,18 +2797,6 @@ static void bad_nameoff_patch(uint32_t at)
     st_patch(at + 8u, 0xfffffff0u);
 }
 
-/* BAD_STRING from a bad nameoff: the contract names "the first violation" but
- * not which word of the PROP header err_off designates, so require it inside
- * that PROP's 12-byte header (token, len, nameoff). Every alternative outcome
- * these tests discriminate against lies outside that window. */
-#define EXPECT_BAD_NAMEOFF_AT(prop_rel)                                       \
-    do {                                                                      \
-        EXPECT(JE_FDT_BAD_STRING);                                            \
-        if (EO < I.off_st + (prop_rel) || EO >= I.off_st + (prop_rel) + 12u)  \
-            FAILF("err_off %u not in bad-nameoff PROP [%u,%u)", EO,           \
-                  I.off_st + (prop_rel), I.off_st + (prop_rel) + 12u);        \
-    } while (0)
-
 /* Codex test review (2): DUPLICATE is decided by NAME before the repeat's value
  * is examined. Each repeat carries a value that would otherwise be its own
  * error (BAD_CELLS, BAD_STRING, CONFLICT), so a value-first parser fails. */
@@ -3377,6 +3371,344 @@ static void test_reg_timing(void)
     }
 }
 
+/* Round-4 err_off pins and memory END_NODE order (contract a4712a8):
+ *  - memory node without `reg` -> BAD_RANGE at ITS END_NODE;
+ *  - exactly one initrd property -> BAD_RANGE at /chosen's END_NODE;
+ *  - memory END_NODE order: status value (BAD_STRING) -> disabled skip ->
+ *    `reg` absent -> `reg` decode;
+ *  - device_type on a depth-3 node: duplicate-tracked if tracked, value not
+ *    inspected.
+ * Each case is built so the plausible wrong answers (the child's END_NODE, the
+ * PROP, a post-walk status, a later violation) are distinguishable. */
+static void test_end_node_pins(void)
+{
+    static const uint8_t z12[12];
+    uint32_t at, end_at, st_at;
+
+    /* --- memory without reg: END_NODE of the memory node itself --- */
+    for (uint32_t k = 0u; k < 4u; k++) {
+        /* k0: plain; k1: valid status "okay" first; k2: a child subtree
+         * (err_off is the memory node's END_NODE, not the child's); k3: "ok"
+         * after device_type, then an unconsumed property */
+        b_reset();
+        root_open(2u, 2u);
+        mem("ok", 2u, 2u, RAM_B, RAM_S);
+        b_begin("m");
+        if (k == 1u)
+            b_s("status", "okay");
+        b_s("device_type", "memory");
+        if (k == 3u) {
+            b_s("status", "ok");
+            b_s("compatible", "x");
+        }
+        if (k == 2u) {
+            b_begin("sub");
+            b_s("compatible", "x");
+            b_end();
+        }
+        end_at = b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_at);
+    }
+    /* ... it is a WALK-time error: it beats a later sibling's bad nameoff and
+     * post-walk NO_MEMORY (it is the only memory node) */
+    b_reset();
+    root_open(2u, 2u);
+    mem("ok", 2u, 2u, RAM_B, RAM_S);
+    b_begin("m");
+    b_s("device_type", "memory");
+    end_at = b_end();
+    b_begin("leaf");
+    at = bad_nameoff_prop();
+    b_end();
+    root_close();
+    b_finish();
+    bad_nameoff_patch(at);
+    EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_at);
+    b_reset();
+    root_open(2u, 2u);
+    b_begin("m");
+    b_s("device_type", "memory");
+    end_at = b_end();
+    root_close();
+    b_finish();
+    EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_at);
+    /* ... but an earlier violation inside its subtree wins */
+    b_reset();
+    root_open(2u, 2u);
+    mem("ok", 2u, 2u, RAM_B, RAM_S);
+    b_begin("m");
+    b_s("device_type", "memory");
+    b_begin("sub");
+    at = bad_nameoff_prop();
+    b_end();
+    b_end();
+    root_close();
+    b_finish();
+    bad_nameoff_patch(at);
+    EXPECT_BAD_NAMEOFF_AT(at);
+
+    /* --- exactly one initrd property: /chosen's END_NODE --- */
+    for (uint32_t w = 0u; w < 2u; w++) {
+        const char *one = w == 0u ? "linux,initrd-start" : "linux,initrd-end";
+        /* trailing property and a child subtree: err_off is /chosen's own
+         * END_NODE, not the PROP and not the child's END_NODE */
+        b_reset();
+        root_open(2u, 2u);
+        mem("ok", 2u, 2u, RAM_B, RAM_S);
+        b_begin("chosen");
+        b_be(one, 0x44000000u, w == 0u ? 4u : 8u);
+        b_s("bootargs", "x");
+        b_begin("sub");
+        b_s("compatible", "x");
+        b_end();
+        end_at = b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_at);
+        /* walk-time: beats a later sibling's bad nameoff */
+        b_reset();
+        root_open(2u, 2u);
+        mem("ok", 2u, 2u, RAM_B, RAM_S);
+        b_begin("chosen");
+        b_be(one, 0x44000000u, 4u);
+        end_at = b_end();
+        b_begin("leaf");
+        at = bad_nameoff_prop();
+        b_end();
+        root_close();
+        b_finish();
+        bad_nameoff_patch(at);
+        EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_at);
+        /* walk-time: beats post-walk NO_MEMORY (no memory node at all, and a
+         * memory node AFTER /chosen whose RAM would not contain the value) */
+        b_reset();
+        root_open(2u, 2u);
+        b_begin("chosen");
+        b_be(one, 0x44000000u, 4u);
+        end_at = b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_at);
+        b_reset();
+        root_open(2u, 2u);
+        b_begin("chosen");
+        b_be(one, 0x10000000u, 4u);
+        end_at = b_end();
+        mem("ok", 2u, 2u, RAM_B, RAM_S);
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_at);
+        /* an earlier violation inside /chosen's subtree wins */
+        b_reset();
+        root_open(2u, 2u);
+        mem("ok", 2u, 2u, RAM_B, RAM_S);
+        b_begin("chosen");
+        b_be(one, 0x44000000u, 4u);
+        b_begin("sub");
+        at = bad_nameoff_prop();
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        bad_nameoff_patch(at);
+        EXPECT_BAD_NAMEOFF_AT(at);
+        /* ... and a repeat of the one property in /chosen (DUPLICATE at it) */
+        b_reset();
+        root_open(2u, 2u);
+        mem("ok", 2u, 2u, RAM_B, RAM_S);
+        b_begin("chosen");
+        b_be(one, 0x44000000u, 4u);
+        at = b_be(one, 0x44000000u, 4u);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+    }
+
+    /* --- memory END_NODE order --- */
+    for (uint32_t w = 0u; w < 2u; w++) { /* w==1: device_type first */
+        /* (1) status value first: malformed status beats a zero-size reg, an
+         * overflowing reg and a 12-byte reg (would be BAD_RANGE / BAD_CELLS at
+         * the reg PROP), and a missing reg (BAD_RANGE at END_NODE) */
+        for (uint32_t k = 0u; k < 4u; k++) {
+            b_reset();
+            root_open(2u, 2u);
+            mem("ok", 2u, 2u, RAM_B, RAM_S);
+            b_begin("m");
+            if (k == 0u)
+                b_reg1(2u, 2u, 0x80000000u, 0u);
+            else if (k == 1u)
+                b_reg1(2u, 2u, 0xfffffffffffff000ull, 0x1000u);
+            else if (k == 2u)
+                b_prop("reg", z12, 12u);
+            if (w == 1u)
+                b_s("device_type", "memory");
+            st_at = b_empty("status");
+            if (w == 0u)
+                b_s("device_type", "memory");
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_BAD_STRING, I.off_st + st_at);
+        }
+        /* (2) disabled -> skip before reg absent / reg decode: the only memory
+         * node, disabled, with no reg / zero-size / 12-byte reg -> post-walk
+         * NO_MEMORY (not BAD_RANGE/BAD_CELLS); with another memory node -> OK */
+        for (uint32_t k = 0u; k < 3u; k++) {
+            for (uint32_t other = 0u; other < 2u; other++) {
+                b_reset();
+                root_open(2u, 2u);
+                if (other == 1u)
+                    mem("ok", 2u, 2u, RAM_B, RAM_S);
+                b_begin("m");
+                if (w == 1u)
+                    b_s("device_type", "memory");
+                if (k == 1u)
+                    b_reg1(2u, 2u, 0x80000000u, 0u);
+                else if (k == 2u)
+                    b_prop("reg", z12, 12u);
+                b_s("status", "disabled");
+                if (w == 0u)
+                    b_s("device_type", "memory");
+                b_end();
+                root_close();
+                b_finish();
+                if (other == 0u) {
+                    EXPECT(JE_FDT_NO_MEMORY);
+                } else {
+                    EXPECT(JE_FDT_OK);
+                    CHECK(C.ram_count == 1u && has_ram(&C, RAM_B, RAM_S));
+                }
+            }
+        }
+        /* (3) reg absent after a VALID okay status -> END_NODE, not status */
+        b_reset();
+        root_open(2u, 2u);
+        mem("ok", 2u, 2u, RAM_B, RAM_S);
+        b_begin("m");
+        if (w == 1u)
+            b_s("device_type", "memory");
+        st_at = b_s("status", "okay");
+        if (w == 0u)
+            b_s("device_type", "memory");
+        end_at = b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_at);
+        CHECK(EO != I.off_st + st_at);
+        /* (4) reg decode is at END_NODE (err_off still the reg PROP): an
+         * earlier violation inside the node's subtree, or a later repeat in
+         * the node, beats a zero-size / 12-byte reg */
+        for (uint32_t k = 0u; k < 2u; k++) {
+            uint32_t reg_at;
+            b_reset();
+            root_open(2u, 2u);
+            mem("ok", 2u, 2u, RAM_B, RAM_S);
+            b_begin("m");
+            if (w == 1u)
+                b_s("device_type", "memory");
+            reg_at = k == 0u ? b_reg1(2u, 2u, 0x80000000u, 0u) : b_prop("reg", z12, 12u);
+            if (w == 0u)
+                b_s("device_type", "memory");
+            b_begin("sub");
+            at = bad_nameoff_prop();
+            b_end();
+            b_end();
+            root_close();
+            b_finish();
+            bad_nameoff_patch(at);
+            EXPECT_BAD_NAMEOFF_AT(at);
+            CHECK(EO != I.off_st + reg_at);
+            b_reset();
+            root_open(2u, 2u);
+            mem("ok", 2u, 2u, RAM_B, RAM_S);
+            b_begin("m");
+            b_s("device_type", "memory");
+            if (k == 0u)
+                b_reg1(2u, 2u, 0x80000000u, 0u);
+            else
+                b_prop("reg", z12, 12u);
+            b_s("status", "okay");
+            at = b_s(w == 0u ? "device_type" : "status", w == 0u ? "memory" : "okay");
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+            /* control: the same reg alone fails at its PROP */
+            b_reset();
+            root_open(2u, 2u);
+            mem("ok", 2u, 2u, RAM_B, RAM_S);
+            b_begin("m");
+            b_s("device_type", "memory");
+            reg_at = k == 0u ? b_reg1(2u, 2u, 0x80000000u, 0u) : b_prop("reg", z12, 12u);
+            b_s("status", "okay");
+            b_begin("sub");
+            b_end();
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(k == 0u ? JE_FDT_BAD_RANGE : JE_FDT_BAD_CELLS, I.off_st + reg_at);
+        }
+    }
+
+    /* --- depth-3 device_type: not inspected; duplicate-tracked if tracked --- */
+    {
+        static const uint8_t nonul[6] = { 'm', 'e', 'm', 'o', 'r', 'y' };
+        for (uint32_t k = 0u; k < 3u; k++) {
+            /* empty / non-NUL / "memory" device_type on a rsv child -> OK, the
+             * child stays a reservation (not memory, not CONFLICT) */
+            b_reset();
+            root_open(2u, 2u);
+            mem("ok", 2u, 2u, RAM_B, RAM_S);
+            rm_open(2u, 2u);
+            b_begin("r");
+            if (k == 0u)
+                b_empty("device_type");
+            else if (k == 1u)
+                b_prop("device_type", nonul, 6u);
+            else
+                b_s("device_type", "memory");
+            b_reg1(2u, 2u, RAM_B + 0x1000u, 0x1000u);
+            b_end();
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT(JE_FDT_OK);
+            CHECK(C.ram_count == 1u && C.rsv_count == 1u &&
+                  C.rsv[0].base == RAM_B + 0x1000u && C.rsv[0].size == 0x1000u);
+        }
+        /* tracked rsv child: a repeated device_type (empty values) -> DUPLICATE */
+        b_reset();
+        root_open(2u, 2u);
+        mem("ok", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        b_begin("r");
+        b_empty("device_type");
+        at = b_empty("device_type");
+        b_reg1(2u, 2u, RAM_B + 0x1000u, 0x1000u);
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        /* untracked depth-3 node (under a non-rsv node): repeat is OK */
+        b_reset();
+        root_open(2u, 2u);
+        mem("ok", 2u, 2u, RAM_B, RAM_S);
+        b_begin("soc");
+        b_begin("dev");
+        b_empty("device_type");
+        b_empty("device_type");
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT(JE_FDT_OK);
+    }
+}
+
 static void test_no_memory(void)
 {
     /* no memory node at all */
@@ -3717,15 +4049,19 @@ static void test_bad_range(void)
     root_close();
     b_finish();
     EXPECT(JE_FDT_BAD_RANGE);
-    b_reset();
-    root_open(2u, 2u);
-    mem("m", 2u, 2u, RAM_B, RAM_S);
-    b_begin("m2");
-    b_s("device_type", "memory");
-    b_end();
-    root_close();
-    b_finish();
-    EXPECT(JE_FDT_BAD_RANGE);
+    {
+        /* memory node without reg -> BAD_RANGE at ITS END_NODE (round-4 pin) */
+        uint32_t end_at;
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        b_begin("m2");
+        b_s("device_type", "memory");
+        end_at = b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_at);
+    }
     /* second pair in one reg zero-size */
     {
         const uint64_t p[4] = { RAM_B, RAM_S, 0x80000000u, 0u };
@@ -3795,26 +4131,28 @@ static void test_bad_range(void)
     b_finish();
     EXPECT(JE_FDT_BAD_RANGE);
 
-    /* initrd: half-present, end <= start, bad lengths, outside / partial / spanning */
+    /* initrd: half-present, end <= start, bad lengths, outside / partial / spanning.
+     * Exactly one present -> BAD_RANGE at /chosen's END_NODE (round-4 pin). */
     {
+        uint32_t end_at;
         b_reset();
         root_open(2u, 2u);
         mem("m", 2u, 2u, RAM_B, RAM_S);
         b_begin("chosen");
         b_be("linux,initrd-start", 0x44000000u, 4u);
-        b_end();
+        end_at = b_end();
         root_close();
         b_finish();
-        EXPECT(JE_FDT_BAD_RANGE);
+        EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_at);
         b_reset();
         root_open(2u, 2u);
         mem("m", 2u, 2u, RAM_B, RAM_S);
         b_begin("chosen");
         b_be("linux,initrd-end", 0x44000000u, 8u);
-        b_end();
+        end_at = b_end();
         root_close();
         b_finish();
-        EXPECT(JE_FDT_BAD_RANGE);
+        EXPECT_AT(JE_FDT_BAD_RANGE, I.off_st + end_at);
     }
     {
         static const uint64_t se[][2] = {
@@ -4601,6 +4939,7 @@ int main(void)
     test_memory_status_timing();
     test_rsv_cells_deferral();
     test_reg_timing();
+    test_end_node_pins();
     test_no_memory();
     test_range_limit();
     test_bad_range();
