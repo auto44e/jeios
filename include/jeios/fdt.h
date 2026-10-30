@@ -57,12 +57,14 @@ typedef enum {
                           * root; PROP after a child node; END_NODE at depth 0; END with
                           * depth != 0; non-NOP/END token after the root's END_NODE */
     JE_FDT_BAD_STRING,   /* node name with no NUL before the struct-block end, or >
-                          * JE_FDT_MAX_NAME bytes; nameoff >=
-                          * size_dt_strings or no NUL inside the strings block */
+                          * JE_FDT_MAX_NAME bytes (incl. the root's); nameoff >=
+                          * size_dt_strings or no NUL inside the strings block; a
+                          * consumed string value (status, device_type) that is empty
+                          * or whose last byte is not NUL */
     JE_FDT_DEPTH_LIMIT,
     JE_FDT_NODE_LIMIT,
     JE_FDT_PROP_LIMIT,
-    JE_FDT_DUPLICATE,    /* a CONSUMED property repeated in one node, or a second
+    JE_FDT_DUPLICATE,    /* a CONSUMED property repeated in one tracked node (any status), or a second
                           * /chosen or /reserved-memory node */
     JE_FDT_BAD_CELLS,    /* root #address-cells/#size-cells absent, len != 4, or not in
                           * {1,2}; /reserved-memory cells absent or != root's, or its
@@ -81,6 +83,8 @@ typedef enum {
     JE_FDT_OVERLAP,      /* two RAM ranges overlap; check(): kernel image overlaps the
                           * DTB source, the initrd or any kept reservation; DTB source
                           * overlaps the initrd */
+    JE_FDT_CONFLICT,     /* a node claims two roles: /chosen or /reserved-memory with
+                          * device_type "memory" */
     JE_FDT_STATUS_COUNT
 } je_fdt_status;
 
@@ -145,7 +149,8 @@ je_fdt_status je_fdt_copy_plan(const uint8_t hdr[JE_FDT_HEADER_SIZE],
  *   size_dt_struct a multiple of 4; canonical ORDER rsvmap < struct < strings
  *   with struct start >= rsvmap terminator end and strings start >= struct end;
  *   every block end <= totalsize. Zero-size blocks are valid, including one that
- *   starts exactly at totalsize. Any block byte at/after len -> TRUNCATED.
+ *   starts exactly at totalsize or exactly at len (totalsize > len is not fatal by
+ *   itself). Any byte of a NONZERO-size block at/after len -> TRUNCATED.
  * RSVMAP: 16-byte big-endian {u64 addr, u64 size} entries from off_mem_rsvmap,
  *   terminated by addr==0 && size==0. > JE_FDT_MAX_RSVMAP entries before the
  *   terminator -> RANGE_LIMIT; terminator not ending <= off_dt_struct ->
@@ -153,7 +158,11 @@ je_fdt_status je_fdt_copy_plan(const uint8_t hdr[JE_FDT_HEADER_SIZE],
  *   Always 64-bit, independent of cells.
  * STRUCT (single pass, file order, first violation wins): tokens BEGIN_NODE=1,
  *   END_NODE=2, PROP=3, NOP=4, END=9; anything else -> BAD_TOKEN. Leading NOPs
- *   allowed; the first node must be the root with an empty name. Node name: NUL
+ *   allowed; the first node must be the root with an empty name (the name
+ *   rules below are checked first -> BAD_STRING; a terminated non-empty root
+ *   name -> BAD_TOKEN at its BEGIN_NODE). Every node's PROPs precede its first
+ *   child (PROP after a child -> BAD_TOKEN), so all of a node's properties are
+ *   known at its first child BEGIN_NODE. Node name: NUL
  *   inside the struct block, <= MAX_NAME bytes, padded to 4. PROP: {u32 len,
  *   u32 nameoff}, value padded to 4, computed in 64-bit. Depth > MAX_DEPTH,
  *   nodes > MAX_NODES, props-in-one-node > MAX_PROPS_PER_NODE -> the *_LIMIT.
@@ -167,25 +176,42 @@ je_fdt_status je_fdt_copy_plan(const uint8_t hdr[JE_FDT_HEADER_SIZE],
  *     property list ends: at its first child BEGIN_NODE (or its END_NODE if it
  *     has no children) -> BAD_CELLS, err_off = that token. This precedes any
  *     use of the cells by a child.
+ *   Node names match EXACTLY (no unit-address stripping: "chosen@0" is an
+ *   ordinary node). `status` is okay iff its value is exactly "okay\0" or
+ *   "ok\0"; any other NUL-terminated value is disabled.
  *   - memory: any depth-2 node whose device_type is exactly "memory" (name not
- *     used); skipped if `status` present and not "okay"/"ok"; `reg` required
+ *     used); skipped if `status` present and not okay; `reg` required
  *     (absent -> BAD_RANGE) using ROOT cells. A node is classified at its
  *     END_NODE (reg may precede device_type). Multiple memory nodes aggregate.
  *   - /reserved-memory: the depth-2 node named exactly "reserved-memory"; must
  *     have its own #address-cells/#size-cells equal to root's and an empty
- *     `ranges` (else BAD_CELLS). Depth-3 children: `reg` (using those cells)
- *     yields reservation CANDIDATES, collected in walk order; the
- *     (JE_FDT_MAX_RSV+1)-th candidate range -> RANGE_LIMIT immediately (walk-time,
- *     err_off = that `reg` PROP), before any post-walk RAM classification — this
- *     bounds parser scratch without a second pass. Status-disabled children
- *     skipped; `no-map` recorded; `size` without `reg` -> rsv_dynamic++.
- *   - /chosen: the depth-2 node named exactly "chosen". linux,initrd-start/-end
+ *     `ranges` (else BAD_CELLS), decided at its first child BEGIN_NODE (or its
+ *     END_NODE if childless), err_off = that token — before any child uses them.
+ *     Its own `status` is IGNORED (reservations are always honored: skipping
+ *     them would fail open; matches Linux). Depth-3 children: `reg` (using those
+ *     cells) yields reservation CANDIDATES, collected in walk order. Within one
+ *     `reg`, ranges are checked in order: validity (BAD_RANGE) first, then the
+ *     count; the (JE_FDT_MAX_RSV+1)-th VALID candidate range -> RANGE_LIMIT
+ *     immediately (walk-time, err_off = that `reg` PROP token), before any
+ *     post-walk RAM classification — this bounds parser scratch without a
+ *     second pass. Status-disabled children are skipped (their ranges are not
+ *     candidates; matches Linux); `no-map` recorded; `size` without `reg` ->
+ *     rsv_dynamic++.
+ *   - /chosen: the depth-2 node named exactly "chosen"; its `status` is IGNORED
+ *     (matches Linux). linux,initrd-start/-end
  *     each 4 or 8 bytes (independently); exactly one present, end <= start, or a
  *     bad length -> BAD_RANGE.
+ *   - /chosen or /reserved-memory with device_type "memory" -> CONFLICT at that
+ *     device_type PROP (fail closed; no name/type precedence).
  *   - consumed properties: #address-cells, #size-cells, reg, device_type,
- *     status, ranges, no-map, size, linux,initrd-start, linux,initrd-end in the
- *     nodes above; a repeat in the same node -> DUPLICATE. A second "chosen" or
- *     "reserved-memory" depth-2 node -> DUPLICATE.
+ *     status, ranges, no-map, size, linux,initrd-start, linux,initrd-end. TRACKED
+ *     nodes: the root, every depth-2 node, and every depth-3 /reserved-memory
+ *     child. Each tracked node has its own set of seen consumed names (direct
+ *     properties only; a child never affects its parent's set). A repeat ->
+ *     DUPLICATE at the REPEATING PROP token, as it is encountered (so err_off is
+ *     the earliest repeat in file order), regardless of status or
+ *     classification. A second "chosen" or "reserved-memory" depth-2 node ->
+ *     DUPLICATE at its BEGIN_NODE.
  * POST-WALK, in this order: ram_count == 0 -> NO_MEMORY; any two RAM ranges
  *   overlapping (adjacent is fine) -> OVERLAP; then each reservation (memreserve
  *   entries first, then /reserved-memory in walk order): fully inside ONE RAM
@@ -193,8 +219,9 @@ je_fdt_status je_fdt_copy_plan(const uint8_t hdr[JE_FDT_HEADER_SIZE],
  *   rsv_ignored++; otherwise -> BAD_RANGE. Reservations may overlap each other,
  *   the initrd and the DTB (bootloaders reserve those). Then initrd must lie
  *   fully inside one RAM range (else BAD_RANGE).
- * Status-disabled nodes are fully skipped for semantics but still structurally
- * validated and counted.
+ * `status` matters only on memory nodes and /reserved-memory children; there a
+ * disabled node is skipped for semantics (with its whole subtree) but is still
+ * structurally validated, counted and duplicate-tracked.
  */
 je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
                            je_boot_ctx *out, uint32_t *err_off);
@@ -216,7 +243,8 @@ typedef struct {
 
 /*
  * Validate a successfully parsed context against arch facts. In this order:
- * NULL -> BAD_ARG; pa_bits outside 32..52, or kernel_image/dtb_src invalid ->
+ * NULL, ram_count > JE_FDT_MAX_RAM or rsv_count > JE_FDT_MAX_RSV -> BAD_ARG
+ * (err_idx FACTS; never index past the arrays); pa_bits outside 32..52, or kernel_image/dtb_src invalid ->
  * BAD_RANGE (err_idx FACTS); any RAM/kept-reservation/initrd/kernel/dtb end
  * above 2^pa_bits -> BAD_RANGE; kernel_image not fully inside one RAM range ->
  * BAD_RANGE (KERNEL); dtb_src not fully inside one RAM range -> BAD_RANGE (DTB);
