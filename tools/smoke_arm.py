@@ -47,6 +47,14 @@ Discipline (mirrors the x86 smoke harness + the ADR 0002 D6 evidence rule):
     with its return code. The child is always terminated and reaped (no
     zombie); that reap (<= 5 s, then SIGKILL) is the only time outside the
     deadline. Every --version probe is bounded by VERSION_TIMEOUT_S;
+  - --vector-test pins every vector line EXACTLY: the PASS line is the full
+    literal text main.c prints, and the raw "elr=" must equal the address of
+    the global symbol je_arm_brk_site, resolved by a bounded pure-Python
+    .symtab scan of the ELF the Image was built from (--elf, default the
+    Image's sibling jeios-arm.elf). The ELF is bound to the Image: the Image
+    word at (je_arm_brk_site - _text) must be BRK #0xa55a. A missing,
+    malformed, stripped or mismatched ELF under --vector-test is a FAIL (never
+    a SKIP); --require additionally demands the ELF exist in every mode;
   - assert pa_bits EXACTLY (--expect-pa-bits, default 44 for the pinned
     virt-8.2 / cortex-a72 profile);
   - SKIP (exit 0, clearly labelled) if the aarch64 toolchain /
@@ -60,6 +68,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -133,21 +142,34 @@ QEMU_KILL_RE = re.compile(
 STDERR_MAX = 64 * 1024
 # Vector-test build: the planted BRK must vector to the EL1h sync slot and the
 # handler must assert the exact syndrome. These ordered markers replace the
-# default terminal and prove the deliberate exception end-to-end.
-VECTOR_TEST_MARKERS = [
-    exact(b"JeiOS/aarch64: triggering deliberate BRK #0xa55a ..."),
-    exact(b"JeiOS/aarch64: EXCEPTION vector=0x0000000000000004 "
-          b"ec=0x000000000000003c il=0x0000000000000001 iss=0x000000000000a55a"),
-    # Assert the RAW syndrome line independently (not just the in-kernel PASS), so
-    # a bug in the kernel's own comparator cannot produce a false PASS: exact
-    # ESR and SPSR observed on the wire; ELR is build-dependent (hex shape only).
-    valued(b"JeiOS/aarch64:   esr=0x00000000f200a55a elr=<hex> spsr=0x00000000800003c5",
-           rb"JeiOS/aarch64:   esr=0x00000000f200a55a elr=" + HEX16
-           + rb" spsr=0x00000000800003c5"),
-    valued(b"JeiOS/aarch64: vector self-test PASS (...)",
-           rb"JeiOS/aarch64: vector self-test PASS \([^\n]*\)"),
-    exact(b"JeiOS/aarch64: exception handled; halted"),
-]
+# default terminal and prove the deliberate exception end-to-end. Every line is
+# pinned EXACTLY: the PASS text is the full literal kernel/arch/aarch64/main.c
+# prints (if main.c's text changes, this must change with it), and the ELR is
+# the address of the global symbol je_arm_brk_site resolved from the ELF the
+# Image was built from (see resolve_brk_site), not "any hex".
+VECTOR_PASS = (b"JeiOS/aarch64: vector self-test PASS (planted BRK #0xa55a "
+               b"vectored to EL1h sync slot 4 with exact ESR 0xf200a55a; "
+               b"ELR==brk site; SPSR EL1h+DAIF-masked)")
+BRK_SITE_SYM = b"je_arm_brk_site"
+IMAGE_BASE_SYM = b"_text"  # linker.ld: the Image is the ELF from _text on
+# A64 BRK #imm16 encoding (DDI0487 C6.2 BRK): 0xd4200000 | imm16 << 5.
+BRK_A55A_INSN = 0xD4200000 | (0xA55A << 5)
+
+
+def vector_test_markers(brk_site):
+    return [
+        exact(b"JeiOS/aarch64: triggering deliberate BRK #0xa55a ..."),
+        exact(b"JeiOS/aarch64: EXCEPTION vector=0x0000000000000004 "
+              b"ec=0x000000000000003c il=0x0000000000000001 iss=0x000000000000a55a"),
+        # Assert the RAW syndrome line independently (not just the in-kernel
+        # PASS), so a bug in the kernel's own comparator cannot produce a false
+        # PASS: exact ESR, SPSR AND ELR (== &je_arm_brk_site from the ELF).
+        exact(b"JeiOS/aarch64:   esr=0x00000000f200a55a elr=" + hx(brk_site)
+              + b" spsr=0x00000000800003c5"),
+        exact(VECTOR_PASS),
+        exact(b"JeiOS/aarch64: exception handled; halted"),
+    ]
+
 
 COPIED_RE = re.compile(
     rb"JeiOS/aarch64: dtb copied len=0x([0-9a-f]{16}) totalsize=0x([0-9a-f]{16})"
@@ -183,6 +205,112 @@ class Fixture:
         if len(hdr) != 40:
             raise ValueError(f"fixture {path}: fewer than 40 header bytes")
         self.off_dt_struct = int.from_bytes(hdr[8:12], "big")
+
+
+# Bound on the ELF read: the kernel ELF (with DWARF) is far smaller; anything
+# bigger is not the artifact we expect and is refused rather than slurped.
+ELF_MAX = 64 * 1024 * 1024
+EM_AARCH64 = 183
+SHT_SYMTAB = 2
+STB_GLOBAL = 1
+SHN_LORESERVE = 0xFF00  # st_shndx >= this is ABS/COMMON/XINDEX, not a section
+
+
+class ElfError(Exception):
+    pass
+
+
+def elf_defined_symbols(data, wanted):
+    """Pure-Python ELF64 little-endian AArch64 .symtab scan (no nm, no
+    subprocess). Returns {name: [(st_value, binding), ...]} for every name in
+    `wanted` that is DEFINED in a real section (0 < st_shndx < SHN_LORESERVE).
+    Every offset/size is bounds-checked against `data`; any malformation
+    raises ElfError (fail closed, never a guessed address)."""
+    def unpack(fmt, off):
+        size = struct.calcsize(fmt)
+        if off < 0 or off + size > len(data):
+            raise ElfError(f"truncated ELF reading {size} bytes at 0x{off:x}")
+        return struct.unpack_from(fmt, data, off)
+
+    if data[:4] != b"\x7fELF":
+        raise ElfError("not an ELF file (bad magic)")
+    if data[4] != 2 or data[5] != 1:
+        raise ElfError("not ELFCLASS64 little-endian")
+    (_, _, e_machine, _, _, _, e_shoff, _, _, _, _, e_shentsize, e_shnum,
+     _) = unpack("<16sHHIQQQIHHHHHH", 0)
+    if e_machine != EM_AARCH64:
+        raise ElfError(f"e_machine={e_machine}, need EM_AARCH64 ({EM_AARCH64})")
+    if e_shnum == 0 or e_shentsize != 64:
+        raise ElfError(f"unsupported section table (shnum={e_shnum}, "
+                       f"shentsize={e_shentsize})")
+    shdrs = [unpack("<IIQQQQIIQQ", e_shoff + i * 64) for i in range(e_shnum)]
+    symtabs = [sh for sh in shdrs if sh[1] == SHT_SYMTAB]
+    if len(symtabs) != 1:
+        raise ElfError(f"expected exactly one SHT_SYMTAB, found {len(symtabs)} "
+                       f"(stripped ELF?)")
+    _, _, _, _, sym_off, sym_size, sym_link, _, _, sym_entsize = symtabs[0]
+    if sym_entsize != 24 or sym_size % 24 != 0:
+        raise ElfError(f"bad .symtab entsize={sym_entsize} size={sym_size}")
+    if sym_link >= e_shnum:
+        raise ElfError(f".symtab sh_link={sym_link} out of range")
+    str_off, str_size = shdrs[sym_link][4], shdrs[sym_link][5]
+    if str_off + str_size > len(data):
+        raise ElfError("string table extends past end of file")
+    strtab = data[str_off:str_off + str_size]
+    found = {name: [] for name in wanted}
+    for i in range(sym_size // 24):
+        st_name, st_info, _, st_shndx, st_value, _ = unpack("<IBBHQQ",
+                                                            sym_off + i * 24)
+        if st_name >= len(strtab):
+            raise ElfError(f"symbol {i}: name offset 0x{st_name:x} out of range")
+        end = strtab.find(b"\0", st_name)
+        if end < 0:
+            raise ElfError(f"symbol {i}: unterminated name")
+        name = strtab[st_name:end]
+        if name in found and 0 < st_shndx < SHN_LORESERVE:
+            found[name].append((st_value, st_info >> 4))
+    return found
+
+
+def resolve_brk_site(elf_path, image_path):
+    """Address of the global je_arm_brk_site from the ELF the Image was built
+    from, cross-checked against the Image itself: the Image (objcopy -O binary
+    from _text) must hold BRK #0xa55a at offset (je_arm_brk_site - _text). That
+    binds the ELF to the booted Image, so a stale/foreign ELF FAILs instead of
+    supplying a plausible address. Calls fail() on any problem."""
+    try:
+        if os.path.getsize(elf_path) > ELF_MAX:
+            fail(f"--elf {elf_path} larger than {ELF_MAX} bytes")
+        with open(elf_path, "rb") as f:
+            data = f.read(ELF_MAX + 1)
+        syms = elf_defined_symbols(data, (BRK_SITE_SYM, IMAGE_BASE_SYM))
+    except (OSError, ElfError) as e:
+        fail(f"--vector-test: cannot resolve {BRK_SITE_SYM.decode()} from "
+             f"--elf {elf_path}: {e}")
+    brk = syms[BRK_SITE_SYM]
+    if len(brk) != 1 or brk[0][1] != STB_GLOBAL:
+        fail(f"--vector-test: need exactly one defined GLOBAL "
+             f"{BRK_SITE_SYM.decode()} in {elf_path}, found {brk}")
+    base = syms[IMAGE_BASE_SYM]
+    if len(base) != 1:
+        fail(f"--vector-test: need exactly one defined {IMAGE_BASE_SYM.decode()} "
+             f"in {elf_path}, found {base}")
+    site, text = brk[0][0], base[0][0]
+    with open(image_path, "rb") as f:
+        image = f.read()
+    off = site - text
+    if off < 0 or off + 4 > len(image):
+        fail(f"--vector-test: {BRK_SITE_SYM.decode()}=0x{site:x} outside Image "
+             f"[_text=0x{text:x}, +0x{len(image):x}) (ELF/Image mismatch)")
+    insn = int.from_bytes(image[off:off + 4], "little")
+    if insn != BRK_A55A_INSN:
+        fail(f"--vector-test: Image word at {BRK_SITE_SYM.decode()} offset "
+             f"0x{off:x} is 0x{insn:08x}, not BRK #0xa55a (0x{BRK_A55A_INSN:08x})"
+             f"; --elf {elf_path} is not the ELF this Image was built from")
+    print(f"elf:   {elf_path}  sha256={hashlib.sha256(data).hexdigest()}  "
+          f"{BRK_SITE_SYM.decode()}=0x{site:016x} (Image word 0x{insn:08x} "
+          f"== BRK #0xa55a)")
+    return site
 
 
 def tool_version(cmd):
@@ -443,6 +571,10 @@ def main():
                     help="expect the JE_ARM_DTB_BAD parser rejection (BAD_TOKEN)")
     ap.add_argument("--require", action="store_true",
                     help="missing QEMU/toolchain/image is a FAIL, not a SKIP")
+    ap.add_argument("--elf", metavar="PATH",
+                    help="ELF the Image was built from (default: the Image's "
+                         "sibling jeios-arm.elf); --vector-test resolves "
+                         "je_arm_brk_site from it and requires ELR to equal it")
     ap.add_argument("--log", metavar="PATH",
                     help="write the raw serial log here (kept after the run)")
     args = ap.parse_args()
@@ -478,6 +610,12 @@ def main():
               f"DTB CRC check may fail")
     if not os.path.exists(args.image):
         skip(f"image {args.image} not built")
+    elf = args.elf or os.path.join(os.path.dirname(args.image), "jeios-arm.elf")
+    # The ELF is the only source of the expected ELR, so under --vector-test it
+    # is mandatory (FAIL, never SKIP); --require demands it in every mode.
+    if not os.path.isfile(elf) and (args.vector_test or args.require):
+        fail(f"{'--vector-test' if args.vector_test else '--require'}: "
+             f"ELF {elf} not found")
 
     markers = list(BASE_MARKERS)
     markers[3] = exact(b"JeiOS/aarch64: bss clear verified" if args.bss_verified
@@ -493,7 +631,10 @@ def main():
         ]
     else:
         markers += dtb_good_markers()
-        markers += VECTOR_TEST_MARKERS if args.vector_test else [exact(TERM_DEFAULT)]
+        if args.vector_test:
+            markers += vector_test_markers(resolve_brk_site(elf, args.image))
+        else:
+            markers += [exact(TERM_DEFAULT)]
     # Every mode ends on a fixed (exact) line; that line is the terminal marker.
     final_line = markers[-1][0]
     # Stop early (instead of burning the whole timeout) once the run can no

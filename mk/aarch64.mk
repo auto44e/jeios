@@ -113,8 +113,11 @@ aarch64: $(ARM_BUILD)/Image
 # window; the harness stops QEMU once the mode's final marker is seen as a
 # complete line and the settle elapses, so a PASS normally takes well under it.
 # Expiry without that marker, or with less than the settle window left, is a FAIL.
+# The ELF the Image was objcopied from is passed via --elf: under
+# ARM_VECTOR_TEST=1 the harness resolves je_arm_brk_site from it and requires the
+# reported ELR to equal that address exactly (missing ELF is a FAIL).
 # Variable names ARM_DTB_BAD / ARM_REQUIRE / ARM_SMOKE_TIMEOUT are frozen (CI
 # uses them).
 ARM_SMOKE_TIMEOUT ?= 15
 smoke-aarch64: $(ARM_BUILD)/Image
-	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_REQUIRE)),--require,)
+	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_REQUIRE)),--require,)
