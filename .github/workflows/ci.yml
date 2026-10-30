@@ -23,15 +23,24 @@ jobs:
         run: make integration
   aarch64:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install ARM64 build and emulation tools
         run: sudo apt-get update && sudo apt-get install -y make python3 gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-system-arm
       - name: Record ARM64 toolchain and emulator versions
         shell: bash
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -eu
+          echo "Checked-out commit (git rev-parse HEAD; synthetic merge on pull_request):"
           git rev-parse HEAD
+          echo "PR head SHA (empty on push): ${PR_HEAD_SHA}"
+          echo "github.sha: ${WORKFLOW_SHA}"
+          echo "Installed package versions:"
+          dpkg-query -W -f='${Package} ${Version}\n' qemu-system-arm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu make python3
           aarch64-linux-gnu-gcc --version
           aarch64-linux-gnu-ld --version
           qemu-system-aarch64 --version
@@ -47,23 +56,21 @@ jobs:
         run: make aarch64
       - name: ARM64 normal boot
         run: |
-          make smoke-aarch64 ARM_REQUIRE=1
-          sha256sum build/aarch64*/Image
+          make smoke-aarch64 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=30
       - name: ARM64 deliberate vector fault
         run: |
-          make smoke-aarch64 ARM_REQUIRE=1 ARM_VECTOR_TEST=1
-          sha256sum build/aarch64*/Image
+          make smoke-aarch64 ARM_REQUIRE=1 ARM_VECTOR_TEST=1 ARM_SMOKE_TIMEOUT=30
       - name: ARM64 malformed DTB rejection
         run: |
-          make smoke-aarch64 ARM_REQUIRE=1 ARM_DTB_BAD=1
-          sha256sum build/aarch64*/Image
+          make smoke-aarch64 ARM_REQUIRE=1 ARM_DTB_BAD=1 ARM_SMOKE_TIMEOUT=30
       - name: ARM64 BSS validation
         run: |
-          make smoke-aarch64 ARM_REQUIRE=1 ARM_BSS_CHECK=1
-          sha256sum build/aarch64*/Image
+          make smoke-aarch64 ARM_REQUIRE=1 ARM_BSS_CHECK=1 ARM_SMOKE_TIMEOUT=30
       - name: Upload ARM64 serial logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: aarch64-serial-logs
           path: build/aarch64*/serial.log
+          retention-days: 30
+          if-no-files-found: error
