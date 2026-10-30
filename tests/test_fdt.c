@@ -245,9 +245,9 @@ static void enc1(uint8_t *out, uint32_t *o, uint64_t v, uint32_t cells)
 /* `reg` with npairs {base,size} pairs encoded with the given cells. */
 static uint32_t b_reg(uint32_t ac, uint32_t sc, uint32_t npairs, const uint64_t *pairs)
 {
-    uint8_t t[16u * 16u];
+    uint8_t t[17u * 16u];
     uint32_t o = 0u;
-    CHECK(npairs <= 16u);
+    CHECK(npairs <= 17u);
     for (uint32_t i = 0u; i < npairs; i++) {
         enc1(t, &o, pairs[2u * i], ac);
         enc1(t, &o, pairs[2u * i + 1u], sc);
@@ -361,13 +361,16 @@ static void rm_open(uint32_t ac, uint32_t sc)
     b_empty("ranges");
 }
 
-static void rm_child(const char *name, uint64_t base, uint64_t size, bool nomap)
+/* Returns the struct-relative offset of the child's `reg` PROP token. */
+static uint32_t rm_child(const char *name, uint64_t base, uint64_t size, bool nomap)
 {
+    uint32_t reg_at;
     b_begin(name);
-    b_reg1(2u, 2u, base, size);
+    reg_at = b_reg1(2u, 2u, base, size);
     if (nomap)
         b_empty("no-map");
     b_end();
+    return reg_at;
 }
 
 static void chosen_initrd(uint64_t s, uint32_t sb, uint64_t e, uint32_t eb)
@@ -1106,6 +1109,90 @@ static void test_header(void)
     want_(parse_img_len(48u), JE_FDT_BAD_LAYOUT, __LINE__);  /* layout before TRUNCATED */
 }
 
+/* Zero-size blocks are valid, including one starting exactly at totalsize and
+ * one starting exactly at `len` (it has no byte at/after len, so it is not
+ * TRUNCATED) — contract update bdf446a. Only the strings block can be empty in
+ * a parseable blob (the rsvmap always has its terminator, the struct block its
+ * END). With no strings no PROP can be named, so the root cannot carry its
+ * cells: a blob with an empty strings block can never parse OK. The "positive"
+ * proof is therefore that header/layout/truncation all PASS and the walk runs to
+ * the next rule: root cells absent -> BAD_CELLS at an exact struct token (or
+ * BAD_STRING for a PROP's nameoff), never BAD_LAYOUT or TRUNCATED. */
+static void test_zero_size_strings(void)
+{
+    uint32_t end_at, child_at;
+
+    /* empty strings at struct end == totalsize == len */
+    b_reset();
+    b_begin("");
+    end_at = b_end();
+    b_endtok();
+    b_finish();
+    CHECK(I.size_str == 0u && I.off_str == I.len && I.off_str == I.off_st + I.size_st);
+    EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + end_at);
+    /* same with a child node: decision at the child's BEGIN_NODE */
+    b_reset();
+    b_begin("");
+    child_at = b_begin("c");
+    b_end();
+    b_end();
+    b_endtok();
+    b_finish();
+    CHECK(I.size_str == 0u && I.off_str == I.len);
+    EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + child_at);
+    /* empty strings after a gap, starting exactly at totalsize == len */
+    b_reset();
+    B.str_gap = 8u;
+    b_begin("");
+    end_at = b_end();
+    b_endtok();
+    b_finish();
+    CHECK(I.size_str == 0u && I.off_str == I.len && I.off_str > I.off_st + I.size_st);
+    EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + end_at);
+    /* empty strings starting exactly at `len`, with totalsize > len (padding
+     * absent from the copy) */
+    b_reset();
+    b_begin("");
+    end_at = b_end();
+    b_endtok();
+    b_finish();
+    h_set(H_TOTAL, I.len + 64u);
+    EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + end_at);
+    b_reset();
+    B.str_gap = 12u;
+    b_begin("");
+    child_at = b_begin("c");
+    b_end();
+    b_end();
+    b_endtok();
+    b_finish();
+    h_set(H_TOTAL, I.len + 4096u);
+    CHECK(I.off_str == I.len);
+    EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + child_at);
+    /* empty strings at totalsize with totalsize < len is not exercised: the
+     * glue never copies more than totalsize (copy_len = min(...)). */
+
+    /* a PROP with an empty strings block: nameoff 0 >= size_dt_strings 0 ->
+     * BAD_STRING, reached only if the layout was accepted */
+    b_reset();
+    b_begin("");
+    b_prop_off(0u, "\0\0\0\2", 4u);
+    b_end();
+    b_endtok();
+    b_finish();
+    CHECK(I.size_str == 0u && I.off_str == I.len);
+    EXPECT_IN_ST(JE_FDT_BAD_STRING);
+
+    /* negative control: the empty block one word PAST totalsize is BAD_LAYOUT */
+    b_reset();
+    b_begin("");
+    b_end();
+    b_endtok();
+    b_finish();
+    h_set(H_OFF_STR, I.len + 4u);
+    EXPECT(JE_FDT_BAD_LAYOUT);
+}
+
 static void test_layout(void)
 {
     /* off_mem_rsvmap < 40 */
@@ -1253,6 +1340,12 @@ static void test_layout(void)
     build_simple();
     h_set(H_SZ_ST, I.size_st - 4u);
     EXPECT(JE_FDT_BAD_LAYOUT);
+    /* zero-size struct block: the first token runs past the block */
+    build_simple();
+    h_set(H_SZ_ST, 0u);
+    EXPECT(JE_FDT_BAD_LAYOUT);
+
+    test_zero_size_strings();
 }
 
 static void test_rsvmap(void)
@@ -1509,20 +1602,44 @@ static void test_strings(void)
     }
 }
 
-/* Unterminated node name at the struct end: contract lists both "node name
- * unterminated" (BAD_STRING) and "a name running past the struct block"
- * (BAD_LAYOUT); accept either (recorded in WORKER_NOTES.md). */
+/* Node name with no NUL before the struct-block end. Contract update bdf446a
+ * (W2 ambiguity A1) pins this to BAD_STRING; BAD_LAYOUT no longer covers names.
+ * The strings block (which contains NULs) follows the struct block directly, so
+ * a parser that searches for the NUL past the struct end is caught too. */
 static void test_unterminated_name(void)
 {
+    /* short name, struct ends inside it */
     b_reset();
     root_open(2u, 2u);
     mem("m", 2u, 2u, RAM_B, RAM_S);
     st_word(T_BEGIN);
     st_bytes("abcd", 4u);
     b_finish();
-    je_fdt_status s = parse_img();
-    if (s != JE_FDT_BAD_STRING && s != JE_FDT_BAD_LAYOUT)
-        FAILF("unterminated name: got %s, want BAD_STRING or BAD_LAYOUT", nm(s));
+    EXPECT_IN_ST(JE_FDT_BAD_STRING);
+    /* ... and with the strings block NOT adjacent (garbage gap without NULs) */
+    b_reset();
+    B.str_gap = 8u;
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    st_word(T_BEGIN);
+    st_bytes("abcd", 4u);
+    b_finish();
+    EXPECT_IN_ST(JE_FDT_BAD_STRING);
+    /* name both unterminated and longer than JE_FDT_MAX_NAME */
+    {
+        char name[JE_FDT_MAX_NAME + 41u];
+        memset(name, 'a', sizeof name);
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        st_word(T_BEGIN);
+        st_bytes(name, (uint32_t)sizeof name);
+        b_finish();
+        EXPECT_IN_ST(JE_FDT_BAD_STRING);
+    }
+    /* Not tested: an unterminated name in the ROOT position (BAD_STRING vs
+     * "first node not an empty-named root" BAD_TOKEN is unordered by the
+     * contract; recorded as ambiguity A20 in WORKER_NOTES.md). */
 }
 
 static void nest(uint32_t extra_levels)
@@ -1786,27 +1903,102 @@ static void test_duplicate(void)
 
 static void test_bad_cells(void)
 {
-    /* root #address-cells / #size-cells absent */
+    /* root #address-cells / #size-cells absent: decided when the root's property
+     * list ends, err_off = the root's first child BEGIN_NODE (contract bdf446a) */
+    {
+        uint32_t child_at;
+        b_reset();
+        b_begin("");
+        b_u32("#size-cells", 2u);
+        child_at = b_begin("m");
+        b_s("device_type", "memory");
+        b_reg1(2u, 2u, RAM_B, RAM_S);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + child_at);
+        b_reset();
+        b_begin("");
+        b_u32("#address-cells", 2u);
+        child_at = b_begin("m");
+        b_s("device_type", "memory");
+        b_reg1(2u, 2u, RAM_B, RAM_S);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + child_at);
+        /* both absent, root has other properties; NOPs between the last root
+         * property and the child do not move the decision point */
+        b_reset();
+        b_begin("");
+        b_s("compatible", "x");
+        b_nop();
+        b_nop();
+        child_at = b_begin("m");
+        b_s("device_type", "memory");
+        b_reg1(2u, 2u, RAM_B, RAM_S);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + child_at);
+        /* the decision precedes a defect later in that child (BAD_TOKEN) and
+         * a later child's own semantics */
+        b_reset();
+        b_begin("");
+        b_s("compatible", "x"); /* non-empty strings block: isolate this rule */
+        child_at = b_begin("c");
+        st_word(0x77u);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + child_at);
+        /* ... and precedes a memory child whose reg could only be decoded with
+         * cells (the classification happens at that child's END_NODE) */
+        b_reset();
+        b_begin("");
+        b_u32("#address-cells", 2u);
+        child_at = b_begin("m");
+        b_s("device_type", "memory");
+        b_prop("reg", "\0\0\0\1", 4u); /* would be BAD_CELLS at the child too */
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + child_at);
+    }
+    /* childless root: err_off = the root's END_NODE. Walk-time BAD_CELLS also
+     * precedes post-walk NO_MEMORY. */
+    {
+        uint32_t end_at;
+        /* (no properties at all -> also an empty strings block) */
+        b_reset();
+        b_begin("");
+        end_at = b_end();
+        b_endtok();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + end_at);
+        b_reset();
+        b_begin("");
+        b_u32("#address-cells", 2u);
+        b_nop();
+        end_at = b_end();
+        b_endtok();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + end_at);
+        b_reset();
+        b_begin("");
+        b_u32("#size-cells", 1u);
+        end_at = b_end();
+        b_nop();
+        b_endtok();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + end_at);
+    }
+    /* positive control: cells present, childless root -> walk OK, NO_MEMORY */
     b_reset();
-    b_begin("");
-    b_u32("#size-cells", 2u);
-    mem("m", 2u, 2u, RAM_B, RAM_S);
+    root_open(2u, 2u);
     root_close();
     b_finish();
-    EXPECT(JE_FDT_BAD_CELLS);
-    b_reset();
-    b_begin("");
-    b_u32("#address-cells", 2u);
-    mem("m", 2u, 2u, RAM_B, RAM_S);
-    root_close();
-    b_finish();
-    EXPECT(JE_FDT_BAD_CELLS);
-    /* walk-time BAD_CELLS precedes post-walk NO_MEMORY */
-    b_reset();
-    b_begin("");
-    root_close();
-    b_finish();
-    EXPECT(JE_FDT_BAD_CELLS);
+    EXPECT(JE_FDT_NO_MEMORY);
     /* bad length / value */
     {
         static const uint32_t vals[] = { 0u, 3u, 4u, 0xffffffffu };
@@ -1962,6 +2154,159 @@ static void test_no_memory(void)
     EXPECT(JE_FDT_NO_MEMORY);
 }
 
+/* /reserved-memory `reg` CANDIDATES are bounded during the walk (contract update
+ * bdf446a): the (JE_FDT_MAX_RSV+1)-th candidate RANGE -> RANGE_LIMIT at once,
+ * err_off = that `reg` PROP, before any post-walk RAM classification. Literal
+ * reading: a candidate is one {base,size} range of an enabled depth-3 child's
+ * `reg`; memreserve entries, status-disabled children and size-only (dynamic)
+ * children are not candidates. */
+static void test_rsv_candidates(void)
+{
+    uint32_t reg_at = 0u;
+
+    /* 17 children, all inside RAM */
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    rm_open(2u, 2u);
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV + 1u; i++)
+        reg_at = rm_child("r", 0x48000000u + i * 0x1000u, 0x1000u, false);
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT_AT(JE_FDT_RANGE_LIMIT, I.off_st + reg_at);
+    /* 17 candidates ALL outside RAM: candidate bound, not kept bound */
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    rm_open(2u, 2u);
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV + 1u; i++)
+        reg_at = rm_child("r", 0x80000000u + i * 0x1000u, 0x1000u, false);
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT_AT(JE_FDT_RANGE_LIMIT, I.off_st + reg_at);
+    /* ... and 17 PARTIAL candidates: walk-time RANGE_LIMIT beats post-walk
+     * BAD_RANGE */
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    rm_open(2u, 2u);
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV + 1u; i++)
+        reg_at = rm_child("r", RAM_B + RAM_S - 0x1000u, 0x2000u, false);
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT_AT(JE_FDT_RANGE_LIMIT, I.off_st + reg_at);
+    /* the 17th candidate precedes a later struct defect (first violation in
+     * file order) */
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    rm_open(2u, 2u);
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV + 1u; i++)
+        reg_at = rm_child("r", 0x80000000u + i * 0x1000u, 0x1000u, false);
+    b_end();
+    st_word(0x77u);
+    root_close();
+    b_finish();
+    EXPECT_AT(JE_FDT_RANGE_LIMIT, I.off_st + reg_at);
+    /* exactly 16 candidates outside RAM -> OK, all ignored */
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    rm_open(2u, 2u);
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV; i++)
+        rm_child("r", 0x80000000u + i * 0x1000u, 0x1000u, false);
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT(JE_FDT_OK);
+    CHECK(C.rsv_count == 0u && C.rsv_ignored == JE_FDT_MAX_RSV);
+    /* candidates are counted per RANGE: one child with 17 pairs */
+    {
+        uint64_t p[2u * (JE_FDT_MAX_RSV + 1u)];
+        for (uint32_t i = 0u; i < JE_FDT_MAX_RSV + 1u; i++) {
+            p[2u * i] = 0x80000000u + (uint64_t)i * 0x1000u;
+            p[2u * i + 1u] = 0x1000u;
+        }
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        b_begin("r");
+        reg_at = b_reg(2u, 2u, JE_FDT_MAX_RSV + 1u, p);
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_RANGE_LIMIT, I.off_st + reg_at);
+        /* 16 pairs in one child + 1 more child: the 17th is the second reg */
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        b_begin("r");
+        b_reg(2u, 2u, JE_FDT_MAX_RSV, p);
+        b_end();
+        reg_at = rm_child("s", 0x90000000u, 0x1000u, false);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_RANGE_LIMIT, I.off_st + reg_at);
+        /* 16 pairs in one child -> OK */
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        b_begin("r");
+        b_reg(2u, 2u, JE_FDT_MAX_RSV, p);
+        b_end();
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT(JE_FDT_OK);
+        CHECK(C.rsv_count == 0u && C.rsv_ignored == JE_FDT_MAX_RSV);
+    }
+    /* not candidates: memreserve entries, disabled and size-only children.
+     * 16 memreserve (outside RAM) + 16 candidates (outside) + 1 disabled + 1
+     * dynamic -> OK */
+    b_reset();
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSVMAP; i++)
+        b_rsv(0x90000000u + i * 0x1000u, 0x1000u);
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    rm_open(2u, 2u);
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV; i++)
+        rm_child("r", 0x80000000u + i * 0x1000u, 0x1000u, false);
+    b_begin("off");
+    b_s("status", "disabled");
+    b_reg1(2u, 2u, 0x88000000u, 0x1000u);
+    b_end();
+    b_begin("dyn");
+    b_be("size", 0x1000u, 8u);
+    b_end();
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT(JE_FDT_OK);
+    CHECK(C.rsv_count == 0u && C.rsv_ignored == JE_FDT_MAX_RSVMAP + JE_FDT_MAX_RSV &&
+          C.rsv_dynamic == 1u);
+    /* 16 candidates with a mix of kept / ignored -> OK; the kept ones are below
+     * the kept bound */
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    rm_open(2u, 2u);
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV; i++)
+        rm_child("r", ((i & 1u) ? 0x80000000u : RAM_B) + i * 0x1000u, 0x1000u, false);
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT(JE_FDT_OK);
+    CHECK(C.rsv_count == JE_FDT_MAX_RSV / 2u && C.rsv_ignored == JE_FDT_MAX_RSV / 2u);
+}
+
 static void test_range_limit(void)
 {
     /* > MAX_RAM ranges: one node with 9 pairs, and 9 nodes */
@@ -2010,17 +2355,7 @@ static void test_range_limit(void)
     root_close();
     b_finish();
     EXPECT(JE_FDT_RANGE_LIMIT);
-    /* ... 17 /reserved-memory children */
-    b_reset();
-    root_open(2u, 2u);
-    mem("m", 2u, 2u, RAM_B, RAM_S);
-    rm_open(2u, 2u);
-    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV + 1u; i++)
-        rm_child("r", 0x48000000u + i * 0x1000u, 0x1000u, false);
-    b_end();
-    root_close();
-    b_finish();
-    EXPECT(JE_FDT_RANGE_LIMIT);
+    test_rsv_candidates();
 }
 
 static void test_bad_range(void)
@@ -2272,31 +2607,93 @@ static void test_postwalk_order(void)
     root_close();
     b_finish();
     EXPECT(JE_FDT_BAD_RANGE);
-    /* memreserve entries are processed BEFORE /reserved-memory: 17 kept children
-     * (RANGE_LIMIT) lose to a partial memreserve entry (BAD_RANGE). */
+    /* Updated for contract bdf446a: 17 /reserved-memory reg CANDIDATES are a
+     * WALK-time RANGE_LIMIT (err_off = the 17th reg PROP), so they beat a
+     * partial memreserve entry whose BAD_RANGE is only decided post-walk.
+     * (Round 1 expected BAD_RANGE here, from the post-walk-only bound.) */
+    {
+        uint32_t reg_at = 0u;
+        b_reset();
+        b_rsv(RAM_B - 0x1000u, 0x2000u);
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        for (uint32_t i = 0u; i < JE_FDT_MAX_RSV + 1u; i++)
+            reg_at = rm_child("r", 0x48000000u + i * 0x1000u, 0x1000u, false);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_RANGE_LIMIT, I.off_st + reg_at);
+    }
+    /* memreserve entries are still processed BEFORE /reserved-memory post-walk:
+     * with only 16 candidates (16 kept children, under the walk bound) a partial
+     * memreserve entry is BAD_RANGE ... */
     b_reset();
     b_rsv(RAM_B - 0x1000u, 0x2000u);
     root_open(2u, 2u);
     mem("m", 2u, 2u, RAM_B, RAM_S);
     rm_open(2u, 2u);
-    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV + 1u; i++)
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV; i++)
         rm_child("r", 0x48000000u + i * 0x1000u, 0x1000u, false);
     b_end();
     root_close();
     b_finish();
     EXPECT(JE_FDT_BAD_RANGE);
-    /* reservation checks precede the initrd-in-RAM check */
+    /* ... 1 kept memreserve + 16 kept children = 17 kept -> post-walk
+     * kept-bound RANGE_LIMIT; a partial memreserve entry placed before the kept
+     * one is classified first and still wins (BAD_RANGE). */
     b_reset();
+    b_rsv(RAM_B, 0x1000u);
     root_open(2u, 2u);
     mem("m", 2u, 2u, RAM_B, RAM_S);
     rm_open(2u, 2u);
-    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV + 1u; i++)
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV; i++)
         rm_child("r", 0x48000000u + i * 0x1000u, 0x1000u, false);
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT(JE_FDT_RANGE_LIMIT);
+    b_reset();
+    b_rsv(RAM_B - 0x1000u, 0x2000u);
+    b_rsv(RAM_B, 0x1000u);
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    rm_open(2u, 2u);
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV; i++)
+        rm_child("r", 0x48000000u + i * 0x1000u, 0x1000u, false);
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT(JE_FDT_BAD_RANGE);
+    /* post-walk kept-bound RANGE_LIMIT (16 memreserve + 1 child, all kept)
+     * precedes the initrd-in-RAM check */
+    b_reset();
+    for (uint32_t i = 0u; i < JE_FDT_MAX_RSV; i++)
+        b_rsv(RAM_B + i * 0x1000u, 0x1000u);
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    rm_open(2u, 2u);
+    rm_child("r", 0x48000000u, 0x1000u, false);
     b_end();
     chosen_initrd(0x30000000u, 4u, 0x30100000u, 4u);
     root_close();
     b_finish();
     EXPECT(JE_FDT_RANGE_LIMIT);
+    /* walk-time candidate RANGE_LIMIT also precedes it */
+    {
+        uint32_t reg_at = 0u;
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        for (uint32_t i = 0u; i < JE_FDT_MAX_RSV + 1u; i++)
+            reg_at = rm_child("r", 0x48000000u + i * 0x1000u, 0x1000u, false);
+        b_end();
+        chosen_initrd(0x30000000u, 4u, 0x30100000u, 4u);
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_RANGE_LIMIT, I.off_st + reg_at);
+    }
 }
 
 /* ------------------------------------------------------------------------- */
