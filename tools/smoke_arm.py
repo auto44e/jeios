@@ -18,13 +18,25 @@ Discipline (mirrors the x86 smoke harness + the ADR 0002 D6 evidence rule):
     — proving the DTB that booted is byte-identical to the one the hosted
     parser tests use;
   - record the image SHA-256, tool versions, and the exact QEMU command;
-  - poll the serial FILE while QEMU runs: once the mode's final marker is seen
-    (in --dtb-bad mode that is the expected FATAL line), wait SETTLE_S to catch
-    unexpected trailing output, then terminate QEMU — only that path is
-    PASS-eligible. The kernel halts forever in WFE, so QEMU exiting on its own
-    is a crash/abort: FAIL with its return code. --timeout expiring without the
-    final marker: FAIL ("timeout before final marker"). The child is always
-    killed and reaped (no zombie);
+  - markers count only on COMPLETE serial lines (terminated by "\n"; a
+    trailing "\r" is tolerated). The mode's terminal marker (in --dtb-bad mode
+    the expected FATAL line) must match a whole line exactly, never a
+    substring or a line still being written;
+  - poll the serial FILE while QEMU runs: once the terminal line is seen, keep
+    QEMU running for a full SETTLE_S window to catch late output, then
+    terminate and reap QEMU and re-read the WHOLE log. All validation runs on
+    that final log, so anything QEMU wrote up to the kill is judged: the
+    terminal line must be the LAST line (any line after it is a FAIL), a
+    trailing partial (unterminated) line is a FAIL, and any FATAL other than
+    --dtb-bad's one expected line is a FAIL. Only that path is PASS-eligible;
+  - --timeout (finite, > 0) bounds the whole run INCLUDING the settle window:
+    terminal line not seen by the deadline -> FAIL ("timeout before final
+    marker"); seen with less than SETTLE_S left -> FAIL ("timeout before
+    settle complete"), since a PASS requires a full settle window. The kernel
+    halts forever in WFE, so QEMU exiting on its own is a crash/abort: FAIL
+    with its return code. The child is always terminated and reaped (no
+    zombie); that reap (<= 5 s, then SIGKILL) is the only time outside the
+    deadline. Every --version probe is bounded by VERSION_TIMEOUT_S;
   - assert pa_bits EXACTLY (--expect-pa-bits, default 44 for the pinned
     virt-8.2 / cortex-a72 profile);
   - SKIP (exit 0, clearly labelled) if the aarch64 toolchain /
@@ -34,6 +46,7 @@ Discipline (mirrors the x86 smoke harness + the ADR 0002 D6 evidence rule):
 """
 import argparse
 import hashlib
+import math
 import os
 import re
 import shutil
@@ -60,6 +73,8 @@ QEMU_VERSION_RE = re.compile(r"QEMU emulator version (\d+)\.(\d+)\.(\d+)")
 # output (a late FATAL, an exception dump) is still caught before the kill.
 SETTLE_S = 0.5
 POLL_S = 0.05
+# Bound on every `tool --version` probe so a wedged binary cannot hang CI.
+VERSION_TIMEOUT_S = 10
 
 # Ordered step-1 markers. "bss cleared" (default) vs "bss clear verified"
 # (patterned-BSS build) — accept either, but if the verified form is present it
@@ -125,9 +140,11 @@ class Fixture:
 
 def tool_version(cmd):
     try:
-        return subprocess.check_output([cmd, "--version"], text=True,
-                                       stderr=subprocess.STDOUT).splitlines()[0]
-    except Exception:
+        out = subprocess.check_output([cmd, "--version"], text=True,
+                                      stderr=subprocess.STDOUT,
+                                      timeout=VERSION_TIMEOUT_S)
+        return out.splitlines()[0]
+    except (OSError, subprocess.SubprocessError, IndexError):
         return "(unknown)"
 
 
@@ -135,23 +152,41 @@ def qemu_version(cmd):
     """(major, minor, micro) parsed from `cmd --version`, or None."""
     try:
         out = subprocess.check_output([cmd, "--version"], text=True,
-                                      stderr=subprocess.STDOUT, timeout=10)
+                                      stderr=subprocess.STDOUT,
+                                      timeout=VERSION_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return None
     m = QEMU_VERSION_RE.search(out)
     return tuple(int(g) for g in m.groups()) if m else None
 
 
+def split_lines(out):
+    """(complete_lines, partial): complete lines are those terminated by \n,
+    with the \n and one trailing \r removed; partial is any unterminated
+    tail (b"" if the log ends on a line boundary)."""
+    parts = out.split(b"\n")
+    partial = parts.pop()  # bytes after the last \n (all of out if none)
+    return [ln[:-1] if ln.endswith(b"\r") else ln for ln in parts], partial
+
+
+def line_of(marker):
+    """A marker as a bare line (CRLF/LF stripped) for whole-line comparison."""
+    return marker.rstrip(b"\n").rstrip(b"\r")
+
+
 def run_qemu(cmd, serial_path, final_marker, early_stop, timeout):
-    """Run QEMU, polling the serial FILE. Returns the captured bytes on the
-    PASS-eligible path (final marker / early-stop marker seen, settled, QEMU
-    still running and then terminated by us); calls fail() otherwise."""
+    """Run QEMU, polling the serial FILE, bounded by `timeout` seconds overall
+    (settle included). Returns (final_log, early): final_log is the WHOLE
+    serial file re-read after QEMU has been terminated and reaped; early is
+    True if we stopped on the early_stop substring (a run that cannot PASS;
+    the caller's validation must then FAIL). PASS-eligible only when the
+    terminal line was seen as a complete line, a full SETTLE_S window then
+    elapsed inside the deadline with QEMU still running, and we killed it.
+    Every other path calls fail()."""
     # stderr goes to an unlinked temp FILE, not a pipe: an undrained pipe could
     # fill and block QEMU mid-boot.
     errf = tempfile.TemporaryFile(prefix="jeios-arm-qemu-stderr-")
-    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=errf)
-    out = b""
+    term_line = line_of(final_marker)
 
     def read_serial():
         try:
@@ -160,46 +195,11 @@ def run_qemu(cmd, serial_path, final_marker, early_stop, timeout):
         except OSError:
             return b""  # QEMU may not have created it yet
 
-    def self_exit(rc):
-        sys.stdout.write(read_serial().decode("ascii", "replace") + "\n")
-        errf.seek(0)
-        err = errf.read(4096).decode("utf-8", "replace").strip()
-        if err:
-            print("qemu stderr: " + err)
-        fail(f"QEMU exited on its own with return code {rc} (the kernel halts "
-             f"forever, so a self-exit is a crash/abort)")
+    deadline = time.monotonic() + timeout
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=errf)
 
-    try:
-        deadline = time.monotonic() + timeout
-        seen = False
-        while True:
-            out = read_serial()
-            if final_marker in out or (early_stop is not None and early_stop in out):
-                seen = True
-                break
-            rc = proc.poll()
-            if rc is not None:
-                self_exit(rc)
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(POLL_S)
-        if not seen:
-            sys.stdout.write(out.decode("ascii", "replace") + "\n")
-            fail(f"timeout before final marker after {timeout}s "
-                 f"(waiting for: {final_marker.decode().strip()})")
-        settle_end = time.monotonic() + SETTLE_S
-        while time.monotonic() < settle_end:
-            rc = proc.poll()
-            if rc is not None:
-                self_exit(rc)
-            time.sleep(POLL_S)
-        rc = proc.poll()
-        if rc is not None:
-            self_exit(rc)
-        return read_serial()
-    finally:
-        # Always stop and reap the child, on every path (incl. fail()'s
-        # SystemExit and KeyboardInterrupt).
+    def stop():
         if proc.poll() is None:
             proc.terminate()
             try:
@@ -207,6 +207,64 @@ def run_qemu(cmd, serial_path, final_marker, early_stop, timeout):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+
+    def fail_with_log(msg):
+        stop()  # so the dumped log is final (everything up to the kill)
+        sys.stdout.write(read_serial().decode("ascii", "replace") + "\n")
+        errf.seek(0)
+        err = errf.read(4096).decode("utf-8", "replace").strip()
+        if err:
+            print("qemu stderr: " + err)
+        fail(msg)
+
+    def check_alive():
+        rc = proc.poll()
+        if rc is not None:
+            fail_with_log(f"QEMU exited on its own with return code {rc} (the "
+                          f"kernel halts forever, so a self-exit is a "
+                          f"crash/abort)")
+
+    try:
+        seen = early = False
+        while True:
+            # Only complete lines count; a line still being written (or a log
+            # cut mid-line) can never satisfy the terminal marker.
+            lines, _ = split_lines(read_serial())
+            if term_line in lines:
+                seen = True
+                break
+            if early_stop is not None and any(early_stop in ln for ln in lines):
+                early = True
+                break
+            check_alive()
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(POLL_S)
+        if early:
+            stop()
+            return read_serial(), True
+        if not seen:
+            fail_with_log(f"timeout before final marker after {timeout}s "
+                          f"(waiting for: {term_line.decode()})")
+        # Settle: PASS needs a FULL window inside the deadline, else late output
+        # would go unobserved; never extend past --timeout.
+        settle_end = time.monotonic() + SETTLE_S
+        if settle_end > deadline:
+            fail_with_log(f"timeout before settle complete: terminal marker seen "
+                          f"with {max(0.0, deadline - time.monotonic()):.3f}s of "
+                          f"--timeout {timeout}s left, need {SETTLE_S}s")
+        while time.monotonic() < settle_end:
+            check_alive()
+            time.sleep(POLL_S)
+        check_alive()
+        stop()
+        # Re-read AFTER terminate+reap: the caller judges everything QEMU wrote
+        # up to the kill, not the snapshot that satisfied the poll.
+        return read_serial(), False
+    finally:
+        # Always stop and reap the child, on every path (incl. fail()'s
+        # SystemExit and KeyboardInterrupt).
+        stop()
         errf.close()
 
 
@@ -216,12 +274,34 @@ def fail(msg):
 
 
 def check_ordered(out, markers):
+    """Markers in order within the log. Callers have already rejected a
+    partial trailing line, so every match lies on a complete line."""
     pos = 0
     for m in markers:
         idx = out.find(m, pos)
         if idx < 0:
             fail(f"missing/out-of-order marker: {m.decode()}")
         pos = idx + len(m)
+
+
+def check_lines(out, final_marker):
+    """Whole-log line discipline on the FINAL (post-kill) log: no unterminated
+    tail, and the terminal marker is exactly the last complete line, appearing
+    once — so nothing (a late FATAL, a stray marker, an exception dump) may
+    follow it."""
+    lines, partial = split_lines(out)
+    if partial:
+        fail(f"trailing partial (unterminated) serial line: "
+             f"{partial[:120].decode('ascii', 'replace')!r}")
+    term = line_of(final_marker)
+    n = lines.count(term)
+    if n != 1:
+        fail(f"terminal line {term.decode()!r} must appear exactly once as a "
+             f"whole line, found {n}")
+    if lines[-1] != term:
+        after = lines[lines.index(term) + 1:]
+        fail(f"unexpected output after terminal line: "
+             f"{[ln.decode('ascii', 'replace') for ln in after[:5]]}")
 
 
 def check_dtb_copied(out, fx):
@@ -253,13 +333,26 @@ def dtb_good_markers():
     ]
 
 
+def timeout_arg(text):
+    """argparse type: a finite number of seconds > 0 (nan/inf/0/negative are
+    parse errors — a non-finite deadline would never expire)."""
+    try:
+        v = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}")
+    if not math.isfinite(v) or v <= 0:
+        raise argparse.ArgumentTypeError(f"must be finite and > 0, got {text!r}")
+    return v
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("image")
-    ap.add_argument("--timeout", type=float, default=15,
-                    help="overall QEMU run bound in seconds; expiry before the "
-                         "final marker is a FAIL")
+    ap.add_argument("--timeout", type=timeout_arg, default=15.0,
+                    help="bound in seconds (finite, > 0) on the whole QEMU run "
+                         "INCLUDING the %ss settle window; final marker not seen, "
+                         "or seen with < %ss left, is a FAIL" % (SETTLE_S, SETTLE_S))
     ap.add_argument("--expect-pa-bits", type=int, default=44, metavar="N",
                     help="exact pa_bits the boot must report (pinned virt-8.2 "
                          "cortex-a72 profile: 44)")
@@ -287,8 +380,6 @@ def main():
     if args.dtb_bad and args.vector_test:
         fail("--dtb-bad and --vector-test are mutually exclusive (the DTB "
              "rejection halts before the BRK)")
-    if args.timeout < 0:
-        fail(f"--timeout must be >= 0, got {args.timeout}")
     qemu = args.qemu
     if shutil.which(qemu) is None:
         skip(f"{qemu} not installed")
@@ -360,7 +451,8 @@ def main():
     print("cmd:   " + " ".join(cmd))
 
     try:
-        out = run_qemu(cmd, serial_path, final_marker, early_stop, args.timeout)
+        out, early = run_qemu(cmd, serial_path, final_marker, early_stop,
+                              args.timeout)
     finally:
         if args.log:
             print(f"log:   {serial_path}")
@@ -373,10 +465,12 @@ def main():
     sys.stdout.write(out.decode("ascii", "replace"))
     sys.stdout.write("\n")
 
+    # Everything below judges the FINAL log (re-read after QEMU was killed).
     if args.dtb_bad:
         # Exactly one FATAL, and it must be the expected parser rejection.
-        fatal_lines = [ln for ln in out.split(b"\n") if b"FATAL" in ln]
-        if fatal_lines != [bad_line.rstrip(b"\n")]:
+        # Checked over the raw log so a FATAL in a partial tail is also seen.
+        fatal_lines = [line_of(ln) for ln in out.split(b"\n") if b"FATAL" in ln]
+        if fatal_lines != [line_of(bad_line)]:
             fail(f"--dtb-bad: expected exactly the BAD_TOKEN FATAL line, got "
                  f"{[ln.decode('ascii', 'replace') for ln in fatal_lines]}")
         for forbidden in (b"JeiOS/aarch64: dtb parsed", VALIDATED, TERM_DEFAULT):
@@ -385,6 +479,7 @@ def main():
     elif b"FATAL" in out:
         fail("FATAL marker present")
 
+    check_lines(out, final_marker)
     check_ordered(out, markers)
     if not args.dtb_bad:
         pa = VALIDATED_RE.findall(out)
@@ -398,6 +493,10 @@ def main():
     # BEFORE the dtb-bad injection, so it must match the fixture in all modes.
     check_dtb_copied(out, fx)
 
+    if early:
+        # Defensive: an early stop means a FATAL / forbidden marker was seen,
+        # which the checks above must already have rejected.
+        fail("early-stop marker seen but validation did not fail (harness bug)")
     print("QEMU aarch64 smoke: PASS")
 
 

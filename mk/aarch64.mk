@@ -108,9 +108,11 @@ aarch64: $(ARM_BUILD)/Image
 # exact command, and SKIPs (never PASSes) if the toolchain or
 # qemu-system-aarch64 is absent — unless ARM_REQUIRE=1, which turns every SKIP
 # into a FAIL (remote CI). Not wired into `make check`.
-# ARM_SMOKE_TIMEOUT (seconds, default 15) bounds the whole QEMU run; the harness
-# stops QEMU as soon as the mode's final marker is seen (plus a short settle), so
-# a PASS normally takes well under it, and expiry without that marker is a FAIL.
+# ARM_SMOKE_TIMEOUT (seconds, finite and > 0, default 15; 0/nan/inf are a parse
+# error) bounds the whole QEMU run INCLUDING the 0.5 s post-terminal settle
+# window; the harness stops QEMU once the mode's final marker is seen as a
+# complete line and the settle elapses, so a PASS normally takes well under it.
+# Expiry without that marker, or with less than the settle window left, is a FAIL.
 # Variable names ARM_DTB_BAD / ARM_REQUIRE / ARM_SMOKE_TIMEOUT are frozen (CI
 # uses them).
 ARM_SMOKE_TIMEOUT ?= 15
