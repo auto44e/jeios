@@ -18,10 +18,20 @@ Discipline (mirrors the x86 smoke harness + the ADR 0002 D6 evidence rule):
     — proving the DTB that booted is byte-identical to the one the hosted
     parser tests use;
   - record the image SHA-256, tool versions, and the exact QEMU command;
-  - markers count only on COMPLETE serial lines (terminated by "\n"; a
-    trailing "\r" is tolerated). The mode's terminal marker (in --dtb-bad mode
-    the expected FATAL line) must match a whole line exactly, never a
-    substring or a line still being written;
+  - markers count only on COMPLETE serial lines (terminated by "\n"; one
+    trailing "\r" is stripped, so LF and CRLF logs are judged identically).
+    Every expected marker must match a WHOLE line, in order: fixed lines by
+    exact equality, value-carrying lines by a full-line pattern anchored at
+    the line start (fixed text + exact-width hex fields). A marker's text
+    appearing mid-line, or in a line still being written, never counts. The
+    mode's terminal marker (in --dtb-bad mode the expected FATAL line) must be
+    the last line;
+  - QEMU stderr is judged on EVERY run, PASS included: after QEMU is
+    terminated and reaped, each non-empty stderr line must be exactly the
+    SIGTERM notice QEMU 8.2 prints when this harness kills it
+    ("qemu-system-aarch64: terminating on signal 15 from pid <our pid>
+    (<name>)", name optional), at most once; any other stderr output (a QEMU
+    internal error, a device warning) is a FAIL and is printed;
   - poll the serial FILE while QEMU runs: once the terminal line is seen, keep
     QEMU running for a full SETTLE_S window to catch late output, then
     terminate and reap QEMU and re-read the WHOLE log. All validation runs on
@@ -75,40 +85,77 @@ SETTLE_S = 0.5
 POLL_S = 0.05
 # Bound on every `tool --version` probe so a wedged binary cannot hang CI.
 VERSION_TIMEOUT_S = 10
+# A 16-digit lowercase hex field, the width the kernel prints every hex value at.
+HEX16 = rb"0x[0-9a-f]{16}"
 
 # Ordered step-1 markers. "bss cleared" (default) vs "bss clear verified"
 # (patterned-BSS build) — accept either, but if the verified form is present it
 # must be the verified one; see --bss-verified.
+#
+# A marker is (description, line -> bool) and matches one WHOLE normalized
+# line (see split_lines): exact() for fixed lines, valued() for lines whose
+# tail carries build-dependent values (addresses), matched as a full-line
+# pattern anchored at the line start.
+
+
+def exact(line):
+    return (line, lambda ln: ln == line)
+
+
+def valued(desc, pattern):
+    rx = re.compile(pattern)
+    return (desc, lambda ln: rx.fullmatch(ln) is not None)
+
+
 BASE_MARKERS = [
-    b"JeiOS/aarch64: entry EL1",
-    b"JeiOS/aarch64: stack ready",
-    b"JeiOS/aarch64: tcr_el1 initialized (tbi0=0)",
+    exact(b"JeiOS/aarch64: entry EL1"),
+    valued(b"JeiOS/aarch64: stack ready sp=<hex>",
+           rb"JeiOS/aarch64: stack ready sp=" + HEX16),
+    valued(b"JeiOS/aarch64: tcr_el1 initialized (tbi0=0) tcr=<hex>",
+           rb"JeiOS/aarch64: tcr_el1 initialized \(tbi0=0\) tcr=" + HEX16),
     None,  # bss line, filled below
-    b"JeiOS/aarch64: dtb pointer recorded",
-    b"JeiOS/aarch64: vectors installed",
+    valued(b"JeiOS/aarch64: dtb pointer recorded dtb=<hex>",
+           rb"JeiOS/aarch64: dtb pointer recorded dtb=" + HEX16),
+    valued(b"JeiOS/aarch64: vectors installed vbar=<hex>",
+           rb"JeiOS/aarch64: vectors installed vbar=" + HEX16),
 ]
 # Default build terminal marker (no vector test).
 TERM_DEFAULT = b"JeiOS/aarch64: initialization complete; halted"
 VALIDATED = b"JeiOS/aarch64: boot context validated pa_bits="
-VALIDATED_RE = re.compile(rb"JeiOS/aarch64: boot context validated pa_bits=(\d+)\r?\n")
+VALIDATED_RE = re.compile(rb"JeiOS/aarch64: boot context validated pa_bits=(\d+)")
+# The one stderr line QEMU 8.2.2 (os-posix.c qemu_system_killed path) emits
+# when we SIGTERM it; observed verbatim on 8.2.2:
+#   "qemu-system-aarch64: terminating on signal 15 from pid 1561788 (/bin/bash)"
+# The "(name)" part is absent when QEMU cannot resolve the sender's name.
+QEMU_KILL_RE = re.compile(
+    rb"qemu-system-aarch64: terminating on signal 15 from pid (\d+)(?: \([^\n]*\))?")
+# Bound on how much stderr is read/judged; more than this is itself a FAIL.
+STDERR_MAX = 64 * 1024
 # Vector-test build: the planted BRK must vector to the EL1h sync slot and the
 # handler must assert the exact syndrome. These ordered markers replace the
 # default terminal and prove the deliberate exception end-to-end.
 VECTOR_TEST_MARKERS = [
-    b"JeiOS/aarch64: triggering deliberate BRK",
-    b"JeiOS/aarch64: EXCEPTION vector=0x0000000000000004 ec=0x000000000000003c",
+    exact(b"JeiOS/aarch64: triggering deliberate BRK #0xa55a ..."),
+    exact(b"JeiOS/aarch64: EXCEPTION vector=0x0000000000000004 "
+          b"ec=0x000000000000003c il=0x0000000000000001 iss=0x000000000000a55a"),
     # Assert the RAW syndrome line independently (not just the in-kernel PASS), so
     # a bug in the kernel's own comparator cannot produce a false PASS: exact
-    # ESR/ELR-shape/SPSR observed on the wire.
-    b"esr=0x00000000f200a55a",
-    b"spsr=0x00000000800003c5",
-    b"JeiOS/aarch64: vector self-test PASS",
-    b"JeiOS/aarch64: exception handled; halted",
+    # ESR and SPSR observed on the wire; ELR is build-dependent (hex shape only).
+    valued(b"JeiOS/aarch64:   esr=0x00000000f200a55a elr=<hex> spsr=0x00000000800003c5",
+           rb"JeiOS/aarch64:   esr=0x00000000f200a55a elr=" + HEX16
+           + rb" spsr=0x00000000800003c5"),
+    valued(b"JeiOS/aarch64: vector self-test PASS (...)",
+           rb"JeiOS/aarch64: vector self-test PASS \([^\n]*\)"),
+    exact(b"JeiOS/aarch64: exception handled; halted"),
 ]
 
 COPIED_RE = re.compile(
     rb"JeiOS/aarch64: dtb copied len=0x([0-9a-f]{16}) totalsize=0x([0-9a-f]{16})"
-    rb" crc32=0x([0-9a-f]{16}) crc_len=0x([0-9a-f]{16})\r?\n")
+    rb" crc32=0x([0-9a-f]{16}) crc_len=0x([0-9a-f]{16})")
+COPIED = valued(b"JeiOS/aarch64: dtb copied len=<hex> totalsize=<hex> "
+                b"crc32=<hex> crc_len=<hex>", COPIED_RE.pattern)
+VALIDATED_LINE = valued(b"JeiOS/aarch64: boot context validated pa_bits=<N>",
+                        VALIDATED_RE.pattern)
 
 
 def hx(v):
@@ -169,15 +216,17 @@ def split_lines(out):
     return [ln[:-1] if ln.endswith(b"\r") else ln for ln in parts], partial
 
 
-def line_of(marker):
-    """A marker as a bare line (CRLF/LF stripped) for whole-line comparison."""
-    return marker.rstrip(b"\n").rstrip(b"\r")
+def line_of(raw):
+    """A raw log segment as a bare line (one trailing \r stripped)."""
+    return raw[:-1] if raw.endswith(b"\r") else raw
 
 
-def run_qemu(cmd, serial_path, final_marker, early_stop, timeout):
+def run_qemu(cmd, serial_path, term_line, early_stop, timeout):
     """Run QEMU, polling the serial FILE, bounded by `timeout` seconds overall
-    (settle included). Returns (final_log, early): final_log is the WHOLE
-    serial file re-read after QEMU has been terminated and reaped; early is
+    (settle included). Returns (final_log, early, stderr): final_log is the
+    WHOLE serial file re-read after QEMU has been terminated and reaped;
+    stderr is everything QEMU wrote to stderr up to that reap (at most
+    STDERR_MAX + 1 bytes, so an oversize stream is detectable); early is
     True if we stopped on the early_stop substring (a run that cannot PASS;
     the caller's validation must then FAIL). PASS-eligible only when the
     terminal line was seen as a complete line, a full SETTLE_S window then
@@ -186,7 +235,6 @@ def run_qemu(cmd, serial_path, final_marker, early_stop, timeout):
     # stderr goes to an unlinked temp FILE, not a pipe: an undrained pipe could
     # fill and block QEMU mid-boot.
     errf = tempfile.TemporaryFile(prefix="jeios-arm-qemu-stderr-")
-    term_line = line_of(final_marker)
 
     def read_serial():
         try:
@@ -208,11 +256,14 @@ def run_qemu(cmd, serial_path, final_marker, early_stop, timeout):
                 proc.kill()
                 proc.wait()
 
+    def read_stderr():
+        errf.seek(0)
+        return errf.read(STDERR_MAX + 1)
+
     def fail_with_log(msg):
         stop()  # so the dumped log is final (everything up to the kill)
         sys.stdout.write(read_serial().decode("ascii", "replace") + "\n")
-        errf.seek(0)
-        err = errf.read(4096).decode("utf-8", "replace").strip()
+        err = read_stderr()[:4096].decode("utf-8", "replace").strip()
         if err:
             print("qemu stderr: " + err)
         fail(msg)
@@ -242,7 +293,7 @@ def run_qemu(cmd, serial_path, final_marker, early_stop, timeout):
             time.sleep(POLL_S)
         if early:
             stop()
-            return read_serial(), True
+            return read_serial(), True, read_stderr()
         if not seen:
             fail_with_log(f"timeout before final marker after {timeout}s "
                           f"(waiting for: {term_line.decode()})")
@@ -260,7 +311,7 @@ def run_qemu(cmd, serial_path, final_marker, early_stop, timeout):
         stop()
         # Re-read AFTER terminate+reap: the caller judges everything QEMU wrote
         # up to the kill, not the snapshot that satisfied the poll.
-        return read_serial(), False
+        return read_serial(), False, read_stderr()
     finally:
         # Always stop and reap the child, on every path (incl. fail()'s
         # SystemExit and KeyboardInterrupt).
@@ -273,18 +324,43 @@ def fail(msg):
     sys.exit(1)
 
 
-def check_ordered(out, markers):
-    """Markers in order within the log. Callers have already rejected a
-    partial trailing line, so every match lies on a complete line."""
+def check_stderr(err):
+    """Judge QEMU's stderr on every run (PASS included): each non-empty line
+    must be QEMU's SIGTERM notice naming THIS process as the sender, at most
+    once. Anything else (a QEMU internal error, a warning) is a FAIL."""
+    if len(err) > STDERR_MAX:
+        fail(f"qemu stderr exceeds {STDERR_MAX} bytes")
+    kills = 0
+    bad = []
+    for ln in err.split(b"\n"):
+        if not ln:
+            continue
+        m = QEMU_KILL_RE.fullmatch(ln)
+        if m is not None and int(m.group(1)) == os.getpid():
+            kills += 1
+            print("stderr: " + ln.decode("utf-8", "replace") + "  (expected kill notice)")
+        else:
+            bad.append(ln)
+    if bad or kills > 1:
+        sys.stdout.write("qemu stderr:\n" + err.decode("utf-8", "replace") + "\n")
+        fail(f"unexpected QEMU stderr ({len(bad)} unrecognised line(s), "
+             f"{kills} kill notice(s); only one SIGTERM notice from pid "
+             f"{os.getpid()} is allowed)")
+
+
+def check_ordered(lines, markers):
+    """Markers in order, each matching one WHOLE normalized line strictly
+    after the previous marker's line. Callers have already rejected a partial
+    trailing line, so `lines` are exactly the complete lines."""
     pos = 0
-    for m in markers:
-        idx = out.find(m, pos)
-        if idx < 0:
-            fail(f"missing/out-of-order marker: {m.decode()}")
-        pos = idx + len(m)
+    for desc, match in markers:
+        idx = next((i for i in range(pos, len(lines)) if match(lines[i])), None)
+        if idx is None:
+            fail(f"missing/out-of-order marker (whole line): {desc.decode()}")
+        pos = idx + 1
 
 
-def check_lines(out, final_marker):
+def check_lines(out, term):
     """Whole-log line discipline on the FINAL (post-kill) log: no unterminated
     tail, and the terminal marker is exactly the last complete line, appearing
     once — so nothing (a late FATAL, a stray marker, an exception dump) may
@@ -293,7 +369,6 @@ def check_lines(out, final_marker):
     if partial:
         fail(f"trailing partial (unterminated) serial line: "
              f"{partial[:120].decode('ascii', 'replace')!r}")
-    term = line_of(final_marker)
     n = lines.count(term)
     if n != 1:
         fail(f"terminal line {term.decode()!r} must appear exactly once as a "
@@ -304,9 +379,9 @@ def check_lines(out, final_marker):
              f"{[ln.decode('ascii', 'replace') for ln in after[:5]]}")
 
 
-def check_dtb_copied(out, fx):
+def check_dtb_copied(lines, fx):
     """The copied line must exist once and its CRC must match the fixture."""
-    found = COPIED_RE.findall(out)
+    found = [m.groups() for m in map(COPIED_RE.fullmatch, lines) if m]
     if len(found) != 1:
         fail(f"expected exactly one well-formed 'dtb copied' line, found {len(found)}")
     length, total, crc, crc_len = (int(x, 16) for x in found[0])
@@ -326,10 +401,11 @@ def dtb_good_markers():
     # Exact for the pinned machine/-m: fixture has an empty memreserve map, no
     # /reserved-memory, no initrd, one /memory reg [0x40000000, +256 MiB).
     return [
-        b"JeiOS/aarch64: dtb copied len=",
-        b"JeiOS/aarch64: dtb parsed ram=1 rsv=0 ignored=0 dynamic=0 initrd=0\r\n",
-        b"JeiOS/aarch64:   ram[0] base=" + hx(0x40000000) + b" size=" + hx(0x10000000),
-        VALIDATED,
+        COPIED,
+        exact(b"JeiOS/aarch64: dtb parsed ram=1 rsv=0 ignored=0 dynamic=0 initrd=0"),
+        exact(b"JeiOS/aarch64:   ram[0] base=" + hx(0x40000000) + b" size="
+              + hx(0x10000000)),
+        VALIDATED_LINE,
     ]
 
 
@@ -404,21 +480,22 @@ def main():
         skip(f"image {args.image} not built")
 
     markers = list(BASE_MARKERS)
-    markers[3] = (b"JeiOS/aarch64: bss clear verified" if args.bss_verified
-                  else b"JeiOS/aarch64: bss cleared")
+    markers[3] = exact(b"JeiOS/aarch64: bss clear verified" if args.bss_verified
+                       else b"JeiOS/aarch64: bss cleared")
     bad_line = (b"JeiOS/aarch64: FATAL dtb rejected status=BAD_TOKEN off="
-                + hx(fx.off_dt_struct) + b"\r\n")
+                + hx(fx.off_dt_struct))
     if args.dtb_bad:
         markers += [
-            b"JeiOS/aarch64: dtb copied len=",
-            b"JeiOS/aarch64: dtb-bad test: wrote token 0x0000000a at off="
-            + hx(fx.off_dt_struct),
-            bad_line,
+            COPIED,
+            exact(b"JeiOS/aarch64: dtb-bad test: wrote token 0x0000000a at off="
+                  + hx(fx.off_dt_struct)),
+            exact(bad_line),
         ]
     else:
         markers += dtb_good_markers()
-        markers += VECTOR_TEST_MARKERS if args.vector_test else [TERM_DEFAULT]
-    final_marker = markers[-1]
+        markers += VECTOR_TEST_MARKERS if args.vector_test else [exact(TERM_DEFAULT)]
+    # Every mode ends on a fixed (exact) line; that line is the terminal marker.
+    final_line = markers[-1][0]
     # Stop early (instead of burning the whole timeout) once the run can no
     # longer PASS: outside --dtb-bad any FATAL means the kernel halted on an
     # error path; in --dtb-bad the forbidden "validated" marker means the
@@ -451,8 +528,8 @@ def main():
     print("cmd:   " + " ".join(cmd))
 
     try:
-        out, early = run_qemu(cmd, serial_path, final_marker, early_stop,
-                              args.timeout)
+        out, early, err = run_qemu(cmd, serial_path, final_line, early_stop,
+                                   args.timeout)
     finally:
         if args.log:
             print(f"log:   {serial_path}")
@@ -465,12 +542,14 @@ def main():
     sys.stdout.write(out.decode("ascii", "replace"))
     sys.stdout.write("\n")
 
-    # Everything below judges the FINAL log (re-read after QEMU was killed).
+    # Everything below judges the FINAL log (re-read after QEMU was killed)
+    # and the final stderr. stderr first: a QEMU-level error voids the run.
+    check_stderr(err)
     if args.dtb_bad:
         # Exactly one FATAL, and it must be the expected parser rejection.
         # Checked over the raw log so a FATAL in a partial tail is also seen.
         fatal_lines = [line_of(ln) for ln in out.split(b"\n") if b"FATAL" in ln]
-        if fatal_lines != [line_of(bad_line)]:
+        if fatal_lines != [bad_line]:
             fail(f"--dtb-bad: expected exactly the BAD_TOKEN FATAL line, got "
                  f"{[ln.decode('ascii', 'replace') for ln in fatal_lines]}")
         for forbidden in (b"JeiOS/aarch64: dtb parsed", VALIDATED, TERM_DEFAULT):
@@ -479,10 +558,11 @@ def main():
     elif b"FATAL" in out:
         fail("FATAL marker present")
 
-    check_lines(out, final_marker)
-    check_ordered(out, markers)
+    check_lines(out, final_line)
+    lines, _ = split_lines(out)  # check_lines rejected any partial tail
+    check_ordered(lines, markers)
     if not args.dtb_bad:
-        pa = VALIDATED_RE.findall(out)
+        pa = [m.group(1) for m in map(VALIDATED_RE.fullmatch, lines) if m]
         if len(pa) != 1:
             fail(f"expected exactly one 'boot context validated pa_bits=N' line, "
                  f"found {len(pa)}")
@@ -491,7 +571,7 @@ def main():
         print(f"pa:    pa_bits={int(pa[0])} == expected")
     # In every mode the copy precedes the parse; its CRC is over the copy taken
     # BEFORE the dtb-bad injection, so it must match the fixture in all modes.
-    check_dtb_copied(out, fx)
+    check_dtb_copied(lines, fx)
 
     if early:
         # Defensive: an early stop means a FATAL / forbidden marker was seen,
