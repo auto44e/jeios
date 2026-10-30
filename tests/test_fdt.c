@@ -3002,6 +3002,268 @@ static void test_dup_before_value(void)
     }
 }
 
+/* Codex final review (round 7) finding 1: duplicate-before-value for every
+ * remaining consumed name that has a value rule. In each case the FIRST
+ * instance is valid and the repeat carries a value that would otherwise be its
+ * own error (BAD_RANGE / BAD_CELLS), so a value-first parser returns that error
+ * instead of DUPLICATE at the repeating PROP. */
+static void test_dup_before_value_r7(void)
+{
+    static const uint8_t twelve[12] = { 0, 0, 0, 0, 0x44, 0, 0, 0, 0, 0, 0, 0 };
+    static const uint8_t four[4] = { 0, 0, 0, 1 };
+    static const struct { const uint8_t *v; uint32_t len; } bad[] = {
+        { NULL, 0u }, { twelve, 12u },
+    };
+    uint32_t at;
+
+    for (uint32_t k = 0u; k < sizeof bad / sizeof bad[0]; k++) {
+        /* /chosen linux,initrd-start valid (4 and 8 bytes), then repeated
+         * with a bad length; the valid -end follows the repeat */
+        for (uint32_t sb = 4u; sb <= 8u; sb += 4u) {
+            b_reset();
+            root_open(2u, 2u);
+            mem("m", 2u, 2u, RAM_B, RAM_S);
+            b_begin("chosen");
+            b_be("linux,initrd-start", 0x44000000u, sb);
+            at = b_prop("linux,initrd-start", bad[k].v, bad[k].len);
+            b_be("linux,initrd-end", 0x44100000u, 4u);
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        }
+        /* /chosen linux,initrd-end valid, then repeated with a bad length,
+         * with -start before and after the pair */
+        for (uint32_t w = 0u; w < 2u; w++) {
+            b_reset();
+            root_open(2u, 2u);
+            mem("m", 2u, 2u, RAM_B, RAM_S);
+            b_begin("chosen");
+            if (w == 0u)
+                b_be("linux,initrd-start", 0x44000000u, 4u);
+            b_be("linux,initrd-end", 0x44100000u, 8u);
+            at = b_prop("linux,initrd-end", bad[k].v, bad[k].len);
+            if (w == 1u)
+                b_be("linux,initrd-start", 0x44000000u, 4u);
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        }
+        /* only one initrd property, repeated with a bad length: the repeat
+         * (walk-time, at the PROP) precedes the END_NODE "exactly one" check */
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        b_begin("chosen");
+        b_be("linux,initrd-start", 0x44000000u, 4u);
+        at = b_prop("linux,initrd-start", bad[k].v, bad[k].len);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        /* memory `reg` valid then repeated empty / 12-byte (not a multiple of
+         * the 16-byte 2/2 pair), device_type before and after */
+        for (uint32_t w = 0u; w < 2u; w++) {
+            b_reset();
+            root_open(2u, 2u);
+            b_begin("m");
+            if (w == 0u)
+                b_s("device_type", "memory");
+            b_reg1(2u, 2u, RAM_B, RAM_S);
+            at = b_prop("reg", bad[k].v, bad[k].len);
+            if (w == 1u)
+                b_s("device_type", "memory");
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        }
+        /* first memory `reg` malformed, then a valid repeat: reg is decoded at
+         * END_NODE, the repeat precedes it */
+        b_reset();
+        root_open(2u, 2u);
+        b_begin("m");
+        b_s("device_type", "memory");
+        b_prop("reg", bad[k].v, bad[k].len);
+        at = b_reg1(2u, 2u, RAM_B, RAM_S);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        /* /reserved-memory child `reg` valid then repeated bad; and bad then
+         * valid (child reg is decoded at the child's END_NODE) */
+        for (uint32_t w = 0u; w < 2u; w++) {
+            b_reset();
+            root_open(2u, 2u);
+            mem("m", 2u, 2u, RAM_B, RAM_S);
+            rm_open(2u, 2u);
+            b_begin("r");
+            if (w == 0u) {
+                b_reg1(2u, 2u, RAM_B + 0x1000u, 0x1000u);
+                at = b_prop("reg", bad[k].v, bad[k].len);
+            } else {
+                b_prop("reg", bad[k].v, bad[k].len);
+                at = b_reg1(2u, 2u, RAM_B + 0x1000u, 0x1000u);
+            }
+            b_end();
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        }
+    }
+    /* /reserved-memory `ranges` (empty, valid) then a NON-empty repeat; and a
+     * non-empty first `ranges` then an empty repeat (the ranges value is
+     * decided at the first child / END_NODE, the repeat precedes it); with a
+     * child and childless */
+    for (uint32_t w = 0u; w < 2u; w++) {
+        for (uint32_t c = 0u; c < 2u; c++) {
+            b_reset();
+            root_open(2u, 2u);
+            mem("m", 2u, 2u, RAM_B, RAM_S);
+            b_begin("reserved-memory");
+            b_u32("#address-cells", 2u);
+            b_u32("#size-cells", 2u);
+            if (w == 0u) {
+                b_empty("ranges");
+                at = b_prop("ranges", four, 4u);
+            } else {
+                b_prop("ranges", four, 4u);
+                at = b_empty("ranges");
+            }
+            if (c == 0u)
+                rm_child("r", 2u, 2u, RAM_B + 0x1000u, 0x1000u, false);
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        }
+    }
+    /* rsv child `size` (8 bytes) then repeated empty / 4-byte; `no-map`
+     * (empty) then repeated non-empty; on an okay and a disabled child
+     * (DUPLICATE regardless of status) */
+    for (uint32_t d = 0u; d < 2u; d++) {
+        for (uint32_t k = 0u; k < 3u; k++) {
+            b_reset();
+            root_open(2u, 2u);
+            mem("m", 2u, 2u, RAM_B, RAM_S);
+            rm_open(2u, 2u);
+            b_begin("r");
+            if (d == 1u)
+                b_s("status", "disabled");
+            if (k == 0u) {
+                b_be("size", 0x1000u, 8u);
+                at = b_empty("size");
+            } else if (k == 1u) {
+                b_be("size", 0x1000u, 8u);
+                at = b_prop("size", four, 4u);
+            } else {
+                b_reg1(2u, 2u, RAM_B + 0x1000u, 0x1000u);
+                b_empty("no-map");
+                at = b_prop("no-map", four, 4u);
+            }
+            b_end();
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_DUPLICATE, I.off_st + at);
+        }
+    }
+}
+
+/* Codex final review (round 7) finding 2: device_type is consumed on EVERY
+ * depth-2 node, including the special /chosen and /reserved-memory nodes, so a
+ * non-NUL-terminated (len 4 "okay") or empty value there -> BAD_STRING at that
+ * PROP (walk-time), ahead of any later violation in the node. */
+static void test_special_devtype_scope(void)
+{
+    static const uint8_t nonul[4] = { 'o', 'k', 'a', 'y' };
+    uint32_t at;
+
+    for (uint32_t k = 0u; k < 2u; k++) {
+        const uint8_t *v = k == 0u ? NULL : nonul;
+        uint32_t vl = k == 0u ? 0u : 4u;
+        for (uint32_t w = 0u; w < 2u; w++) {
+            /* /chosen: device_type first, or after a valid initrd pair */
+            b_reset();
+            root_open(2u, 2u);
+            mem("m", 2u, 2u, RAM_B, RAM_S);
+            b_begin("chosen");
+            if (w == 0u)
+                at = b_prop("device_type", v, vl);
+            b_be("linux,initrd-start", 0x44000000u, 4u);
+            b_be("linux,initrd-end", 0x44100000u, 4u);
+            if (w == 1u)
+                at = b_prop("device_type", v, vl);
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_BAD_STRING, I.off_st + at);
+            /* /reserved-memory: device_type first (before its cells), or
+             * after cells/ranges with a child following */
+            b_reset();
+            root_open(2u, 2u);
+            mem("m", 2u, 2u, RAM_B, RAM_S);
+            if (w == 0u) {
+                b_begin("reserved-memory");
+                at = b_prop("device_type", v, vl);
+                b_u32("#address-cells", 2u);
+                b_u32("#size-cells", 2u);
+                b_empty("ranges");
+            } else {
+                rm_open(2u, 2u);
+                at = b_prop("device_type", v, vl);
+            }
+            rm_child("r", 2u, 2u, RAM_B + 0x1000u, 0x1000u, false);
+            b_end();
+            root_close();
+            b_finish();
+            EXPECT_AT(JE_FDT_BAD_STRING, I.off_st + at);
+        }
+        /* childless /chosen with only the bad device_type; childless
+         * /reserved-memory whose cells are also MISSING (BAD_CELLS at its
+         * END_NODE would come later) */
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        b_begin("chosen");
+        at = b_prop("device_type", v, vl);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_STRING, I.off_st + at);
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        b_begin("reserved-memory");
+        at = b_prop("device_type", v, vl);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT_AT(JE_FDT_BAD_STRING, I.off_st + at);
+    }
+    /* positive controls: a terminated non-"memory" device_type on both special
+     * nodes is OK and both still take effect */
+    b_reset();
+    root_open(2u, 2u);
+    mem("m", 2u, 2u, RAM_B, RAM_S);
+    b_begin("chosen");
+    b_s("device_type", "okay");
+    b_be("linux,initrd-start", 0x44000000u, 4u);
+    b_be("linux,initrd-end", 0x44100000u, 4u);
+    b_end();
+    rm_open(2u, 2u);
+    b_s("device_type", "okay");
+    rm_child("r", 2u, 2u, RAM_B + 0x1000u, 0x1000u, false);
+    b_end();
+    root_close();
+    b_finish();
+    EXPECT(JE_FDT_OK);
+    CHECK(C.has_initrd && C.initrd.base == 0x44000000u);
+    CHECK(C.rsv_count == 1u && C.rsv[0].base == RAM_B + 0x1000u);
+}
+
 /* Claude parser review probes 1a-1g: a malformed status / device_type VALUE is
  * validated only where it is consumed (device_type on depth-2 nodes; status on
  * memory nodes and /reserved-memory children). Everywhere else -> OK. */
@@ -5005,6 +5267,8 @@ int main(void)
     test_status_values();
     test_bad_cells();
     test_dup_before_value();
+    test_dup_before_value_r7();
+    test_special_devtype_scope();
     test_unconsumed_strings();
     test_memory_status_timing();
     test_rsv_cells_deferral();
