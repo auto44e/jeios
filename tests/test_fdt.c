@@ -2779,6 +2779,76 @@ static void test_bad_cells(void)
         b_finish();
         EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + at);
     }
+    /* round-6: a cells property of length 8 whose FIRST word is a valid value
+     * (equal to root's) is still BAD_CELLS (len must be exactly 4). Kills a
+     * `len == 4` -> `len >= 4` mutant that would read only the first word.
+     * The second word is 0 or 2, so neither "first word" nor "last word"
+     * readings of an over-long value can pass. */
+    {
+        static const uint8_t two_lo[8] = { 0, 0, 0, 2, 0, 0, 0, 0 };
+        static const uint8_t two_hi[8] = { 0, 0, 0, 2, 0, 0, 0, 2 };
+        for (uint32_t v = 0u; v < 2u; v++) {
+            const uint8_t *eight = v == 0u ? two_lo : two_hi;
+            /* root: rejected at the offending PROP token itself */
+            for (uint32_t w = 0u; w < 2u; w++) {
+                uint32_t at;
+                b_reset();
+                b_begin("");
+                if (w == 0u) {
+                    at = b_prop("#address-cells", eight, 8u);
+                    b_u32("#size-cells", 2u);
+                } else {
+                    b_u32("#address-cells", 2u);
+                    at = b_prop("#size-cells", eight, 8u);
+                }
+                mem("m", 2u, 2u, RAM_B, RAM_S);
+                root_close();
+                b_finish();
+                EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + at);
+            }
+            /* /reserved-memory under a 2/2 root: w selects which cell property
+             * is over-long; c == 0: childless (err_off = its END_NODE),
+             * c == 1: one child valid for 2/2 (err_off = child BEGIN_NODE) */
+            for (uint32_t w = 0u; w < 2u; w++) {
+                for (uint32_t c = 0u; c < 2u; c++) {
+                    uint32_t at;
+                    b_reset();
+                    root_open(2u, 2u);
+                    mem("m", 2u, 2u, RAM_B, RAM_S);
+                    b_begin("reserved-memory");
+                    if (w == 0u) {
+                        b_prop("#address-cells", eight, 8u);
+                        b_u32("#size-cells", 2u);
+                    } else {
+                        b_u32("#address-cells", 2u);
+                        b_prop("#size-cells", eight, 8u);
+                    }
+                    b_empty("ranges");
+                    if (c == 0u) {
+                        at = b_end();
+                    } else {
+                        at = b_begin("r");
+                        b_reg1(2u, 2u, RAM_B, 0x1000u);
+                        b_end();
+                        b_end();
+                    }
+                    root_close();
+                    b_finish();
+                    EXPECT_AT(JE_FDT_BAD_CELLS, I.off_st + at);
+                }
+            }
+        }
+        /* positive control: the same trees with len-4 <2> cells parse OK */
+        b_reset();
+        root_open(2u, 2u);
+        mem("m", 2u, 2u, RAM_B, RAM_S);
+        rm_open(2u, 2u);
+        rm_child("r", 2u, 2u, RAM_B, 0x1000u, false);
+        b_end();
+        root_close();
+        b_finish();
+        EXPECT(JE_FDT_OK);
+    }
 }
 
 /* ------------------------------------------------------------------------- */
