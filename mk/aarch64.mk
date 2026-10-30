@@ -24,6 +24,14 @@ endif
 ifeq ($(ARM_VECTOR_TEST),1)
 ARM_BUILD   := build/aarch64-vectest
 endif
+# Optional parser fault-injection build (issue #52): after the DTB copy and
+# before the parse, overwrite the first struct token IN THE COPY with the unknown
+# token 0x0000000A; the parser must reject with BAD_TOKEN and the boot must halt
+# before "boot context validated". `make aarch64 ARM_DTB_BAD=1`. Separate build
+# dir so the toggle never reuses stale objects.
+ifeq ($(ARM_DTB_BAD),1)
+ARM_BUILD   := build/aarch64-dtbbad
+endif
 
 # Freestanding, no PIC/stack-protector, STRICT alignment (pre-MMU RAM is
 # Device-nGnRnE so unaligned accesses fault), and general-regs-only (a stray
@@ -46,6 +54,10 @@ endif
 ifeq ($(ARM_VECTOR_TEST),1)
 ARM_CFLAGS  += -DJE_ARM_VECTOR_TEST
 ARM_ASFLAGS += -DJE_ARM_VECTOR_TEST
+endif
+ifeq ($(ARM_DTB_BAD),1)
+ARM_CFLAGS  += -DJE_ARM_DTB_BAD
+ARM_ASFLAGS += -DJE_ARM_DTB_BAD
 endif
 
 ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/vectors.o $(ARM_BUILD)/fdt.o
@@ -79,9 +91,13 @@ aarch64: $(ARM_BUILD)/Image
 	@echo "aarch64 Image: $$(wc -c <$(ARM_BUILD)/Image) bytes"
 
 # Boot the Image on the pinned QEMU target and assert the ordered markers. The
-# harness captures serial to a FILE (stdout races the timeout kill), rejects any
-# FATAL line, requires the terminal marker, records image SHA-256 + tool
-# versions + the exact command, and SKIPs (never PASSes) if the toolchain or
-# qemu-system-aarch64 is absent. Not wired into `make check`.
+# harness captures serial to a FILE (stdout races the timeout kill) — always
+# $(ARM_BUILD)/serial.log so CI can upload it — rejects any unexpected FATAL
+# line, requires the DTB markers (incl. a CRC32 match against the committed
+# fixture) and the terminal marker, records image SHA-256 + tool versions + the
+# exact command, and SKIPs (never PASSes) if the toolchain or
+# qemu-system-aarch64 is absent — unless ARM_REQUIRE=1, which turns every SKIP
+# into a FAIL (remote CI). Not wired into `make check`.
+# Variable names ARM_DTB_BAD / ARM_REQUIRE are frozen (CI uses them).
 smoke-aarch64: $(ARM_BUILD)/Image
-	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,)
+	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --log $(ARM_BUILD)/serial.log $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_REQUIRE)),--require,)

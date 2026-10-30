@@ -13,6 +13,8 @@
  *     this only sets the field — behavioral enforcement is the MMU PR);
  *   - write SCTLR_EL1 to a DEFINED value (MMU/caches off, SP-alignment SA=1,
  *     RES1 bits preserved) so SP-alignment faulting is deterministic;
+ *   - guard the DTB pointer (nonzero, 8-aligned, conservative extent disjoint
+ *     from the image) BEFORE BSS is touched, since BSS holds the copy buffer;
  *   - clear BSS with plain aligned stores (NO DC ZVA: pre-MMU RAM is
  *     Device-nGnRnE, so unaligned / cache-maintenance ops fault);
  *   - stash the DTB pointer into .data (survives, unlike a .bss slot);
@@ -111,6 +113,41 @@ real_start:
     msr     SCTLR_EL1, x0
     isb
 
+    /* ---- DTB pointer guard (issue #52; mp1-dtb debate item 8). MUST run before
+     * the BSS clear (and before the JE_ARM_BSS_CHECK pattern fill): BSS now holds
+     * the 64 KiB DTB copy buffer, so a firmware DTB lying inside our image extent
+     * would be destroyed by the clear before C could copy it. Conservative test
+     * on the saved x0 (x19), WITHOUT dereferencing it (we do not read firmware
+     * memory here; the header read happens in C once vectors are installed):
+     *   - x0 != 0                   (boot protocol: a DTB is always passed);
+     *   - x0 8-byte aligned         (arm64 booting.rst requirement);
+     *   - NOT (x0 < IMAGE_END && x0 + JE_FDT_MAX_TOTAL > _text): the largest DTB
+     *     the parser will ever accept (totalsize cap, 2 MiB) placed at x0 must be
+     *     disjoint from the whole image extent [_text, _end) — _end covers .data,
+     *     .bss (incl. the copy buffer) and the boot stack (linker.ld). Using the
+     *     cap instead of the real totalsize is deliberately conservative: it
+     *     rejects some valid-but-close placements, never accepts an overlap.
+     * Overflow: the addition is only evaluated when x0 < _end, and _end is a
+     * small link-time address (~0x4009xxxx), so x0 + 2 MiB cannot wrap there.
+     * JE_ARM_DTB_GUARD_SPAN must equal JE_FDT_MAX_TOTAL (fdt.h is C-only, so it
+     * is duplicated here; main.c _Static_asserts the C side of that equality).
+     * On violation: bounded DR-only FATAL marker + halt (el_fatal pattern). ---- */
+#define JE_ARM_DTB_GUARD_SPAN 0x200000   /* == JE_FDT_MAX_TOTAL (2 MiB) */
+    cbz     x19, dtb_fatal
+    tst     x19, #7
+    b.ne    dtb_fatal
+    adrp    x0, _end
+    add     x0, x0, #:lo12:_end          /* IMAGE_END (exclusive) */
+    cmp     x19, x0
+    b.hs    9f                           /* x0 >= IMAGE_END: disjoint */
+    adrp    x1, _text
+    add     x1, x1, #:lo12:_text
+    movz    x2, #(JE_ARM_DTB_GUARD_SPAN >> 16), lsl #16
+    add     x2, x19, x2                  /* x0 + MAX_TOTAL (no wrap, see above) */
+    cmp     x2, x1
+    b.hi    dtb_fatal                    /* x0 + MAX_TOTAL > _text: overlap */
+9:
+
     /* ---- Clear BSS with plain aligned 16-byte stores. __bss_start/__bss_end
      * are 16-byte aligned by the linker script. No DC ZVA (Device memory). ---- */
     adrp    x0, __bss_start
@@ -181,5 +218,20 @@ load_fatal:
     b       8b
 load_fatal_msg:
     .asciz  "JeiOS/aarch64: FATAL load address != link address; halted\r\n"
+
+    /* ---- DTB pointer invalid (NULL / misaligned) or the conservative DTB
+     * extent overlaps the image. Bounded DR-only FATAL marker + halt; reached
+     * before the BSS clear, so nothing in BSS may be relied on. ---- */
+dtb_fatal:
+    movz    x1, #0x0900, lsl #16
+    adr     x2, dtb_fatal_msg
+10: ldrb    w3, [x2], #1
+    cbz     w3, 11f
+    str     w3, [x1]
+    b       10b
+11: wfe
+    b       11b
+dtb_fatal_msg:
+    .asciz  "JeiOS/aarch64: FATAL dtb pointer invalid or overlaps image; halted\r\n"
 
 .section .note.GNU-stack, "", @progbits

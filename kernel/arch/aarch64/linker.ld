@@ -47,6 +47,11 @@ SECTIONS
     }
 
     . = ALIGN(16);
+    /* _end is IMAGE_END: the exclusive end of the WHOLE in-memory extent
+     * (file-backed + NOLOAD .bss incl. the 64 KiB DTB copy buffer + boot stack).
+     * boot.S rejects a DTB pointer whose conservative extent intersects
+     * [_text, _end), and main.c passes [_text, _end) to je_boot_ctx_check as the
+     * kernel_image fact (issue #52). */
     _end = .;
     __image_size = _end - _text;
 
@@ -89,3 +94,9 @@ ASSERT(__stack_bottom >= __bss_end, "stack must follow BSS (no overlap)");
 /* ...and inside the published in-memory image extent. */
 ASSERT(__stack_top <= _end, "stack must lie within the image extent");
 ASSERT(__bss_end   <= _end, "BSS must lie within the image extent");
+/* The DTB copy buffer (main.c, issue #52) must lie in the cleared BSS, hence
+ * inside [_text, _end) — the extent the boot.S guard and the kernel_image fact
+ * cover — and be 16-byte aligned. */
+ASSERT(je_arm_dtb_copy >= __bss_start, "DTB copy buffer must be in BSS");
+ASSERT(je_arm_dtb_copy + 0x10000 <= __bss_end, "DTB copy buffer (64 KiB) must be in BSS");
+ASSERT((je_arm_dtb_copy & 0xf) == 0, "DTB copy buffer must be 16-byte aligned");
