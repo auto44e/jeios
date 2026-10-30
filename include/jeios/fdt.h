@@ -248,7 +248,8 @@ je_fdt_status je_fdt_copy_plan(const uint8_t hdr[JE_FDT_HEADER_SIZE],
  *     `reg` decode. device_type on a depth-3 node is duplicate-tracked (if
  *     tracked) but its value is not inspected. A nameoff whose string has no
  *     NUL before the strings-block end is a bad nameoff (PROP token). Post-walk
- *     "initrd not inside one RAM range" -> err_off = the linux,initrd-end PROP.
+ *     "initrd not inside one RAM range" and walk-time end <= start -> err_off =
+ *     the linux,initrd-end PROP.
  *   - A repeat in an UNTRACKED node is OK: nothing there is consumed.
  *   - A walk-time BAD_RANGE/BAD_CELLS from a `reg` (memory or /reserved-memory
  *     child) has err_off = that `reg` PROP token.
