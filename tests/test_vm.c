@@ -296,7 +296,11 @@ static void test_admission(void)
     const size_t initial_free = 253u;
     uint32_t index;
     size_t before;
+    size_t i;
+    bool seen[JE_VM_MAX_PROCESSES] = {false};
 
+    /* The fixture pool must hold P full builds, or BUSY would be masked by NOMEM. */
+    assert((size_t)JE_VM_MAX_PROCESSES * need <= initial_free);
     init_blob();
 
     reset_vm(0u);
@@ -307,15 +311,27 @@ static void test_admission(void)
     assert(pages.free_count == before);
     assert(all_processes_free(&vm));
 
+    /* ADR 0010 D2: exactly JE_VM_MAX_PROCESSES builds are admitted, each in a
+     * distinct slot; the (P+1)-th is BUSY with no page or process-table change. */
     reset_vm(0u);
-    assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &index) == JE_OK);
-    assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &index) == JE_OK);
+    for (i = 0u; i < JE_VM_MAX_PROCESSES; ++i) {
+        index = UINT32_MAX;
+        assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &index) == JE_OK);
+        assert(index < JE_VM_MAX_PROCESSES);
+        assert(!seen[index]);
+        seen[index] = true;
+    }
+    assert(pages.free_count == initial_free - (size_t)JE_VM_MAX_PROCESSES * need);
     before = pages.free_count;
+    memcpy(procs_before, vm.procs, sizeof procs_before);
     assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &index) ==
            JE_ERR_BUSY);
     assert(pages.free_count == before);
-    assert(je_vm_destroy(&vm, 0u) == JE_OK);
-    assert(je_vm_destroy(&vm, 1u) == JE_OK);
+    assert(memcmp(vm.procs, procs_before, sizeof procs_before) == 0);
+    for (i = 0u; i < JE_VM_MAX_PROCESSES; ++i)
+        assert(je_vm_destroy(&vm, (uint32_t)i) == JE_OK);
+    assert(pages.free_count == initial_free);
+    assert(all_processes_free(&vm));
 
     reset_vm(initial_free - need + 1u);
     before = pages.free_count;
@@ -514,6 +530,310 @@ static void test_teardown_hook(void)
     assert(all_processes_free(&vm));
 }
 
+/* ADR 0010 D2: the two-process isolation property above, at the full P. Every
+ * pair of the P concurrently READY processes has distinct roots and disjoint
+ * extents, each passes the audit, and destroying all returns every page. */
+static void test_all_processes_isolated(void)
+{
+    const je_vm_image image = image_fixture();
+    const size_t initial_free = 253u;
+    uint32_t idx[JE_VM_MAX_PROCESSES];
+    size_t a, b, i, j;
+
+    init_blob();
+    reset_vm(0u);
+    for (a = 0u; a < JE_VM_MAX_PROCESSES; ++a) {
+        assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &idx[a]) == JE_OK);
+        assert(idx[a] < JE_VM_MAX_PROCESSES);
+    }
+    assert(pages.free_count == initial_free - (size_t)JE_VM_MAX_PROCESSES * build_need());
+    for (a = 0u; a < JE_VM_MAX_PROCESSES; ++a) {
+        assert(je_vm_audit(&vm, idx[a]) == JE_OK);
+        for (b = a + 1u; b < JE_VM_MAX_PROCESSES; ++b) {
+            const je_vm_process *pa = &vm.procs[idx[a]];
+            const je_vm_process *pb = &vm.procs[idx[b]];
+
+            assert(idx[a] != idx[b]);
+            assert(pa->root != pb->root);
+            assert(pa->kstack_physical != pb->kstack_physical);
+            for (i = 0u; i < pa->extent_count; ++i)
+                for (j = 0u; j < pb->extent_count; ++j)
+                    assert(!extents_overlap(&pa->extents[i], &pb->extents[j]));
+        }
+    }
+    for (a = 0u; a < JE_VM_MAX_PROCESSES; ++a)
+        assert(je_vm_destroy(&vm, idx[a]) == JE_OK);
+    assert(pages.free_count == initial_free);
+    assert(all_processes_free(&vm));
+}
+
+/* Fill `t` with SELF handles and prove it admits exactly `quota` LIVE handles:
+ * the table reports the quota, allocation succeeds until live == quota, the
+ * next one is QUOTA (not NOSLOTS: quota < capacity) with *out 0 and live
+ * unchanged, and closing one makes exactly one more admissible. Does not assume
+ * how many handles the builder seeds (it may seed none). */
+static void assert_admits_exactly(je_handle_table *t, uint32_t quota)
+{
+    je_handle h = 0u;
+    je_handle last = 0u;
+    uint32_t start;
+    uint32_t k;
+
+    assert(t->capacity == JE_VM_HANDLE_CAP);
+    assert(t->quota == quota);
+    start = t->live;
+    assert(start <= quota);
+    for (k = start; k < quota; ++k) {
+        assert(je_handle_alloc(t, t, JE_HANDLE_OBJ_SELF, 0x1u, &h) == JE_HANDLE_OK);
+        assert(h != 0u);
+        last = h;
+    }
+    assert(t->live == quota);
+    h = 1u;
+    assert(je_handle_alloc(t, t, JE_HANDLE_OBJ_SELF, 0x1u, &h) == JE_HANDLE_QUOTA);
+    assert(h == 0u);
+    assert(t->live == quota);
+    if (last != 0u) {
+        assert(je_handle_close(t, last) == JE_HANDLE_OK);
+        assert(t->live == quota - 1u);
+        assert(je_handle_alloc(t, t, JE_HANDLE_OBJ_SELF, 0x1u, &h) == JE_HANDLE_OK);
+        assert(je_handle_alloc(t, t, JE_HANDLE_OBJ_SELF, 0x1u, &h) == JE_HANDLE_QUOTA);
+        assert(t->live == quota);
+    }
+}
+
+/* One rejected je_vm_build_quota call: INVALID, and NO state change — pages,
+ * every process slot, and zero backend (fallible-op) attempts. */
+static void assert_quota_rejected(const je_vm_image *image, int nx,
+                                  uint32_t quota)
+{
+    uint32_t index = UINT32_MAX;
+
+    pages_before = pages;
+    memcpy(procs_before, vm.procs, sizeof procs_before);
+    je_vm_fake_fail_at(0u);   /* reset the attempt counter, inject nothing */
+    assert(je_vm_build_quota(&vm, image, blob, sizeof blob, nx, quota, &index) ==
+           JE_ERR_INVALID);
+    assert(je_vm_fake_fallible_count() == 0u);
+    assert(memcmp(&pages, &pages_before, sizeof pages) == 0);
+    assert(memcmp(vm.procs, procs_before, sizeof procs_before) == 0);
+}
+
+/* ADR 0010 D2 / vm.h: handle_quota outside 1..JE_VM_HANDLE_QUOTA_MAX is INVALID,
+ * checked FIRST. Negative cases run first so they also hold against the
+ * fail-closed stub; the positive cases need the real implementation. */
+static void test_build_quota_range(void)
+{
+    const je_vm_image good = image_fixture();
+    je_vm_image bad_version = image_fixture();
+    je_vm_image bad_segments = image_fixture();
+    const uint32_t bad[] = { 0u, JE_VM_HANDLE_QUOTA_MAX + 1u, JE_VM_HANDLE_CAP,
+                             UINT32_MAX };
+    size_t i;
+
+    bad_version.version = JE_VM_IMAGE_VERSION + 1u;   /* would be UNSUPPORTED */
+    bad_segments.segment_count = 0u;                  /* would be INVALID */
+    _Static_assert(JE_VM_HANDLE_QUOTA_MAX == JE_VM_HANDLE_CAP - 1u, "quota max");
+    _Static_assert(JE_VM_HANDLE_QUOTA_DEFAULT >= 1u &&
+                   JE_VM_HANDLE_QUOTA_DEFAULT <= JE_VM_HANDLE_QUOTA_MAX, "quota default");
+    init_blob();
+    reset_vm(0u);
+    /* Control: these inputs really do take the other error paths with a valid
+     * quota through je_vm_build, so INVALID below is the range check winning. */
+    {
+        uint32_t index = UINT32_MAX;
+        assert(je_vm_build(&vm, &good, blob, sizeof blob, 0, &index) == JE_ERR_UNSUPPORTED);
+        assert(je_vm_build(&vm, &bad_version, blob, sizeof blob, 1, &index) ==
+               JE_ERR_UNSUPPORTED);
+        assert(all_processes_free(&vm));
+    }
+    for (i = 0u; i < sizeof bad / sizeof bad[0]; ++i) {
+        assert_quota_rejected(&good, 1, bad[i]);
+        assert_quota_rejected(&good, 0, bad[i]);          /* beats no-NX */
+        assert_quota_rejected(&bad_version, 1, bad[i]);   /* beats UNSUPPORTED */
+        assert_quota_rejected(&bad_segments, 1, bad[i]);  /* beats image INVALID */
+        assert(all_processes_free(&vm));
+    }
+    /* With every slot READY, an out-of-range quota is still INVALID (not BUSY). */
+    {
+        uint32_t index;
+        for (i = 0u; i < JE_VM_MAX_PROCESSES; ++i)
+            assert(je_vm_build(&vm, &good, blob, sizeof blob, 1, &index) == JE_OK);
+        assert_quota_rejected(&good, 1, 0u);
+        assert_quota_rejected(&good, 1, JE_VM_HANDLE_QUOTA_MAX + 1u);
+        for (i = 0u; i < JE_VM_MAX_PROCESSES; ++i)
+            assert(je_vm_destroy(&vm, (uint32_t)i) == JE_OK);
+    }
+
+    /* In-range boundary quotas are NOT rejected by the range check: they reach
+     * the ordinary checks (no NX -> UNSUPPORTED, full table -> BUSY). */
+    {
+        uint32_t index = UINT32_MAX;
+        size_t before = pages.free_count;
+        assert(je_vm_build_quota(&vm, &good, blob, sizeof blob, 0, 1u, &index) ==
+               JE_ERR_UNSUPPORTED);
+        assert(je_vm_build_quota(&vm, &good, blob, sizeof blob, 0,
+                                 JE_VM_HANDLE_QUOTA_MAX, &index) == JE_ERR_UNSUPPORTED);
+        assert(pages.free_count == before);
+        assert(all_processes_free(&vm));
+    }
+}
+
+static void test_build_quota_admits(void)
+{
+    const je_vm_image image = image_fixture();
+    const size_t initial_free = 253u;
+    uint32_t index;
+
+    init_blob();
+
+    /* je_vm_build == je_vm_build_quota(DEFAULT): exactly 15 live handles. */
+    _Static_assert(JE_VM_HANDLE_QUOTA_DEFAULT == 15u, "M3b default quota unchanged");
+    reset_vm(0u);
+    assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &index) == JE_OK);
+    assert_admits_exactly(&vm.procs[index].htable, JE_VM_HANDLE_QUOTA_DEFAULT);
+    assert(je_vm_destroy(&vm, index) == JE_OK);
+    assert(pages.free_count == initial_free);
+
+    /* Same build through the quota entry point at DEFAULT: same observable
+     * result (state, entry, pages charged, table shape). */
+    {
+        je_vm_process via_build;
+        uint32_t i2;
+
+        reset_vm(0u);
+        assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &index) == JE_OK);
+        via_build = vm.procs[index];
+        reset_vm(0u);
+        assert(je_vm_build_quota(&vm, &image, blob, sizeof blob, 1,
+                                 JE_VM_HANDLE_QUOTA_DEFAULT, &i2) == JE_OK);
+        assert(i2 == index);
+        assert(vm.procs[i2].state == via_build.state);
+        assert(vm.procs[i2].entry == via_build.entry);
+        assert(vm.procs[i2].extent_count == via_build.extent_count);
+        assert(vm.procs[i2].journal_count == via_build.journal_count);
+        assert(vm.procs[i2].held_kstack == via_build.held_kstack);
+        assert(vm.procs[i2].htable.capacity == via_build.htable.capacity);
+        assert(vm.procs[i2].htable.quota == via_build.htable.quota);
+        assert(vm.procs[i2].htable.live == via_build.htable.live);
+        assert(pages.free_count == initial_free - build_need());
+        assert(je_vm_audit(&vm, i2) == JE_OK);
+        assert_admits_exactly(&vm.procs[i2].htable, JE_VM_HANDLE_QUOTA_DEFAULT);
+        assert(je_vm_destroy(&vm, i2) == JE_OK);
+    }
+
+    /* Boundaries: quota 1 and quota MAX each build normally and admit exactly
+     * that many live handles. */
+    {
+        const uint32_t q[] = { 1u, JE_VM_HANDLE_QUOTA_MAX };
+        size_t i;
+
+        for (i = 0u; i < sizeof q / sizeof q[0]; ++i) {
+            reset_vm(0u);
+            index = UINT32_MAX;
+            assert(je_vm_build_quota(&vm, &image, blob, sizeof blob, 1, q[i],
+                                     &index) == JE_OK);
+            assert(index < JE_VM_MAX_PROCESSES);
+            assert(vm.procs[index].state == JE_VM_READY);
+            assert(pages.free_count == initial_free - build_need());
+            assert(je_vm_audit(&vm, index) == JE_OK);
+            assert_admits_exactly(&vm.procs[index].htable, q[i]);
+            assert(je_vm_destroy(&vm, index) == JE_OK);
+            assert(pages.free_count == initial_free);
+            assert(all_processes_free(&vm));
+        }
+    }
+}
+
+/* P concurrent builds, each with a different quota spanning 1..MAX: every table
+ * gets its own quota, filling one table does not change any other, and a slot
+ * reused after destroy takes the NEW build's quota (no stale quota). */
+static void test_build_quota_independent(void)
+{
+    const je_vm_image image = image_fixture();
+    uint32_t idx[JE_VM_MAX_PROCESSES];
+    uint32_t q[JE_VM_MAX_PROCESSES];
+    uint32_t live_before[JE_VM_MAX_PROCESSES];
+    size_t a, b;
+
+    _Static_assert(JE_VM_MAX_PROCESSES >= 2u, "independence needs two processes");
+    _Static_assert(JE_VM_MAX_PROCESSES <= JE_VM_HANDLE_QUOTA_MAX, "distinct quotas");
+    init_blob();
+    reset_vm(0u);
+    for (a = 0u; a < JE_VM_MAX_PROCESSES; ++a) {
+        /* q[0] = 1, q[P-1] = MAX, strictly increasing in between. */
+        q[a] = 1u + (uint32_t)(a * (JE_VM_HANDLE_QUOTA_MAX - 1u) /
+                               (JE_VM_MAX_PROCESSES - 1u));
+        if (a > 0u) assert(q[a] > q[a - 1u]);
+        assert(je_vm_build_quota(&vm, &image, blob, sizeof blob, 1, q[a],
+                                 &idx[a]) == JE_OK);
+    }
+    assert(q[0] == 1u && q[JE_VM_MAX_PROCESSES - 1u] == JE_VM_HANDLE_QUOTA_MAX);
+    for (a = 0u; a < JE_VM_MAX_PROCESSES; ++a)
+        assert(vm.procs[idx[a]].htable.quota == q[a]);
+    /* Fill in reverse so a later (smaller) quota is checked after a larger one
+     * was filled. */
+    for (a = JE_VM_MAX_PROCESSES; a-- > 0u;) {
+        for (b = 0u; b < JE_VM_MAX_PROCESSES; ++b)
+            live_before[b] = vm.procs[idx[b]].htable.live;
+        assert_admits_exactly(&vm.procs[idx[a]].htable, q[a]);
+        for (b = 0u; b < JE_VM_MAX_PROCESSES; ++b) {
+            if (b == a) continue;
+            assert(vm.procs[idx[b]].htable.live == live_before[b]);
+            assert(vm.procs[idx[b]].htable.quota == q[b]);
+        }
+    }
+    /* Reuse the quota-MAX slot with quota 1 and the quota-1 slot via je_vm_build. */
+    {
+        const size_t hi = JE_VM_MAX_PROCESSES - 1u;
+        uint32_t re;
+
+        assert(je_vm_destroy(&vm, idx[hi]) == JE_OK);
+        assert(je_vm_build_quota(&vm, &image, blob, sizeof blob, 1, 1u, &re) == JE_OK);
+        assert(re == idx[hi]);
+        assert_admits_exactly(&vm.procs[re].htable, 1u);
+        assert(je_vm_destroy(&vm, idx[0]) == JE_OK);
+        assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &re) == JE_OK);
+        assert(re == idx[0]);
+        assert_admits_exactly(&vm.procs[re].htable, JE_VM_HANDLE_QUOTA_DEFAULT);
+    }
+    for (a = 0u; a < JE_VM_MAX_PROCESSES; ++a)
+        assert(je_vm_destroy(&vm, idx[a]) == JE_OK);
+    assert(pages.free_count == 253u);
+    assert(all_processes_free(&vm));
+}
+
+/* Rollback through the quota entry point (non-default quota): every injected
+ * backend failure leaves pages and every process slot byte-identical. */
+static void test_build_quota_rollback(void)
+{
+    const je_vm_image image = image_fixture();
+    size_t fallible_count;
+    unsigned failure;
+    uint32_t index;
+
+    init_blob();
+    reset_vm(0u);
+    je_vm_fake_fail_at(0u);
+    assert(je_vm_build_quota(&vm, &image, blob, sizeof blob, 1,
+                             JE_VM_HANDLE_QUOTA_MAX, &index) == JE_OK);
+    fallible_count = je_vm_fake_fallible_count();
+    assert(fallible_count > 0u && fallible_count <= (size_t)UINT_MAX);
+    assert(je_vm_destroy(&vm, index) == JE_OK);
+    for (failure = 1u; failure <= (unsigned)fallible_count; ++failure) {
+        reset_vm(0u);
+        pages_before = pages;
+        memcpy(procs_before, vm.procs, sizeof procs_before);
+        je_vm_fake_fail_at(failure);
+        index = UINT32_MAX;
+        assert(je_vm_build_quota(&vm, &image, blob, sizeof blob, 1,
+                                 JE_VM_HANDLE_QUOTA_MAX, &index) != JE_OK);
+        assert(all_processes_free(&vm));
+        assert(memcmp(&pages, &pages_before, sizeof pages) == 0);
+        assert(memcmp(vm.procs, procs_before, sizeof procs_before) == 0);
+    }
+}
+
 int main(void)
 {
     test_image_validation();
@@ -521,5 +841,10 @@ int main(void)
     test_build_audit_and_teardown();
     test_rollback();
     test_teardown_hook();
-    puts("vm: PASS (validation, admission, audit, permissions, zeroing, rollback, teardown, death-hook)");
+    test_all_processes_isolated();
+    test_build_quota_range();
+    test_build_quota_admits();
+    test_build_quota_independent();
+    test_build_quota_rollback();
+    puts("vm: PASS (validation, admission at P, audit, permissions, zeroing, rollback, teardown, death-hook, P-way isolation, handle quota)");
 }

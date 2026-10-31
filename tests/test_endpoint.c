@@ -7,11 +7,23 @@
  * kernel-only, exercised directly here).
  */
 #include <jeios/endpoint.h>
+#include <jeios/vm.h>   /* constants only: the per-process table shape */
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
-#define CAP 16u
-#define QUOTA 15u
+/* The local table mirrors a je_vm_build process table (ADR 0010 D2: capacity
+ * H, default quota 15), so a test that fills "a process's quota" fills the real
+ * one. Was 16/15. */
+#define CAP JE_VM_HANDLE_CAP
+#define QUOTA JE_VM_HANDLE_QUOTA_DEFAULT
+
+/* Pool-exhaustion table: both ends of every pool record plus one spare pair, so
+ * the pool (E), never the table, is the binding limit. At E=24 this exceeds a
+ * process table (48 > H=40), hence a dedicated table. */
+#define POOL_T_CAP (2u * JE_EP_POOL_CAP + 2u)
+static je_handle_slot g_pool_slots[POOL_T_CAP];
+static je_handle_table g_pool_t;
 
 static je_handle_slot g_slots[CAP];
 static je_handle_table g_t;
@@ -196,14 +208,47 @@ int main(void)
     /* 9. Pool exhaustion + create unwind: fill the pool, next create NOSLOTS and
      *    leaves t0 unchanged; also a create whose SECOND mint fails unwinds the
      *    first mint and the record completely. */
-    fresh(CAP);   /* generous table quota so the pool is the limiter */
+    /*    ADR 0010 D2: exactly JE_EP_POOL_CAP (E) creates succeed; the (E+1)-th
+     *    is NOSLOTS and mutates neither the pool nor the table (byte-compare).
+     *    Freeing one record makes exactly one more create admissible. */
+    fresh(CAP);
     {
+        static je_endpoint_pool pool_before;
+        static je_handle_table t_before;
+        static je_handle_slot slots_before[POOL_T_CAP];
         je_handle a0[JE_EP_POOL_CAP], a1[JE_EP_POOL_CAP];
-        for (uint32_t i = 0; i < JE_EP_POOL_CAP; ++i) make_pair(&a0[i], &a1[i]);
+        assert(je_handle_table_init(&g_pool_t, g_pool_slots, POOL_T_CAP, POOL_T_CAP));
+        for (uint32_t i = 0; i < JE_EP_POOL_CAP; ++i) {
+            assert(je_endpoint_channel_create(&g_pool, &g_pool_t, JE_EP_RIGHTS_ALL,
+                                              &g_pool_t, JE_EP_RIGHTS_ALL,
+                                              &a0[i], &a1[i]) == JE_EP_OK);
+            assert(je_endpoint_pool_allocated(&g_pool) == i + 1u);
+        }
         assert(je_endpoint_pool_allocated(&g_pool) == JE_EP_POOL_CAP);
+        assert(g_pool_t.live == 2u * JE_EP_POOL_CAP);   /* table NOT the limiter */
+        memcpy(&pool_before, &g_pool, sizeof g_pool);
+        memcpy(&t_before, &g_pool_t, sizeof g_pool_t);
+        memcpy(slots_before, g_pool_slots, sizeof g_pool_slots);
         je_handle x0 = 1u, x1 = 1u;
-        assert(je_endpoint_channel_create(&g_pool, &g_t, JE_EP_RIGHTS_ALL,
-                                          &g_t, JE_EP_RIGHTS_ALL, &x0, &x1)
+        assert(je_endpoint_channel_create(&g_pool, &g_pool_t, JE_EP_RIGHTS_ALL,
+                                          &g_pool_t, JE_EP_RIGHTS_ALL, &x0, &x1)
+               == JE_EP_NOSLOTS);
+        assert(x0 == 0u && x1 == 0u);
+        assert(memcmp(&g_pool, &pool_before, sizeof g_pool) == 0);
+        assert(memcmp(&g_pool_t, &t_before, sizeof g_pool_t) == 0);
+        assert(memcmp(g_pool_slots, slots_before, sizeof g_pool_slots) == 0);
+        /* Release one record (last ref of both ends) -> one create fits again. */
+        const uint32_t mid = JE_EP_POOL_CAP / 2u;
+        assert(je_endpoint_handle_close(&g_pool, &g_pool_t, a0[mid]) == JE_EP_OK);
+        assert(je_endpoint_handle_close(&g_pool, &g_pool_t, a1[mid]) == JE_EP_OK);
+        assert(je_endpoint_pool_allocated(&g_pool) == JE_EP_POOL_CAP - 1u);
+        assert(je_endpoint_channel_create(&g_pool, &g_pool_t, JE_EP_RIGHTS_ALL,
+                                          &g_pool_t, JE_EP_RIGHTS_ALL,
+                                          &a0[mid], &a1[mid]) == JE_EP_OK);
+        assert(je_endpoint_pool_allocated(&g_pool) == JE_EP_POOL_CAP);
+        x0 = x1 = 1u;
+        assert(je_endpoint_channel_create(&g_pool, &g_pool_t, JE_EP_RIGHTS_ALL,
+                                          &g_pool_t, JE_EP_RIGHTS_ALL, &x0, &x1)
                == JE_EP_NOSLOTS);
         assert(x0 == 0u && x1 == 0u);
     }
