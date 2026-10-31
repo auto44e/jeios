@@ -161,14 +161,6 @@ je_handle_status je_handle_dup_self(je_handle_table *t, je_handle src,
  * stale/free/retired handle returns STALE and changes nothing. */
 je_handle_status je_handle_close(je_handle_table *t, je_handle h);
 
-/* Read-only slot enumerator (M3c): if slot `index` is LIVE, write its current
- * handle (encode of index+generation) to *out_handle and its object type to
- * *out_type, and return true; otherwise return false and write nothing. Never
- * mutates the table and never exposes the object pointer. This lets an
- * object-aware layer (e.g. the endpoint release walk + the typed-close
- * dispatcher) find and re-address LIVE slots of its type WITHOUT reaching into
- * `slots` directly, preserving table purity. `index` >= capacity returns false.
- * Both out params are REQUIRED. */
 /* ADR 0010 D3 typed dispatch: resolve a handle of ANY type. Same precedence as
  * lookup minus the type and rights checks. A NULL t or out pointer is a caller bug and
  * is reported as BADINDEX (the pure enum has no INVALID). Otherwise: index out of
@@ -178,6 +170,14 @@ je_handle_status je_handle_close(je_handle_table *t, je_handle h);
 je_handle_status je_handle_resolve_any(const je_handle_table *t, je_handle h,
                                        uint32_t *type, uint32_t *rights, void **obj);
 
+/* Read-only slot enumerator (M3c): if slot `index` is LIVE, write its current
+ * handle (encode of index+generation) to *out_handle and its object type to
+ * *out_type, and return true; otherwise return false and write nothing. Never
+ * mutates the table and never exposes the object pointer. This lets an
+ * object-aware layer (e.g. the endpoint release walk + the typed-close
+ * dispatcher) find and re-address LIVE slots of its type WITHOUT reaching into
+ * `slots` directly, preserving table purity. `index` >= capacity returns false.
+ * Both out params are REQUIRED. */
 bool je_handle_live_at(const je_handle_table *t, uint32_t index,
                        je_handle *out_handle, uint32_t *out_type);
 

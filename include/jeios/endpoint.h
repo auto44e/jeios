@@ -241,9 +241,14 @@ je_ep_status je_endpoint_channel_create(je_endpoint_pool *pool,
 /* ADR 0010 D-DEV: identical to je_endpoint_channel_create, but the new record is
  * charged to `creator` against pool->procs (je_proc_charge). Order:
  *   1. find a free record (none -> NOSLOTS; nothing charged);
- *   2. charge (at quota -> JE_EP_QUOTA; nothing allocated, nothing minted);
+ *   2. charge (at quota -> JE_EP_QUOTA; an invalid, stale or non-LIVE creator ->
+ *      JE_EP_INVALID; either way nothing is allocated or minted) [Claude A2];
  *   3. mint both ends (a failure unwinds the record AND uncharges);
- *   4. on success, record->creator = creator.
+ *   4. on success, record->creator = creator if the record was charged, otherwise
+ *      NONE (pool->procs NULL or creator NONE) [Claude A4, Codex P2-4].
+ * JE_EP_QUOTA deliberately covers BOTH "creator at creation quota" and "table
+ * live-slot quota". Both reach ring 3 as H_QUOTA, as ADR 0010 says: no new
+ * statuses [Claude A3].
  * When the record is later freed, it uncharges `creator` exactly once (je_proc_uncharge
  * checks the identity). creator NONE, or pool->procs NULL -> uncharged: the existing
  * behaviour, used by the kernel fixture seed. je_endpoint_channel_create(...) ==
