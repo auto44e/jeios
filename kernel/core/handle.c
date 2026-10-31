@@ -207,3 +207,11 @@ bool je_handle_live_at(const je_handle_table *t, uint32_t index,
     *out_type = s->type;
     return true;
 }
+
+/* ADR 0010 D3 pre-wiring STUB (lead): fail closed until PR-B lands. */
+je_handle_status je_handle_resolve_any(const je_handle_table *t, je_handle h,
+                                       uint32_t *type, uint32_t *rights, void **obj)
+{
+    (void)t; (void)h; (void)type; (void)rights; (void)obj;
+    return JE_HANDLE_BADINDEX;
+}

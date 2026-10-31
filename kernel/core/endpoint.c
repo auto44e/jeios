@@ -57,6 +57,7 @@ void je_endpoint_pool_init(je_endpoint_pool *pool)
 {
     if (!pool) return;
     pool->allocated_count = 0u;
+    pool->procs = NULL;
     for (uint32_t i = 0; i < JE_EP_POOL_CAP; ++i) {
         je_ep_channel *r = &pool->rec[i];
         r->allocated = false;
@@ -913,4 +914,18 @@ je_ep_status je_endpoint_recv_commit_caps(je_endpoint_pool *pool,
      * AFTER dequeue so the queue slot no longer references the target. */
     for (uint8_t c = 0; c < mcaps; ++c) release_capdesc_inflight(pool, &snap[c]);
     return JE_EP_OK;
+}
+
+/* ADR 0010 D-DEV pre-wiring STUB (lead): the uncharged path delegates; charging
+ * fails closed until PR-B lands. */
+je_ep_status je_endpoint_channel_create_by(je_endpoint_pool *pool, je_proc_id creator,
+                                           je_handle_table *t0, uint32_t rights0,
+                                           je_handle_table *t1, uint32_t rights1,
+                                           je_handle *out0, je_handle *out1)
+{
+    if (creator.gen == 0u || !pool || !pool->procs)
+        return je_endpoint_channel_create(pool, t0, rights0, t1, rights1, out0, out1);
+    if (out0) *out0 = 0u;
+    if (out1) *out1 = 0u;
+    return JE_EP_INVALID;
 }

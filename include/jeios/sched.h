@@ -52,7 +52,8 @@ bool je_sched_wait_pending(je_ep_channel **rec, uint8_t *side, uint64_t *rdi,
 void je_sched_wait_finish(void);
 je_status je_sched_current_slot(uint32_t *out_slot);
 /* Public death-reason numbering (matches the scheduler's internal record). */
-enum { JE_DEATH_FAULT = 0, JE_DEATH_EXIT = 1, JE_DEATH_BAD_RETURN = 2 };
+enum { JE_DEATH_FAULT = 0, JE_DEATH_EXIT = 1, JE_DEATH_BAD_RETURN = 2,
+       JE_DEATH_KILLED = 3 /* ADR 0010 D4/D8; produced from PR-D */ };
 /* M3a #4 step 4: reap DYING user processes from bootstrap (slot 0, irq off)
  * while peers run. Returns count reaped, or a negative je_status on violation. */
 int je_sched_reap_dead(void);

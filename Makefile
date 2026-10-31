@@ -16,7 +16,7 @@ CPPFLAGS += -DJE_DEV_COPY_INJECT
 endif
 CFLAGS := -std=c11 -O2 -g $(WARN) -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -m64 -march=x86-64 -mno-red-zone -mgeneral-regs-only
 CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c kernel/core/boot.c kernel/core/alloc.c
-SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/handle.c kernel/core/endpoint.c kernel/core/endpoint_kern.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
+SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/handle.c kernel/core/endpoint.c kernel/core/endpoint_kern.c kernel/core/proc.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
 OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o $(BUILD)/kernel/arch/x86_64/trap_entry.o $(BUILD)/kernel/arch/x86_64/register_probe.o $(BUILD)/kernel/arch/x86_64/user_demo.o $(BUILD)/kernel/arch/x86_64/usercopy.o
 .PHONY: all check test iso smoke clean
 all: $(BUILD)/jeios.elf
@@ -31,7 +31,7 @@ $(BUILD)/%.o: %.S
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_fdt
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_fdt
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
@@ -41,6 +41,7 @@ test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm
 	./$(BUILD)/test_handle
 	./$(BUILD)/test_handle_rw
 	./$(BUILD)/test_endpoint
+	./$(BUILD)/test_proc
 	./$(BUILD)/test_fdt
 check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
@@ -96,9 +97,14 @@ $(BUILD)/test_handle_rw: tests/test_handle.c kernel/core/handle.c $(wildcard inc
 # M3c endpoint lifecycle core (ADR 0009 D-SEQ step 2): hostable, links the pure
 # handle table; proves destruction-on-last-ref, split refcount, and REFOVERFLOW
 # with no kernel state and no ring-3 path (create is kernel-only).
-$(BUILD)/test_endpoint: tests/test_endpoint.c kernel/core/endpoint.c kernel/core/handle.c $(wildcard include/jeios/*.h)
+$(BUILD)/test_endpoint: tests/test_endpoint.c kernel/core/endpoint.c kernel/core/handle.c kernel/core/proc.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_endpoint.c kernel/core/endpoint.c kernel/core/handle.c -o $@
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_endpoint.c kernel/core/endpoint.c kernel/core/handle.c kernel/core/proc.c -o $@
+
+# ADR 0010 D4: hosted PROCESS-record pool suite (pure kernel/core/proc.c).
+$(BUILD)/test_proc: tests/test_proc.c kernel/core/proc.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_proc.c kernel/core/proc.c -o $@
 
 # Issue #52: hosted bounded-FDT parser suite (pure kernel/core/fdt.c, no arch
 # code), ASan+UBSan. Includes the generated real-QEMU fixture header.

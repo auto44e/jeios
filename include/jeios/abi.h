@@ -116,10 +116,12 @@ typedef enum {
                               * meta=R10, R8, R9). Non-blocking: copies len bytes
                               * from ubuf into the peer's inbound queue. len must
                               * be <= JE_EP_MSG_MAX. The handle needs the SEND right.
-                              * R10 layout: R10[7:0] = cap_count (MUST be 0 until
-                              * step 5; any nonzero -> INVALID), R10[63:8] reserved
-                              * (must be 0). R8 reserved for step 5 cap-array ptr
-                              * (must be 0). R9 reserved (must be 0).
+                              * R10 layout: R10[7:0] = cap_count (0..JE_ABI_MSG_CAPS_MAX;
+                              * capability transfer has been live since M3c step 5, ADR 0009
+                              * A5-4), R10[63:8] reserved (must be 0). R8 = user u32[]
+                              * cap array (non-zero iff cap_count != 0). R9 reserved
+                              * (must be 0). [Comment corrected in M4 PR-B; it previously
+                              * said cap_count must be 0.]
                               * Status precedence (frozen): decode INVALID
                               * (meta/reserved/len/wide-handle, before any user
                               * access) > BADINDEX/STALE/WRONGTYPE > DENIED >
@@ -143,6 +145,15 @@ typedef enum {
                               *    delivered (OK) or required cap count
                               *    (SHORT_BUFFER); both 0 on other statuses. A
                               *    nonzero-timeout recv never returns EMPTY. */
+    /* 13 CLOCK_TICKS, 14 PROC_SPAWN, 16 PROC_KILL and 17-19 DEV_* are reserved by
+     * ADR 0010 for later M4 PRs. Until then they stay UNSUPPORTED. */
+    , JE_SYS_PROC_STATUS = 15 /* M4 proc_status(h=RDI, out=RSI): needs INSPECT on a
+                              * PROCESS handle. Copies a 16-byte je_abi_proc_status
+                              * {u32 state, u32 reason, u64 code} to user memory at RSI
+                              * through the checked copy-out path. A fault gives
+                              * INVALID and nothing is written. RDX..R9 reserved (0);
+                              * RDI[63:32] must be 0. Non-blocking and idempotent
+                              * (ADR 0010 D4). */
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYS_COPY_FIXUP_INJECT = 4  /* dev-only: raw-copy an unmapped page to test the fixup */
 #endif
@@ -155,6 +166,7 @@ typedef enum {
 /* M3c endpoint object type (ADR 0009). Pinned equal to the table-side
  * JE_ENDPOINT_OBJ_TYPE in the syscall glue via _Static_assert. */
 #define JE_ABI_OBJ_ENDPOINT 2u
+#define JE_ABI_OBJ_PROCESS 3u   /* ADR 0010 D3 */
 /* M3c D6 (step 4): max message payload bytes a try_send accepts. ABI-visible
  * (ring 3 must know the cap); pinned equal to the table-side JE_EP_MSG_MAX in the
  * syscall glue. */
@@ -176,6 +188,24 @@ _Static_assert(JE_SYS_HANDLE_DUP == 9, "abi op handle_dup");
 _Static_assert(JE_SYS_ENDPOINT_CREATE == 10, "abi op endpoint_create");
 _Static_assert(JE_SYS_TRY_SEND == 11, "abi op try_send");
 _Static_assert(JE_SYS_TRY_RECV == 12, "abi op try_recv");
+_Static_assert(JE_SYS_PROC_STATUS == 15, "abi op proc_status (ADR 0010)");
+
+/* ADR 0010 D4: PROC_STATUS output. state: 1 LIVE, 2 DYING, 3 DEAD (0 FREE is never
+ * observable through a live handle). reason (valid when DYING/DEAD): 0 FAULT,
+ * 1 EXIT, 2 BAD_RETURN, 3 KILLED. code: the exit code for EXIT, otherwise 0. */
+typedef struct {
+    uint32_t state;
+    uint32_t reason;
+    uint64_t code;
+} je_abi_proc_status;
+_Static_assert(sizeof(je_abi_proc_status) == 16u, "proc_status ABI size");
+#define JE_ABI_PROC_LIVE  1u
+#define JE_ABI_PROC_DYING 2u
+#define JE_ABI_PROC_DEAD  3u
+#define JE_ABI_DEATH_FAULT      0u
+#define JE_ABI_DEATH_EXIT       1u
+#define JE_ABI_DEATH_BAD_RETURN 2u
+#define JE_ABI_DEATH_KILLED     3u
 
 /* M3b rights ABI (ADR 0008 revisit, frozen here). Rights are a fixed uint32_t
  * bitmask. handle_rights masks its output to JE_ABI_RIGHTS_KNOWN so no internal
@@ -203,8 +233,13 @@ _Static_assert(JE_SYS_TRY_RECV == 12, "abi op try_recv");
 #define JE_ABI_RIGHT_SEND     0x2u             /* endpoint: may try_send */
 #define JE_ABI_RIGHT_RECV     0x4u             /* endpoint: may try_recv */
 #define JE_ABI_RIGHT_TRANSFER 0x8u             /* endpoint: may grant to a peer */
+/* ADR 0010 D3: PROCESS rights are INSPECT (shared) and KILL. KILL is known from
+ * PR-B so DUP can carry it; the PROC_KILL op that consumes it arrives in PR-D. */
+#define JE_ABI_RIGHT_KILL     0x10u            /* process: may kill (ADR 0010 D8) */
 #define JE_ABI_RIGHTS_KNOWN  (JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_SEND \
-                              | JE_ABI_RIGHT_RECV | JE_ABI_RIGHT_TRANSFER)
+                              | JE_ABI_RIGHT_RECV | JE_ABI_RIGHT_TRANSFER \
+                              | JE_ABI_RIGHT_KILL)
+_Static_assert(JE_ABI_RIGHT_KILL == 0x10u, "abi right kill (ADR 0010)");
 _Static_assert(JE_ABI_RIGHT_INSPECT == 0x1u, "abi right inspect");
 _Static_assert(JE_ABI_RIGHT_SEND == 0x2u && JE_ABI_RIGHT_RECV == 0x4u
                && JE_ABI_RIGHT_TRANSFER == 0x8u, "abi endpoint rights pinned");
