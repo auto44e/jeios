@@ -170,7 +170,8 @@ je_status je_thread_create(void (*entry)(void *),void *arg)
  * process's concrete 5-page run (held by #3); its top is TSS.RSP0. Requires NX
  * (ADR 0007 D2). Does NOT allocate from je_kernel_pages — the kstack belongs to
  * the vm process and is freed by je_vm_destroy, never by je_sched_reap. */
-je_status je_thread_create_user(je_vm *vm, uint32_t index)
+je_status je_thread_create_user_start(je_vm *vm, uint32_t index,
+                                      const je_user_startup *st, uint32_t *out_slot)
 {
     if (!ready || !vm || index >= JE_VM_MAX_PROCESSES) return JE_ERR_INVALID;
     if (!je_arch_has_nx()) return JE_ERR_UNSUPPORTED; /* D2 */
@@ -191,6 +192,14 @@ je_status je_thread_create_user(je_vm *vm, uint32_t index)
      * validator allows top inclusive); RIP at validated entry. */
     je_trap_frame *f = (void *)(uintptr_t)(rsp0_top - sizeof(*f));
     *f = (je_trap_frame){0};
+    if (st) {
+        f->rdi = st->rdi;
+        f->rsi = st->rsi;
+        f->rdx = st->rdx;
+        f->rcx = st->rcx;
+        f->r8 = st->r8;
+        f->r9 = st->r9;
+    }
     f->cs = JE_UFRAME_USER_CS; f->ss = JE_UFRAME_USER_SS;
     f->rip = JE_VM_ARENA_BASE + p->entry;
     f->rsp = JE_VM_ARENA_BASE + JE_VM_ARENA_SIZE;
@@ -215,7 +224,14 @@ je_status je_thread_create_user(je_vm *vm, uint32_t index)
             return JE_ERR_INVALID;
         }
     }
+    if (out_slot) *out_slot = (uint32_t)slot;
     return JE_OK;
+}
+
+je_status je_thread_create_user(je_vm *vm, uint32_t index)
+{
+    return je_thread_create_user_start(vm, index, (const je_user_startup *)0,
+                                       (uint32_t *)0);
 }
 /* M3a #4 step 4: mark a user thread DYING with a death record (never requeued;
  * reclaimed later by je_sched_reap_dead from bootstrap). Kernel threads never
@@ -644,11 +660,11 @@ uint64_t je_sched_min_dispatches(void)
     return min;
 }
 
-/* ADR 0010 D5 pre-wiring STUB (lead): only the all-zero startup is supported until PR-C. */
-je_status je_thread_create_user_start(je_vm *vm, uint32_t index,
-                                      const je_user_startup *st, uint32_t *out_slot)
+unsigned je_sched_user_thread_count(void)
 {
-    if (st) return JE_ERR_UNSUPPORTED;
-    if (out_slot) *out_slot = 0u;
-    return je_thread_create_user(vm, index);
+    unsigned count = 0u;
+    for (unsigned i = 1u; i < JE_THREAD_MAX; ++i)
+        if (threads[i].kind == THREAD_USER && threads[i].state != EMPTY)
+            ++count;
+    return count;
 }
