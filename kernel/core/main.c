@@ -27,6 +27,7 @@ extern void je_endpoint_kern_set_proc_pool(je_proc_pool *pool);
 extern je_status je_process_handle_mint(je_vm *vm, uint32_t index, je_proc_id id,
                                         uint32_t rights, je_handle *out,
                                         je_handle_status *out_alloc_status);
+extern const char je_c_hello_blob_sha256[];
 static je_boot_context boot;
 static _Noreturn void fail(const char *message)
 {
@@ -114,6 +115,7 @@ extern unsigned char je_user_demo_start[], je_user_demo_end[];
 extern unsigned char je_user_proc_exit7_start[], je_user_proc_exit7_end[];
 extern unsigned char je_user_m4b_start[], je_user_m4b_end[];
 extern unsigned char je_user_m4c_start[], je_user_m4c_end[];
+extern unsigned char je_user_m4e_start[], je_user_m4e_end[];
 extern unsigned char je_user_m4d_start[], je_user_m4d_end[];
 extern unsigned char je_user_m4d_ready_start[], je_user_m4d_ready_end[];
 extern unsigned char je_user_m4d_blocked_start[], je_user_m4d_blocked_end[];
@@ -143,7 +145,7 @@ typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_EXIT=3,
                PROG_EPFAULT=11, PROG_EPIPC=12, PROG_EPRECV_TO=13,
                PROG_PING=14, PROG_PONG=15, PROG_PROC_EXIT7=16,
                PROG_M4B=17, PROG_M4C=18, PROG_M4D=19, PROG_M4D_READY=20,
-               PROG_M4D_BLOCKED=21, PROG_M4D_WOKEN=22 } user_prog;
+               PROG_M4D_BLOCKED=21, PROG_M4D_WOKEN=22, PROG_M4E=23 } user_prog;
 static int vm_s3_inited;
 /* Initialize the shared step-3/4 vm once. The M3 fixture still uses two
  * processes, while the backing pool now has the M4 D2 capacity for later PRs. */
@@ -170,6 +172,7 @@ static uint32_t vm_s3_build_quota_kind(user_prog prog, uint32_t ep_limit,
     case PROG_PROC_EXIT7: start=je_user_proc_exit7_start; end=je_user_proc_exit7_end; break;
     case PROG_M4B:        start=je_user_m4b_start;        end=je_user_m4b_end;        break;
     case PROG_M4C:        start=je_user_m4c_start;        end=je_user_m4c_end;        break;
+    case PROG_M4E:        start=je_user_m4e_start;        end=je_user_m4e_end;        break;
     case PROG_M4D:        start=je_user_m4d_start;        end=je_user_m4d_end;        break;
     case PROG_M4D_READY:  start=je_user_m4d_ready_start;  end=je_user_m4d_ready_end;  break;
     case PROG_M4D_BLOCKED:start=je_user_m4d_blocked_start;end=je_user_m4d_blocked_end;break;
@@ -2288,6 +2291,133 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                 fail("JeiOS fatal: M4d final pool baseline\r\n");
             je_arch_console_write(
                 "M4d-s1: PROC_KILL OK (READY, BLOCKED_IPC, WOKEN-reserved, EXIT first-reason, supervisor guard, self/after-death/unlinked/rights, next-syscall PROC_STATUS)\r\n");
+        }
+        /* --- M4e-s1: build-time ELF conversion plus a real ring-3 C image.
+         * The assembly parent owns the LAUNCHER and creates the channel. It
+         * grants only SEND on one end, then waits for READY and child DEAD.
+         * The coordinator audits before granting the parent permission to
+         * inspect/reap the child, keeping the lifecycle observations ordered. */
+        {
+            if (process_pool.used_count != 0u || je_endpoint_kernel_allocated() != 0u)
+                fail("JeiOS fatal: M4e baseline\r\n");
+            uint32_t spawner = vm_s3_build_quota(PROG_M4E, JE_EP_POOL_CAP);
+            je_handle launcher = 0u;
+            uint64_t setup_flags = je_arch_irq_save();
+            je_handle_status launcher_status = je_handle_alloc(
+                &vm_s3.procs[spawner].htable, (void *)0, JE_ABI_OBJ_LAUNCHER,
+                JE_ABI_RIGHT_SPAWN, &launcher);
+            je_arch_irq_restore(setup_flags);
+            if (launcher_status != JE_HANDLE_OK || launcher == 0u)
+                fail("JeiOS fatal: M4e launcher\r\n");
+            je_user_startup startup = {
+                JE_ABI_STARTUP_V1, 1u, launcher, 0u, 0u, 0u
+            };
+            if (je_thread_create_user_start(&vm_s3, spawner, &startup,
+                                            (uint32_t *)0) != JE_OK)
+                fail("JeiOS fatal: M4e spawner thread\r\n");
+
+            bool child_audited = false;
+            bool child_reaped = false;
+            uint32_t child_vm = JE_VM_MAX_PROCESSES;
+            je_proc_id child_id = JE_PROC_ID_NONE;
+            uint64_t phase_start = je_sched_ticks();
+            uint64_t phase_spins = 0u;
+            for (;;) {
+                uint64_t phase_flags = je_arch_irq_save();
+                uint64_t phase = vm_s3_scratch(spawner, 0x1f00u);
+                if (phase == 99u) {
+                    je_arch_irq_restore(phase_flags);
+                    fail("JeiOS fatal: M4e ring-3 assertion\r\n");
+                }
+                for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+                    je_proc_rec *rec = &process_pool.rec[i];
+                    if (rec->state != JE_PROC_LIVE && rec->state != JE_PROC_DYING)
+                        continue;
+                    if (!rec->run_linked || rec->vm_index >= JE_VM_MAX_PROCESSES
+                        || i == vm_s3_proc_ids[spawner].index)
+                        continue;
+                    if (!child_audited) {
+                        if (je_vm_audit(&vm_s3, rec->vm_index) != JE_OK) {
+                            je_arch_irq_restore(phase_flags);
+                            fail("JeiOS fatal: M4e child audit\r\n");
+                        }
+                        child_audited = true;
+                        child_vm = rec->vm_index;
+                        child_id = (je_proc_id){ i, rec->gen };
+                        vm_s3_scratch_write(spawner, 0x1f28u, 1u);
+                    }
+                }
+                if (child_audited && phase >= 2u && !child_reaped) {
+                    uint32_t state = JE_PROC_FREE;
+                    uint32_t reason = 0u;
+                    uint64_t code = 0u;
+                    if (je_proc_status(&process_pool, child_id, &state,
+                                       &reason, &code) != JE_OK) {
+                        je_arch_irq_restore(phase_flags);
+                        fail("JeiOS fatal: M4e child status\r\n");
+                    }
+                    if (state == JE_PROC_DYING) {
+                        if (reason != JE_DEATH_EXIT || code != 0u) {
+                            je_arch_irq_restore(phase_flags);
+                            fail("JeiOS fatal: M4e child exit status\r\n");
+                        }
+                        if (je_sched_reap_dead() < 0) {
+                            je_arch_irq_restore(phase_flags);
+                            fail("JeiOS fatal: M4e child reap\r\n");
+                        }
+                        child_reaped = true;
+                    }
+                }
+                if (child_audited && phase < 2u && !child_reaped) {
+                    uint32_t state = JE_PROC_FREE;
+                    uint32_t reason = 0u;
+                    uint64_t code = 0u;
+                    if (je_proc_status(&process_pool, child_id, &state,
+                                       &reason, &code) == JE_OK
+                        && state == JE_PROC_DYING
+                        && (reason != JE_DEATH_EXIT || code != 0u)) {
+                        je_arch_irq_restore(phase_flags);
+                        fail("JeiOS fatal: M4e child failed before READY\r\n");
+                    }
+                }
+                if (child_reaped) {
+                    uint32_t state = JE_PROC_FREE;
+                    uint32_t reason = 0u;
+                    uint64_t code = 0u;
+                    if (je_proc_status(&process_pool, child_id, &state,
+                                       &reason, &code) != JE_OK
+                        || state != JE_PROC_DEAD || reason != JE_DEATH_EXIT
+                        || code != 0u) {
+                        je_arch_irq_restore(phase_flags);
+                        fail("JeiOS fatal: M4e child DEAD status\r\n");
+                    }
+                }
+                je_arch_irq_restore(phase_flags);
+                if (child_audited && child_reaped && phase == 3u)
+                    break;
+                if (je_sched_ticks() - phase_start > 500u || ++phase_spins > 1000000u) {
+                    fail("JeiOS fatal: M4e bounded wait\r\n");
+                }
+                if (child_audited && phase >= 2u)
+                    je_kernel_idle_step();
+                else
+                    m4d_wait_interrupt();
+            }
+            uint64_t parent_reap_start = je_sched_ticks();
+            while (je_sched_has_process(&vm_s3, spawner)) {
+                if (je_sched_ticks() - parent_reap_start > 200u)
+                    fail("JeiOS fatal: M4e parent reap timeout\r\n");
+                je_kernel_idle_step();
+            }
+            if (child_vm >= JE_VM_MAX_PROCESSES
+                || je_sched_has_process(&vm_s3, child_vm)
+                || je_endpoint_kernel_allocated() != 0u
+                || process_pool.used_count != 0u)
+                fail("JeiOS fatal: M4e pool baseline\r\n");
+            je_arch_console_write(
+                "M4e-s1: ring-3 C image OK (startup v1, rodata/data/bss, CLOCK_TICKS, READY, exit 0); image sha256=");
+            je_arch_console_write(je_c_hello_blob_sha256);
+            je_arch_console_write("\r\n");
         }
         /* M3c leaves no VM process intentionally live: B was torn down before
          * the cross-table, timeout, and bootstrap proofs. */
