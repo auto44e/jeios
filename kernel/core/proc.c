@@ -86,7 +86,8 @@ je_status je_proc_link(je_proc_pool *pool, je_proc_id id, uint32_t thread_slot,
                        uint32_t vm_index)
 {
     je_proc_rec *rec = record_for(pool, id);
-    if (!rec || rec->state != JE_PROC_LIVE) return JE_ERR_INVALID;
+    if (!rec || rec->state != JE_PROC_LIVE || rec->run_linked)
+        return JE_ERR_INVALID;
     rec->run_linked = true;
     rec->thread_slot = thread_slot;
     rec->vm_index = vm_index;
@@ -96,6 +97,7 @@ je_status je_proc_link(je_proc_pool *pool, je_proc_id id, uint32_t thread_slot,
 je_status je_proc_on_dying(je_proc_pool *pool, je_proc_id id, uint32_t reason,
                            uint64_t code)
 {
+    if (reason > JE_PROC_REASON_MAX) return JE_ERR_INVALID;
     je_proc_rec *rec = record_for(pool, id);
     if (!rec) return JE_ERR_INVALID;
     if (rec->state == JE_PROC_DYING || rec->state == JE_PROC_DEAD) return JE_OK;
@@ -148,7 +150,7 @@ je_status je_proc_status(const je_proc_pool *pool, je_proc_id id, uint32_t *stat
 
 je_status je_proc_charge(je_proc_pool *pool, je_proc_id id)
 {
-    if (id.gen == 0u) return JE_OK;
+    if (id.index == 0u && id.gen == 0u) return JE_OK;
     je_proc_rec *rec = record_for(pool, id);
     if (!rec) return JE_ERR_INVALID;
     if (rec->ep_charge >= rec->ep_limit) return JE_ERR_DENIED;
