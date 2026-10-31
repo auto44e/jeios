@@ -520,6 +520,59 @@ re-stale-after-reuse assertion, the measured quota count, the softened per-proce
 wording, the ADR wide-handle amendment, and the pinned ABI static-asserts).
 AI-assisted review only; not independent human qualification.
 
+## M4 PR-B — PROCESS records, automatic reaper, typed dispatch, PROC_STATUS, creation quota (ADR 0010 D3/D4/D-DEV) — 2026-10-31
+
+Owner-approved as D-OWNER-2 (death path / reaper), D-OWNER-4 (typed `query`/`rights`/`dup`) and D-OWNER-8 (the D-DEV deviation fix).
+
+**PROCESS records.** New pure module `kernel/core/proc.c` with contract `include/jeios/proc.h`. It is a pool of R = 48 records, each identified by {index, generation}.
+- Lifecycle: FREE → LIVE → DYING → DEAD → FREE once no handle refs remain. A slot whose generation is exhausted is retired and never reused.
+- Each record holds its run link, death reason and code, a supervisor flag, its handle-ref count, and the endpoint-creation charge.
+- Only `on_reaped` clears the run link. Abandon is used only for spawn rollback, on a record that was never linked.
+
+**Death path.**
+- `mark_dying` records the reason on the record.
+- `je_sched_reap_dead` captures the thread's back-link, then runs `drop_user` → `je_vm_destroy` → `je_proc_on_reaped`, all at IF=0. Any failure after `drop_user` is fatal.
+- One shared idle step (IF=0: reap, fail-stop on error; then `sti; hlt`) drives both the final idle loop and the M4b fixture's wait loops. QEMU therefore exercises the automatic reaper.
+- When a fixture tears down a live process directly, that teardown is recorded as KILLED.
+
+**Typed dispatch** (syscall.c) uses a table over SELF, ENDPOINT and PROCESS, with known rights, a dup policy and retain/release hooks:
+- `QUERY` works on any live type, via `je_handle_resolve_any`.
+- `RIGHTS` requires INSPECT.
+- `DUP` attenuates: SELF via `dup_self`; ENDPOINT via `je_endpoint_kern_dup` (this is the first time ring 3 can see endpoint dup); PROCESS by retaining the record before allocating the handle, with rollback.
+- `CLOSE` releases exactly once.
+- The teardown walk releases PROCESS refs as well as endpoint refs.
+- A LIVE PROCESS slot whose record is invalid is a fail-stop invariant break.
+
+**PROC_STATUS (op 15)** needs INSPECT. It takes a snapshot and writes a 16-byte copy-out; a fault gives INVALID and nothing is written.
+
+**D-DEV** (fixes ADR 0009 D5):
+- `je_endpoint_channel_create_by` checks for a free record (NOSLOTS), then charges a LIVE creator (QUOTA, or INVALID for an invalid creator), then mints, unwinding and uncharging on failure.
+- The charge is released at record destruction, and only against the same identity.
+- NONE is exactly {0,0} and is used only by the kernel seed.
+- A user thread with no identity fails closed.
+
+**ABI.** Appended to ABI v0: op 15, `JE_ABI_OBJ_PROCESS` 3, `JE_ABI_RIGHT_KILL` 0x10, `je_abi_proc_status`, and the `JE_ABI_PROC_*` / `JE_ABI_DEATH_*` values, all pinned by `_Static_assert`. A stale `abi.h` comment saying `cap_count` must be 0 was corrected.
+
+**Evidence (local).**
+- `make check`: proc, proc_retire (JE_PROC_GEN_MAX=3), handle resolve_any, the endpoint D-DEV matrix, and syscall decode.
+- `make smoke` / `make integration` and the three x86 profiles.
+- QEMU markers `M4b-s1: PROCESS record status/typed dispatch OK (...)` and `M4b-s1: endpoint creation quota/charge release OK`.
+- ARM: all 4 modes.
+- Remote CI is recorded in the PR.
+
+**Provenance (worker mode; AI-assisted, not human qualification).**
+
+| Part | Author | Adversarial reviewer |
+|---|---|---|
+| Header contracts and stubs | lead | both, via review |
+| Kernel implementation | Codex | Claude |
+| Hosted tests, written from headers only | Claude | Codex |
+| Contract pins; `JE_SYSCALL_PROC_STATUS` enum; 2-line `je_proc_charge` fix | lead | round-3 review |
+
+Details are in `docs/adr/debates/m4b-reviews.md` and `docs/adr/debates/m4b-workers/`.
+
+**Not yet:** spawn, kill, LAUNCHER and CLOCK_TICKS (PR-C/PR-D). Today PROCESS handles are minted only by kernel fixtures.
+
 ## M4 PR-A — capacity raise + per-table handle quota (ADR 0010 D2) — 2026-10-31
 
 ADR 0010 D2, owner-approved as D-OWNER-1. This is a tested-path change, and the owner gated it.

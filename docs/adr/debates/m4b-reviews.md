@@ -134,3 +134,75 @@ confirmed sound
 - **Header ambiguities A2–A10 and A12: pinned in proc.h / endpoint.h**, with the proposer recorded inline. A3 (QUOTA overloaded) is kept deliberately, because ADR 0010 adds no new statuses. A11 (comment placement) is fixed.
 - **Claude P2-1 (mint into an unwired table) and P2-2 (fail-stop on invariant breaks in syscalls): accepted.** So are all of Claude's P3 items, including the ABI `_Static_assert` pins and retain/release hooks in the dispatch table to match ADR D3. Claude P3-14 is accepted too: one QEMU creation-quota check is added, so quota evidence is no longer hosted-only.
 - **Codex P2-6 (PROC_STATUS action not pinned): accepted.** The lead added `JE_SYSCALL_PROC_STATUS` to `syscall.h` during integration, replacing the worker's local `#define 13u`.
+
+## Round 3 — Claude verifying the Codex fixes
+
+No new P1 or P2 in round 3. All 14 round-1 findings are addressed: 12 fully fixed and 2 partly (#9 and #13). The round-2 diff adds three P3s. This was read-only: I did not build or run `make` or `smoke`.
+
+**Round-1 findings**
+
+1. **FIXED.** `je_process_handle_mint(vm, index, …)` now requires `je_endpoint_kern_is_wired` (`syscall.c:290-295`).
+2. **FIXED.** PROC_STATUS, CLOSE and DUP now halt through `syscall_invariant` on an orphan object, `refs == 0` or a close mismatch (`syscall.c:487-493`, `:583-589`, `:686-695`). DUP's retain failing with anything other than BUSY can only be an invariant break, because the identity was just rebuilt from the record, so halting there is correct.
+3. **FIXED.** A user caller must match the target vm and index and have a non-zero gen, otherwise it gets `JE_EP_CORRUPT`. Only a kernel caller falls back to NONE (`endpoint_kern.c:95-103`).
+4. **FIXED.** Any failure after `drop_user` calls `abort_scheduler` (`sched.c:562-566`), and `je_kernel_idle_step` fails stop on a negative result (`sched.c:571-576`). The BUSY returns can't fire on bootstrap: `current==0`, the kernel CR3 is loaded and RSP0 is poisoned (`sched.c:258-259`), so an abort there means a real invariant break.
+5. **FIXED.** The registration table is keyed per index by vm, re-pointing to a different vm is rejected, and `unregister` runs in `drop_user` and `vm_s3_destroy` (`sched.c:76-94`).
+6. **FIXED.** Linking an already-linked record is rejected (`proc.c:89`).
+7. **FIXED.** `drop_user` no longer writes the record, and only `on_reaped` clears the run link. `vm_s3_destroy` now goes through `on_dying(KILLED)` → `vm_destroy` → `on_reaped` instead of `abandon` (`main.c:212-235`).
+8. **FIXED.** `refs == 0` is checked before release at CLOSE (`syscall.c:584`), in the walk (`endpoint.c:614`) and in `dispatch_release_process`.
+9. **FIXED-BUT-INCOMPLETE.** The ABI asserts for state and death reason are in `syscall.c:155-165`. But `endpoint.c:10` still defines `JE_PROCESS_OBJ_TYPE 3u` as a bare literal with no assert.
+   - Fix: add `_Static_assert(JE_PROCESS_OBJ_TYPE == JE_ABI_OBJ_PROCESS)` in `endpoint_kern.c`, which can include `abi.h`.
+10. **FIXED (partly hand-coded).** The table now has `inspect_result`, `retain` and `release`, and mint and DUP call through them. CLOSE calls `dispatch_release_process` directly, and the `endpoint.c` walk is still hand-coded. That is acceptable, but the PR should say so.
+11. **FIXED.** `irq_save`/`restore` now wraps alloc+register, both mints, `proc_link`, the child status poll, the `used_count` read and `vm_s3_destroy`.
+12. **FIXED** (`endpoint_kern.c:113`).
+13. **FIXED-BUT-WRONG (P3).** The `movl` at `0x1714` no longer overlaps `0x1718`. It still overwrites the upper half of the 8-byte word written at `0x1710` (`user_demo.S:235`).
+    - Fix: move it to a free 8-byte-aligned scratch slot. `0x1760` is free.
+14. **FIXED.** The parent now has `ep_limit = 1`. Create 1 succeeds, create 2 must return 7 (H_QUOTA), and after closing both ends create 3 must succeed.
+    - The fixture really tests the creation quota, not the table quota: the table quota is 15 and the parent holds at most 7 handles (SELF + 2 PROCESS + 4 endpoint ends), so 7 can only come from the creation charge.
+
+**New findings in the round-2 diff**
+
+- **P3: two progress waits have no bound.** `main.c:1205-1216`: the two `for (;;)` loops waiting for parent progress ≥1 and ≥2 have no spin counter. A parent that faults before writing progress hangs the kernel with no fatal message, and smoke reports a timeout instead of the cause.
+  - Fix: add a bounded spin counter like the child loop's, or fail when `je_proc_status(parent)` shows DYING/DEAD before the expected progress value.
+- **P3: the parent's death is never checked.** The final wait only checks `used_count == 0` (`main.c:1218-1226`). A parent that faults after writing progress 2 still prints both OK lines.
+  - Fix: before the parent reaps, copy its status into a kernel-side snapshot, or keep a kernel-held PROCESS handle to it, and assert reason EXIT with the expected code.
+- **P3: a fixture-path hazard remains.** `vm_s3_destroy` on a process whose thread is DYING but was never dropped would destroy the vm under a live scheduler slot, and the reaper would then abort. No current caller does this: the XA/XB callers have no thread, and every other caller runs `drop_user` first. This predates round 2.
+  - Fix: assert in `vm_s3_destroy` that no scheduler slot still references `(vm, idx)`.
+
+**Confirmed sound**
+- **Records:** none is revived or used after free. PROCESS objects resolve only to non-FREE records with their current generation. DEAD records stay pinned by `handle_refs`, and they are freed exactly once, by `on_reaped` or by the last release.
+- **Charging:** NONE is exactly `{0,0}`. A `{i,0}` creator now reaches `je_proc_charge`, gets INVALID and is mapped to `JE_EP_INVALID`. Only charged records store a creator, so uncharging can't drift.
+- **`je_proc_charge`:** the lead's fix is correct. The NULL-pool check comes first, and only LIVE records are charged.
+- **Teardown:** `vm_s3_destroy` reports the first terminal reason (KILLED only if the process was still LIVE). It releases other records' handles before `on_reaped`, and it unwinds IF on every error return.
+- **Automatic reaper:** the child wait observes DEAD through `je_proc_status`, not through the old manual reap. The parent's ring-3 PROC_STATUS poll is correct.
+- **Interrupts and ordering:** `idle_step` restores IF=0 before reaping, and the reaper itself enforces IF=0. Error precedence is unchanged.
+
+## Round 3 — Codex verifying (with mutants)
+
+1. **FIXED** — user callers with missing/stale identity now fail closed; kernel seed remains explicit. `kernel/core/endpoint_kern.c:98-104`
+
+2. **FIXED** — charging requires an exact LIVE record. `kernel/core/proc.c:156-160`
+
+3. **FIXED** — reaper preserves the link through VM teardown, then clears it; failures fail-stop. `kernel/core/sched.c:559-565`, `kernel/core/sched.c:571-575`
+
+4. **FIXED** — uncharged creations publish `JE_PROC_ID_NONE`, preventing detached-pool mis-uncharge. `kernel/core/endpoint.c:455-506`
+
+8. **FIXED** — retirement-on-failing-search is explicitly contractual and field-tested. `kernel/core/proc.c:51-68`, `tests/test_proc_retire.c:150-173`
+
+9. **FIXED** — death reasons above `JE_PROC_REASON_MAX` are rejected. `kernel/core/proc.c:97-99`
+
+Mutation results:
+
+- abandon-link guard: **KILL** (`test_proc.c:250`)
+- reap-field clearing: **KILL** (`test_proc.c:297`)
+- wrong `PROC_STATUS` action: **KILL** (`test_syscall.c:143`)
+- any gen-0 treated as NONE: **KILL** by endpoint suite (`test_endpoint.c:527`); survives `test_proc` alone
+- missing LIVE check: **KILL** (`test_proc.c:555`)
+
+**New P1** — the M4b child receives `JE_EP_POOL_CAP` endpoint quota through the default builder, despite D-DEV requiring `JE_EP_CHILD_QUOTA_MAX == 0`; a hostile child can exhaust the endpoint pool and starve the supervisor. Use role-specific spawn quotas, especially `vm_s3_build_quota(PROG_PROC_EXIT7, JE_EP_CHILD_QUOTA_MAX)`, and add a ring-3 `H_QUOTA` assertion. `kernel/core/main.c:207-209`, `kernel/core/main.c:1171`
+
+confirmed sound
+## Lead disposition of round 3
+
+- **Codex P1 (the M4b child fixture got the full pool as its creation quota, contradicting D-DEV's child maximum of 0): accepted.** The child now gets `JE_EP_CHILD_QUOTA_MAX`, and a ring-3 attempt asserts H_QUOTA. M3c fixture processes are not supervisor children and keep `JE_EP_POOL_CAP`.
+- **Claude P3s accepted:** bounded progress waits; the parent's own death reason is asserted; a static assert pins the PROCESS type literal; the scratch overlap is moved; `vm_s3_destroy` asserts that no scheduler slot still references the process. Claude's #10 note is recorded in the PR: the CLOSE path and the endpoint.c walk still call release directly rather than through the dispatch hook.
+- **All five Codex mutants are now killed.**
