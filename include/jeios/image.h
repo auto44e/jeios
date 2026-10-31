@@ -1,0 +1,32 @@
+/*
+ * ADR 0010 D5 built-in image table (kernel only). PROC_SPAWN's image_id indexes this
+ * table. Each entry is a checked je_vm_image v1 descriptor (ADR 0007 D8; no ELF in the
+ * kernel) plus its source blob. Blobs point straight at read-only kernel bytes:
+ * je_vm_build copies them into fresh frames. IDs are dense, 0 .. count-1. The table is
+ * built once by je_builtin_images_init() at boot (sizes of linked symbols are not
+ * constant expressions) and is read-only afterwards. Each descriptor passes
+ * je_vm_image_validate, which init checks.
+ */
+#ifndef JEIOS_IMAGE_H
+#define JEIOS_IMAGE_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <jeios/status.h>
+#include <jeios/vm.h>
+
+typedef struct {
+    je_vm_image    desc;
+    const uint8_t *blob;
+    size_t         blob_len;
+    const char    *name;      /* diagnostics only */
+} je_builtin_image;
+
+/* Build and validate the table. Call once at boot. Any invalid entry -> that status
+ * (the kernel fail-stops). Idempotent: a second call returns JE_OK with no change. */
+je_status je_builtin_images_init(void);
+/* NULL for an unknown id, or before init. */
+const je_builtin_image *je_builtin_image_get(uint32_t image_id);
+uint32_t                je_builtin_image_count(void);
+
+#endif /* JEIOS_IMAGE_H */

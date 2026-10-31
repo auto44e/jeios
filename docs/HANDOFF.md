@@ -1,5 +1,18 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-C (#53) — spawn/LAUNCHER/startup-v1/CLOCK_TICKS — observed 2026-10-31T13:20:28+00:00
+
+Branch `feat/m4c-spawn`, based on main `83782c0` (#62 merged; main CI green).
+
+- **Implemented:** ADR 0010 D5 and D6. Details are in IMPLEMENTATION, "M4 PR-C".
+- **Tested locally:** check, smoke, integration, the three x86 profiles, NX five times in a row, and all four ARM modes.
+- **Planned:** PR-D (`PROC_KILL`). Its code map is ready.
+- **Blocked:** nothing.
+
+**PR-D honesty item.** ADR 0009 A6-CLARIFY-2 and ADR 0010 D8 refer to a test-only forced-kill hook, but it **does not exist** in the code. `je_endpoint_kern_wait_cancel` has no callers. PR-D must correct this with a dated note.
+
+**Verification lesson.** `make all` does not rebuild `build/0/jeios.iso`. Run `make smoke` (or rebuild the ISO) before calling `tools/smoke.py` directly. Otherwise you boot a stale image.
+
 ## M4 PR-B (#53) — PROCESS records + reaper + typed dispatch — observed 2026-10-31T03:30Z
 
 Branch `feat/m4b-process`, based on main `5dbd0d8` (#60 and #61 merged; main CI green at `5dbd0d8`).

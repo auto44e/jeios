@@ -1,8 +1,12 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Hosted unit tests for the M3a #5 pure syscall decoder. */
 #include <jeios/syscall.h>
+#include <jeios/endpoint.h>   /* JE_EP_CHILD_QUOTA_MAX (op 14 decode bound) */
+#include <jeios/vm.h>         /* JE_VM_HANDLE_QUOTA_MAX / _DEFAULT (op 14 decode bound) */
 #include <assert.h>
+#include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 
 static je_syscall_action dec(uint64_t op, uint64_t a0, uint64_t a1, uint64_t a2,
                              uint64_t a3, uint64_t a4, uint64_t a5,
@@ -10,6 +14,172 @@ static je_syscall_action dec(uint64_t op, uint64_t a0, uint64_t a1, uint64_t a2,
 {
     uint64_t args[6] = { a0,a1,a2,a3,a4,a5 };
     return je_syscall_decode(op, args, st, res);
+}
+
+/* ADR 0010 D5 op 14 decode. Argument order is the frozen ABI register order:
+ * a0=RDI launcher, a1=RSI image_id, a2=RDX grants, a3=R10 grant_count,
+ * a4=R8 quotas, a5=R9 reserved. */
+#define SP_H     UINT64_C(0x00010000)   /* a well-formed 32-bit launcher handle */
+#define SP_GPTR  UINT64_C(0x40002000)   /* a nonzero grants pointer */
+
+static void spawn_ok(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                     uint64_t a4, uint64_t a5)
+{
+    je_abi_status st = JE_ABI_INVALID; uint64_t res = 0;
+    assert(dec(JE_SYS_PROC_SPAWN, a0,a1,a2,a3,a4,a5,&st,&res)==JE_SYSCALL_PROC_SPAWN);
+    assert(st==JE_ABI_OK);
+}
+
+static void spawn_invalid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                          uint64_t a4, uint64_t a5)
+{
+    je_abi_status st = JE_ABI_OK; uint64_t res = 0xdeadu;
+    assert(dec(JE_SYS_PROC_SPAWN, a0,a1,a2,a3,a4,a5,&st,&res)==JE_SYSCALL_RETURN);
+    assert(st==JE_ABI_INVALID && res==0);
+}
+
+/* abi.h constants, quota-pack macros and the grant layout (ADR 0010 D3/D5). */
+static void test_spawn_abi_constants(void)
+{
+    assert(JE_ABI_OBJ_LAUNCHER == 4u);
+    assert(JE_ABI_RIGHT_SPAWN == 0x20u);
+    assert((JE_ABI_RIGHTS_KNOWN & JE_ABI_RIGHT_SPAWN) != 0u);
+    /* SPAWN is unique across types (D3): no overlap with any other known right. */
+    assert((JE_ABI_RIGHT_SPAWN & (JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV
+                                  | JE_ABI_RIGHT_TRANSFER | JE_ABI_RIGHT_KILL)) == 0u);
+    assert(JE_ABI_SPAWN_GRANTS_MAX == 4u);
+    assert(JE_ABI_STARTUP_V1 == 1u);
+    assert(JE_VM_HANDLE_QUOTA_DEFAULT == 15u);
+    assert(JE_EP_CHILD_QUOTA_MAX == 0u);   /* M4: any nonzero endpoint quota is INVALID */
+
+    /* Grant layout: {u32 handle @0, u32 rights @4}, 8 bytes, no padding, LE. */
+    assert(sizeof(je_abi_spawn_grant) == 8u);
+    assert(offsetof(je_abi_spawn_grant, handle) == 0u);
+    assert(offsetof(je_abi_spawn_grant, rights) == 4u);
+    {
+        static const unsigned char wire[8] = { 0x01,0x00,0x02,0x00, 0x0a,0x00,0x00,0x00 };
+        je_abi_spawn_grant g;
+        memcpy(&g, wire, sizeof g);
+        assert(g.handle == 0x00020001u && g.rights == 0x0au);
+    }
+    {
+        je_abi_spawn_grant arr[JE_ABI_SPAWN_GRANTS_MAX];
+        assert(sizeof arr == 32u);          /* grant_count x 8 bytes, no stride padding */
+    }
+
+    /* Quota pack/unpack round-trip, including both 16-bit field extremes. */
+    {
+        static const uint32_t hv[] = { 0u, 1u, 15u, 39u, 40u, 0xfffeu, 0xffffu };
+        static const uint32_t ev[] = { 0u, 1u, 0x7fffu, 0xffffu };
+        for (unsigned i = 0; i < sizeof hv / sizeof hv[0]; ++i)
+            for (unsigned j = 0; j < sizeof ev / sizeof ev[0]; ++j) {
+                uint64_t q = JE_ABI_SPAWN_QUOTAS(hv[i], ev[j]);
+                assert((q >> 32) == 0u);
+                assert(JE_ABI_SPAWN_QUOTA_HANDLES(q) == hv[i]);
+                assert(JE_ABI_SPAWN_QUOTA_EPS(q) == ev[j]);
+            }
+    }
+    /* The unpack macros only look at [31:0]: bits [63:32] are the decoder's job. */
+    assert(JE_ABI_SPAWN_QUOTA_HANDLES(UINT64_C(0xffffffff00000005)) == 5u);
+    assert(JE_ABI_SPAWN_QUOTA_EPS(UINT64_C(0xffffffff00070005)) == 7u);
+    assert(JE_ABI_SPAWN_QUOTAS(0u, 0u) == 0u);
+    assert(JE_ABI_SPAWN_QUOTAS(1u, 2u) == UINT64_C(0x00020001));
+}
+
+static void test_clock_ticks_decode(void)
+{
+    je_abi_status st; uint64_t res;
+    /* ADR 0010 D6: no args, no authority -> the CLOCK_TICKS action, OK. The tick
+     * value itself is written by the glue (not hostable). */
+    assert(dec(JE_SYS_CLOCK_TICKS, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_CLOCK_TICKS && st==JE_ABI_OK);
+    /* every argument register reserved: low bit and top bit, one at a time */
+    for (unsigned k = 0; k < 6u; ++k) {
+        static const uint64_t vals[] = { 1u, UINT64_C(0x8000000000000000), UINT64_C(0xffffffffffffffff) };
+        for (unsigned v = 0; v < 3u; ++v) {
+            uint64_t a[6] = { 0,0,0,0,0,0 };
+            a[k] = vals[v];
+            res = 0xdeadu;
+            assert(je_syscall_decode(JE_SYS_CLOCK_TICKS, a, &st, &res)==JE_SYSCALL_RETURN);
+            assert(st==JE_ABI_INVALID && res==0);
+        }
+    }
+    /* all args dirty */
+    assert(dec(JE_SYS_CLOCK_TICKS, 1,2,3,4,5,6,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID && res==0);
+    /* no 64-bit op aliasing */
+    assert(dec(UINT64_C(0x100000000) | JE_SYS_CLOCK_TICKS, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
+}
+
+static void test_proc_spawn_decode(void)
+{
+    je_abi_status st; uint64_t res;
+    const uint64_t QMAX = JE_ABI_SPAWN_QUOTAS(JE_VM_HANDLE_QUOTA_MAX, 0u);
+
+    /* --- boundary OKs --- */
+    spawn_ok(SP_H, 0, 0, 0, 0, 0);                         /* no grants, default quotas */
+    for (uint64_t n = 1; n <= JE_ABI_SPAWN_GRANTS_MAX; ++n)
+        spawn_ok(SP_H, 0, SP_GPTR, n, 0, 0);               /* 1..4 grants, ptr present */
+    spawn_ok(SP_H, 0, SP_GPTR, JE_ABI_SPAWN_GRANTS_MAX, QMAX, 0);  /* count 4 + quota MAX */
+    spawn_ok(SP_H, 0, 0, 0, JE_ABI_SPAWN_QUOTAS(1u, 0u), 0);       /* handle quota 1 */
+    spawn_ok(SP_H, 0, 0, 0, JE_ABI_SPAWN_QUOTAS(JE_VM_HANDLE_QUOTA_DEFAULT, 0u), 0);
+    spawn_ok(SP_H, 0, 0, 0, QMAX, 0);                      /* handle quota MAX (39) */
+    spawn_ok(SP_H, 0, 0, 0, JE_ABI_SPAWN_QUOTAS(0u, JE_EP_CHILD_QUOTA_MAX), 0); /* eps = MAX (0) */
+    /* abi.h op 14 (include/jeios/abi.h:154-157): the decode reject list is
+     * EXHAUSTIVE; launcher validity, image_id validity and the grants pointer are
+     * glue/spawn checks, not decode. So these must DECODE OK.
+     * RDI and RSI at the largest 32-bit values are not wide. An unknown image_id
+     * and a bad/forged launcher handle are glue/spawn-level, not decode. */
+    spawn_ok(UINT64_C(0xffffffff), 0, 0, 0, 0, 0);
+    spawn_ok(SP_H, UINT64_C(0xffffffff), 0, 0, 0, 0);
+    spawn_ok(0, 0, 0, 0, 0, 0);                             /* handle 0 -> glue BADINDEX */
+    /* the grants pointer is checked by the glue's user copy, not by decode */
+    spawn_ok(SP_H, 0, UINT64_C(0xffffffffffffffff), 1, 0, 0);
+    /* spawn.h step 3 pins "n > effective child handle quota -> INVALID". That is a
+     * spawn (kernel) check, not decode: it is absent from the exhaustive abi.h
+     * reject list. n=2 with handle quota 1, and n=4 (GRANTS_MAX) with quota 1, must
+     * still DECODE OK. The spawn-level INVALID is proven by the QEMU fixture, not
+     * by this hosted test. */
+    spawn_ok(SP_H, 0, SP_GPTR, 2, JE_ABI_SPAWN_QUOTAS(1u, 0u), 0);
+    spawn_ok(SP_H, 0, SP_GPTR, JE_ABI_SPAWN_GRANTS_MAX, JE_ABI_SPAWN_QUOTAS(1u, 0u), 0);
+
+    /* --- every pinned INVALID rule (abi.h op 14) --- */
+    /* wide RDI (launcher) */
+    spawn_invalid(UINT64_C(0x100000000), 0, 0, 0, 0, 0);
+    spawn_invalid(UINT64_C(0x8000000000010000), 0, 0, 0, 0, 0);
+    spawn_invalid(UINT64_C(0xffffffffffffffff), 0, 0, 0, 0, 0);
+    /* wide RSI (image_id) */
+    spawn_invalid(SP_H, UINT64_C(0x100000000), 0, 0, 0, 0);
+    spawn_invalid(SP_H, UINT64_C(0x8000000000000000), 0, 0, 0, 0);
+    /* grant_count > JE_ABI_SPAWN_GRANTS_MAX (with a pointer, so only count is wrong) */
+    spawn_invalid(SP_H, 0, SP_GPTR, JE_ABI_SPAWN_GRANTS_MAX + 1u, 0, 0);
+    spawn_invalid(SP_H, 0, SP_GPTR, 0xffu, 0, 0);
+    spawn_invalid(SP_H, 0, SP_GPTR, UINT64_C(0x100000000), 0, 0);       /* wide count, low bits 0 */
+    spawn_invalid(SP_H, 0, SP_GPTR, UINT64_C(0x100000001), 0, 0);       /* must not narrow to 1 */
+    spawn_invalid(SP_H, 0, SP_GPTR, UINT64_C(0xffffffffffffffff), 0, 0);
+    /* RDX/count pairing: RDX != 0 with count 0; RDX == 0 with count > 0 */
+    spawn_invalid(SP_H, 0, SP_GPTR, 0, 0, 0);
+    for (uint64_t n = 1; n <= JE_ABI_SPAWN_GRANTS_MAX; ++n)
+        spawn_invalid(SP_H, 0, 0, n, 0, 0);
+    /* quotas [63:32] != 0 (low half otherwise valid) */
+    spawn_invalid(SP_H, 0, 0, 0, UINT64_C(0x100000000), 0);
+    spawn_invalid(SP_H, 0, 0, 0, UINT64_C(0x8000000000000000), 0);
+    spawn_invalid(SP_H, 0, 0, 0, UINT64_C(0xffffffff00000000) | JE_ABI_SPAWN_QUOTAS(1u, 0u), 0);
+    /* handle quota > JE_VM_HANDLE_QUOTA_MAX */
+    spawn_invalid(SP_H, 0, 0, 0, JE_ABI_SPAWN_QUOTAS(JE_VM_HANDLE_QUOTA_MAX + 1u, 0u), 0);
+    spawn_invalid(SP_H, 0, 0, 0, JE_ABI_SPAWN_QUOTAS(JE_VM_HANDLE_CAP, 0u), 0);
+    spawn_invalid(SP_H, 0, 0, 0, JE_ABI_SPAWN_QUOTAS(0xffffu, 0u), 0);
+    /* endpoint quota > JE_EP_CHILD_QUOTA_MAX (= 0 in M4, so 1 is already INVALID) */
+    spawn_invalid(SP_H, 0, 0, 0, JE_ABI_SPAWN_QUOTAS(0u, JE_EP_CHILD_QUOTA_MAX + 1u), 0);
+    spawn_invalid(SP_H, 0, 0, 0, JE_ABI_SPAWN_QUOTAS(1u, 1u), 0);
+    spawn_invalid(SP_H, 0, 0, 0, JE_ABI_SPAWN_QUOTAS(0u, 0xffffu), 0);
+    /* R9 reserved */
+    spawn_invalid(SP_H, 0, 0, 0, 0, 1);
+    spawn_invalid(SP_H, 0, 0, 0, 0, UINT64_C(0x8000000000000000));
+    spawn_invalid(SP_H, 0, SP_GPTR, 1, QMAX, 1);            /* otherwise-valid call + R9 */
+    /* several rules broken at once: still INVALID, never the spawn action */
+    spawn_invalid(UINT64_C(0x100000000), UINT64_C(0x100000000), 0, 5, UINT64_C(0x100000000), 1);
+
+    /* no 64-bit op aliasing */
+    assert(dec(UINT64_C(0x100000000) | JE_SYS_PROC_SPAWN, SP_H,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
 }
 
 int main(void)
@@ -130,10 +300,22 @@ int main(void)
     assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_KILL,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
     assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_INSPECT|JE_ABI_RIGHT_KILL,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
     assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHTS_KNOWN,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
-    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0x20u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* SPAWN: PR-C, unknown now */
-    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_KILL|0x20u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* known+unknown */
-    for (uint32_t bit = 0x20u; bit != 0u; bit <<= 1)   /* every bit above KILL */
+    /* HISTORY (PR-B): 0x20 was unknown here and dup(self, 0x20) was INVALID. ADR
+     * 0010 D5 (PR-C) appends SPAWN=0x20 to JE_ABI_RIGHTS_KNOWN, so 0x20 is now a
+     * well-formed request: decode returns the DUP action and the known-but-unheld
+     * (or LAUNCHER not-DUP-able) DENIED is the glue's decision. The unknown-bit
+     * INVALID contract moves to the next still-unknown bit, 0x40. NOTE: ADR 0010
+     * D3 reserves 0x40/0x80/0x100 for DEVICE; the PR that makes them known must
+     * move these lines again. */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_SPAWN,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_INSPECT|JE_ABI_RIGHT_SPAWN,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0x40u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* still unknown */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_KILL|0x40u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* known+unknown */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_SPAWN|0x40u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* known+unknown */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHTS_KNOWN|0x80000000u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    for (uint32_t bit = 0x40u; bit != 0u; bit <<= 1)   /* every bit above SPAWN */
         assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, bit,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+    assert(JE_ABI_RIGHTS_KNOWN == 0x3fu);   /* exactly INSPECT..SPAWN known in PR-C */
 
     /* proc_status (op 15, ADR 0010 D4): h=RDI (must fit 32 bits), out=RSI,
      * RDX..R9 reserved (0). A clean call decodes to exactly the named action
@@ -155,10 +337,16 @@ int main(void)
     /* wide handle AND a reserved arg together: still INVALID, never an action */
     assert(dec(JE_SYS_PROC_STATUS, UINT64_C(0x100000000), 0x40002000,1,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
 
-    /* Ops reserved by ADR 0010 for later PRs stay UNSUPPORTED (13 CLOCK_TICKS,
-     * 14 PROC_SPAWN, 16 PROC_KILL, 17-19 DEV_*), clean or dirty args alike. */
+    /* ADR 0010 PR-C: ops 13 CLOCK_TICKS and 14 PROC_SPAWN are now decoded. */
+    test_spawn_abi_constants();
+    test_clock_ticks_decode();
+    test_proc_spawn_decode();
+
+    /* Ops reserved by ADR 0010 for later PRs stay UNSUPPORTED (16 PROC_KILL,
+     * 17-19 DEV_*, and 20 beyond), clean or dirty args alike. HISTORY: 13 and 14
+     * were in this list until PR-C. */
     {
-        static const uint64_t later_ops[] = { 13u, 14u, 16u, 17u, 18u, 19u, 20u };
+        static const uint64_t later_ops[] = { 16u, 17u, 18u, 19u, 20u };
         for (unsigned i = 0; i < sizeof later_ops / sizeof later_ops[0]; ++i) {
             assert(dec(later_ops[i], 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
             assert(dec(later_ops[i], 0x00010000,0x40002000,1,2,3,4,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
@@ -169,6 +357,7 @@ int main(void)
 
     printf("syscall: PASS (abi_query, yield, exit, copy_probe, handle self/close/query/rights/dup, "
            "endpoint_create, try_send/try_recv decode, dup KILL known, proc_status decode, "
-           "reserved-arg, wide-handle, unknown-rights, full-width op, unsupported 13/14/16-20)\n");
+           "clock_ticks decode, proc_spawn decode, spawn ABI layout, dup SPAWN known, "
+           "reserved-arg, wide-handle, unknown-rights, full-width op, unsupported 16-20)\n");
     return 0;
 }

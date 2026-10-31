@@ -520,6 +520,57 @@ re-stale-after-reuse assertion, the measured quota count, the softened per-proce
 wording, the ADR wide-handle amendment, and the pinned ABI static-asserts).
 AI-assisted review only; not independent human qualification.
 
+## M4 PR-C — spawn, LAUNCHER, startup register ABI, CLOCK_TICKS (ADR 0010 D5/D6) — 2026-10-31
+
+Owner-approved under D-OWNER-7 (`CLOCK_TICKS`), with D5 as accepted in ADR 0010.
+
+**ABI.** These additions are appended to v0:
+- op 13 `CLOCK_TICKS`;
+- op 14 `PROC_SPAWN`;
+- object type `JE_ABI_OBJ_LAUNCHER` (4) and right `JE_ABI_RIGHT_SPAWN` (0x20);
+- `je_abi_spawn_grant`, the quota macros and `JE_ABI_STARTUP_V1`.
+
+The op-14 decode list is exhaustive. Launcher, image and pointer validity are checked in the glue or in spawn, not in decode.
+
+**Spawn** (`kernel/core/spawn.c`; contract in `include/jeios/spawn.h`) runs with IF=0. Its precedence is:
+1. launcher;
+2. image;
+3. quotas, including n greater than the effective child quota;
+4. grants (ENDPOINT only, with TRANSFER, rights a subset);
+5. the caller-table `je_handle_can_alloc` preflight;
+6. a journal: record, VM build, grant mints, thread with startup v1, then publish of a PROCESS handle with INSPECT|KILL.
+
+On failure the journal is undone in reverse, and every pool returns to its baseline. Once the thread exists, rollback uses `on_dying(KILLED)` and then `on_reaped`. Internal NOMEM/BUSY become `H_NOSLOTS`. Spawn itself runs no audit; the fixture audits the child. There is a kernel-internal fail-Nth hook with a fired counter, and it is disarmed after every spawn.
+
+**Other pieces:**
+- A built-in image table (`image.c`), validated at boot.
+- `je_thread_create_user_start` (startup registers).
+- The LAUNCHER row in typed dispatch: `QUERY` returns 4; `RIGHTS` and `DUP` return DENIED.
+
+**Evidence: the QEMU fixture M4c-s1 (NX profile).**
+- The spawner reads its startup v1 registers (LAUNCHER in RDX) and asserts that every other GPR is zero.
+- The child asserts the full zero-fill and the grant order by `RIGHTS`: `SEND|INSPECT` and `SEND|RECV|INSPECT`. It also checks attenuation behaviourally: `RECV` on the send-only end is DENIED.
+- The child sends a message and exits with code 5.
+- `CLOCK_TICKS` is monotonic, and a nonzero argument gives INVALID.
+- Every negative spawn checks `RDX==0` and an IF=0 baseline. The cases are: bad image, no TRANSFER, superset rights, count 5, endpoint quota 1, SELF passed as launcher, a stale launcher, and BADINDEX. Separately, `n > quota` is shown to be rejected before the journal, because the step-1 failpoint never fires.
+- Fail-Nth covers steps 1–5 and each grant index. It checks the fired counter and the baselines for pages, endpoints (with refs), records, threads, VMs and caller handles.
+- Unfired-arm, disarm and published-rights probes are included.
+- The spawn cost is measured in TSC cycles.
+- The hosted tests cover `can_alloc`, the op-13/14 decode matrix, the startup-v1 uframe check and the `out_rflags` sentinel.
+
+**Provenance (worker mode; AI-assisted, not human qualification).**
+
+| Part | Author | Adversarial reviewer |
+|---|---|---|
+| Headers and stubs | lead | both |
+| Implementation and fixture | Codex (4 rounds) | Claude (core review, fixture review, verification) |
+| Hosted tests, written from headers only | Claude (3 rounds) | Codex (with mutants) |
+| Phase-6 ack fix and disarm probe | lead | verified by running the mutant |
+
+Details are in `docs/adr/debates/m4c-reviews.md` and `m4c-workers/`.
+
+**Not yet:** kill (PR-D), the ring-3 C image path (PR-E), and the supervisor (PR-F).
+
 ## M4 PR-B — PROCESS records, automatic reaper, typed dispatch, PROC_STATUS, creation quota (ADR 0010 D3/D4/D-DEV) — 2026-10-31
 
 Owner-approved as D-OWNER-2 (death path / reaper), D-OWNER-4 (typed `query`/`rights`/`dup`) and D-OWNER-8 (the D-DEV deviation fix).

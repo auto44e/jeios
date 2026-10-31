@@ -437,6 +437,166 @@ static void test_resolve_any(void)
     (void) h_odd;
 }
 
+/* ADR 0010 D5 step 0: je_handle_can_alloc. Written from handle.h only (the
+ * implementation was not read). Contract: pure and read-only, and returns exactly
+ * the status je_handle_alloc would return on the same table right now. */
+static je_handle_slot g_ca_scratch[CAP];
+static int g_ca_obj;
+
+/* Assert can_alloc(t) == want, that it changed nothing (slot bytes and every
+ * accounting field), that a second call agrees, and that a real alloc on a
+ * byte-identical scratch copy of the table returns the same status. */
+static void ca_check(const je_handle_table *t, je_handle_status want)
+{
+    je_handle_slot before[CAP];
+    je_handle_slot *slots_before = t->slots;
+    uint32_t cap_before = t->capacity, quota_before = t->quota, live_before = t->live;
+    assert(t->capacity <= CAP);
+    memcpy(before, t->slots, t->capacity * sizeof before[0]);
+
+    je_handle_status s = je_handle_can_alloc(t);
+    assert(s == want);
+    assert(memcmp(before, t->slots, t->capacity * sizeof before[0]) == 0);
+    assert(t->slots == slots_before && t->capacity == cap_before
+           && t->quota == quota_before && t->live == live_before);
+    assert(je_handle_can_alloc(t) == s);                 /* idempotent */
+
+    /* Oracle: what alloc returns on an identical copy. */
+    je_handle_table c = *t;
+    memcpy(g_ca_scratch, t->slots, t->capacity * sizeof g_ca_scratch[0]);
+    c.slots = g_ca_scratch;
+    je_handle h = 0xdeadu;
+    je_handle_status a = je_handle_alloc(&c, &g_ca_obj, 1u, 0u, &h);
+    assert(a == s);
+    assert((a == JE_HANDLE_OK) == (h != 0u));
+}
+
+/* Retire the first r non-retired slots of t (lowest-free allocation always picks
+ * the first FREE slot, so r * GEN_MAX alloc+close cycles retire slots in order).
+ * Requires every slot to be FREE or RETIRED on entry. */
+static void ca_retire(je_handle_table *t, uint32_t r)
+{
+    je_handle h;
+    for (uint32_t k = 0; k < r * JE_HANDLE_GEN_MAX; ++k) {
+        assert(je_handle_alloc(t, &g_ca_obj, 1u, 0u, &h) == JE_HANDLE_OK);
+        assert(je_handle_close(t, h) == JE_HANDLE_OK);
+    }
+}
+
+static void test_can_alloc(void)
+{
+    je_handle h, hs[CAP];
+
+    /* NULL table -> BADINDEX. */
+    assert(je_handle_can_alloc((const je_handle_table *)0) == JE_HANDLE_BADINDEX);
+
+    /* Empty table -> OK. Then a real alloc agrees and lands. */
+    {
+        je_handle_table t = mk(CAP);
+        ca_check(&t, JE_HANDLE_OK);
+        assert(je_handle_alloc(&t, &g_ca_obj, 1u, 0u, &h) == JE_HANDLE_OK);
+        ca_check(&t, JE_HANDLE_OK);
+    }
+
+    /* Quota 0 (disabled table) -> QUOTA on an empty table. */
+    {
+        je_handle_table t = mk(0u);
+        ca_check(&t, JE_HANDLE_QUOTA);
+    }
+
+    /* Quota 3 < capacity: OK below, QUOTA at the quota (FREE slots remain, so
+     * this is QUOTA, not NOSLOTS), OK again after one close, QUOTA after refill. */
+    {
+        je_handle_table t = mk(3u);
+        for (uint32_t i = 0; i < 3u; ++i) {
+            ca_check(&t, JE_HANDLE_OK);
+            assert(je_handle_alloc(&t, &g_ca_obj, 1u, 0u, &hs[i]) == JE_HANDLE_OK);
+        }
+        ca_check(&t, JE_HANDLE_QUOTA);
+        assert(je_handle_close(&t, hs[1]) == JE_HANDLE_OK);
+        ca_check(&t, JE_HANDLE_OK);
+        assert(je_handle_alloc(&t, &g_ca_obj, 1u, 0u, &hs[1]) == JE_HANDLE_OK);
+        ca_check(&t, JE_HANDLE_QUOTA);
+    }
+
+    /* Quota == capacity, every slot LIVE: both QUOTA and NOSLOTS apply; QUOTA wins
+     * (ADR 0008 D8 precedence, which alloc applies). After a close -> OK. */
+    {
+        je_handle_table t = mk(CAP);
+        for (uint32_t i = 0; i < CAP; ++i)
+            assert(je_handle_alloc(&t, &g_ca_obj, 1u, 0u, &hs[i]) == JE_HANDLE_OK);
+        ca_check(&t, JE_HANDLE_QUOTA);
+        assert(je_handle_close(&t, hs[CAP - 1u]) == JE_HANDLE_OK);
+        ca_check(&t, JE_HANDLE_OK);
+    }
+
+    /* Every slot RETIRED, live 0 < quota -> NOSLOTS. CAP * GEN_MAX cycles (about
+     * 524k at the production width) are cheap enough to run in both builds. */
+    {
+        je_handle_table t = mk(CAP);
+        ca_retire(&t, CAP);
+        for (uint32_t i = 0; i < CAP; ++i)
+            assert(t.slots[i].state == JE_HSLOT_RETIRED);
+        assert(t.live == 0u);
+        ca_check(&t, JE_HANDLE_NOSLOTS);
+    }
+
+    /* Mixed RETIRED + LIVE, live < quota, no FREE slot -> NOSLOTS. */
+    {
+        je_handle_table t = mk(CAP);
+        ca_retire(&t, 2u);
+        ca_check(&t, JE_HANDLE_OK);                       /* FREE slots remain */
+        for (uint32_t i = 0; i < CAP - 2u; ++i)
+            assert(je_handle_alloc(&t, &g_ca_obj, 1u, 0u, &hs[i]) == JE_HANDLE_OK);
+        assert(t.live == CAP - 2u);
+        ca_check(&t, JE_HANDLE_NOSLOTS);
+        /* a close frees a slot -> OK */
+        assert(je_handle_close(&t, hs[0]) == JE_HANDLE_OK);
+        ca_check(&t, JE_HANDLE_OK);
+    }
+
+    /* Mixed RETIRED + LIVE with live == quota and no FREE slot: QUOTA and NOSLOTS
+     * both apply; QUOTA before NOSLOTS. */
+    {
+        je_handle_table t = mk(CAP - 3u);
+        ca_retire(&t, 3u);
+        for (uint32_t i = 0; i < CAP - 3u; ++i)
+            assert(je_handle_alloc(&t, &g_ca_obj, 1u, 0u, &hs[i]) == JE_HANDLE_OK);
+        assert(t.live == t.quota);
+        ca_check(&t, JE_HANDLE_QUOTA);
+    }
+
+    /* can_alloc followed by alloc on the REAL table: the preflight answer holds
+     * (the spawn usage: preflight, then the publishing alloc). */
+    {
+        je_handle_table t = mk(2u);
+        assert(je_handle_can_alloc(&t) == JE_HANDLE_OK);
+        assert(je_handle_alloc(&t, &g_ca_obj, 3u, 0x11u, &h) == JE_HANDLE_OK);
+        assert(je_handle_can_alloc(&t) == JE_HANDLE_OK);
+        assert(je_handle_alloc(&t, &g_ca_obj, 3u, 0x11u, &h) == JE_HANDLE_OK);
+        assert(je_handle_can_alloc(&t) == JE_HANDLE_QUOTA);
+        h = 0xdeadu;
+        assert(je_handle_alloc(&t, &g_ca_obj, 3u, 0x11u, &h) == JE_HANDLE_QUOTA && h == 0u);
+    }
+
+    /* Capacity-1 table: OK, then (quota 1) QUOTA, then retired -> NOSLOTS. */
+    {
+        je_handle_slot one[1];
+        je_handle_table t;
+        assert(je_handle_table_init(&t, one, 1u, 1u));
+        ca_check(&t, JE_HANDLE_OK);
+        assert(je_handle_alloc(&t, &g_ca_obj, 1u, 0u, &h) == JE_HANDLE_OK);
+        ca_check(&t, JE_HANDLE_QUOTA);
+        assert(je_handle_close(&t, h) == JE_HANDLE_OK);
+        ca_check(&t, JE_HANDLE_OK);
+        while (t.slots[0].state != JE_HSLOT_RETIRED) {
+            assert(je_handle_alloc(&t, &g_ca_obj, 1u, 0u, &h) == JE_HANDLE_OK);
+            assert(je_handle_close(&t, h) == JE_HANDLE_OK);
+        }
+        ca_check(&t, JE_HANDLE_NOSLOTS);
+    }
+}
+
 int main(void)
 {
     test_encode_decode();
@@ -446,17 +606,18 @@ int main(void)
     test_rights_of();
     test_dup();
     test_resolve_any();
+    test_can_alloc();
 #ifdef JE_HANDLE_TEST_WIDTH
     test_saturation_and_retirement();
     test_noslots_via_retirement();
     printf("handle: PASS (encode/decode, alloc/lookup/close, quota, "
            "saturation->retire, retired-capacity loss, noslots-via-retirement, "
-           "resolve_any) "
+           "resolve_any, can_alloc) "
            "[reduced width gen_bits=%u]\n", (unsigned)JE_HANDLE_GEN_BITS);
 #else
     test_production_boundaries();
     printf("handle: PASS (encode/decode, alloc/lookup/close, forged/stale/"
-           "wrongtype/denied, quota precedence, resolve_any) [production 16/16]\n");
+           "wrongtype/denied, quota precedence, resolve_any, can_alloc) [production 16/16]\n");
 #endif
     return 0;
 }

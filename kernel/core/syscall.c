@@ -16,18 +16,18 @@
 #include <jeios/sched.h>
 #include <jeios/trap.h>
 #include <jeios/usercopy.h>
-#ifndef JE_SYSCALL_HOSTED_TEST
 #include <jeios/vm.h>
-#include <jeios/handle.h>
 #include <jeios/endpoint.h>
+#ifndef JE_SYSCALL_HOSTED_TEST
+#include <jeios/handle.h>
 #include <jeios/endpoint_kern.h>
 #include <jeios/proc.h>
 #include <jeios/arch.h>
+#include <jeios/spawn.h>
 extern je_ep_status je_endpoint_kern_dup(je_vm *vm, uint32_t index, je_handle src,
                                          uint32_t rights, je_handle *out);
 extern bool je_endpoint_kern_is_wired(const je_vm *vm);
 #endif
-
 
 /* Pure decode: given the operation and its six argument registers, decide the
  * action, the ABI status to return in RAX, and any scalar result for RDX. No
@@ -124,6 +124,22 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
         if ((r8 == 0u) != (r9 == 0u)) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_TRY_RECV;
+    case JE_SYS_CLOCK_TICKS:
+        if (rdi|rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_CLOCK_TICKS;
+    case JE_SYS_PROC_SPAWN: {
+        uint32_t handle_quota = JE_ABI_SPAWN_QUOTA_HANDLES(r8);
+        uint32_t endpoint_quota = JE_ABI_SPAWN_QUOTA_EPS(r8);
+        if ((rdi >> 32) || (rsi >> 32) || r9 != 0u
+            || r10 > JE_ABI_SPAWN_GRANTS_MAX
+            || ((r10 == 0u) != (rdx == 0u))
+            || (r8 >> 32) != 0u
+            || handle_quota > JE_VM_HANDLE_QUOTA_MAX
+            || endpoint_quota > JE_EP_CHILD_QUOTA_MAX) {
+            *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN;
+        }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_PROC_SPAWN;
+    }
     case JE_SYS_PROC_STATUS:
         /* proc_status(h=RDI, out_ptr=RSI): the handle is narrowed only after
          * this decode check; all other registers are reserved. */
@@ -191,7 +207,7 @@ static bool process_id_from_object(je_proc_pool *pool, void *object,
 static je_status dispatch_retain_process(void *object);
 static void dispatch_release_process(void *object);
 
-static const je_type_dispatch type_dispatch[JE_PROCESS_TYPE + 1u] = {
+static const je_type_dispatch type_dispatch[JE_ABI_OBJ_LAUNCHER + 1u] = {
     [JE_ABI_OBJ_SELF] = {
         JE_ABI_RIGHT_INSPECT, JE_DUP_POLICY_SELF, JE_ABI_OBJ_SELF,
         (je_status (*)(void *))0, (void (*)(void *))0
@@ -205,12 +221,16 @@ static const je_type_dispatch type_dispatch[JE_PROCESS_TYPE + 1u] = {
     [JE_ABI_OBJ_PROCESS] = {
         JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL, JE_DUP_POLICY_PROCESS,
         JE_ABI_OBJ_PROCESS, dispatch_retain_process, dispatch_release_process
+    },
+    [JE_ABI_OBJ_LAUNCHER] = {
+        JE_ABI_RIGHT_SPAWN, JE_DUP_POLICY_DENIED, JE_ABI_OBJ_LAUNCHER,
+        (je_status (*)(void *))0, (void (*)(void *))0
     }
 };
 
 static const je_type_dispatch *dispatch_for_type(uint32_t type)
 {
-    if (type == 0u || type > JE_PROCESS_TYPE
+    if (type == 0u || type > JE_ABI_OBJ_LAUNCHER
         || type_dispatch[type].known_rights == 0u)
         return (const je_type_dispatch *)0;
     return &type_dispatch[type];
@@ -261,7 +281,7 @@ static bool process_id_from_object(je_proc_pool *pool, void *object, je_proc_id 
     return false;
 }
 
-static _Noreturn void syscall_invariant(const char *message)
+_Noreturn void syscall_invariant(const char *message)
 {
     je_arch_console_write(message);
     je_arch_halt();
@@ -287,9 +307,11 @@ static void dispatch_release_process(void *object)
 }
 
 je_status je_process_handle_mint(je_vm *vm, uint32_t index, je_proc_id id,
-                                 uint32_t rights, je_handle *out)
+                                 uint32_t rights, je_handle *out,
+                                 je_handle_status *out_alloc_status)
 {
     if (out) *out = 0u;
+    if (out_alloc_status) *out_alloc_status = JE_HANDLE_OK;
     if (!vm || index >= JE_VM_MAX_PROCESSES || !out
         || !je_endpoint_kern_is_wired(vm) || !dispatch_for_type(JE_PROCESS_TYPE)
         || (rights & ~JE_ABI_RIGHTS_KNOWN) != 0u
@@ -305,6 +327,7 @@ je_status je_process_handle_mint(je_vm *vm, uint32_t index, je_proc_id id,
                                              (void *)&pool->rec[id.index],
                                              JE_PROCESS_TYPE, rights, &h);
     if (alloc != JE_HANDLE_OK) {
+        if (out_alloc_status) *out_alloc_status = alloc;
         type_dispatch[JE_PROCESS_TYPE].release((void *)&pool->rec[id.index]);
         switch (alloc) {
         case JE_HANDLE_QUOTA: return JE_ERR_DENIED;
@@ -587,11 +610,11 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
                 syscall_invariant("JeiOS fatal: PROCESS close mismatch\r\n");
             dispatch_release_process(object);
             f->rax=(uint64_t)JE_ABI_OK; f->rdx=0;
-        } else if (type != JE_ABI_OBJ_SELF) {
-            f->rax = (uint64_t)JE_ABI_H_WRONGTYPE; f->rdx = 0;
-        } else {
+        } else if (type == JE_ABI_OBJ_SELF || type == JE_ABI_OBJ_LAUNCHER) {
             je_handle_status s = je_handle_close(t, h);
             f->rax = (uint64_t)handle_status_to_abi(s); f->rdx = 0;
+        } else {
+            f->rax = (uint64_t)JE_ABI_H_WRONGTYPE; f->rdx = 0;
         }
         return je_sched_return_to_user(f);
     }
@@ -720,6 +743,43 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         f->rax = (uint64_t)ep_status_to_abi(s);
         f->rdx = (s == JE_EP_OK)
                ? ((uint64_t)h0 | ((uint64_t)h1 << 32)) : 0u;
+        return je_sched_return_to_user(f);
+    }
+    case JE_SYSCALL_CLOCK_TICKS:
+        f->rax = (uint64_t)JE_ABI_OK;
+        f->rdx = je_sched_ticks();
+        return je_sched_return_to_user(f);
+    case JE_SYSCALL_PROC_SPAWN: {
+        je_vm *vm; uint32_t index;
+        if (!current_vm_index(&vm, &index)) {
+            f->rax = (uint64_t)JE_ABI_INVALID; f->rdx = 0u;
+            return je_sched_return_to_user(f);
+        }
+        uint32_t count = (uint32_t)f->r10;
+        void *launcher_object = (void *)0;
+        je_handle_status launcher_status = je_handle_lookup(
+            &vm->procs[index].htable, (je_handle)f->rdi,
+            JE_ABI_OBJ_LAUNCHER, JE_ABI_RIGHT_SPAWN, &launcher_object);
+        (void)launcher_object;
+        if (launcher_status != JE_HANDLE_OK) {
+            f->rax = (uint64_t)handle_status_to_abi(launcher_status);
+            f->rdx = 0u;
+            return je_sched_return_to_user(f);
+        }
+        je_abi_spawn_grant grants[JE_ABI_SPAWN_GRANTS_MAX];
+        if (count != 0u
+            && je_copy_from_user(grants, f->rdx,
+                                 (uint64_t)count * sizeof grants[0]) != JE_ABI_OK) {
+            f->rax = (uint64_t)JE_ABI_INVALID; f->rdx = 0u;
+            return je_sched_return_to_user(f);
+        }
+        je_handle child = 0u;
+        je_abi_status s = je_proc_spawn(
+            vm, index, (je_handle)f->rdi, (uint32_t)f->rsi, grants, count,
+            JE_ABI_SPAWN_QUOTA_HANDLES(f->r8),
+            JE_ABI_SPAWN_QUOTA_EPS(f->r8), &child);
+        f->rax = (uint64_t)s;
+        f->rdx = (uint64_t)child;
         return je_sched_return_to_user(f);
     }
     case JE_SYSCALL_TRY_SEND: {

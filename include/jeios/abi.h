@@ -145,7 +145,29 @@ typedef enum {
                               *    delivered (OK) or required cap count
                               *    (SHORT_BUFFER); both 0 on other statuses. A
                               *    nonzero-timeout recv never returns EMPTY. */
-    /* 13 CLOCK_TICKS, 14 PROC_SPAWN, 16 PROC_KILL and 17-19 DEV_* are reserved by
+    , JE_SYS_CLOCK_TICKS = 13 /* M4 clock_ticks(): RDI..R9 must be 0. RDX = monotonic
+                              * count of 100 Hz PIT ticks since boot (je_sched_ticks). Not
+                              * wall time; never decreases; no authority (ADR 0010 D6). */
+    , JE_SYS_PROC_SPAWN = 14 /* M4 proc_spawn(launcher=RDI, image_id=RSI, grants=RDX,
+                              * grant_count=R10, quotas=R8); R9 reserved (0). Needs SPAWN
+                              * on a LAUNCHER handle. RDI and RSI must fit in 32 bits.
+                              * Decode (pure) rejects with INVALID (EXHAUSTIVE list;
+                              * launcher validity, image_id validity and the grants
+                              * pointer are glue/spawn checks, not decode) [Codex
+                              * PR-C test review P3]: wide RDI/RSI,
+                              * grant_count > JE_ABI_SPAWN_GRANTS_MAX, RDX/count
+                              * mismatch, quotas [63:32] != 0, handle quota >
+                              * JE_VM_HANDLE_QUOTA_MAX, endpoint quota >
+                              * JE_EP_CHILD_QUOTA_MAX, R9 != 0. grants -> grant_count x
+                              * je_abi_spawn_grant (<= JE_ABI_SPAWN_GRANTS_MAX); RDX != 0
+                              * iff grant_count != 0. quotas: [15:0] child handle quota
+                              * (0 = default 15, else 1..JE_VM_HANDLE_QUOTA_MAX), [31:16]
+                              * child endpoint creation quota (<= JE_EP_CHILD_QUOTA_MAX,
+                              * which is 0 in M4), [63:32] must be 0. -> RDX = new
+                              * PROCESS handle (INSPECT|KILL) in the caller's table, 0
+                              * on failure. Transactional: on any failure every pool is
+                              * back to baseline and the child never ran (ADR 0010 D5). */
+    /* 16 PROC_KILL and 17-19 DEV_* are reserved by
      * ADR 0010 for later M4 PRs. Until then they stay UNSUPPORTED. */
     , JE_SYS_PROC_STATUS = 15 /* M4 proc_status(h=RDI, out=RSI): needs INSPECT on a
                               * PROCESS handle. Copies a 16-byte je_abi_proc_status
@@ -167,6 +189,7 @@ typedef enum {
  * JE_ENDPOINT_OBJ_TYPE in the syscall glue via _Static_assert. */
 #define JE_ABI_OBJ_ENDPOINT 2u
 #define JE_ABI_OBJ_PROCESS 3u   /* ADR 0010 D3 */
+#define JE_ABI_OBJ_LAUNCHER 4u  /* ADR 0010 D3: SPAWN only; no INSPECT; not DUP-able */
 /* M3c D6 (step 4): max message payload bytes a try_send accepts. ABI-visible
  * (ring 3 must know the cap); pinned equal to the table-side JE_EP_MSG_MAX in the
  * syscall glue. */
@@ -189,6 +212,27 @@ _Static_assert(JE_SYS_ENDPOINT_CREATE == 10, "abi op endpoint_create");
 _Static_assert(JE_SYS_TRY_SEND == 11, "abi op try_send");
 _Static_assert(JE_SYS_TRY_RECV == 12, "abi op try_recv");
 _Static_assert(JE_SYS_PROC_STATUS == 15, "abi op proc_status (ADR 0010)");
+_Static_assert(JE_SYS_CLOCK_TICKS == 13, "abi op clock_ticks (ADR 0010 D6)");
+_Static_assert(JE_SYS_PROC_SPAWN == 14, "abi op proc_spawn (ADR 0010 D5)");
+
+/* ADR 0010 D5: spawn grant entry. 8 bytes, little-endian, no padding. `handle` names
+ * an ENDPOINT in the caller's table; the caller's handle must hold TRANSFER; `rights`
+ * must be a subset of its rights (unknown bits -> INVALID). */
+typedef struct {
+    uint32_t handle;
+    uint32_t rights;
+} je_abi_spawn_grant;
+_Static_assert(sizeof(je_abi_spawn_grant) == 8u, "spawn grant ABI size");
+#define JE_ABI_SPAWN_GRANTS_MAX 4u
+#define JE_ABI_SPAWN_QUOTA_HANDLES(q) ((uint32_t)((q) & 0xffffu))
+#define JE_ABI_SPAWN_QUOTA_EPS(q)     ((uint32_t)(((q) >> 16) & 0xffffu))
+#define JE_ABI_SPAWN_QUOTAS(h, e)     ((uint64_t)(h) | ((uint64_t)(e) << 16))
+/* Startup register ABI v1 (ADR 0010 D5). At a spawned process's first dispatch:
+ * RDI = JE_ABI_STARTUP_V1, RSI = n grants, RDX/RCX/R8/R9 = the minted handles in grant
+ * order (zero beyond n), RSP = image stack top, every other GPR zero. The kernel-seeded
+ * supervisor gets the same layout with n = 1 and RDX = its LAUNCHER handle (PR-C lead
+ * decision; the ADR left this unspecified). */
+#define JE_ABI_STARTUP_V1 1u
 
 /* ADR 0010 D4: PROC_STATUS output. state: 1 LIVE, 2 DYING, 3 DEAD (0 FREE is never
  * observable through a live handle). reason (valid when DYING/DEAD): 0 FAULT,
@@ -236,10 +280,12 @@ _Static_assert(sizeof(je_abi_proc_status) == 16u, "proc_status ABI size");
 /* ADR 0010 D3: PROCESS rights are INSPECT (shared) and KILL. KILL is known from
  * PR-B so DUP can carry it; the PROC_KILL op that consumes it arrives in PR-D. */
 #define JE_ABI_RIGHT_KILL     0x10u            /* process: may kill (ADR 0010 D8) */
+#define JE_ABI_RIGHT_SPAWN    0x20u            /* launcher: may spawn (ADR 0010 D5) */
 #define JE_ABI_RIGHTS_KNOWN  (JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_SEND \
                               | JE_ABI_RIGHT_RECV | JE_ABI_RIGHT_TRANSFER \
-                              | JE_ABI_RIGHT_KILL)
+                              | JE_ABI_RIGHT_KILL | JE_ABI_RIGHT_SPAWN)
 _Static_assert(JE_ABI_RIGHT_KILL == 0x10u, "abi right kill (ADR 0010)");
+_Static_assert(JE_ABI_RIGHT_SPAWN == 0x20u, "abi right spawn (ADR 0010)");
 _Static_assert(JE_ABI_RIGHT_INSPECT == 0x1u, "abi right inspect");
 _Static_assert(JE_ABI_RIGHT_SEND == 0x2u && JE_ABI_RIGHT_RECV == 0x4u
                && JE_ABI_RIGHT_TRANSFER == 0x8u, "abi endpoint rights pinned");

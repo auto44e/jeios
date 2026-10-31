@@ -74,28 +74,38 @@ bool je_handle_table_init(je_handle_table *t, je_handle_slot *slots,
     return true;
 }
 
-je_handle_status je_handle_alloc(je_handle_table *t, void *object,
-                                 uint32_t type, uint32_t rights, je_handle *out)
+static je_handle_status alloc_preflight(const je_handle_table *t,
+                                        uint32_t *free_index)
 {
-    if (!out) return JE_HANDLE_BADINDEX;   /* out is required: never mint a
-                                            * handle the caller cannot receive
-                                            * (that would leak a LIVE slot). */
-    *out = 0u;
     if (!t) return JE_HANDLE_BADINDEX;
     /* QUOTA takes precedence over NOSLOTS when both could apply (ADR 0008 D8). */
     if (t->live >= t->quota) return JE_HANDLE_QUOTA;
     for (uint32_t i = 0; i < t->capacity; ++i) {       /* lowest-FREE-index */
         if (t->slots[i].state == JE_HSLOT_FREE) {
-            t->slots[i].state = JE_HSLOT_LIVE;
-            t->slots[i].object = object;
-            t->slots[i].type = type;
-            t->slots[i].rights = rights;
-            t->live++;
-            *out = je_handle_encode(i, t->slots[i].generation);
+            if (free_index) *free_index = i;
             return JE_HANDLE_OK;
         }
     }
     return JE_HANDLE_NOSLOTS;    /* all slots LIVE or RETIRED */
+}
+
+je_handle_status je_handle_alloc(je_handle_table *t, void *object,
+                                 uint32_t type, uint32_t rights, je_handle *out)
+{
+    uint32_t index = 0u;
+    if (!out) return JE_HANDLE_BADINDEX;   /* out is required: never mint a
+                                            * handle the caller cannot receive
+                                            * (that would leak a LIVE slot). */
+    *out = 0u;
+    je_handle_status preflight = alloc_preflight(t, &index);
+    if (preflight != JE_HANDLE_OK) return preflight;
+    t->slots[index].state = JE_HSLOT_LIVE;
+    t->slots[index].object = object;
+    t->slots[index].type = type;
+    t->slots[index].rights = rights;
+    t->live++;
+    *out = je_handle_encode(index, t->slots[index].generation);
+    return JE_HANDLE_OK;
 }
 
 /* Shared slot resolver for lookup and rights_of, so the two can never drift in
@@ -220,4 +230,9 @@ je_handle_status je_handle_resolve_any(const je_handle_table *t, je_handle h,
     *rights = s->rights;
     *obj = s->object;
     return JE_HANDLE_OK;
+}
+
+je_handle_status je_handle_can_alloc(const je_handle_table *t)
+{
+    return alloc_preflight(t, (uint32_t *)0);
 }

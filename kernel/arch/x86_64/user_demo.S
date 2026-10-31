@@ -298,6 +298,541 @@ m4b_fail:
     jmp m4b_fail
 je_user_m4b_end:
 
+/* M4c-s1 kernel-seeded spawner. */
+.globl je_user_m4c_start
+.globl je_user_m4c_end
+je_user_m4c_start:
+    /* Startup-v1 sets only RDI/RSI/RDX for n=1. Every other GPR must be zero
+     * before the parent uses any syscall or scratch register. */
+    orq %rax, %r11
+    orq %rbx, %r11
+    orq %rbp, %r11
+    orq %rcx, %r11
+    orq %r8,  %r11
+    orq %r9,  %r11
+    orq %r10, %r11
+    orq %r12, %r11
+    orq %r13, %r11
+    orq %r14, %r11
+    orq %r15, %r11
+    jnz m4c_parent_fail
+    movq %rdi, 0x40001800
+    movq %rsi, 0x40001808
+    movq %rdx, 0x40001810
+    movq $1, 0x40001b10
+    movq $0, 0x40001b08
+    movq $0, 0x40001b20
+    cmpq $1, 0x40001800
+    jne m4c_parent_fail
+    cmpq $1, 0x40001808
+    jne m4c_parent_fail
+    cmpq $0, 0x40001810
+    je m4c_parent_fail
+
+    movq $10, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001818
+    movq %rdx, 0x40001820
+    movq $2, 0x40001b10
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    movq 0x40001820, %rax
+    movl %eax, 0x40001828
+    shrq $32, %rax
+    movl %eax, 0x40001830
+    movl 0x40001828, %eax
+    movl %eax, 0x40001900
+    movl $3, 0x40001904
+    movl 0x40001830, %eax
+    movl %eax, 0x40001908
+    movl $7, 0x4000190c
+
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi
+    movq $0x40001900, %rdx
+    movq $2, %r10
+    movq $8, %r8
+    xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001838
+    movq %rdx, 0x40001840
+    movq $3, 0x40001b10
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    cmpq $0, 0x40001840
+    je m4c_parent_fail
+
+    movq $13, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rdx, 0x40001848
+    movq $4, 0x40001b10
+    movq $13, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rdx, 0x40001850
+    cmpq 0x40001848, %rdx
+    jb m4c_parent_fail
+    /* CLOCK_TICKS takes no arguments. A nonzero argument is INVALID and
+     * produces no tick result. */
+    movq $13, %rax
+    movq $1, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001858
+    movq %rdx, 0x40001860
+    cmpq $2, %rax
+    jne m4c_parent_fail
+    cmpq $0, %rdx
+    jne m4c_parent_fail
+
+    movq $12, %rax
+    movl 0x40001830, %edi
+    movq $0x40001a00, %rsi
+    movq $64, %rdx
+    xorq %r8,%r8; xorq %r9,%r9
+    movq $0x1000, %r10
+    int $0x80
+    movq %rax, 0x40001858
+    movq %rdx, 0x40001860
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    cmpq $1, %rdx
+    jne m4c_parent_fail
+    cmpb $0x5a, 0x40001a00
+    jne m4c_parent_fail
+    movq $5, 0x40001b10
+    movq $2, 0x40001b00
+
+    movl $0x01000000, %ecx
+m4c_parent_status:
+    movq $15, %rax
+    movq 0x40001840, %rdi
+    movq $0x40001a10, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001868
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    movl 0x40001a10, %eax
+    cmpl $1, %eax
+    jne 1f
+    decl %ecx
+    jnz m4c_parent_status
+    jmp m4c_parent_fail
+1:
+    cmpl $2, %eax
+    je m4c_parent_status_done
+    cmpl $3, %eax
+    jne m4c_parent_fail
+m4c_parent_status_done:
+    cmpl $1, 0x40001a14
+    jne m4c_parent_fail
+    cmpq $5, 0x40001a18
+    jne m4c_parent_fail
+
+    /* Phase 6 brackets every negative PROC_SPAWN below. The kernel takes its
+     * baseline and acknowledges with 1b20=1 before these calls begin. */
+    /* Lead fix (verification review P2): no "movq $0, 0x40001b20" here. 1b20 is
+     * already zero, and clearing it after publishing phase 6 could overwrite the
+     * kernel's ack if a timer tick landed between the two stores (lost ack, which
+     * makes a correct run time out). */
+    movq $6, 0x40001b10
+    movl $0x7fffffff, %ecx
+m4c_parent_negative_wait:
+    cmpq $1, 0x40001b20
+    je m4c_parent_negative_calls
+    decl %ecx
+    jnz m4c_parent_negative_wait
+    jmp m4c_parent_fail
+m4c_parent_negative_calls:
+
+    /* Bad image, no TRANSFER, rights superset, count 5 and endpoint quota 1. */
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    movq $99, %rsi
+    movq $0x40001900, %rdx
+    movq $2, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001870
+    movq %rdx, 0x40001878
+    cmpq $2, %rax
+    jne m4c_parent_fail
+    cmpq $0, %rdx
+    jne m4c_parent_fail
+
+    movq $9, %rax
+    movl 0x40001828, %edi
+    movq $2, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001878
+    movq %rdx, %r12
+    movl %r12d, 0x40001900
+    movl $2, 0x40001904
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $1, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001880
+    movq %rdx, 0x40001888
+    cmpq $6, %rax
+    jne m4c_parent_fail
+    cmpq $0, %rdx
+    jne m4c_parent_fail
+    movq $6, %rax; movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4c_parent_fail
+
+    movq $9, %rax
+    movl 0x40001828, %edi
+    movq $0xa, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001888
+    movq %rdx, %r12
+    movl %r12d, 0x40001900
+    movl $6, 0x40001904
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $1, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001890
+    movq %rdx, 0x40001898
+    cmpq $6, %rax
+    jne m4c_parent_fail
+    cmpq $0, %rdx
+    jne m4c_parent_fail
+    movq $6, %rax; movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4c_parent_fail
+
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $5, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001898
+    movq %rdx, 0x400018a0
+    cmpq $2, %rax
+    jne m4c_parent_fail
+    cmpq $0, %rdx
+    jne m4c_parent_fail
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $2, %r10; movq $0x10008, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018a8
+    movq %rdx, 0x400018b0
+    cmpq $2, %rax
+    jne m4c_parent_fail
+    cmpq $0, %rdx
+    jne m4c_parent_fail
+
+    /* SELF is a reachable wrong-type launcher. */
+    movq $5, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rdx, %r12
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    movq $14, %rax; movq %r12, %rdi
+    xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $2, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018c0
+    movq %rdx, 0x400018c8
+    cmpq $5, %rax
+    jne m4c_parent_fail
+    cmpq $0, %rdx
+    jne m4c_parent_fail
+    movq $6, %rax; movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4c_parent_fail
+
+    /* A closed DUP is a stale launcher. */
+    movq $9, %rax
+    movl 0x40001828, %edi
+    movq $3, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018d0
+    movq %rdx, %r12
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    cmpq $0, %r12
+    je m4c_parent_fail
+    movq $6, %rax; movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    movq $14, %rax; movq %r12, %rdi
+    xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $2, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018d8
+    movq %rdx, 0x400018e0
+    cmpq $3, %rax
+    jne m4c_parent_fail
+    cmpq $0, %rdx
+    jne m4c_parent_fail
+
+    /* Zero is a never-allocated/bad-index launcher. */
+    movq $14, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $2, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018e8
+    movq %rdx, 0x400018f0
+    cmpq $4, %rax
+    jne m4c_parent_fail
+    cmpq $0, %rdx
+    jne m4c_parent_fail
+
+    /* Synchronize after all negative spawns, then restore valid grants. */
+    movq $7, 0x40001b10
+    movl $0x7fffffff, %ecx
+m4c_parent_negative_done:
+    cmpq $2, 0x40001b20
+    je m4c_parent_restore_grants
+    decl %ecx
+    jnz m4c_parent_negative_done
+    jmp m4c_parent_fail
+m4c_parent_restore_grants:
+    movl 0x40001828, %eax
+    movl %eax, 0x40001900
+    movl $3, 0x40001904
+    movl 0x40001830, %eax
+    movl %eax, 0x40001908
+    movl $7, 0x4000190c
+
+    /* The kernel takes a complete IF=0 baseline before this deliberately
+     * invalid spawn. One handle slot cannot hold two startup grants, so the
+     * frozen precedence requires INVALID before any allocation or VM change. */
+    movq $9, 0x40001b10
+    movl $0x7fffffff, %ecx
+m4c_parent_quota_wait:
+    cmpq $1, 0x40001b20
+    je m4c_parent_quota_call
+    decl %ecx
+    jnz m4c_parent_quota_wait
+    jmp m4c_parent_fail
+m4c_parent_quota_call:
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi
+    movq $0x40001900, %rdx
+    movq $2, %r10
+    movq $1, %r8
+    xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018d0
+    cmpq $2, %rax
+    jne m4c_parent_fail
+    cmpq $0, %rdx
+    jne m4c_parent_fail
+    movq $10, 0x40001b10
+    movl $0x7fffffff, %ecx
+m4c_parent_quota_done_wait:
+    cmpq $2, 0x40001b20
+    je 1f
+    decl %ecx
+    jnz m4c_parent_quota_done_wait
+    jmp m4c_parent_fail
+1:
+
+    /* DUP and RIGHTS on LAUNCHER are DENIED; QUERY returns object type 4. */
+    movq $9, %rax; movq 0x40001810, %rdi; movq $0x20, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018b0
+    cmpq $6, %rax
+    jne m4c_parent_fail
+    movq $8, %rax; movq 0x40001810, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018b8
+    cmpq $6, %rax
+    jne m4c_parent_fail
+    movq $7, %rax; movq 0x40001810, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018c0
+    movq %rdx, 0x400018c8
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    cmpq $4, %rdx
+    jne m4c_parent_fail
+    movq $0, 0x40001b20
+    movq $8, 0x40001b10
+    movq $1, 0x40001b00
+    movl $0x7fffffff, %ecx
+m4c_parent_hold:
+    cmpq $3, 0x40001b20
+    je m4c_parent_done
+    decl %ecx
+    jnz m4c_parent_hold
+    jmp m4c_parent_fail
+m4c_parent_done:
+    movq $2, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    jmp m4c_parent_fail
+m4c_parent_fail:
+    movq $99, 0x40001b00
+    movq $2, %rax; movq $99, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    ud2
+je_user_m4c_end:
+
+/* M4c-s1 built-in spawn child. Startup ABI v1 is saved before the first
+ * syscall: RDI=version, RSI=grant count, RDX/RCX/R8/R9=real handles. The
+ * child checks the two attenuated endpoint rights, sends one byte on RDX,
+ * and exits(5). Scratch is at 0x1800..0x1858 in USER_DATA. */
+.globl je_user_spawn_child_start
+.globl je_user_spawn_child_end
+je_user_spawn_child_start:
+    /* Startup-v1 sets RDI/RSI/RDX/RCX for n=2. Every other GPR must be zero
+     * before the child saves or uses its grant handles. */
+    orq %rax, %r11
+    orq %rbx, %r11
+    orq %rbp, %r11
+    orq %r8,  %r11
+    orq %r9,  %r11
+    orq %r10, %r11
+    orq %r12, %r11
+    orq %r13, %r11
+    orq %r14, %r11
+    orq %r15, %r11
+    jnz m4c_child_fail
+    movq %rdi, 0x40001800
+    movq %rsi, 0x40001808
+    movq %rdx, 0x40001810
+    movq %rcx, 0x40001818
+    movq %r8,  0x40001820
+    movq %r9,  0x40001828
+    movq $1, 0x40001b18
+    cmpq $1, 0x40001800
+    jne m4c_child_fail
+    cmpq $2, 0x40001808
+    jne m4c_child_fail
+    cmpq $0, 0x40001820
+    jne m4c_child_fail
+    cmpq $0, 0x40001828
+    jne m4c_child_fail
+    cmpq $0, 0x40001810
+    je m4c_child_fail
+    cmpq $0, 0x40001818
+    je m4c_child_fail
+    movq $2, 0x40001b18
+
+    movq $7, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001838
+    movq %rdx, 0x40001840
+    cmpq $0, %rax
+    jne m4c_child_fail
+    cmpq $2, %rdx
+    jne m4c_child_fail
+    movq $3, 0x40001b18
+
+    movq $8, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001848
+    movq %rdx, 0x40001850
+    cmpq $0, %rax
+    jne m4c_child_fail
+    cmpq $3, %rdx
+    jne m4c_child_fail
+    movq $4, 0x40001b18
+
+    movq $12, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001878
+    cmpq $6, %rax
+    jne m4c_child_fail
+    movq $5, 0x40001b18
+
+    movq $7, %rax
+    movq 0x40001818, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001858
+    movq %rdx, 0x40001860
+    cmpq $0, %rax
+    jne m4c_child_fail
+    cmpq $2, %rdx
+    jne m4c_child_fail
+    movq $6, 0x40001b18
+
+    movq $8, %rax
+    movq 0x40001818, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001868
+    movq %rdx, 0x40001870
+    cmpq $0, %rax
+    jne m4c_child_fail
+    cmpq $7, %rdx
+    jne m4c_child_fail
+    movq $6, 0x40001b18
+
+    movb $0x5a, 0x40001900
+    movq $11, %rax
+    movq 0x40001810, %rdi
+    movq $0x40001900, %rsi
+    movq $1, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001880
+    cmpq $0, %rax
+    jne m4c_child_fail
+    movq $7, 0x40001b18
+    movq $1, 0x40001b00
+    movl $0x7fffffff, %ecx
+m4c_child_hold:
+    cmpq $2, 0x40001b08
+    je 1f
+    decl %ecx
+    jnz m4c_child_hold
+    jmp m4c_child_fail
+1:
+    movq $7, 0x40001b18
+    movq $1, 0x40001830
+    movq $2, %rax
+    movq $5, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    ud2
+
+m4c_child_fail:
+    movq $99, 0x40001830
+    movq $2, %rax
+    movq $99, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    ud2
+je_user_spawn_child_end:
+
 /* M3a #4 step 3: a hostile-FP demo for the D7 enforcement proof. Executes an SSE
  * instruction at CPL3; with CR0.EM=1 (set by je_arch_cpu_policy_init) the CPU
  * raises #UD (vector 6) instead of executing it, proving D7 denies SIMD to ring

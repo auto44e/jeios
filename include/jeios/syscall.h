@@ -25,6 +25,8 @@ typedef enum {
     JE_SYSCALL_TRY_SEND = 11,        /* M3c D6: glue copies user->staging then
                                       * enqueues into the peer inbound */
     JE_SYSCALL_TRY_RECV = 12,        /* M3c D6: glue peeks, copies out, commits */
+    JE_SYSCALL_CLOCK_TICKS = 13,     /* ADR 0010 D6: glue sets RDX = je_sched_ticks() */
+    JE_SYSCALL_PROC_SPAWN = 14,      /* ADR 0010 D5: glue copies grants in, calls je_proc_spawn */
     JE_SYSCALL_PROC_STATUS = 15      /* ADR 0010 D4: glue snapshots the record, copies out */
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYSCALL_COPY_FIXUP_INJECT = 4  /* glue raw-copies an unmapped page (fixup test) */
