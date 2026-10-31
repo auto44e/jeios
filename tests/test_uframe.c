@@ -18,6 +18,17 @@ static je_trap_frame good(void)
     return f;
 }
 
+/* uframe.h: "On any violation return false and leave *out_rflags untouched."
+ * Every reject goes through this oracle so a mutant that writes *out_rflags
+ * before rejecting is caught [Codex PR-C test review P2-1]. */
+#define SENTINEL UINT64_C(0xa5a5a5a5a5a5a5a5)
+static void reject(const je_trap_frame *f, uint64_t base, uint64_t size)
+{
+    uint64_t o = SENTINEL;
+    assert(!je_uframe_check(f, base, size, &o));
+    assert(o == SENTINEL);
+}
+
 int main(void)
 {
     uint64_t out = 0;
@@ -29,25 +40,25 @@ int main(void)
 
     /* RIP bounds: base ok, base-1 reject, top-1 ok, top reject. */
     f = good(); f.rip = BASE;        assert(je_uframe_check(&f, BASE, SIZE, &out));
-    f = good(); f.rip = BASE - 1;    assert(!je_uframe_check(&f, BASE, SIZE, &out));
+    f = good(); f.rip = BASE - 1;    reject(&f, BASE, SIZE);
     f = good(); f.rip = TOP - 1;     assert(je_uframe_check(&f, BASE, SIZE, &out));
-    f = good(); f.rip = TOP;         assert(!je_uframe_check(&f, BASE, SIZE, &out));
+    f = good(); f.rip = TOP;         reject(&f, BASE, SIZE);
 
     /* RSP bounds: top ok (inclusive), top+1 reject, base reject, base+1 ok. */
     f = good(); f.rsp = TOP;         assert(je_uframe_check(&f, BASE, SIZE, &out));
-    f = good(); f.rsp = TOP + 1;     assert(!je_uframe_check(&f, BASE, SIZE, &out));
-    f = good(); f.rsp = BASE;        assert(!je_uframe_check(&f, BASE, SIZE, &out));
+    f = good(); f.rsp = TOP + 1;     reject(&f, BASE, SIZE);
+    f = good(); f.rsp = BASE;        reject(&f, BASE, SIZE);
     f = good(); f.rsp = BASE + 1;    assert(je_uframe_check(&f, BASE, SIZE, &out));
 
     /* Wrong selectors reject (DPL0 or wrong RPL). */
-    f = good(); f.cs = 0x08;         assert(!je_uframe_check(&f, BASE, SIZE, &out));
-    f = good(); f.cs = 0x30;         assert(!je_uframe_check(&f, BASE, SIZE, &out)); /* RPL0 */
-    f = good(); f.ss = 0x10;         assert(!je_uframe_check(&f, BASE, SIZE, &out));
-    f = good(); f.ss = 0x28;         assert(!je_uframe_check(&f, BASE, SIZE, &out)); /* RPL0 */
+    f = good(); f.cs = 0x08;         reject(&f, BASE, SIZE);
+    f = good(); f.cs = 0x30;         reject(&f, BASE, SIZE); /* RPL0 */
+    f = good(); f.ss = 0x10;         reject(&f, BASE, SIZE);
+    f = good(); f.ss = 0x28;         reject(&f, BASE, SIZE); /* RPL0 */
 
     /* Non-canonical RIP/RSP reject. */
-    f = good(); f.rip = UINT64_C(0x0000800000000000); assert(!je_uframe_check(&f, BASE, SIZE, &out));
-    f = good(); f.rsp = UINT64_C(0xdead000000000000); assert(!je_uframe_check(&f, BASE, SIZE, &out));
+    f = good(); f.rip = UINT64_C(0x0000800000000000); reject(&f, BASE, SIZE);
+    f = good(); f.rsp = UINT64_C(0xdead000000000000); reject(&f, BASE, SIZE);
 
     /* RFLAGS sanitize: IF forced on even if user cleared it; IOPL/NT/TF/VM/AC/
      * ID/RF/DF forced off; arithmetic flags preserved. */
@@ -72,8 +83,8 @@ int main(void)
     assert(out & (UINT64_C(1)<<11));           /* OF preserved */
 
     /* Degenerate args reject. */
-    f = good(); assert(!je_uframe_check(&f, BASE, 0, &out));         /* size 0 */
-    f = good(); assert(!je_uframe_check(NULL, BASE, SIZE, &out));    /* null frame */
+    f = good(); reject(&f, BASE, 0);         /* size 0 */
+    f = good(); reject(NULL, BASE, SIZE);    /* null frame */
     f = good(); assert(!je_uframe_check(&f, BASE, SIZE, NULL));      /* null out */
 
     /* ADR 0010 D5 startup register ABI v1: the spawned thread's first frame has
@@ -118,7 +129,7 @@ int main(void)
         assert(out == ((UINT64_C(1)<<9) | (UINT64_C(1)<<1)));
         /* ...and nonzero argument registers do not rescue an invalid frame. */
         f.rip = TOP;
-        assert(!je_uframe_check(&f, BASE, SIZE, &out));
+        reject(&f, BASE, SIZE);
     }
 
     printf("uframe: PASS (bounds, selectors, canonical, rflags sanitize, startup-v1 GPRs)\n");

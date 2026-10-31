@@ -123,13 +123,23 @@ static void test_proc_spawn_decode(void)
     spawn_ok(SP_H, 0, 0, 0, JE_ABI_SPAWN_QUOTAS(JE_VM_HANDLE_QUOTA_DEFAULT, 0u), 0);
     spawn_ok(SP_H, 0, 0, 0, QMAX, 0);                      /* handle quota MAX (39) */
     spawn_ok(SP_H, 0, 0, 0, JE_ABI_SPAWN_QUOTAS(0u, JE_EP_CHILD_QUOTA_MAX), 0); /* eps = MAX (0) */
-    /* RDI and RSI at the largest 32-bit values are not wide. An unknown image_id
+    /* abi.h op 14 (include/jeios/abi.h:154-157): the decode reject list is
+     * EXHAUSTIVE; launcher validity, image_id validity and the grants pointer are
+     * glue/spawn checks, not decode. So these must DECODE OK.
+     * RDI and RSI at the largest 32-bit values are not wide. An unknown image_id
      * and a bad/forged launcher handle are glue/spawn-level, not decode. */
     spawn_ok(UINT64_C(0xffffffff), 0, 0, 0, 0, 0);
     spawn_ok(SP_H, UINT64_C(0xffffffff), 0, 0, 0, 0);
     spawn_ok(0, 0, 0, 0, 0, 0);                             /* handle 0 -> glue BADINDEX */
     /* the grants pointer is checked by the glue's user copy, not by decode */
     spawn_ok(SP_H, 0, UINT64_C(0xffffffffffffffff), 1, 0, 0);
+    /* spawn.h step 3 pins "n > effective child handle quota -> INVALID". That is a
+     * spawn (kernel) check, not decode: it is absent from the exhaustive abi.h
+     * reject list. n=2 with handle quota 1, and n=4 (GRANTS_MAX) with quota 1, must
+     * still DECODE OK. The spawn-level INVALID is proven by the QEMU fixture, not
+     * by this hosted test. */
+    spawn_ok(SP_H, 0, SP_GPTR, 2, JE_ABI_SPAWN_QUOTAS(1u, 0u), 0);
+    spawn_ok(SP_H, 0, SP_GPTR, JE_ABI_SPAWN_GRANTS_MAX, JE_ABI_SPAWN_QUOTAS(1u, 0u), 0);
 
     /* --- every pinned INVALID rule (abi.h op 14) --- */
     /* wide RDI (launcher) */
