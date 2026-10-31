@@ -16,6 +16,7 @@
 extern void je_sched_set_proc_pool(je_proc_pool *pool);
 extern je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id);
 extern je_status je_sched_unregister_process(je_vm *vm, uint32_t index);
+extern bool je_sched_has_process(je_vm *vm, uint32_t index);
 extern void je_kernel_idle_step(void);
 extern void je_endpoint_kern_set_proc_pool(je_proc_pool *pool);
 extern je_status je_process_handle_mint(je_vm *vm, uint32_t index, je_proc_id id,
@@ -211,8 +212,14 @@ static uint32_t vm_s3_build(user_prog prog)
 
 static je_status vm_s3_destroy(uint32_t idx)
 {
+    if (idx >= JE_VM_MAX_PROCESSES) return JE_ERR_INVALID;
     je_proc_id id = vm_s3_proc_ids[idx];
     uint64_t flags = je_arch_irq_save();
+    if (je_sched_has_process(&vm_s3, idx)) {
+        je_arch_console_write("JeiOS fatal: s3 destroy has scheduler reference\r\n");
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
     if (id.gen != 0u && je_proc_on_dying(&process_pool, id, JE_DEATH_KILLED, 0u) != JE_OK) {
         je_arch_irq_restore(flags);
         return JE_ERR_INVALID;
@@ -1168,7 +1175,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
         {
             if (process_pool.used_count != 0u)
                 fail("JeiOS fatal: M4b process baseline\r\n");
-            uint32_t child = vm_s3_build(PROG_PROC_EXIT7);
+            uint32_t child = vm_s3_build_quota(PROG_PROC_EXIT7, JE_EP_CHILD_QUOTA_MAX);
             uint32_t parent = vm_s3_build_quota(PROG_M4B, 1u);
             je_handle inspect_kill = 0u, kill_only = 0u;
             uint64_t mint_flags = je_arch_irq_save();
@@ -1185,6 +1192,10 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             vm_s3_scratch_write(parent, 0x1608u, kill_only);
             if (je_thread_create_user(&vm_s3, child) != JE_OK)
                 fail("JeiOS fatal: M4b child thread\r\n");
+            uint64_t child_pool_flags = je_arch_irq_save();
+            uint32_t child_pool_before = je_endpoint_kernel_allocated();
+            je_arch_irq_restore(child_pool_flags);
+            bool child_quota_checked = false;
             for (uint64_t child_spins = 0u; ; ) {
                 uint32_t child_state = JE_PROC_FREE;
                 uint32_t child_reason = 0u;
@@ -1196,25 +1207,95 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                 je_arch_irq_restore(child_flags);
                 if (child_status != JE_OK)
                     fail("JeiOS fatal: M4b child status\r\n");
-                if (child_state == JE_PROC_DEAD) break;
+                if (child_state == JE_PROC_DYING && !child_quota_checked) {
+                    if (vm_s3_scratch(child, 0x1768u) != 7u)
+                        fail("JeiOS fatal: M4b child endpoint quota not H_QUOTA\r\n");
+                    child_pool_flags = je_arch_irq_save();
+                    uint32_t child_pool_after = je_endpoint_kernel_allocated();
+                    je_arch_irq_restore(child_pool_flags);
+                    if (child_pool_after != child_pool_before)
+                        fail("JeiOS fatal: M4b child quota changed endpoint pool\r\n");
+                    child_quota_checked = true;
+                }
+                if (child_state == JE_PROC_DEAD) {
+                    if (!child_quota_checked)
+                        fail("JeiOS fatal: M4b child reaped before quota probe\r\n");
+                    break;
+                }
+                if (child_state != JE_PROC_LIVE && child_state != JE_PROC_DYING)
+                    fail("JeiOS fatal: M4b child reached invalid state\r\n");
                 if (++child_spins > 100000000ull)
                     fail("JeiOS fatal: M4b child did not exit\r\n");
                 je_kernel_idle_step();
             }
             if (je_thread_create_user(&vm_s3, parent) != JE_OK)
                 fail("JeiOS fatal: M4b parent thread\r\n");
-            for (;;) {
+            for (uint64_t parent_progress_spins = 0u; ; ) {
                 uint64_t progress = vm_s3_scratch(parent, 0x1610u);
                 if (progress == 99u) fail("JeiOS fatal: M4b parent assertion\r\n");
                 if (progress >= 1u) break;
+                uint32_t parent_state = JE_PROC_FREE;
+                uint32_t parent_reason = 0u;
+                uint64_t parent_code = 0u;
+                uint64_t parent_flags = je_arch_irq_save();
+                je_status parent_status = je_proc_status(
+                    &process_pool, vm_s3_proc_ids[parent], &parent_state,
+                    &parent_reason, &parent_code);
+                je_arch_irq_restore(parent_flags);
+                (void)parent_reason;
+                (void)parent_code;
+                if (parent_status != JE_OK)
+                    fail("JeiOS fatal: M4b parent record invalid before progress 1\r\n");
+                if (parent_state == JE_PROC_DYING || parent_state == JE_PROC_DEAD)
+                    fail("JeiOS fatal: M4b parent died before progress 1\r\n");
+                if (++parent_progress_spins > 100000000ull)
+                    fail("JeiOS fatal: M4b parent did not reach progress 1\r\n");
                 je_kernel_idle_step();
             }
-            for (;;) {
+            for (uint64_t parent_progress_spins = 0u; ; ) {
                 uint64_t progress = vm_s3_scratch(parent, 0x1610u);
                 if (progress == 99u) fail("JeiOS fatal: M4b post-reap assertion\r\n");
                 if (progress >= 2u) break;
+                uint32_t parent_state = JE_PROC_FREE;
+                uint32_t parent_reason = 0u;
+                uint64_t parent_code = 0u;
+                uint64_t parent_flags = je_arch_irq_save();
+                je_status parent_status = je_proc_status(
+                    &process_pool, vm_s3_proc_ids[parent], &parent_state,
+                    &parent_reason, &parent_code);
+                je_arch_irq_restore(parent_flags);
+                (void)parent_reason;
+                (void)parent_code;
+                if (parent_status != JE_OK)
+                    fail("JeiOS fatal: M4b parent record invalid before progress 2\r\n");
+                if (parent_state == JE_PROC_DYING || parent_state == JE_PROC_DEAD)
+                    fail("JeiOS fatal: M4b parent died before progress 2\r\n");
+                if (++parent_progress_spins > 100000000ull)
+                    fail("JeiOS fatal: M4b parent did not reach progress 2\r\n");
                 je_kernel_idle_step();
             }
+            uint32_t parent_death_state = JE_PROC_FREE;
+            uint32_t parent_death_reason = 0u;
+            uint64_t parent_death_code = 0u;
+            for (uint64_t parent_death_spins = 0u; ; ) {
+                uint64_t parent_flags = je_arch_irq_save();
+                je_status parent_status = je_proc_status(
+                    &process_pool, vm_s3_proc_ids[parent], &parent_death_state,
+                    &parent_death_reason, &parent_death_code);
+                je_arch_irq_restore(parent_flags);
+                if (parent_status != JE_OK)
+                    fail("JeiOS fatal: M4b parent record unavailable before reap\r\n");
+                if (parent_death_state == JE_PROC_DYING) break;
+                if (parent_death_state == JE_PROC_DEAD)
+                    fail("JeiOS fatal: M4b parent reaped before death snapshot\r\n");
+                if (parent_death_state != JE_PROC_LIVE)
+                    fail("JeiOS fatal: M4b parent reached invalid death state\r\n");
+                if (++parent_death_spins > 100000000ull)
+                    fail("JeiOS fatal: M4b parent did not reach DYING\r\n");
+                je_kernel_idle_step();
+            }
+            if (parent_death_reason != JE_DEATH_EXIT || parent_death_code != 0u)
+                fail("JeiOS fatal: M4b parent death was not EXIT(0)\r\n");
             uint64_t parent_spins = 0u;
             for (;;) {
                 uint64_t used_flags = je_arch_irq_save();

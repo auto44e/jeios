@@ -21,6 +21,7 @@
  *   0x1620: endpoint_create packed handles; 0x1628: endpoint dup handle
  *   0x1630..0x1750: operation/status/result words
  *   0x1718: PROC_STATUS output {state,reason,code}; 0x1728: post-reap state
+ *   0x1760: parent close status; 0x1768: child endpoint-quota status
  * The M4b parent checks every result in ring 3 and writes progress 99 on failure.
  */
 .section .rodata.user_demo,"a"
@@ -38,6 +39,11 @@ je_user_demo_end:
 .globl je_user_proc_exit7_start
 .globl je_user_proc_exit7_end
 je_user_proc_exit7_start:
+    /* A D-DEV child may not create endpoints: record exactly one H_QUOTA probe. */
+    movq $10, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001768
     movq $2, %rax
     movq $7, %rdi
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
@@ -239,7 +245,7 @@ je_user_m4b_start:
     movq %r14, %rdi
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
-    movl %eax, 0x40001714
+    movl %eax, 0x40001760
     cmpq $0, %rax
     jne m4b_fail
     /* Closing both ends released the charge: a third create must succeed. */
