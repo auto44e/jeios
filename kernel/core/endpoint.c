@@ -7,6 +7,8 @@
  */
 #include <jeios/endpoint.h>
 
+#define JE_PROCESS_OBJ_TYPE 3u
+
 /* Policy-bound pins (ADR 0009 D4): REF_MAX must admit every non-handle owning
  * ref (queue depth + waiters) and still be small enough to reach in a test, and
  * it must fit the uint16_t counters. */
@@ -62,6 +64,7 @@ void je_endpoint_pool_init(je_endpoint_pool *pool)
         je_ep_channel *r = &pool->rec[i];
         r->allocated = false;
         r->generation = 1u;            /* never 0 */
+        r->creator = JE_PROC_ID_NONE;
         for (uint8_t s = 0; s < 2u; ++s) {
             r->end[s].state = JE_EP_END_FREE;
             r->end[s].handle_refs = 0u;
@@ -129,6 +132,8 @@ static void maybe_free_record(je_endpoint_pool *pool, je_ep_channel *rec)
         if (queue_cap_total(&rec->end[s].inbound) != 0u) return; /* unreachable; fail-safe */
     }
     /* Both ends fully unreferenced: reclaim. Bump generation (never 0). */
+    if (pool->procs) je_proc_uncharge(pool->procs, rec->creator);
+    rec->creator = JE_PROC_ID_NONE;
     rec->allocated = false;
     rec->generation = (rec->generation == 0xffffffffu) ? 1u
                                                        : rec->generation + 1u;
@@ -180,7 +185,6 @@ static je_ep_status retain_handle(je_ep_end *e)
     e->handle_refs++;
     return JE_EP_OK;
 }
-
 /* Drop one handle_ref on an end that definitely holds at least one (infallible
  * for a valid live ref). On reaching 0: this end CLOSED, a live peer -> PEER_CLOSED,
  * then try to reclaim the record. */
@@ -416,6 +420,7 @@ je_ep_status je_endpoint_release_inflight(je_endpoint_pool *pool,
 static void unwind_record(je_ep_channel *rec)
 {
     rec->allocated = false;
+    rec->creator = JE_PROC_ID_NONE;
     for (uint8_t s = 0; s < 2u; ++s) {
         rec->end[s].state = JE_EP_END_FREE;
         rec->end[s].handle_refs = 0u;
@@ -424,10 +429,10 @@ static void unwind_record(je_ep_channel *rec)
     }
 }
 
-je_ep_status je_endpoint_channel_create(je_endpoint_pool *pool,
-                                        je_handle_table *t0, uint32_t rights0,
-                                        je_handle_table *t1, uint32_t rights1,
-                                        je_handle *out0, je_handle *out1)
+je_ep_status je_endpoint_channel_create_by(je_endpoint_pool *pool, je_proc_id creator,
+                                           je_handle_table *t0, uint32_t rights0,
+                                           je_handle_table *t1, uint32_t rights1,
+                                           je_handle *out0, je_handle *out1)
 {
     if (out0) *out0 = 0u;
     if (out1) *out1 = 0u;
@@ -447,6 +452,14 @@ je_ep_status je_endpoint_channel_create(je_endpoint_pool *pool,
     }
     if (!rec) return JE_EP_NOSLOTS;   /* pool exhausted */
 
+    bool charged = false;
+    if (pool->procs && creator.gen != 0u) {
+        je_status cs = je_proc_charge(pool->procs, creator);
+        if (cs == JE_ERR_DENIED) return JE_EP_QUOTA;
+        if (cs != JE_OK) return JE_EP_CORRUPT;
+        charged = true;
+    }
+
     /* Tentatively allocate the record and open both ends. */
     rec->allocated = true;
     for (uint8_t s = 0; s < 2u; ++s) {
@@ -459,10 +472,15 @@ je_ep_status je_endpoint_channel_create(je_endpoint_pool *pool,
     /* Mint end 0: retain then alloc. retain of a fresh end cannot overflow. */
     je_handle h0 = 0u, h1 = 0u;
     je_ep_status rs = retain_handle(&rec->end[0]);
-    if (rs != JE_EP_OK) { unwind_record(rec); return rs; }   /* unreachable */
+    if (rs != JE_EP_OK) {
+        if (charged) je_proc_uncharge(pool->procs, creator);
+        unwind_record(rec);
+        return rs;
+    }
     je_handle_status a0 = je_handle_alloc(t0, (void *)&rec->end[0],
                                           JE_ENDPOINT_OBJ_TYPE, rights0, &h0);
     if (a0 != JE_HANDLE_OK) {
+        if (charged) je_proc_uncharge(pool->procs, creator);
         unwind_record(rec);                /* record never observed */
         return hstat(a0);
     }
@@ -471,6 +489,7 @@ je_ep_status je_endpoint_channel_create(je_endpoint_pool *pool,
     rs = retain_handle(&rec->end[1]);
     if (rs != JE_EP_OK) {                   /* unreachable; unwind end 0 fully */
         (void)je_handle_close(t0, h0);
+        if (charged) je_proc_uncharge(pool->procs, creator);
         unwind_record(rec);
         return rs;
     }
@@ -479,14 +498,25 @@ je_ep_status je_endpoint_channel_create(je_endpoint_pool *pool,
     if (a1 != JE_HANDLE_OK) {
         /* Roll back the whole transaction: close h0, drop both retains, free. */
         (void)je_handle_close(t0, h0);
+        if (charged) je_proc_uncharge(pool->procs, creator);
         unwind_record(rec);
         return hstat(a1);
     }
 
+    rec->creator = creator;
     pool->allocated_count++;
     *out0 = h0;
     *out1 = h1;
     return JE_EP_OK;
+}
+
+je_ep_status je_endpoint_channel_create(je_endpoint_pool *pool,
+                                        je_handle_table *t0, uint32_t rights0,
+                                        je_handle_table *t1, uint32_t rights1,
+                                        je_handle *out0, je_handle *out1)
+{
+    return je_endpoint_channel_create_by(pool, JE_PROC_ID_NONE, t0, rights0,
+                                         t1, rights1, out0, out1);
 }
 
 /* ---- close seam ----------------------------------------------------------- */
@@ -559,15 +589,42 @@ int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t)
         je_handle h = 0u;
         uint32_t type = 0u;
         if (!je_handle_live_at(t, i, &h, &type)) continue;
-        if (type != JE_ENDPOINT_OBJ_TYPE) continue;   /* leave SELF etc. to the zero */
-        je_ep_status s = je_endpoint_handle_close(pool, t, h);
+        je_ep_status s;
+        if (type == JE_ENDPOINT_OBJ_TYPE) {
+            s = je_endpoint_handle_close(pool, t, h);
+        } else if (type == JE_PROCESS_OBJ_TYPE && pool->procs) {
+            uint32_t resolved_type = 0u;
+            uint32_t rights = 0u;
+            void *object = (void *)0;
+            je_handle_status hs = je_handle_resolve_any(t, h, &resolved_type,
+                                                        &rights, &object);
+            (void)rights;
+            if (hs != JE_HANDLE_OK || resolved_type != JE_PROCESS_OBJ_TYPE)
+                return -1;
+            bool found = false;
+            je_proc_id id = JE_PROC_ID_NONE;
+            for (uint32_t p = 0u; p < JE_PROC_REC_MAX; ++p) {
+                if (object == (void *)&pool->procs->rec[p]
+                    && pool->procs->rec[p].state != JE_PROC_FREE) {
+                    id = (je_proc_id){p, pool->procs->rec[p].gen};
+                    found = true;
+                    break;
+                }
+            }
+            if (!found || je_handle_close(t, h) != JE_HANDLE_OK) return -1;
+            je_proc_release(pool->procs, id);
+            s = JE_EP_OK;
+        } else {
+            continue;
+        }
         if (s != JE_EP_OK) return -1;   /* invariant break: caller must fail-stop */
         released++;
     }
     /* Post-condition: no endpoint slot may remain LIVE. */
     for (uint32_t i = 0; i < t->capacity; ++i) {
         je_handle h = 0u; uint32_t type = 0u;
-        if (je_handle_live_at(t, i, &h, &type) && type == JE_ENDPOINT_OBJ_TYPE)
+        if (je_handle_live_at(t, i, &h, &type) &&
+            (type == JE_ENDPOINT_OBJ_TYPE || type == JE_PROCESS_OBJ_TYPE))
             return -1;   /* a LIVE endpoint survived the walk -> fatal */
     }
     return released;
@@ -914,18 +971,4 @@ je_ep_status je_endpoint_recv_commit_caps(je_endpoint_pool *pool,
      * AFTER dequeue so the queue slot no longer references the target. */
     for (uint8_t c = 0; c < mcaps; ++c) release_capdesc_inflight(pool, &snap[c]);
     return JE_EP_OK;
-}
-
-/* ADR 0010 D-DEV pre-wiring STUB (lead): the uncharged path delegates; charging
- * fails closed until PR-B lands. */
-je_ep_status je_endpoint_channel_create_by(je_endpoint_pool *pool, je_proc_id creator,
-                                           je_handle_table *t0, uint32_t rights0,
-                                           je_handle_table *t1, uint32_t rights1,
-                                           je_handle *out0, je_handle *out1)
-{
-    if (creator.gen == 0u || !pool || !pool->procs)
-        return je_endpoint_channel_create(pool, t0, rights0, t1, rights1, out0, out1);
-    if (out0) *out0 = 0u;
-    if (out1) *out1 = 0u;
-    return JE_EP_INVALID;
 }

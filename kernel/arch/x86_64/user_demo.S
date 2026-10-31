@@ -13,6 +13,15 @@
  * Runs at CPL3 with no stack use, no syscalls, no FP/SIMD: just a memory
  * increment loop, which is exactly enough to prove real ring-3 execution under
  * timer preemption.
+ *
+ * M4b-s1 scratch contract (arena USER_DATA at 0x40001000):
+ *   0x1600/0x1608: PROCESS handles (INSPECT|KILL, KILL-only)
+ *   0x1610: parent progress (1 = waiting for bootstrap reap, 2 = done, 99 = fail)
+ *   0x1618: bootstrap writes 1 after reaping child B
+ *   0x1620: endpoint_create packed handles; 0x1628: endpoint dup handle
+ *   0x1630..0x1710: operation/status/result words
+ *   0x1718: PROC_STATUS output {state,reason,code}; 0x1728: post-reap state
+ * The M4b parent checks every result in ring 3 and writes progress 99 on failure.
  */
 .section .rodata.user_demo,"a"
 .code64
@@ -23,6 +32,235 @@ je_user_demo_start:
     incq 0x40001000            /* absolute disp32; heartbeat in USER_DATA page */
     jmp 1b
 je_user_demo_end:
+
+/* M4b-s1 child: clean exit(7), leaving its PROCESS record DYING until the
+ * bootstrap reaper runs. */
+.globl je_user_proc_exit7_start
+.globl je_user_proc_exit7_end
+je_user_proc_exit7_start:
+    movq $2, %rax
+    movq $7, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    jmp je_user_proc_exit7_start
+je_user_proc_exit7_end:
+
+/* M4b-s1 parent: PROCESS status/typed dispatch and endpoint typed dispatch.
+ * No stack or indirect calls: every failure records progress=99 and parks. */
+.globl je_user_m4b_start
+.globl je_user_m4b_end
+je_user_m4b_start:
+    /* PROC_STATUS(child, 0x1718): DYING or DEAD, EXIT, code 7. */
+    movq $15, %rax
+    movq 0x40001600, %rdi
+    movq $0x40001718, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001630
+    testq %rax,%rax
+    jne m4b_fail
+    movl 0x40001718, %eax
+    movq %rax, 0x40001638
+    cmpl $2, %eax
+    je 1f
+    cmpl $3, %eax
+    jne m4b_fail
+1:
+    movl 0x4000171c, %eax
+    movq %rax, 0x40001640
+    cmpl $1, %eax
+    jne m4b_fail
+    movq 0x40001720, %rax
+    movq %rax, 0x40001648
+    cmpq $7, %rax
+    jne m4b_fail
+    /* KILL-only handle cannot inspect status. */
+    movq $15, %rax
+    movq 0x40001608, %rdi
+    movq $0x40001718, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001650
+    cmpq $6, %rax
+    jne m4b_fail
+    /* Kernel-address output is rejected before any user write. */
+    movq $15, %rax
+    movq 0x40001600, %rdi
+    movq $0xffffffff80000000, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001658
+    cmpq $2, %rax
+    jne m4b_fail
+    /* QUERY=PROCESS and RIGHTS=INSPECT|KILL. */
+    movq $7, %rax
+    movq 0x40001600, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001660
+    movq %rdx, 0x40001668
+    cmpq $0, %rax
+    jne m4b_fail
+    cmpq $3, %rdx
+    jne m4b_fail
+    movq $8, %rax
+    movq 0x40001600, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001670
+    movq %rdx, 0x40001678
+    cmpq $0, %rax
+    jne m4b_fail
+    cmpq $0x11, %rdx
+    jne m4b_fail
+    /* DUP(INSPECT), then RIGHTS on the attenuated handle. */
+    movq $9, %rax
+    movq 0x40001600, %rdi
+    movq $1, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001680
+    movq %rdx, 0x40001688
+    cmpq $0, %rax
+    jne m4b_fail
+    testq %rdx,%rdx
+    je m4b_fail
+    movq %rdx, %r12
+    movq $8, %rax
+    movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001690
+    movq %rdx, 0x40001698
+    cmpq $0, %rax
+    jne m4b_fail
+    cmpq $1, %rdx
+    jne m4b_fail
+    /* A known-but-unheld superset is DENIED. */
+    movq $9, %rax
+    movq 0x40001600, %rdi
+    movq $0x13, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400016a0
+    cmpq $6, %rax
+    jne m4b_fail
+    /* Close the duplicate; a later query is STALE. */
+    movq $6, %rax
+    movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400016a8
+    cmpq $0, %rax
+    jne m4b_fail
+    movq $7, %rax
+    movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400016b0
+    cmpq $3, %rax
+    jne m4b_fail
+    /* Endpoint typed dispatch: QUERY, RIGHTS, attenuating DUP, RIGHTS. */
+    movq $10, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400016b8
+    movq %rdx, 0x400016c0
+    cmpq $0, %rax
+    jne m4b_fail
+    movq %rdx, %r13
+    movl %r13d, %r13d
+    movq %rdx, %r14
+    shrq $32, %r14
+    movq $7, %rax
+    movq %r13, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400016c8
+    movq %rdx, 0x400016d0
+    cmpq $0, %rax
+    jne m4b_fail
+    cmpq $2, %rdx
+    jne m4b_fail
+    movq $8, %rax
+    movq %r13, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400016d8
+    movq %rdx, 0x400016e0
+    cmpq $0, %rax
+    jne m4b_fail
+    cmpq $0xf, %rdx
+    jne m4b_fail
+    movq $9, %rax
+    movq %r13, %rdi
+    movq $1, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400016e8
+    movq %rdx, 0x400016f0
+    cmpq $0, %rax
+    jne m4b_fail
+    testq %rdx,%rdx
+    je m4b_fail
+    movq %rdx, %r15
+    movq $8, %rax
+    movq %r15, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400016f8
+    movq %rdx, 0x40001700
+    cmpq $0, %rax
+    jne m4b_fail
+    cmpq $1, %rdx
+    jne m4b_fail
+    movq $6, %rax
+    movq %r15, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001708
+    cmpq $0, %rax
+    jne m4b_fail
+    movq $6, %rax
+    movq %r13, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001710
+    cmpq $0, %rax
+    jne m4b_fail
+    movq $6, %rax
+    movq %r14, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001714
+    cmpq $0, %rax
+    jne m4b_fail
+    /* Wait for the bootstrap to reap B, then prove the record is still named. */
+    movq $1, 0x40001610
+m4b_wait_reap:
+    cmpq $1, 0x40001618
+    jne m4b_wait_reap
+    movq $15, %rax
+    movq 0x40001600, %rdi
+    movq $0x40001718, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001728
+    cmpq $0, %rax
+    jne m4b_fail
+    movl 0x40001718, %eax
+    movq %rax, 0x40001730
+    cmpq $3, %rax
+    jne m4b_fail
+    movq $2, 0x40001610
+    movq $2, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    jmp m4b_fail
+m4b_fail:
+    movq $99, 0x40001610
+    jmp m4b_fail
+je_user_m4b_end:
 
 /* M3a #4 step 3: a hostile-FP demo for the D7 enforcement proof. Executes an SSE
  * instruction at CPL3; with CR0.EM=1 (set by je_arch_cpu_policy_init) the CPU
