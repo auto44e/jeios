@@ -77,12 +77,23 @@ static void spawn_undo(je_vm *vm, uint32_t index, bool registered,
     if (thread_created) {
         if (je_sched_drop_user(vm, index) != JE_OK)
             je_arch_halt();
+        if (vm_ready) {
+            if (je_vm_destroy(vm, index) != JE_OK)
+                je_arch_halt();
+        }
+        if (je_proc_on_dying(pool, id, JE_DEATH_KILLED, 0u) != JE_OK)
+            je_arch_halt();
+        if (je_proc_on_reaped(pool, id) != JE_OK)
+            je_arch_halt();
+        return;
     } else if (registered) {
         if (je_sched_unregister_process(vm, index) != JE_OK)
             je_arch_halt();
     }
-    if (vm_ready && je_vm_destroy(vm, index) != JE_OK)
-        je_arch_halt();
+    if (vm_ready) {
+        if (je_vm_destroy(vm, index) != JE_OK)
+            je_arch_halt();
+    }
     if (je_proc_abandon(pool, id) != JE_OK)
         je_arch_halt();
 }
