@@ -19,6 +19,8 @@ static _Noreturn void fail(const char *message)
 }
 static atomic_uint completed;
 static atomic_uint capacity_completed;
+_Static_assert((1u + JE_M2_WORKERS) * 2u == 16u,
+               "M2 preemption floor remains the T=8 floor");
 static void worker(void *argument)
 {
     uintptr_t id=(uintptr_t)argument;
@@ -213,6 +215,21 @@ static void vm_s3_scratch_write(uint32_t idx, uint64_t off, uint64_t val)
     je_arch_cr3_load(kroot);
     je_arch_irq_restore(flags);
 }
+static void vm_s3_assert_only_ready(uint32_t survivor, const char *message)
+{
+    if (survivor >= JE_VM_MAX_PROCESSES ||
+        vm_s3.procs[survivor].state != JE_VM_READY)
+        fail(message);
+    for (uint32_t i=0; i<JE_VM_MAX_PROCESSES; ++i)
+        if (i != survivor && vm_s3.procs[i].state != JE_VM_FREE)
+            fail(message);
+}
+static void vm_s3_assert_all_free(const char *message)
+{
+    for (uint32_t i=0; i<JE_VM_MAX_PROCESSES; ++i)
+        if (vm_s3.procs[i].state != JE_VM_FREE)
+            fail(message);
+}
 _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
 {
     (void)je_arch_console_init();
@@ -263,34 +280,49 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
     if (je_thread_sleep(1)!=JE_ERR_DENIED) fail("JeiOS fatal: idle slept\r\n");
     for (uintptr_t i=1;i<=JE_M2_WORKERS;++i)
         if (je_thread_create(worker,(void *)i)!=JE_OK) fail("JeiOS fatal: thread creation\r\n");
-    const unsigned capacity_fill = JE_THREAD_MAX - 1u - JE_M2_WORKERS;
-    for (unsigned i=0u;i<capacity_fill;++i)
-        if (je_thread_create(capacity_probe,(void *)0)!=JE_OK)
-            fail("JeiOS fatal: thread capacity fill\r\n");
-    size_t free_after_create=je_kernel_pages.free_count;
-    if (je_thread_create(capacity_probe,(void *)0)!=JE_ERR_NOMEM
-        || je_kernel_pages.free_count!=free_after_create)
-        fail("JeiOS fatal: thread capacity rollback\r\n");
     je_arch_console_write("M2: seven guarded threads ready; enabling PIT\r\n");
     je_arch_timer_init();
     for (;;) {
         (void)je_arch_irq_save();
         if (atomic_load_explicit(&completed,memory_order_acquire)==JE_M2_WORKERS
-            && atomic_load_explicit(&capacity_completed,memory_order_acquire)==capacity_fill
             && je_sched_finished()) break;
         __asm__ volatile("sti; hlt":::"memory");
     }
-    /* Two passes over the seven-worker M2 workload remain the preemption
-     * invariant. The eight capacity probes are deliberately short-lived and
-     * are not workload iterations; JE_THREAD_MAX*2 would incorrectly count
-     * their spare capacity as required work after the D2 raise. */
-    if (je_sched_preemptions()<JE_M2_WORKERS*2u || je_sched_min_dispatches()<3)
+    if (je_sched_preemptions()<(1u+JE_M2_WORKERS)*2u || je_sched_min_dispatches()<3)
         fail("JeiOS fatal: insufficient preemption\r\n");
     je_arch_console_write("M2: preemption/GPR/sleep/heap checks passed; ticks=");
-    je_arch_console_hex(je_sched_ticks());je_arch_console_write("\r\n");
+    je_arch_console_hex(je_sched_ticks());je_arch_console_write("; preemptions=");
+    je_arch_console_hex(je_sched_preemptions());je_arch_console_write("\r\n");
     if (je_sched_reap()!=JE_OK || je_kernel_pages.free_count!=free_before)
         fail("JeiOS fatal: stack or heap resource leak\r\n");
     je_arch_console_write("M2: exited threads reaped; page accounting restored\r\n");
+    /* M4 D2 capacity phase: after the original M2 workload has been reaped,
+     * create no-allocation probes with interrupts disabled until every
+     * non-idle scheduler slot is occupied. The failed next create must not
+     * allocate or change page accounting. */
+    atomic_store_explicit(&capacity_completed,0,memory_order_release);
+    const unsigned capacity_fill = JE_THREAD_MAX - 1u;
+    const size_t capacity_free_before=je_kernel_pages.free_count;
+    const uint64_t capacity_flags=je_arch_irq_save();
+    for (unsigned i=0u;i<capacity_fill;++i)
+        if (je_thread_create(capacity_probe,(void *)0)!=JE_OK)
+            fail("JeiOS fatal: thread capacity fill\r\n");
+    const size_t free_after_create=je_kernel_pages.free_count;
+    if (je_thread_create(capacity_probe,(void *)0)!=JE_ERR_NOMEM
+        || je_kernel_pages.free_count!=free_after_create)
+        fail("JeiOS fatal: thread capacity rollback\r\n");
+    je_arch_irq_restore(capacity_flags);
+    for (;;) {
+        (void)je_arch_irq_save();
+        if (atomic_load_explicit(&capacity_completed,memory_order_acquire)==capacity_fill
+            && je_sched_finished()) break;
+        __asm__ volatile("sti; hlt":::"memory");
+    }
+    if (je_sched_reap()!=JE_OK || je_kernel_pages.free_count!=capacity_free_before)
+        fail("JeiOS fatal: thread capacity reap/page accounting\r\n");
+    je_arch_console_write("M2: thread capacity exhausted at T=");
+    je_arch_console_hex(JE_THREAD_MAX);
+    je_arch_console_write("; NOMEM rollback and reap OK\r\n");
 
     /* M3a #4 step 2: real per-process page tables + real CR3, exercised at CPL0
      * only (no ring-3, no sched CR3 switch). The happy path runs every boot so
@@ -615,6 +647,10 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
         }
 #endif
 
+        /* M3a intentionally leaves only the fault-survivor B live for the
+         * following M3b/M3c proofs. Every other VM slot must already be FREE. */
+        vm_s3_assert_only_ready(B, "JeiOS fatal: M3a vm process leak\r\n");
+
         /* --- M3b second PR: per-process handle table + handle syscalls --- */
         /* Process H mints a SELF handle, queries it (type==SELF), closes it, and
          * probes the stale/forged/bound/wide/quota/reuse cases, recording each
@@ -667,11 +703,11 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             /* query/close of the now-closed handle: STALE (distinct status). */
             if (vm_s3_scratch(H,0x1048)!=JE_ABI_H_STALE)   fail("JeiOS fatal: s5c query(closed) not STALE\r\n");
             if (vm_s3_scratch(H,0x1050)!=JE_ABI_H_STALE)   fail("JeiOS fatal: s5c close(closed) not STALE\r\n");
-            /* handle 0 is BADINDEX. The legacy demo's encoded index 16 was
-             * formerly index==capacity; with H=40 it is an in-range FREE slot,
-             * so the table correctly reports STALE instead. */
+            /* handle 0 is BADINDEX. Index==capacity is also BADINDEX, while
+             * the separate in-range FREE-slot probe is STALE. */
             if (vm_s3_scratch(H,0x1058)!=JE_ABI_H_BADINDEX) fail("JeiOS fatal: s5c close(0) not BADINDEX\r\n");
-            if (vm_s3_scratch(H,0x1060)!=JE_ABI_H_STALE)   fail("JeiOS fatal: s5c in-range-free not STALE\r\n");
+            if (vm_s3_scratch(H,0x1060)!=JE_ABI_H_BADINDEX) fail("JeiOS fatal: s5c capacity bound not BADINDEX\r\n");
+            if (vm_s3_scratch(H,0x1018)!=JE_ABI_H_STALE)   fail("JeiOS fatal: s5c in-range-free not STALE\r\n");
             /* slot reuse: self#2 took slot 0 at a new generation. */
             if (vm_s3_scratch(H,0x1088)!=JE_ABI_OK)        fail("JeiOS fatal: s5c self#2 not OK\r\n");
             if (vm_s3_scratch(H,0x1078)==0u)               fail("JeiOS fatal: s5c self#2 handle zero\r\n");
@@ -694,8 +730,10 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             (void)je_arch_irq_save();
             if (je_sched_drop_user(&vm_s3, H)!=JE_OK) fail("JeiOS fatal: s5c handle drop\r\n");
             if (je_vm_destroy(&vm_s3, H)!=JE_OK) fail("JeiOS fatal: s5c handle destroy\r\n");
-            je_arch_console_write("M3b-s1: handle self/query/rights/dup/close OK; attenuation drops INSPECT -> handle_rights DENIED (enforcement real); superset DENIED; unknown-right INVALID; reuse re-stales; in-range-free STALE at old bound probe; default quota 15; B alive\r\n");
+            je_arch_console_write("M3b-s1: handle self/query/rights/dup/close OK; attenuation drops INSPECT -> handle_rights DENIED (enforcement real); superset DENIED; unknown-right INVALID; reuse re-stales; BADINDEX at capacity restored; in-range-free STALE; default quota 15; B alive\r\n");
         }
+        /* M3b intentionally preserves only the M3a survivor B. */
+        vm_s3_assert_only_ready(B, "JeiOS fatal: M3b vm process leak\r\n");
 
         /* --- M3c s3: endpoint lifecycle wired to ring 3 + process-death reclaim.
          * Two proofs:
@@ -1062,6 +1100,9 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s7 pool leak after teardown\r\n");
             je_arch_console_write("M3c-s7: bootstrap fixture OK (two ring-3 processes, kernel-seeded channel; B parked -> A's cap-carrying send WOKE it via the continuation; B minted the transferred end; A closed c1 BEFORE B used the mint; B's post-close send reached A's c0 (retained ownership); 4-round ping-pong; DONE teardown; both exited 0; pool reclaimed). The step-5 two-process transfer AND step-6 two-process WOKEN deferrals are now discharged end-to-end.\r\n");
         }
+        /* M3c leaves no VM process intentionally live: B was torn down before
+         * the cross-table, timeout, and bootstrap proofs. */
+        vm_s3_assert_all_free("JeiOS fatal: M3c vm process leak\r\n");
     }
 
     je_arch_console_write("JeiOS: initialization complete; halted\r\n");

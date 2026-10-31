@@ -8,6 +8,11 @@
  */
 #include <jeios/vm.h>
 
+/* user_demo.S encodes JE_VM_HANDLE_CAP as an assembly-only boundary probe.
+ * Keep the literal coupled to the frozen production capacity rather than
+ * allowing the ring-3 test to silently drift if the C header changes. */
+_Static_assert(JE_VM_HANDLE_CAP == 40u, "user demo handle-capacity probe");
+
 /* Builder-side _Noreturn panic wrapper over the backend hook (the header hook
  * cannot be _Noreturn as a struct member). A returning hook is itself a fatal
  * contract violation, so we loop. */

@@ -73,8 +73,11 @@ _Static_assert(JE_BROKER_MAX <= 6u, "ADR 0010 D11 broker bound");
 #define JE_EP_MSG_CAPS_MAX  2u
 /* Each ref counter must admit every non-handle owning ref the design can force
  * (queued caps + waiters) without spuriously overflowing a legitimate acquire,
- * AND be small enough to hit in a test. handle_refs is bounded by table slots;
- * inflight_refs by queue depth + waiters. One shared max covers both. */
+ * AND be small enough to hit in a test. handle_refs has an explicit POLICY
+ * bound of JE_EP_REF_MAX (REFOVERFLOW); it is no longer implied by table slots
+ * now that H=40. ADR 0010's supervisor design must keep <= JE_EP_REF_MAX
+ * handle refs per end. inflight_refs is bounded by queue depth + waiters.
+ * One shared max covers both. */
 #define JE_EP_REF_MAX       8u
 
 /* ENDPOINT object type tag carried in a handle slot. Type 0 is reserved; SELF is
