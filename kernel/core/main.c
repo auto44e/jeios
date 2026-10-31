@@ -21,7 +21,6 @@ extern je_status je_sched_unregister_process(je_vm *vm, uint32_t index);
 extern bool je_sched_has_process(je_vm *vm, uint32_t index);
 extern unsigned je_sched_user_thread_count(void);
 extern void je_kernel_idle_step(void);
-extern uint32_t je_spawn_failpoint_fired(void);
 extern void je_endpoint_kern_set_proc_pool(je_proc_pool *pool);
 extern je_status je_process_handle_mint(je_vm *vm, uint32_t index, je_proc_id id,
                                         uint32_t rights, je_handle *out,

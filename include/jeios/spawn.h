@@ -50,5 +50,8 @@ je_abi_status je_proc_spawn(je_vm *vm, uint32_t caller_idx, je_handle launcher,
  * never fail a later spawn [Claude P2-2]. It stays compiled in the normal kernel
  * because the QEMU smoke run is its evidence; nothing in the syscall path calls it. */
 void je_spawn_failpoint_set(uint32_t step, uint32_t grant_index);
+/* Number of times the failpoint has fired since it was last armed (kernel-internal;
+ * lets fixtures prove a failpoint did or did NOT fire, e.g. validation order). */
+uint32_t je_spawn_failpoint_fired(void);
 
 #endif /* JEIOS_SPAWN_H */

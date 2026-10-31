@@ -347,6 +347,14 @@ image page, so the A6-CLARIFY-1 immutable-text premise is untouched.
 **Flex:** if more than 4 grants are needed, move to a read-only launch-info segment
 under a new startup version.
 
+*Implementation note (PR-C, 2026-10-31; lead decisions, not new owner-gated contract):*
+- **Step 0 uses a preflight.** "Reserve the caller's slot" is implemented as a read-only `je_handle_can_alloc` preflight plus the publishing `je_handle_alloc`, not as a RESERVED slot state. A new slot state would change ADR 0008's frozen slot states. The preflight is equivalent here, because the whole syscall runs at IF=0 on one CPU and nothing touches the caller's table in between.
+- **The supervisor gets its LAUNCHER through startup v1.** RSI = 1 and RDX = launcher. The ADR left this unspecified.
+- **Precedence** is launcher, then image id, then quotas (including n > the effective child quota), then grants, then the preflight, then the journal (pinned in `spawn.h`). Internal NOMEM/BUSY map to `H_NOSLOTS`, because ADR 0010 adds no new statuses.
+- **Rollback once the child thread exists** uses the pinned kernel-forced teardown, `on_dying(KILLED)` then `on_reaped`. Abandon is only for an unlinked record.
+- **No `je_vm_audit` inside spawn**, because spawn runs at IF=0 and the audit is O(N²·pages). The QEMU fixture audits the child instead. This is recorded as a deviation from the M3 fixture habit of auditing every build.
+- **The fail-Nth hook stays compiled in, but kernel-internal only.** Nothing in the syscall path calls it, and it is disarmed after every spawn.
+
 ### D6. Supervisor event loop and time (D-OWNER-7)
 
 The kernel adds no wait-any, wait-set or badge primitive in M4. The supervisor
