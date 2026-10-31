@@ -405,3 +405,6 @@ void je_endpoint_kern_wait_release(je_ep_channel *rec, uint8_t side, uint32_t wh
 {
     (void)je_endpoint_wait_release(&g_kep, rec, side, who);
 }
+
+/* PR-D pre-wiring STUB (lead): returns 0 until the worker implements the counter. */
+uint32_t je_endpoint_kern_woken_reservations_released(void) { return 0u; }

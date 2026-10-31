@@ -85,6 +85,11 @@ uint32_t je_endpoint_kernel_allocated(void);
 /* ---- M3c D7/A6 blocking-recv bridge ---- */
 /* Release owner (A6-CLARIFY-2), called by sched.c mark_dying with the dying slot. */
 bool je_endpoint_kern_waiter_release_by_id(uint32_t slot);
+/* ADR 0010 D8 evidence counter (kernel-internal, NOT ABI; PR-D lead addition from the
+ * Claude review P2-3). It counts reservations released because a WOKEN waiter
+ * (head_reserved) was released by the death path (waiter_release_by_id). Lets the
+ * M4d-s1 fixture OBSERVE "killed while WOKEN-reserved" instead of inferring it. */
+uint32_t je_endpoint_kern_woken_reservations_released(void);
 /* Recv glue: entry probe (deliverable? empty? closed?) and waiter registration. */
 je_ep_status je_endpoint_kern_recv_entry_probe(je_vm *vm, uint32_t index, je_handle h);
 je_ep_status je_endpoint_kern_wait_register(je_vm *vm, uint32_t index, je_handle h,
