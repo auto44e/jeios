@@ -10,6 +10,11 @@
 #include <jeios/sched.h>   /* je_sched_wake_ipc for the blocking-recv bridge */
 #include <jeios/arch.h>
 
+/* ADR 0010 D2 endpoint pool formula (needs both vm.h and endpoint.h). */
+_Static_assert(JE_EP_POOL_CAP >= 2u * (JE_VM_MAX_PROCESSES - 1u) + JE_BROKER_MAX + 1u + 2u
+               + (JE_VM_MAX_PROCESSES - 1u) * JE_EP_CHILD_QUOTA_MAX + JE_EP_RESERVE,
+               "ADR 0010 D2 endpoint pool formula");
+
 /* The one kernel-wide pool. A dying process's endpoints are reclaimed into it by
  * the teardown hook; a leaked record would eventually exhaust it (the whole
  * point of A3-1). */

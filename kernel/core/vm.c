@@ -505,3 +505,14 @@ je_status je_vm_audit(const je_vm *vm, uint32_t index)
     }
     return JE_OK;
 }
+
+/* ADR 0010 D2 pre-wiring STUB (lead): fail-closed until the PR-A implementation
+ * lands. Replaced by the real per-table quota build. */
+je_status je_vm_build_quota(je_vm *vm, const je_vm_image *image, const void *blob,
+                            size_t blob_len, int nx_available, uint32_t handle_quota,
+                            uint32_t *out_index)
+{
+    (void)vm; (void)image; (void)blob; (void)blob_len; (void)nx_available;
+    (void)handle_quota; (void)out_index;
+    return JE_ERR_INVALID;
+}

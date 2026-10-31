@@ -6,7 +6,10 @@
 #include <jeios/status.h>
 #include <jeios/vm.h>
 #include <jeios/endpoint.h>   /* je_ep_channel, for the blocking-recv waiter API */
-#define JE_THREAD_MAX 8u
+/* ADR 0010 D2: T = 1 idle + 7 M2 workers + P user threads. Was 8. */
+#define JE_THREAD_MAX 16u
+#define JE_M2_WORKERS 7u   /* the M2 boot workload stays at exactly 7 workers */
+_Static_assert(JE_THREAD_MAX >= 1u + JE_M2_WORKERS + JE_VM_MAX_PROCESSES, "ADR 0010 D2 thread capacity");
 /* Single CPU. Bootstrap slot 0 is the idle/monitor task; other slots are kernel
  * threads or (M3a #4) ring-3 user threads bound to a vm process (own CR3 +
  * TSS.RSP0). Init/create/reap require interrupts disabled. Sleep/yield serialize
