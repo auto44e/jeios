@@ -750,11 +750,24 @@ approved (2026-10-31) revising the *detection mechanism* while leaving the D12
 *policy* (refuse, kill-all, reap, verify baselines, halt) unchanged.
 
 **Decision.** The slot-0 monitor loop detects supervisor loss by **scanning the
-supervisor's PROCESS record for a DYING state before it reaps**, rather than by a
-hook inside `mark_dying`. The scan runs at the top of the single slot-0
-monitor/idle loop, before `je_sched_reap_dead()`, so it observes the DYING record
-while it still exists. `mark_dying` and `reap_dead` stay byte-identical to the
-tested M2/kill paths.
+supervisor's PROCESS record by identity before it reaps**: the monitor holds the
+supervisor's `je_proc_id` as a plain value (no handle ref) and treats any
+`je_proc_status(sup_id)` result other than LIVE as loss (DYING, DEAD, or
+reaped-to-FREE — `record_for` rejects a FREE slot or a bumped generation). This is
+a strict superset of scanning for DYING and is necessary because
+`je_kernel_idle_step` itself reaps: a DYING-only scan can miss a supervisor that
+was reaped between two scans. The monitor therefore does **not** call `idle_step`;
+it uses its own wait — `cli; identity-scan; je_sched_reap_dead(); sti; hlt` — with
+the scan and the reap in a single IF=0 section, and the monitor is the **sole**
+reaper entry after seeding. `mark_dying` and `reap_dead` stay byte-identical to
+the tested M2/kill paths.
+
+A supervisor that EXITs normally also leaves its record non-LIVE, so the monitor
+disambiguates success from loss by the report's `phase`: `phase == DONE` prints a
+success marker and runs the same kill-all/reap/baseline/halt sequence; anything
+else is a loss. The **loss** decision never depends on the report being readable
+(a missing magic prints "no report" and still halts); only the success path reads
+`phase == DONE`.
 
 **Why.** `mark_dying` (via `je_proc_on_dying`) is *also* on the normal
 kernel-forced teardown path: `vm_s3_destroy` and `spawn_undo` reach it for fixture
@@ -776,7 +789,11 @@ detection that the scan already provides without touching them.
 
 **Ordering constraint.** No other slot-0 reap may run between the supervisor's
 death and the monitor scan. This holds because slot 0 is the *only* context that
-reaps after seeding, and the monitor loop scans before each `reap_dead`.
+reaps after seeding, the monitor loop is the sole reaper entry, and it scans
+before each `reap_dead`. The monitor asserts the saved supervisor identity is
+still the expected `(index, generation)` each pass. (Identity-based detection also
+makes this robust: even if the record were reaped first, `je_proc_status(sup_id)`
+returning non-LIVE is still observed as loss.)
 
 **Future flex (toward the original D12 wording / "option 2").** If a later design
 needs **synchronous** detection at the instant of death — e.g. a watchdog or a

@@ -735,3 +735,22 @@ je_status je_sched_kill(je_proc_id victim)
     je_arch_irq_restore(flags);
     return JE_OK;
 }
+
+/*
+ * ADR 0010 D12 (PR-F) — fail-closed STUB pre-wired by the lead. The real
+ * implementation (worker) marks every LIVE run-linked user thread except `spare`
+ * DYING(KILLED) per the contract in sched.h. Until then this refuses so a
+ * half-wired supervisor-loss path can never appear to succeed: it asserts slot-0
+ * context, writes 0 killed, and returns INVALID so d12_refuse halts fatally
+ * rather than proceeding on an empty teardown.
+ */
+je_status je_sched_kill_all_user(je_proc_id spare, uint32_t *killed)
+{
+    (void)spare;
+    uint64_t flags = je_arch_irq_save();
+    if ((flags & (UINT64_C(1) << 9)) != 0u) abort_scheduler(); /* IF must be 0 */
+    if (threads[current].kind != THREAD_KERNEL) abort_scheduler(); /* slot-0 only */
+    if (killed) *killed = 0u;
+    je_arch_irq_restore(flags);
+    return JE_ERR_INVALID;   /* not yet implemented: fail closed */
+}

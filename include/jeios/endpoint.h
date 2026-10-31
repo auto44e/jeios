@@ -45,6 +45,7 @@
  */
 #include <jeios/handle.h>
 #include <jeios/proc.h>
+#include <jeios/svc.h>   /* JE_BROKER_MAX (shared with the supervisor, PR-F) */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -56,7 +57,6 @@
  * channel, + 2 kept M3 fixtures, + (P-1) * JE_EP_CHILD_QUOTA_MAX, + JE_EP_RESERVE.
  * Was 4. JE_BROKER_MAX moves to a kernel/supervisor-shared header in PR-F. */
 #define JE_EP_POOL_CAP      24u   /* channel records in a pool */
-#define JE_BROKER_MAX        6u
 #define JE_EP_CHILD_QUOTA_MAX 0u  /* M4: spawned children create no channels (D-DEV) */
 #define JE_EP_RESERVE        1u
 /* The D2 pool formula is asserted in endpoint_kern.c (it needs vm.h's P). */
@@ -64,7 +64,7 @@
  * equal JE_ABI_OBJ_PROCESS; endpoint_kern.c asserts that. It is a literal here so the
  * pure endpoint layer stays free of ABI includes. */
 #define JE_EP_PROCESS_OBJ_TYPE 3u
-_Static_assert(JE_BROKER_MAX <= 6u, "ADR 0010 D11 broker bound");
+/* JE_BROKER_MAX and its D11 bound assert now live in <jeios/svc.h>. */
 #define JE_EP_QUEUE_DEPTH   4u    /* messages per end inbound queue */
 #define JE_EP_MAX_WAITERS   2u    /* waiters per end (unused this PR) */
 /* M3c step 5: max payload BYTES per message (a policy bound, newly chosen here —
