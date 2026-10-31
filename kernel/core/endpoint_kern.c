@@ -24,6 +24,7 @@ _Static_assert(JE_EP_POOL_CAP >= 2u * (JE_VM_MAX_PROCESSES - 1u) + JE_BROKER_MAX
  * point of A3-1). */
 static je_endpoint_pool g_kep;
 static bool g_kep_inited;
+static uint32_t g_woken_reservations_released;
 
 static void kep_init_once(void)
 {
@@ -308,7 +309,23 @@ uint32_t je_endpoint_kernel_allocated(void)
 bool je_endpoint_kern_waiter_release_by_id(uint32_t slot)
 {
     if (!g_kep_inited) return false;
-    return je_endpoint_wait_release_by_id(&g_kep, slot);
+    bool woken_reserved = false;
+    for (uint16_t i = 0; i < JE_EP_POOL_CAP; ++i) {
+        if (!g_kep.rec[i].allocated) continue;
+        for (uint8_t s = 0; s < 2u; ++s) {
+            const je_ep_waiter *waiter = &g_kep.rec[i].end[s].waiter;
+            if (waiter->present && waiter->waiter_id == slot
+                && waiter->cause == JE_EP_WAIT_WOKEN
+                && waiter->head_reserved) {
+                woken_reserved = true;
+                break;
+            }
+        }
+        if (woken_reserved) break;
+    }
+    bool released = je_endpoint_wait_release_by_id(&g_kep, slot);
+    if (released && woken_reserved) ++g_woken_reservations_released;
+    return released;
 }
 
 /* Entry probe + waiter register for the recv glue. */
@@ -406,5 +423,7 @@ void je_endpoint_kern_wait_release(je_ep_channel *rec, uint8_t side, uint32_t wh
     (void)je_endpoint_wait_release(&g_kep, rec, side, who);
 }
 
-/* PR-D pre-wiring STUB (lead): returns 0 until the worker implements the counter. */
-uint32_t je_endpoint_kern_woken_reservations_released(void) { return 0u; }
+uint32_t je_endpoint_kern_woken_reservations_released(void)
+{
+    return g_woken_reservations_released;
+}

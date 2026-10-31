@@ -835,7 +835,8 @@ je_user_spawn_child_end:
 
 /* M4d-s1 PROC_KILL victims and killer. The bootstrap writes PROCESS and
  * endpoint handles into the killer's USER_DATA page before creating its thread.
- * The phase/control words are handshakes with main.c; the killer never yields
+ * The phase/control words are handshakes with main.c; marker 1/2 brackets the
+ * READY PROC_KILL with no other syscall between them. The killer never yields
  * between the WOKEN send and PROC_KILL pair. */
 .globl je_user_m4d_ready_start
 .globl je_user_m4d_ready_end
@@ -903,7 +904,12 @@ je_user_m4d_start:
     movq $1, 0x40001c00
     movq $0, 0x40001bf8
 
-    /* READY victim: kill, then inspect the terminal record. */
+    /* READY victim: let the bootstrap observe marker 1 and the victim's
+     * heartbeat, then kill, leaving marker 2 immediately after the syscall. */
+    movq $1, 0x40001ca0
+m4d_wait_ready_gate:
+    cmpq $1, 0x40001bf8
+    jne m4d_wait_ready_gate
     movq $16, %rax
     movq 0x40001c08, %rdi
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
@@ -911,6 +917,10 @@ je_user_m4d_start:
     movq %rax, 0x40001c80
     cmpq $0, %rax
     jne m4d_fail
+    movq $2, 0x40001ca0
+m4d_wait_ready_observe:
+    cmpq $2, 0x40001bf8
+    jne m4d_wait_ready_observe
     movq $15, %rax
     movq 0x40001c08, %rdi
     movq $0x40001d00, %rsi
@@ -924,7 +934,7 @@ je_user_m4d_start:
     jne m4d_fail
     movq $2, 0x40001c00
 m4d_wait_ready:
-    cmpq $1, 0x40001bf8
+    cmpq $2, 0x40001bf8
     jne m4d_wait_ready
 
     /* BLOCKED_IPC victim: mark_dying must release its waiter, not resume it. */
@@ -954,13 +964,17 @@ m4d_wait_ready:
     jne m4d_fail
     movq $3, 0x40001c00
 m4d_wait_blocked:
-    cmpq $2, 0x40001bf8
+    /* The coordinator writes 3 only after checking this phase and reaping
+     * the blocked victim. Keep phase 3 observable until that point. */
+    cmpq $3, 0x40001bf8
     jne m4d_wait_blocked
 
     /* WOKEN reservation: try_send and PROC_KILL are adjacent syscalls. */
     movq $4, 0x40001c00
 m4d_wait_woken_gate:
-    cmpq $3, 0x40001bf8
+    /* The coordinator writes 4 only after observing the parked victim and
+     * holding its dispatch count stable. */
+    cmpq $4, 0x40001bf8
     jne m4d_wait_woken_gate
     movb $0x4b, 0x40001ed8
     movq $11, %rax
@@ -992,7 +1006,9 @@ m4d_wait_woken_gate:
     jne m4d_fail
     movq $5, 0x40001c00
 m4d_wait_woken:
-    cmpq $4, 0x40001bf8
+    /* The coordinator writes 5 only after checking the killed WOKEN record,
+     * closing/reaping that victim, and preparing the EXIT victim handle. */
+    cmpq $5, 0x40001bf8
     jne m4d_wait_woken
 
     /* Self, rights, wrong type and stale-handle negative cases. */
@@ -1037,6 +1053,61 @@ m4d_wait_woken:
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
     cmpq $3, %rax
+    jne m4d_fail
+
+    /* EXIT first-reason-wins: the bootstrap waits until this record is DYING
+     * from exit(42), and PROC_KILL must be OK without changing reason EXIT=1. */
+    movq $16, %rax
+    movq 0x40001c58, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    movq $15, %rax
+    movq 0x40001c58, %rdi
+    movq $0x40001d80, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    cmpl $2, 0x40001d80
+    je 2f
+    cmpl $3, 0x40001d80
+    jne m4d_fail
+2:
+    cmpl $1, 0x40001d84
+    jne m4d_fail
+    movq $6, %rax
+    movq 0x40001c58, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+
+    /* Supervisor guard: this kernel-seeded record has no real thread, so the
+     * record-level guard must reject it before run-link or D12 loss handling. */
+    movq $16, %rax
+    movq 0x40001c50, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $2, %rax
+    jne m4d_fail
+    movq $15, %rax
+    movq 0x40001c50, %rdi
+    movq $0x40001da0, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    cmpl $1, 0x40001da0
+    jne m4d_fail
+    cmpl $0, 0x40001da4
+    jne m4d_fail
+    movq $6, %rax
+    movq 0x40001c50, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
     jne m4d_fail
 
     /* First reason wins and kill-after-death is idempotent. */

@@ -716,16 +716,19 @@ je_status je_sched_kill(je_proc_id victim)
         je_arch_irq_restore(flags);
         return JE_ERR_INVALID;
     }
-    (void)vm_index;
     if (slot == 0u || slot >= JE_THREAD_MAX
+        || vm_index >= JE_VM_MAX_PROCESSES
         || threads[slot].kind != THREAD_USER
         || threads[slot].proc_id.index != victim.index
         || threads[slot].proc_id.gen != victim.gen
+        || threads[slot].vm_index != vm_index
         || (threads[slot].state != READY && threads[slot].state != BLOCKED_IPC)
         || threads[slot].frame == (je_trap_frame *)0)
         abort_scheduler();
 
-    /* mark_dying clears the frame pointer; snapshot the user return metadata first. */
+    /* mark_dying clears the frame pointer; snapshot the user return metadata first.
+     * For BLOCKED_IPC, block_current rewound frame->rip by JE_INT80_LEN so this
+     * diagnostic RIP names the int 0x80 instruction, not the post-gate RIP. */
     uint64_t rip = threads[slot].frame->rip;
     uint64_t cs = threads[slot].frame->cs;
     mark_dying(slot, DEATH_KILLED, 0u, 0u, 0u, rip, cs, 0u);
