@@ -103,7 +103,8 @@ je_handle_status je_handle_alloc(je_handle_table *t, void *object,
  * *out_slot points at the live slot; on any failure returns the specific status
  * and writes nothing. Pure; never mutates the table. */
 static je_handle_status resolve_slot(const je_handle_table *t, je_handle h,
-                                     uint32_t expected_type, uint32_t required_rights,
+                                     uint32_t expected_type, bool check_type,
+                                     uint32_t required_rights,
                                      const je_handle_slot **out_slot)
 {
     uint32_t index, generation;
@@ -115,7 +116,7 @@ static je_handle_status resolve_slot(const je_handle_table *t, je_handle h,
     /* State first: a FREE or RETIRED slot is STALE regardless of generation. */
     if (s->state != JE_HSLOT_LIVE) return JE_HANDLE_STALE;
     if (s->generation != generation) return JE_HANDLE_STALE;
-    if (s->type != expected_type) return JE_HANDLE_WRONGTYPE;
+    if (check_type && s->type != expected_type) return JE_HANDLE_WRONGTYPE;
     if ((s->rights & required_rights) != required_rights) return JE_HANDLE_DENIED;
     *out_slot = s;
     return JE_HANDLE_OK;
@@ -126,7 +127,7 @@ je_handle_status je_handle_lookup(const je_handle_table *t, je_handle h,
                                   void **out_object)
 {
     const je_handle_slot *s;
-    je_handle_status r = resolve_slot(t, h, expected_type, required_rights, &s);
+    je_handle_status r = resolve_slot(t, h, expected_type, true, required_rights, &s);
     if (r != JE_HANDLE_OK) return r;
     if (out_object) *out_object = s->object;
     return JE_HANDLE_OK;
@@ -137,7 +138,7 @@ je_handle_status je_handle_rights_of(const je_handle_table *t, je_handle h,
                                      uint32_t *out_rights)
 {
     const je_handle_slot *s;
-    je_handle_status r = resolve_slot(t, h, expected_type, required_rights, &s);
+    je_handle_status r = resolve_slot(t, h, expected_type, true, required_rights, &s);
     if (r != JE_HANDLE_OK) return r;
     if (out_rights) *out_rights = s->rights;
     return JE_HANDLE_OK;
@@ -160,7 +161,7 @@ je_handle_status je_handle_dup_self(je_handle_table *t, je_handle src,
      * attenuate); the subset check below enforces "only remove rights". This
      * also returns WRONGTYPE if the named slot is not actually a SELF object. */
     const je_handle_slot *s;
-    je_handle_status r = resolve_slot(t, src, JE_HANDLE_OBJ_SELF, 0u, &s);
+    je_handle_status r = resolve_slot(t, src, JE_HANDLE_OBJ_SELF, true, 0u, &s);
     if (r != JE_HANDLE_OK) return r;
     /* Subset: the derived handle may not hold a right the source lacks. */
     if ((new_rights & ~s->rights) != 0u) return JE_HANDLE_DENIED;
@@ -208,10 +209,15 @@ bool je_handle_live_at(const je_handle_table *t, uint32_t index,
     return true;
 }
 
-/* ADR 0010 D3 pre-wiring STUB (lead): fail closed until PR-B lands. */
 je_handle_status je_handle_resolve_any(const je_handle_table *t, je_handle h,
                                        uint32_t *type, uint32_t *rights, void **obj)
 {
-    (void)t; (void)h; (void)type; (void)rights; (void)obj;
-    return JE_HANDLE_BADINDEX;
+    if (!type || !rights || !obj) return JE_HANDLE_BADINDEX;
+    const je_handle_slot *s;
+    je_handle_status r = resolve_slot(t, h, 0u, false, 0u, &s);
+    if (r != JE_HANDLE_OK) return r;
+    *type = s->type;
+    *rights = s->rights;
+    *obj = s->object;
+    return JE_HANDLE_OK;
 }

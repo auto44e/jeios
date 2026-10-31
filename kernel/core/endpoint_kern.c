@@ -25,6 +25,12 @@ static void kep_init_once(void)
 {
     if (!g_kep_inited) { je_endpoint_pool_init(&g_kep); g_kep_inited = true; }
 }
+
+void je_endpoint_kern_set_proc_pool(je_proc_pool *procs)
+{
+    kep_init_once();
+    g_kep.procs = procs;
+}
 /* Forward decl: peer-close wake helper (defined with the bridge functions). */
 static void kern_peer_close_wake(je_ep_channel *rec, uint8_t side);
 
@@ -77,8 +83,20 @@ je_ep_status je_endpoint_kern_create(je_vm *vm, uint32_t index,
         return JE_EP_CORRUPT;
     kep_init_once();
     je_handle_table *t = &vm->procs[index].htable;
-    return je_endpoint_channel_create(&g_kep, t, JE_EP_RIGHTS_ALL,
-                                      t, JE_EP_RIGHTS_ALL, out0, out1);
+    je_proc_id creator = JE_PROC_ID_NONE;
+    extern je_status je_sched_current_proc_id(je_proc_id *out);
+    if (je_sched_current_proc_id(&creator) != JE_OK) creator = JE_PROC_ID_NONE;
+    return je_endpoint_channel_create_by(&g_kep, creator, t, JE_EP_RIGHTS_ALL,
+                                         t, JE_EP_RIGHTS_ALL, out0, out1);
+}
+
+je_ep_status je_endpoint_kern_dup(je_vm *vm, uint32_t index, je_handle src,
+                                  uint32_t rights, je_handle *out)
+{
+    if (out) *out = 0u;
+    if (!vm || index >= JE_VM_MAX_PROCESSES || !out) return JE_EP_BADINDEX;
+    kep_init_once();
+    return je_endpoint_handle_dup(&g_kep, &vm->procs[index].htable, src, rights, out);
 }
 
 je_ep_status je_endpoint_kern_close(je_vm *vm, uint32_t index, je_handle h)
