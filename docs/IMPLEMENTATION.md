@@ -25,17 +25,56 @@ userspace isolation, SMP safety, driver containment or production readiness.
 Closes a cross-process / kernel disclosure: `je_pages_alloc`/`free` never zeroed
 frame contents, and the VM backend reused freed frames (including as page tables)
 with stale bytes — stale page-table bytes are live PTEs. Fix (owner-approved b+c):
-`vb_scrub_frames` zeroes every frame run on free in `vb_free_extent` and
-`vb_release_hold` (root cause, covers all roles); `vb_link_tables` also clears the
-four table frames before publishing (defense in depth); `je_vm_audit` now rejects
-any present upper-table entry outside the four the build sets. Hosted regression
-test: test_vm `test_audit_rejects_stale_upper` (injects stale entries; verified it
-fails without the audit strengthening). The `je_pages` allocator contract is
-unchanged (it cannot address frame bytes; the backend is the lowest layer that
-can). Verified: `make check` (vm suite incl. stale-upper rejection), `make smoke`,
-`make integration` (11 fault modes), NX profiles, and ARM64 base — all PASS
-locally. Detail and rationale in ADR 0006's security note. Single-agent + ADR;
-AI-assisted review pending on the PR.
+`vb_scrub_frames` zeroes every VM-owned frame run on free in `vb_free_extent` and
+`vb_release_hold` (root cause); `vb_link_tables` also clears the four table frames
+before publishing (defense in depth); `je_vm_audit` now rejects any present
+upper-table entry outside the four the build sets and runs on the ring-3 spawn
+path. Hosted regression test: test_vm `test_audit_rejects_stale_upper` (injects
+stale entries; verified it fails without the audit strengthening). The `je_pages`
+allocator contract is unchanged. Landed as PR #66. Detail and rationale in ADR
+0006's security note and `docs/adr/debates/secfix-frame-zero-reviews.md`.
+
+## M4 PR-F Stage 1 — D12 kernel mechanism — 2026-10-31
+
+This worker-stage change implements only the kernel mechanism that a later
+supervisor monitor will call. It does not add the supervisor image, monitor
+loop, child images, TEST_MODE 12 or the D12 boot marker.
+
+- `je_sched_kill_all_user` now runs only from slot 0 with interrupts disabled.
+  Its first pass classifies every non-empty user slot by the thread back-link
+  and `je_proc_run_link` identity. LIVE READY/BLOCKED_IPC users other than the
+  exact spared identity are marked in a second pass through the unchanged
+  `mark_dying` sequence; DYING users are validated and skipped. Invalid
+  RUNNING/SLEEPING/ZOMBIE states, generation-zero identities and mismatched
+  run links return `JE_ERR_INVALID` without changing any slot or PROCESS
+  record. WOKEN reservations need no special branch because `mark_dying`
+  remains the single idempotent waiter-release owner.
+- `svc_report_read` is a Stage-2-only static helper. It checks that the fixed
+  40-byte report stays within one page, probes the process PTE as present
+  `JE_VM_PERM_RW_NX` before switching CR3, copies seq/body/seq, restores the
+  kernel CR3, and accepts only a stable even sequence plus known fixed-format
+  values. No report field becomes a pointer, length or index.
+- `report_vaddr_in_rw_segment` is a pure unused predicate for the future
+  `JE_IMAGE_SUPERVISOR` image validation hook. It requires exactly one
+  non-executable RW segment, page-safe placement, 8-byte alignment and a
+  location below the guard page.
+
+**Observed evidence at local commit `b3ae3b7b136346290bda91baadc4909ad203b3fb`
+on branch `wip/m4f-impl` (uncommitted worker tree):**
+
+- `ASAN_OPTIONS=detect_leaks=0 make check` — PASS; hosted suite, generated
+  image validators, ELF checks and `test_sched_killall: PASS (66 checks)`.
+- `make smoke` — PASS; rebuilt the NX ISO and QEMU reached
+  `M4e-s1: ring-3 C image OK ...` followed by `QEMU smoke: PASS`.
+- `git diff --check` — PASS.
+
+The hosted scheduler test is real production `kernel/core/sched.c` included
+inside the test translation unit with only private linkage exposed there;
+production `kernel/core/proc.c` supplies PROCESS behavior. Its fakes cover
+only hosted interrupt, console/halt and waiter-release hooks. The report
+reader and placement predicate remain untested by QEMU until Stage 2 supplies
+the supervisor image and monitor. AI-assisted review is not independent human
+qualification.
 
 ## M1a: exception entry
 

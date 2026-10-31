@@ -16,6 +16,7 @@
 #include <jeios/proc.h>
 #include <jeios/image.h>
 #include <jeios/spawn.h>
+#include <jeios/svc.h>
 
 extern void je_sched_set_proc_pool(je_proc_pool *pool);
 extern je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id);
@@ -293,6 +294,107 @@ static uint64_t vm_s3_scratch(uint32_t idx, uint64_t off)
     je_arch_irq_restore(flags);
     return v;
 }
+
+static bool svc_phase_known(uint32_t phase)
+{
+    return phase <= JE_SVC_PHASE_FAILED;
+}
+
+static bool svc_fail_code_known(uint32_t fail_code)
+{
+    return fail_code <= JE_SVC_FAIL_CRASHLOOP;
+}
+
+/*
+ * Stage 2 consumes this reader from the slot-0 monitor. It is intentionally
+ * unused in Stage 1: the report is untrusted user memory, so the PTE probe is
+ * completed before CR3 changes and no field is used as an address or bound.
+ * TODO(PR-F Stage 2): add a sibling validated reader for
+ * JE_SVC_ROLLBACK_GO_VADDR on the same pinned RW report page.
+ */
+static __attribute__((unused)) bool svc_report_read(uint32_t vm_index,
+                                                    je_svc_report *out)
+{
+    _Static_assert(sizeof(je_svc_report) == JE_SVC_REPORT_LEN,
+                   "service report size");
+    _Static_assert((JE_SVC_REPORT_VADDR & (UINT64_C(8) - 1u)) == 0u,
+                   "service report alignment");
+    _Static_assert((JE_SVC_REPORT_VADDR & (JE_PAGE_SIZE - 1u))
+                   + sizeof(je_svc_report) <= JE_PAGE_SIZE,
+                   "service report must not straddle a page");
+
+    if (!out || vm_index >= JE_VM_MAX_PROCESSES || !vm_s3.ops
+        || JE_SVC_REPORT_VADDR < JE_VM_ARENA_BASE
+        || JE_SVC_REPORT_VADDR - JE_VM_ARENA_BASE >= JE_VM_ARENA_SIZE)
+        return false;
+
+    uint64_t off = JE_SVC_REPORT_VADDR - JE_VM_ARENA_BASE;
+    uint64_t page_off = off & (JE_PAGE_SIZE - 1u);
+    if (page_off > JE_PAGE_SIZE - sizeof(je_svc_report))
+        return false;
+
+    /* The PTE probe AND the raw read must happen in the same IF=0 section so no
+     * future unmap/mprotect syscall (none exists today) can invalidate the
+     * mapping between the check and the dereference, and so a non-slot-0 caller
+     * cannot race the supervisor. We assert IF=0 rather than relying on the
+     * absence of those syscalls. (Claude Stage-1 review #2.) */
+    uint64_t flags = je_arch_irq_save();
+    if ((flags & (UINT64_C(1) << 9)) != 0u)
+        fail("JeiOS fatal: svc_report_read IF set\r\n"); /* IF must be 0 */
+
+    uint64_t physical = 0u;
+    je_vm_perm perm = (je_vm_perm)0;
+    int present = 0;
+    if (vm_s3.ops->read_user_pte(vm_s3.ops->context, vm_index,
+                                 off & ~(uint64_t)(JE_PAGE_SIZE - 1u),
+                                 &physical, &perm, &present) != JE_OK
+        || !present || perm != JE_VM_PERM_RW_NX) {
+        je_arch_irq_restore(flags);
+        return false;
+    }
+    (void)physical;
+
+    uint64_t kroot = je_arch_kernel_root_phys();
+    je_arch_cr3_load(vm_s3.procs[vm_index].root);
+
+    volatile const uint32_t *src =
+        (volatile const uint32_t *)(uintptr_t)(JE_VM_ARENA_BASE + off);
+    je_svc_report snapshot = {0};
+    uint32_t seq_first = src[2];
+    snapshot.magic = src[0];
+    snapshot.version = src[1];
+    snapshot.seq = seq_first;
+    snapshot.phase = src[3];
+    snapshot.fail_code = src[4];
+    snapshot.restarts = src[5];
+    snapshot.heartbeats = src[6];
+    snapshot.spoofer_bits = src[7];
+    snapshot.crash_attempts = src[8];
+    snapshot.reserved = src[9];
+    uint32_t seq_second = src[2];
+
+    je_arch_cr3_load(kroot);
+    je_arch_irq_restore(flags);
+
+    if (seq_first != seq_second || (seq_first & 1u) != 0u)
+        return false;
+    if (snapshot.magic != JE_SVC_REPORT_MAGIC
+        || snapshot.version != JE_SVC_REPORT_V0
+        || !svc_phase_known(snapshot.phase)
+        || !svc_fail_code_known(snapshot.fail_code)
+        || snapshot.reserved != 0u)
+        return false;
+    /* Phase and fail_code must agree: FAILED requires a nonzero fail_code, and
+     * any non-FAILED phase (including DONE, which the success path keys on)
+     * requires fail_code == NONE. Reject a self-contradictory report here rather
+     * than leaving the Stage-2 caller to interpret it. (Claude Stage-1 review #3.) */
+    if ((snapshot.phase == JE_SVC_PHASE_FAILED)
+            != (snapshot.fail_code != JE_SVC_FAIL_NONE))
+        return false;
+    *out = snapshot;
+    return true;
+}
+
 /* Write a 64-bit word into proc idx's arena at offset off (CPL0, its CR3).
  * (Currently unused — kept for a future ring-3 fixture that hands a seeded
  * handle to a stub.) First used by the M3c-s7 bootstrap fixture to inject each

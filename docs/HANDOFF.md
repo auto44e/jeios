@@ -1,5 +1,44 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-F Stage 1 — D12 kernel mechanism — observed 2026-10-31T23:05:35+00:00
+
+Repository `auto44e/jeios`, branch `wip/m4f-impl`, inspected commit
+`b3ae3b7b136346290bda91baadc4909ad203b3fb`; this worker left the requested
+changes uncommitted for lead integration.
+
+- **Implemented:** the real slot-0 `je_sched_kill_all_user` mechanism. It
+  validates every user-thread identity/run-link and process state in a first
+  pass, then marks all non-spared LIVE READY/BLOCKED_IPC users through the
+  unchanged `mark_dying` path. DYING records are validated and skipped;
+  RUNNING/SLEEPING/ZOMBIE, generation-zero, and mismatched links return
+  `JE_ERR_INVALID` without mutation. READY wait-pending reservations use the
+  existing idempotent release owner.
+- **Implemented:** Stage-2-only `svc_report_read` scaffolding in `main.c`.
+  It probes the fixed report page as present RW/NX before CR3 switching,
+  reads seq/body/seq, restores the kernel CR3 before return, and validates
+  fixed-format fields. It is unused until the supervisor monitor is added.
+- **Implemented:** the pure supervisor-image `report_vaddr_in_rw_segment`
+  predicate and commented image-table hook. Existing images are not checked
+  against the supervisor-only placement contract.
+- **Implemented:** hosted `test_sched_killall` coverage and Makefile wiring.
+- **Tested (local):** `ASAN_OPTIONS=detect_leaks=0 make check` passed, including
+  `test_sched_killall: PASS (66 checks)`, ELF/image checks and the existing
+  hosted suites. `make smoke` rebuilt `build/0/jeios.iso` and passed QEMU
+  smoke through `M4e-s1` and the existing M3/M4 fixtures.
+- **Not tested:** the new report reader and image predicate are not exercised
+  by the current boot because the supervisor image/monitor is Stage 2. No
+  remote CI or independent human qualification is claimed.
+- **Planned:** Stage 2 supervisor image, monitor identity scan, report success
+  decision, kill-all/reap/baseline refusal path, and TEST_MODE 12.
+- **Blocked:** nothing for this bounded Stage 1 task.
+
+**Changed invariants and hazards:** kill-all is transactional on validation
+failure and only slot 0 may invoke it with IF clear; it does not add a
+`mark_dying` hook or alter `mark_dying`/`je_sched_reap_dead`. The report reader
+still relies on its documented single-CPU, present-mapping/no-fault-recovery
+precondition after the explicit PTE probe. The current QEMU smoke does not
+prove supervisor-loss behavior.
+
 ## M4 PR-E (#53) — ring-3 C image path + `mkimage.py` — observed 2026-10-31T20:59:44Z
 
 Branch `feat/m4e-cimage`, based on main `1413ed8` (#64 merged; main CI green);
