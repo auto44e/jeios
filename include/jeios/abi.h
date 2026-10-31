@@ -151,7 +151,10 @@ typedef enum {
     , JE_SYS_PROC_SPAWN = 14 /* M4 proc_spawn(launcher=RDI, image_id=RSI, grants=RDX,
                               * grant_count=R10, quotas=R8); R9 reserved (0). Needs SPAWN
                               * on a LAUNCHER handle. RDI and RSI must fit in 32 bits.
-                              * Decode (pure) rejects with INVALID: wide RDI/RSI,
+                              * Decode (pure) rejects with INVALID (EXHAUSTIVE list;
+                              * launcher validity, image_id validity and the grants
+                              * pointer are glue/spawn checks, not decode) [Codex
+                              * PR-C test review P3]: wide RDI/RSI,
                               * grant_count > JE_ABI_SPAWN_GRANTS_MAX, RDX/count
                               * mismatch, quotas [63:32] != 0, handle quota >
                               * JE_VM_HANDLE_QUOTA_MAX, endpoint quota >
