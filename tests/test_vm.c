@@ -32,6 +32,11 @@ static je_pages pages_before;
 static je_vm_process procs_before[JE_VM_MAX_PROCESSES];
 static unsigned char blob[256];
 
+/* Free pages after init_pages: the 1 MiB fixture range is 256 pages, minus the
+ * 3-page boot reservation. The single source for every "full pool" comparison;
+ * init_pages asserts the allocator agrees. */
+#define FIXTURE_FREE_PAGES 253u
+
 static void init_pages(je_pages *out)
 {
     je_boot_context boot = {
@@ -46,7 +51,7 @@ static void init_pages(je_pages *out)
         UINT64_C(0x100000), UINT64_C(0x103000)
     };
     assert(je_pages_init(out, &boot) == JE_OK);
-    assert(out->free_count == 253u);
+    assert(out->free_count == FIXTURE_FREE_PAGES);
 }
 
 static void reset_vm(size_t reserve_pages)
@@ -103,12 +108,20 @@ static void init_blob(void)
         blob[64u + i] = (unsigned char)(0xe0u + (unsigned)i);
 }
 
+/* Admission charge for one image_fixture() build (vm.h je_vm_build step 4):
+ * tables + user pages (each segment's memory_size rounded up, plus the fixed
+ * stack) + held kstack. Derived from the fixture so the two cannot drift. */
 static size_t build_need(void)
 {
-    const size_t image_pages = 3u;
-    const size_t stack_pages = 4u;
+    const je_vm_image image = image_fixture();
+    size_t image_pages = 0u;
+    uint32_t i;
 
-    return (size_t)JE_VM_TABLE_PAGES + image_pages + stack_pages +
+    for (i = 0u; i < image.segment_count; ++i)
+        image_pages += (size_t)((image.segments[i].memory_size + JE_PAGE_SIZE - 1u) /
+                                JE_PAGE_SIZE);
+    assert(image_pages == 3u);   /* fixture sanity: three one-page segments */
+    return (size_t)JE_VM_TABLE_PAGES + image_pages + (size_t)JE_VM_STACK_PAGES +
            (size_t)JE_VM_KSTACK_PAGES;
 }
 
@@ -293,7 +306,7 @@ static void test_admission(void)
 {
     const size_t need = build_need();
     const je_vm_image image = image_fixture();
-    const size_t initial_free = 253u;
+    const size_t initial_free = FIXTURE_FREE_PAGES;
     uint32_t index;
     size_t before;
     size_t i;
@@ -345,7 +358,7 @@ static void test_admission(void)
 static void test_build_audit_and_teardown(void)
 {
     const je_vm_image image = image_fixture();
-    const size_t initial_free = 253u;
+    const size_t initial_free = FIXTURE_FREE_PAGES;
     const size_t expected_need = build_need();
     uint32_t first;
     uint32_t second;
@@ -536,7 +549,7 @@ static void test_teardown_hook(void)
 static void test_all_processes_isolated(void)
 {
     const je_vm_image image = image_fixture();
-    const size_t initial_free = 253u;
+    const size_t initial_free = FIXTURE_FREE_PAGES;
     uint32_t idx[JE_VM_MAX_PROCESSES];
     size_t a, b, i, j;
 
@@ -619,6 +632,26 @@ static void assert_quota_rejected(const je_vm_image *image, int nx,
     assert(memcmp(vm.procs, procs_before, sizeof procs_before) == 0);
 }
 
+/* As assert_quota_rejected, but with explicit (possibly NULL) vm, image, blob
+ * and out_index. With target NULL only the pages and the backend counter can
+ * be checked (no vm to inspect); the global `vm` must still be untouched. */
+static void assert_quota_rejected_args(je_vm *target, const je_vm_image *image,
+                                       const void *data, size_t data_len, int nx,
+                                       uint32_t quota, bool with_out)
+{
+    uint32_t index = UINT32_MAX;
+
+    pages_before = pages;
+    memcpy(procs_before, vm.procs, sizeof procs_before);
+    je_vm_fake_fail_at(0u);
+    assert(je_vm_build_quota(target, image, data, data_len, nx, quota,
+                             with_out ? &index : NULL) == JE_ERR_INVALID);
+    assert(je_vm_fake_fallible_count() == 0u);
+    assert(memcmp(&pages, &pages_before, sizeof pages) == 0);
+    assert(memcmp(vm.procs, procs_before, sizeof procs_before) == 0);
+    assert(index == UINT32_MAX);   /* rejected before any output is written */
+}
+
 /* ADR 0010 D2 / vm.h: handle_quota outside 1..JE_VM_HANDLE_QUOTA_MAX is INVALID,
  * checked FIRST. Negative cases run first so they also hold against the
  * fail-closed stub; the positive cases need the real implementation. */
@@ -654,6 +687,27 @@ static void test_build_quota_range(void)
         assert_quota_rejected(&bad_segments, 1, bad[i]);  /* beats image INVALID */
         assert(all_processes_free(&vm));
     }
+    /* NULL arguments with an out-of-range quota. The call must be INVALID,
+     * must not touch pages or any slot, must make zero backend attempts, and
+     * must not write *out_index. NOTE: a NULL-arg check and the quota check both
+     * return INVALID with no side effect, so "quota first" vs "NULL check first,
+     * then quota" CANNOT be told apart here (see WORKER_NOTES). What these DO
+     * catch: NX/BUSY/validation run before the quota check (nx=0 rows would be
+     * UNSUPPORTED), and a quota check placed after the build (the NULL
+     * out_index row with a good image would build or fault under ASan). */
+    for (i = 0u; i < sizeof bad / sizeof bad[0]; ++i) {
+        int nx;
+        for (nx = 0; nx <= 1; ++nx) {
+            assert_quota_rejected_args(NULL, &good, blob, sizeof blob, nx, bad[i], true);
+            assert_quota_rejected_args(&vm, NULL, blob, sizeof blob, nx, bad[i], true);
+            assert_quota_rejected_args(&vm, &good, blob, sizeof blob, nx, bad[i], false);
+            assert_quota_rejected_args(&vm, &good, NULL, 0u, nx, bad[i], true);
+            assert_quota_rejected_args(&vm, &good, NULL, sizeof blob, nx, bad[i], true);
+            assert_quota_rejected_args(&vm, NULL, NULL, 0u, nx, bad[i], false);
+        }
+        assert(all_processes_free(&vm));
+    }
+
     /* With every slot READY, an out-of-range quota is still INVALID (not BUSY). */
     {
         uint32_t index;
@@ -682,7 +736,7 @@ static void test_build_quota_range(void)
 static void test_build_quota_admits(void)
 {
     const je_vm_image image = image_fixture();
-    const size_t initial_free = 253u;
+    const size_t initial_free = FIXTURE_FREE_PAGES;
     uint32_t index;
 
     init_blob();
@@ -799,7 +853,7 @@ static void test_build_quota_independent(void)
     }
     for (a = 0u; a < JE_VM_MAX_PROCESSES; ++a)
         assert(je_vm_destroy(&vm, idx[a]) == JE_OK);
-    assert(pages.free_count == 253u);
+    assert(pages.free_count == FIXTURE_FREE_PAGES);
     assert(all_processes_free(&vm));
 }
 

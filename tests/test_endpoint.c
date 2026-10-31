@@ -25,6 +25,12 @@
 static je_handle_slot g_pool_slots[POOL_T_CAP];
 static je_handle_table g_pool_t;
 
+/* REFOVERFLOW table (4b): room for REF_MAX refs of one end, the peer, and
+ * spare, with quota == capacity, so JE_EP_REF_MAX is the only possible limit. */
+#define REF_T_CAP (JE_EP_REF_MAX + 4u)
+static je_handle_slot g_ref_slots[REF_T_CAP];
+static je_handle_table g_ref_t;
+
 static je_handle_slot g_slots[CAP];
 static je_handle_table g_t;
 static je_endpoint_pool g_pool;
@@ -125,6 +131,50 @@ int main(void)
         assert(over == 0u);
         assert(rec->end[0].handle_refs == JE_EP_REF_MAX);   /* unchanged */
         assert(g_t.live == live_before);                    /* no slot taken */
+    }
+
+    /* 4b. REFOVERFLOW is the limiter, not the table: a table whose capacity and
+     *     quota both exceed the handles one end can ever hold. Dup past
+     *     JE_EP_REF_MAX returns REFOVERFLOW and changes NOTHING (pool, table
+     *     header and slots byte-identical); the table still has room afterwards
+     *     and the other end is unaffected. */
+    {
+        _Static_assert(REF_T_CAP >= JE_EP_REF_MAX + 3u, "table must not be the limiter");
+        static je_endpoint_pool pool_before;
+        static je_handle_table t_before;
+        static je_handle_slot slots_before[REF_T_CAP];
+        je_handle r0 = 0u, r1 = 0u, d = 0u;
+        je_ep_channel *rec; uint8_t side;
+
+        assert(je_handle_table_init(&g_ref_t, g_ref_slots, REF_T_CAP, REF_T_CAP));
+        je_endpoint_pool_init(&g_pool);
+        assert(je_endpoint_channel_create(&g_pool, &g_ref_t, JE_EP_RIGHTS_ALL,
+                                          &g_ref_t, JE_EP_RIGHTS_ALL, &r0, &r1)
+               == JE_EP_OK);
+        assert(je_endpoint_resolve(&g_pool, &g_ref_t, r0, &rec, &side) == JE_EP_OK);
+        for (uint32_t i = 1u; i < JE_EP_REF_MAX; ++i)
+            assert(je_endpoint_handle_dup(&g_pool, &g_ref_t, r0, JE_EP_RIGHTS_ALL,
+                                          &d) == JE_EP_OK);
+        assert(rec->end[side].handle_refs == JE_EP_REF_MAX);
+        assert(g_ref_t.live == JE_EP_REF_MAX + 1u);
+        assert(g_ref_t.live < g_ref_t.quota && g_ref_t.live < g_ref_t.capacity);
+        memcpy(&pool_before, &g_pool, sizeof g_pool);
+        memcpy(&t_before, &g_ref_t, sizeof g_ref_t);
+        memcpy(slots_before, g_ref_slots, sizeof g_ref_slots);
+        d = 77u;
+        assert(je_endpoint_handle_dup(&g_pool, &g_ref_t, r0, JE_EP_RIGHTS_ALL, &d)
+               == JE_EP_REFOVERFLOW);
+        assert(d == 0u);
+        assert(memcmp(&g_pool, &pool_before, sizeof g_pool) == 0);
+        assert(memcmp(&g_ref_t, &t_before, sizeof g_ref_t) == 0);
+        assert(memcmp(g_ref_slots, slots_before, sizeof g_ref_slots) == 0);
+        /* The bound is per end: the peer end still dups into the same table. */
+        assert(je_endpoint_handle_dup(&g_pool, &g_ref_t, r1, JE_EP_RIGHTS_ALL, &d)
+               == JE_EP_OK);
+        assert(d != 0u);
+        /* And the table itself still admits a slot. */
+        assert(je_handle_alloc(&g_ref_t, &g_ref_t, JE_HANDLE_OBJ_SELF, 0x1u, &d)
+               == JE_HANDLE_OK);
     }
 
     /* 5. Dup DENIED on a superset: a RECV-only handle cannot dup to SEND. */
@@ -246,11 +296,33 @@ int main(void)
                                           &g_pool_t, JE_EP_RIGHTS_ALL,
                                           &a0[mid], &a1[mid]) == JE_EP_OK);
         assert(je_endpoint_pool_allocated(&g_pool) == JE_EP_POOL_CAP);
+        assert(g_pool_t.live == 2u * JE_EP_POOL_CAP);
+        /* Both recreated handles are live endpoints on opposite ends of ONE
+         * record, and distinct from each other and from every other handle. */
+        {
+            je_ep_channel *r0, *r1; uint8_t s0, s1;
+            assert(je_endpoint_resolve(&g_pool, &g_pool_t, a0[mid], &r0, &s0) == JE_EP_OK);
+            assert(je_endpoint_resolve(&g_pool, &g_pool_t, a1[mid], &r1, &s1) == JE_EP_OK);
+            assert(r0 == r1 && s0 != s1);
+            assert(a0[mid] != 0u && a1[mid] != 0u && a0[mid] != a1[mid]);
+            for (uint32_t i = 0; i < JE_EP_POOL_CAP; ++i) {
+                if (i == mid) continue;
+                assert(a0[i] != a0[mid] && a0[i] != a1[mid]);
+                assert(a1[i] != a0[mid] && a1[i] != a1[mid]);
+            }
+        }
+        /* The second (E+1)-th attempt is also NOSLOTS with no state change. */
+        memcpy(&pool_before, &g_pool, sizeof g_pool);
+        memcpy(&t_before, &g_pool_t, sizeof g_pool_t);
+        memcpy(slots_before, g_pool_slots, sizeof g_pool_slots);
         x0 = x1 = 1u;
         assert(je_endpoint_channel_create(&g_pool, &g_pool_t, JE_EP_RIGHTS_ALL,
                                           &g_pool_t, JE_EP_RIGHTS_ALL, &x0, &x1)
                == JE_EP_NOSLOTS);
         assert(x0 == 0u && x1 == 0u);
+        assert(memcmp(&g_pool, &pool_before, sizeof g_pool) == 0);
+        assert(memcmp(&g_pool_t, &t_before, sizeof g_pool_t) == 0);
+        assert(memcmp(g_pool_slots, slots_before, sizeof g_pool_slots) == 0);
     }
     /* second-mint failure unwind: t1 quota 0 so end-1 alloc fails with QUOTA.
      * The record and end-0's mint must FULLY unwind — assert the record itself is
