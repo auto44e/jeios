@@ -21,6 +21,7 @@ if args.expect_nx:
     # the smoke run rather than passing silently.
     if args.expect_nx == "present":
         expected.append(b"M3c-s7: bootstrap fixture OK")
+        expected.append(b"M4b-s1: endpoint creation quota/charge release OK")
         expected.append(b"M4b-s1: PROCESS record status/typed dispatch OK")
 print(boot(args.image, cpu=args.cpu, memory=args.memory, expected=expected))
 print("QEMU smoke: PASS")

@@ -453,10 +453,10 @@ je_ep_status je_endpoint_channel_create_by(je_endpoint_pool *pool, je_proc_id cr
     if (!rec) return JE_EP_NOSLOTS;   /* pool exhausted */
 
     bool charged = false;
-    if (pool->procs && creator.gen != 0u) {
+    if (pool->procs && (creator.index != 0u || creator.gen != 0u)) {
         je_status cs = je_proc_charge(pool->procs, creator);
         if (cs == JE_ERR_DENIED) return JE_EP_QUOTA;
-        if (cs != JE_OK) return JE_EP_CORRUPT;
+        if (cs != JE_OK) return JE_EP_INVALID;
         charged = true;
     }
 
@@ -503,7 +503,7 @@ je_ep_status je_endpoint_channel_create_by(je_endpoint_pool *pool, je_proc_id cr
         return hstat(a1);
     }
 
-    rec->creator = creator;
+    rec->creator = charged ? creator : JE_PROC_ID_NONE;
     pool->allocated_count++;
     *out0 = h0;
     *out1 = h1;
@@ -611,9 +611,13 @@ int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t)
                     break;
                 }
             }
-            if (!found || je_handle_close(t, h) != JE_HANDLE_OK) return -1;
+            if (!found || pool->procs->rec[id.index].handle_refs == 0u
+                || je_handle_close(t, h) != JE_HANDLE_OK)
+                return -1;
             je_proc_release(pool->procs, id);
             s = JE_EP_OK;
+        } else if (type == JE_PROCESS_OBJ_TYPE) {
+            return -1;
         } else {
             continue;
         }

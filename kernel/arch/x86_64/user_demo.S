@@ -17,9 +17,9 @@
  * M4b-s1 scratch contract (arena USER_DATA at 0x40001000):
  *   0x1600/0x1608: PROCESS handles (INSPECT|KILL, KILL-only)
  *   0x1610: parent progress (1 = waiting for bootstrap reap, 2 = done, 99 = fail)
- *   0x1618: bootstrap writes 1 after reaping child B
+ *   0x1618: reserved legacy scratch (automatic reaper is observed via PROC_STATUS)
  *   0x1620: endpoint_create packed handles; 0x1628: endpoint dup handle
- *   0x1630..0x1710: operation/status/result words
+ *   0x1630..0x1750: operation/status/result words
  *   0x1718: PROC_STATUS output {state,reason,code}; 0x1728: post-reap state
  * The M4b parent checks every result in ring 3 and writes progress 99 on failure.
  */
@@ -168,9 +168,16 @@ je_user_m4b_start:
     movq %rdx, 0x400016c0
     cmpq $0, %rax
     jne m4b_fail
-    movq %rdx, %r13
+    /* The process creation quota is one: the second channel must fail H_QUOTA. */
+    movq $10, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001738
+    cmpq $7, %rax
+    jne m4b_fail
+    movq 0x400016c0, %r13
     movl %r13d, %r13d
-    movq %rdx, %r14
+    movq 0x400016c0, %r14
     shrq $32, %r14
     movq $7, %rax
     movq %r13, %rdi
@@ -232,26 +239,49 @@ je_user_m4b_start:
     movq %r14, %rdi
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
-    movq %rax, 0x40001714
+    movl %eax, 0x40001714
+    cmpq $0, %rax
+    jne m4b_fail
+    /* Closing both ends released the charge: a third create must succeed. */
+    movq $10, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001740
+    movq %rdx, 0x40001748
+    cmpq $0, %rax
+    jne m4b_fail
+    movq %rdx, %r13
+    movl %r13d, %r13d
+    movq %rdx, %r14
+    shrq $32, %r14
+    movq $6, %rax
+    movq %r13, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001750
+    cmpq $0, %rax
+    jne m4b_fail
+    movq $6, %rax
+    movq %r14, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001758
     cmpq $0, %rax
     jne m4b_fail
     /* Wait for the bootstrap to reap B, then prove the record is still named. */
     movq $1, 0x40001610
 m4b_wait_reap:
-    cmpq $1, 0x40001618
-    jne m4b_wait_reap
     movq $15, %rax
     movq 0x40001600, %rdi
     movq $0x40001718, %rsi
     xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
-    movq %rax, 0x40001728
     cmpq $0, %rax
     jne m4b_fail
     movl 0x40001718, %eax
-    movq %rax, 0x40001730
     cmpq $3, %rax
-    jne m4b_fail
+    jne m4b_wait_reap
+    movq %rax, 0x40001728
     movq $2, 0x40001610
     movq $2, %rax
     xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
