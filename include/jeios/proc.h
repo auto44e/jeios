@@ -58,7 +58,10 @@ typedef enum {
     JE_PROC_DEAD  = 3,
 } je_proc_state;
 
-/* Identity. gen == 0 is never a valid identity, so the all-zero value means "none". */
+/* Identity. gen == 0 is never a valid identity. NONE is EXACTLY {0, 0}; any other
+ * gen-0 value (e.g. {1, 0}) is an INVALID identity, not NONE, and is never treated as
+ * "uncharged". [Claude round-2 finding: round 1 treated any gen-0 id as NONE, which
+ * bypassed the quota.] */
 typedef struct {
     uint32_t index;
     uint32_t gen;

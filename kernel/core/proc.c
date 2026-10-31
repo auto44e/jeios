@@ -150,9 +150,13 @@ je_status je_proc_status(const je_proc_pool *pool, je_proc_id id, uint32_t *stat
 
 je_status je_proc_charge(je_proc_pool *pool, je_proc_id id)
 {
+    /* Lead fix (PR-B integration): the A7 NULL-pool rule takes precedence over NONE,
+     * and charging requires a LIVE record (pinned A8 / Codex P1-2; round 2 missed it,
+     * caught by test_endpoint case 15). */
+    if (!pool) return JE_ERR_INVALID;
     if (id.index == 0u && id.gen == 0u) return JE_OK;
     je_proc_rec *rec = record_for(pool, id);
-    if (!rec) return JE_ERR_INVALID;
+    if (!rec || rec->state != JE_PROC_LIVE) return JE_ERR_INVALID;
     if (rec->ep_charge >= rec->ep_limit) return JE_ERR_DENIED;
     rec->ep_charge++;
     return JE_OK;
