@@ -182,6 +182,92 @@ static void test_proc_spawn_decode(void)
     assert(dec(UINT64_C(0x100000000) | JE_SYS_PROC_SPAWN, SP_H,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
 }
 
+/* ADR 0010 D8 op 16 decode (abi.h JE_SYS_PROC_KILL): h=RDI must fit 32 bits;
+ * RSI..R9 must all be 0; RDX = 0 on return. A clean call decodes to exactly
+ * JE_SYSCALL_PROC_KILL (syscall.h) with OK. Handle resolution (BADINDEX/STALE/
+ * WRONGTYPE/DENIED) and the je_sched_kill outcome (OK/INVALID) are glue/kernel
+ * decisions, not decode: they are proven by the QEMU fixture, not here. */
+static void kill_ok(uint64_t h)
+{
+    je_abi_status st = JE_ABI_INVALID; uint64_t res = 0xdeadu;
+    assert(dec(JE_SYS_PROC_KILL, h,0,0,0,0,0,&st,&res)==JE_SYSCALL_PROC_KILL);
+    assert(st==JE_ABI_OK && res==0);
+}
+
+static void kill_invalid(const uint64_t a[6])
+{
+    je_abi_status st = JE_ABI_OK; uint64_t res = 0xdeadu;
+    assert(je_syscall_decode(JE_SYS_PROC_KILL, a, &st, &res)==JE_SYSCALL_RETURN);
+    assert(st==JE_ABI_INVALID && res==0);
+}
+
+static void test_proc_kill_decode(void)
+{
+    je_abi_status st; uint64_t res;
+    assert(JE_SYS_PROC_KILL == 16u && JE_SYSCALL_PROC_KILL == 16);
+
+    /* --- OK: any 32-bit handle value. Handle 0, a SELF-looking handle and the
+     * largest 32-bit value are all well-formed; their rejection is the glue's. */
+    kill_ok(UINT64_C(0x00010000));
+    kill_ok(0u);
+    kill_ok(1u);
+    kill_ok(UINT64_C(0x7fffffff));
+    kill_ok(UINT64_C(0x80000000));
+    kill_ok(UINT64_C(0xffffffff));
+
+    /* --- wide RDI: each bit of [63:32] alone, plus combined patterns --- */
+    for (unsigned b = 32u; b < 64u; ++b) {
+        uint64_t a[6] = { (UINT64_C(1) << b) | UINT64_C(0x00010000), 0,0,0,0,0 };
+        kill_invalid(a);
+        a[0] = UINT64_C(1) << b;              /* low half 0: must not narrow to 0 */
+        kill_invalid(a);
+    }
+    {
+        static const uint64_t wide[] = { UINT64_C(0x100000000), UINT64_C(0x8000000000010000),
+                                         UINT64_C(0xffffffff00000000), UINT64_C(0xffffffffffffffff) };
+        for (unsigned i = 0; i < sizeof wide / sizeof wide[0]; ++i) {
+            uint64_t a[6] = { wide[i], 0,0,0,0,0 };
+            kill_invalid(a);
+        }
+    }
+
+    /* --- every reserved register RSI..R9 (a1..a5), one at a time: lowest bit,
+     * top bit, all ones, and a plausible pointer --- */
+    {
+        static const uint64_t vals[] = { 1u, UINT64_C(0x8000000000000000),
+                                         UINT64_C(0xffffffffffffffff), UINT64_C(0x40002000) };
+        for (unsigned k = 1u; k < 6u; ++k)
+            for (unsigned v = 0; v < sizeof vals / sizeof vals[0]; ++v)
+                for (unsigned hb = 0; hb < 2u; ++hb) {
+                    uint64_t a[6] = { hb ? UINT64_C(0xffffffff) : UINT64_C(0x00010000), 0,0,0,0,0 };
+                    a[k] = vals[v];
+                    kill_invalid(a);
+                }
+        /* every single bit of every reserved register */
+        for (unsigned k = 1u; k < 6u; ++k)
+            for (unsigned b = 0; b < 64u; ++b) {
+                uint64_t a[6] = { UINT64_C(0x00010000), 0,0,0,0,0 };
+                a[k] = UINT64_C(1) << b;
+                kill_invalid(a);
+            }
+    }
+    /* several rules broken at once: still INVALID, never the kill action */
+    {
+        uint64_t a[6] = { UINT64_C(0x100000000), 1,2,3,4,5 };
+        kill_invalid(a);
+        uint64_t b[6] = { UINT64_C(0x00010000), 1,2,3,4,5 };
+        kill_invalid(b);
+    }
+
+    /* no 64-bit op aliasing onto 16 */
+    assert(dec(UINT64_C(0x100000000) | JE_SYS_PROC_KILL, 0x00010000,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
+    assert(dec(UINT64_C(0xffffffff00000010), 0x00010000,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
+    /* the neighbours keep their own actions: op 15 is not routed to kill, and op 16
+     * with a PROC_STATUS-shaped call (RSI = out ptr) is INVALID, not a status */
+    assert(dec(JE_SYS_PROC_STATUS, 0x00010000,0x40002000,0,0,0,0,&st,&res)==JE_SYSCALL_PROC_STATUS && st==JE_ABI_OK);
+    assert(dec(JE_SYS_PROC_KILL, 0x00010000,0x40002000,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID && res==0);
+}
+
 int main(void)
 {
     je_abi_status st; uint64_t res;
@@ -342,14 +428,19 @@ int main(void)
     test_clock_ticks_decode();
     test_proc_spawn_decode();
 
-    /* Ops reserved by ADR 0010 for later PRs stay UNSUPPORTED (16 PROC_KILL,
-     * 17-19 DEV_*, and 20 beyond), clean or dirty args alike. HISTORY: 13 and 14
-     * were in this list until PR-C. */
+    test_proc_kill_decode();
+
+    /* Ops reserved by ADR 0010 for later PRs stay UNSUPPORTED (17-19 DEV_*, and 20
+     * beyond), clean or dirty args alike. HISTORY: 13 and 14 were in this list
+     * until PR-C; 16 PROC_KILL was in it until PR-D (ADR 0010 D8), and its
+     * UNSUPPORTED expectation is intentionally retired (see test_proc_kill_decode). */
     {
-        static const uint64_t later_ops[] = { 16u, 17u, 18u, 19u, 20u };
+        static const uint64_t later_ops[] = { 17u, 18u, 19u, 20u };
         for (unsigned i = 0; i < sizeof later_ops / sizeof later_ops[0]; ++i) {
             assert(dec(later_ops[i], 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
             assert(dec(later_ops[i], 0x00010000,0x40002000,1,2,3,4,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
+            /* the arg shape that is a valid PROC_KILL must not be one for 17-19 */
+            assert(dec(later_ops[i], 0x00010000,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
         }
     }
     /* op 15 must not alias across the 64-bit op field */
@@ -358,6 +449,7 @@ int main(void)
     printf("syscall: PASS (abi_query, yield, exit, copy_probe, handle self/close/query/rights/dup, "
            "endpoint_create, try_send/try_recv decode, dup KILL known, proc_status decode, "
            "clock_ticks decode, proc_spawn decode, spawn ABI layout, dup SPAWN known, "
-           "reserved-arg, wide-handle, unknown-rights, full-width op, unsupported 16-20)\n");
+           "proc_kill decode, reserved-arg, wide-handle, unknown-rights, full-width op, "
+           "unsupported 17-20)\n");
     return 0;
 }
