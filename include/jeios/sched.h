@@ -27,6 +27,26 @@ je_status je_thread_create_user(je_vm *vm, uint32_t index);
 typedef struct { uint64_t rdi, rsi, rdx, rcx, r8, r9; } je_user_startup;
 je_status je_thread_create_user_start(je_vm *vm, uint32_t index,
                                       const je_user_startup *st, uint32_t *out_slot);
+
+/* ADR 0010 D8 synchronous kill. Caller: the CURRENT user thread, IF=0 (syscall path).
+ * In order:
+ *   1. victim record invalid -> JE_ERR_INVALID;
+ *   2. victim == the caller's own identity -> JE_ERR_INVALID (use EXIT);
+ *   3. victim DYING or DEAD -> JE_OK (idempotent, decided from the RECORD; the first
+ *      terminal reason wins);
+ *   4. victim is the supervisor -> JE_ERR_INVALID (fail closed; it is unnameable in
+ *      the D8 table);
+ *   5. LIVE but not run-linked (no thread yet) -> JE_ERR_INVALID (lead decision, PR-D:
+ *      fail closed; marking DYING with no thread would leave a vm the reaper never
+ *      collects);
+ *   6. the linked thread must be USER, carry the same identity, and be READY or
+ *      BLOCKED_IPC with a frame; anything else is an invariant break -> fail-stop;
+ *   7. mark_dying(slot, KILLED), the single release owner. It releases a WAITING
+ *      waiter or a WOKEN reservation (the head stays queued for other RECV holders)
+ *      and clears wait_pending, so the victim's continuation never runs and it never
+ *      sees CANCELLED.
+ * The victim is reaped later by the idle step. mark_dying itself is unchanged. */
+je_status je_sched_kill(je_proc_id victim);
 /* M3a #4 step 3: remove a user thread (by owning vm process) from scheduling
  * before je_vm_destroy frees its kernel stack. Interrupts disabled; not the
  * running thread. */

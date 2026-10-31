@@ -129,6 +129,14 @@ je_status je_proc_on_dying(je_proc_pool *pool, je_proc_id id, uint32_t reason,
  * JE_ERR_INVALID with no change. */
 je_status je_proc_on_reaped(je_proc_pool *pool, je_proc_id id);
 
+/* ADR 0010 D8: read the run link. JE_OK iff `id` is valid, LIVE or DYING, and
+ * run-linked; then it writes *thread_slot and *vm_index. Any NULL pointer, an invalid
+ * id, or an unlinked record -> JE_ERR_INVALID with the outputs untouched. Pure. */
+je_status je_proc_run_link(const je_proc_pool *pool, je_proc_id id,
+                           uint32_t *thread_slot, uint32_t *vm_index);
+/* ADR 0010 D8/D12: true iff `id` is valid and its record carries the supervisor flag. */
+bool je_proc_is_supervisor(const je_proc_pool *pool, je_proc_id id);
+
 /* PROCESS handle reference. retain: valid id -> handle_refs++ (at JE_PROC_REF_MAX ->
  * JE_ERR_BUSY, no change); invalid -> JE_ERR_INVALID. release: handle_refs--; if the
  * record is DEAD and refs reach 0 it is freed. Release with an invalid id or 0 refs is

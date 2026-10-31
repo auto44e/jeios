@@ -1259,3 +1259,5 @@ processes to drive them end-to-end.
 - the D5 per-process creation quota, which was never implemented in M3c and is recorded as deviation ADR 0010 D-DEV (fixed in M4 PR-B, with its charge-release wording narrowed to the creator's own same-identity PROCESS record: LIVE, DYING or DEAD).
 
 A6-CLARIFY-1 is re-confirmed, not changed. Everything else is unchanged.
+
+*Note (2026-10-31, M4 PR-D):* the test-only forced-kill hook that A6-CLARIFY-2 says would be added "gated like `JE_DEV_COPY_INJECT`" was never implemented. `je_endpoint_kern_wait_cancel` has no callers. The death-releases-reservation evidence was hosted-only until PR-D's `PROC_KILL` QEMU fixture (ADR 0010 D8 correction).

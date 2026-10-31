@@ -462,6 +462,13 @@ internally (ADR 0009 A6-2), for a future non-lethal cancellation.
 **Amends:** the ADR 0009 A6-CLARIFY-2 annotation that the forced-kill path is "never
 in the production ABI". The test-only hook remains for its existing tests.
 
+*Correction (PR-D, 2026-10-31; found by the PR-D code map and verified by the lead with grep):* the sentence above says "The test-only hook remains for its existing tests". That is **false**. The forced-kill test hook described in ADR 0009 A6-CLARIFY-2, "gated like `JE_DEV_COPY_INJECT`", was never implemented:
+- `JE_DEV_COPY_INJECT` is the only `JE_DEV_` gate in the code.
+- `je_endpoint_kern_wait_cancel` has no callers.
+- The release-on-death proof is hosted-only (`tests/test_endpoint.c` case 28). ADR 0009 itself records that.
+
+`PROC_KILL` is therefore the **first** real way to reach `mark_dying` on a non-current READY or BLOCKED_IPC user thread. The original sentence is kept as history. PR-D's QEMU fixture provides the first native evidence for these victim states.
+
 **Re-confirms:** the A6-CLARIFY-1 premise (one CPU, one thread per process,
 immutable text). M4 changes none of these three facts.
 

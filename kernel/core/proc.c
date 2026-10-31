@@ -168,3 +168,10 @@ void je_proc_uncharge(je_proc_pool *pool, je_proc_id id)
     if (!rec || rec->ep_charge == 0u) return;
     rec->ep_charge--;
 }
+
+/* ADR 0010 D8 pre-wiring STUBS (lead): fail closed until PR-D lands. */
+je_status je_proc_run_link(const je_proc_pool *pool, je_proc_id id,
+                           uint32_t *thread_slot, uint32_t *vm_index)
+{ (void)pool; (void)id; (void)thread_slot; (void)vm_index; return JE_ERR_INVALID; }
+bool je_proc_is_supervisor(const je_proc_pool *pool, je_proc_id id)
+{ (void)pool; (void)id; return false; }

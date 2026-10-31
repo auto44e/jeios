@@ -668,3 +668,6 @@ unsigned je_sched_user_thread_count(void)
             ++count;
     return count;
 }
+
+/* ADR 0010 D8 pre-wiring STUB (lead): fails closed until PR-D lands. */
+je_status je_sched_kill(je_proc_id victim) { (void)victim; return JE_ERR_UNSUPPORTED; }

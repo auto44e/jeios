@@ -167,7 +167,16 @@ typedef enum {
                               * PROCESS handle (INSPECT|KILL) in the caller's table, 0
                               * on failure. Transactional: on any failure every pool is
                               * back to baseline and the child never ran (ADR 0010 D5). */
-    /* 16 PROC_KILL and 17-19 DEV_* are reserved by
+    , JE_SYS_PROC_KILL = 16  /* M4 proc_kill(h=RDI): needs KILL on a PROCESS handle;
+                              * RDI[63:32] and RSI..R9 must be 0. Synchronous (ADR 0010
+                              * D8): the victim is marked DYING through the single release
+                              * owner (mark_dying), reason KILLED, and is never dispatched
+                              * again; the killed process never observes CANCELLED.
+                              * -> OK (also when the victim is already DYING/DEAD:
+                              * idempotent, decided from the PROCESS record), INVALID
+                              * (self, a LIVE record with no thread yet, the supervisor),
+                              * H_BADINDEX/H_STALE, H_WRONGTYPE, H_DENIED. RDX = 0. */
+    /* 17-19 DEV_* are reserved by
      * ADR 0010 for later M4 PRs. Until then they stay UNSUPPORTED. */
     , JE_SYS_PROC_STATUS = 15 /* M4 proc_status(h=RDI, out=RSI): needs INSPECT on a
                               * PROCESS handle. Copies a 16-byte je_abi_proc_status
@@ -214,6 +223,7 @@ _Static_assert(JE_SYS_TRY_RECV == 12, "abi op try_recv");
 _Static_assert(JE_SYS_PROC_STATUS == 15, "abi op proc_status (ADR 0010)");
 _Static_assert(JE_SYS_CLOCK_TICKS == 13, "abi op clock_ticks (ADR 0010 D6)");
 _Static_assert(JE_SYS_PROC_SPAWN == 14, "abi op proc_spawn (ADR 0010 D5)");
+_Static_assert(JE_SYS_PROC_KILL == 16, "abi op proc_kill (ADR 0010 D8)");
 
 /* ADR 0010 D5: spawn grant entry. 8 bytes, little-endian, no padding. `handle` names
  * an ENDPOINT in the caller's table; the caller's handle must hold TRANSFER; `rights`
