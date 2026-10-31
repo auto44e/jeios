@@ -236,15 +236,37 @@ static void test_lifecycle(void)
     assert(je_proc_link(&g_pool, a, 4u, 6u) == JE_OK);
     assert(g_pool.rec[a.index].run_linked);
     assert(g_pool.rec[a.index].thread_slot == 4u && g_pool.rec[a.index].vm_index == 6u);
-    /* re-link while still LIVE is allowed by the contract (LIVE is the only rule) */
-    assert(je_proc_link(&g_pool, a, 5u, 7u) == JE_OK);
-    assert(g_pool.rec[a.index].thread_slot == 5u && g_pool.rec[a.index].vm_index == 7u);
+    /* re-link of an already-linked LIVE record: INVALID, no change (proc.h
+     * pinned: "LIVE and not already linked"; one thread per process) */
+    snap();
+    assert(je_proc_link(&g_pool, a, 5u, 7u) == JE_ERR_INVALID);
+    assert_unchanged();
+    assert(je_proc_link(&g_pool, a, 4u, 6u) == JE_ERR_INVALID);   /* same link too */
+    assert_unchanged();
+    /* a LIVE but published (run-linked) record cannot be abandoned, even with
+     * handle_refs == 0 and ep_charge == 0 (proc.h pinned: published == linked) */
+    assert(g_pool.rec[a.index].handle_refs == 0u && g_pool.rec[a.index].ep_charge == 0u);
+    snap();
+    assert(je_proc_abandon(&g_pool, a) == JE_ERR_INVALID);
+    assert_unchanged();
+    assert(state_of(a) == JE_PROC_LIVE && g_pool.used_count == 1u);
+
+    /* a death reason above JE_PROC_REASON_MAX is refused on a LIVE record */
+    assert(JE_PROC_REASON_MAX == 3u);
+    snap();
+    assert(je_proc_on_dying(&g_pool, a, JE_PROC_REASON_MAX + 1u, 5u) == JE_ERR_INVALID);
+    assert_unchanged();
+    assert(je_proc_on_dying(&g_pool, a, 0xffffffffu, 0u) == JE_ERR_INVALID);
+    assert_unchanged();
+    assert(state_of(a) == JE_PROC_LIVE);
 
     /* LIVE -> DYING with {reason, code}; run link survives into DYING */
     assert(je_proc_on_dying(&g_pool, a, 1u, 0x1234567890abcdefu) == JE_OK);
     assert(state_of(a) == JE_PROC_DYING);
     assert(g_pool.rec[a.index].reason == 1u && g_pool.rec[a.index].code == 0x1234567890abcdefu);
     assert(g_pool.rec[a.index].run_linked);
+    /* only on_reaped writes the link: on_dying leaves slot/index intact */
+    assert(g_pool.rec[a.index].thread_slot == 4u && g_pool.rec[a.index].vm_index == 6u);
     assert(je_proc_status(&g_pool, a, &st, &rs, &cd) == JE_OK);
     assert(st == JE_PROC_DYING && rs == 1u && cd == 0x1234567890abcdefu);
 
@@ -257,12 +279,22 @@ static void test_lifecycle(void)
     assert_unchanged();
     assert(je_proc_abandon(&g_pool, a) == JE_ERR_INVALID);
     assert_unchanged();
+    /* DYING + out-of-range reason: whichever status the implementation picks
+     * (the header does not order "already DYING" against the reason bound), the
+     * record must not change: the first terminal reason still wins. */
+    {
+        je_status s = je_proc_on_dying(&g_pool, a, JE_PROC_REASON_MAX + 1u, 1u);
+        assert(s == JE_OK || s == JE_ERR_INVALID);
+        assert_unchanged();
+    }
 
     /* keep a handle so DEAD is observable */
     assert(je_proc_retain(&g_pool, a) == JE_OK);
     /* DYING -> DEAD, run link cleared, record NOT freed (refs 1) */
     assert(je_proc_on_reaped(&g_pool, a) == JE_OK);
     assert(state_of(a) == JE_PROC_DEAD && !g_pool.rec[a.index].run_linked);
+    /* proc.h pinned: on_reaped clears the WHOLE link, thread_slot = vm_index = 0 */
+    assert(g_pool.rec[a.index].thread_slot == 0u && g_pool.rec[a.index].vm_index == 0u);
     assert(g_pool.used_count == 1u);
     assert(je_proc_status(&g_pool, a, &st, &rs, &cd) == JE_OK);
     assert(st == JE_PROC_DEAD && rs == 1u && cd == 0x1234567890abcdefu);  /* reason survives */
@@ -287,10 +319,11 @@ static void test_lifecycle(void)
     /* on_reaped with refs == 0 frees immediately (DYING -> DEAD -> FREE) */
     je_proc_id b = alloc_ok(0u, false);
     assert(id_eq(b, mkid(0u, 2u)));
-    assert(je_proc_link(&g_pool, b, 1u, 1u) == JE_OK);
+    assert(je_proc_link(&g_pool, b, 9u, 13u) == JE_OK);
     assert(je_proc_on_dying(&g_pool, b, 0u, 0u) == JE_OK);
     assert(je_proc_on_reaped(&g_pool, b) == JE_OK);
     assert(state_of(b) == JE_PROC_FREE && !g_pool.rec[b.index].run_linked);
+    assert(g_pool.rec[b.index].thread_slot == 0u && g_pool.rec[b.index].vm_index == 0u);
     assert(g_pool.used_count == 0u);
     assert_rejected_everywhere(b, true);
 
@@ -511,6 +544,28 @@ static void test_charge(void)
     /* NONE must not alias record 0 (which IS allocated here, index 0) */
     assert(a.index == 0u && g_pool.rec[0].ep_charge == 3u);
 
+    /* LIVE-only charging (proc.h pinned): a DYING or DEAD record with room is
+     * refused with INVALID and nothing changes. */
+    {
+        je_proc_id d = alloc_ok(5u, false);
+        assert(je_proc_charge(&g_pool, d) == JE_OK);              /* 1 of 5 while LIVE */
+        assert(je_proc_retain(&g_pool, d) == JE_OK);              /* keep DEAD observable */
+        assert(je_proc_on_dying(&g_pool, d, 1u, 0u) == JE_OK);
+        snap();
+        assert(je_proc_charge(&g_pool, d) == JE_ERR_INVALID);     /* DYING, room */
+        assert_unchanged();
+        assert(je_proc_on_reaped(&g_pool, d) == JE_OK);
+        assert(state_of(d) == JE_PROC_DEAD);
+        snap();
+        assert(je_proc_charge(&g_pool, d) == JE_ERR_INVALID);     /* DEAD, room */
+        assert_unchanged();
+        assert(g_pool.rec[d.index].ep_charge == 1u);
+        je_proc_uncharge(&g_pool, d);                             /* still the same identity */
+        assert(g_pool.rec[d.index].ep_charge == 0u);
+        je_proc_release(&g_pool, d);
+        assert(state_of(d) == JE_PROC_FREE);
+    }
+
     /* uncharge works on the same identity in DYING and in DEAD */
     assert(je_proc_retain(&g_pool, a) == JE_OK);
     assert(je_proc_on_dying(&g_pool, a, 1u, 0u) == JE_OK);
@@ -594,6 +649,41 @@ static void test_used_count(void)
     assert(n == g_pool.used_count);
 }
 
+/* ---- NULL pool (proc.h pinned): every status-returning op -> INVALID, void ops
+ * do nothing, valid() is false. Literal reading: "every" includes charge with
+ * JE_PROC_ID_NONE and pool_init. A live pool is held alongside to show the NULL
+ * calls never fall through to some default/global pool. ------------------------- */
+static void test_null_pool(void)
+{
+    je_proc_pool *const np = (je_proc_pool *)0;
+    uint32_t st = 0xa1u, rs = 0xa2u; uint64_t cd = 0xa3u;
+    fresh();
+    je_proc_id a = alloc_ok(2u, false);
+    snap();
+    {
+        je_proc_id o = mkid(7u, 7u);
+        assert(je_proc_alloc(np, 1u, false, &o) == JE_ERR_INVALID);
+        assert(je_proc_alloc(np, 1u, false, (je_proc_id *)0) == JE_ERR_INVALID);
+    }
+    const je_proc_id ids[3] = { a, mkid(1u, 1u), JE_PROC_ID_NONE };
+    for (uint32_t k = 0; k < 3u; ++k) {
+        je_proc_id id = ids[k];
+        assert(!je_proc_valid(np, id));
+        assert(je_proc_abandon(np, id) == JE_ERR_INVALID);
+        assert(je_proc_link(np, id, 1u, 2u) == JE_ERR_INVALID);
+        assert(je_proc_on_dying(np, id, 1u, 0u) == JE_ERR_INVALID);
+        assert(je_proc_on_reaped(np, id) == JE_ERR_INVALID);
+        assert(je_proc_retain(np, id) == JE_ERR_INVALID);
+        assert(je_proc_status(np, id, &st, &rs, &cd) == JE_ERR_INVALID);
+        assert(je_proc_charge(np, id) == JE_ERR_INVALID);
+        je_proc_release(np, id);
+        je_proc_uncharge(np, id);
+    }
+    je_proc_pool_init(np);
+    assert_unchanged();
+    assert(je_proc_valid(&g_pool, a));
+}
+
 /* ---- pool isolation: two pools never share state ------------------------------- */
 static void test_two_pools(void)
 {
@@ -618,11 +708,13 @@ int main(void)
     test_status();
     test_charge();
     test_used_count();
+    test_null_pool();
     test_two_pools();
     printf("proc: PASS (init, alloc lowest-free/gen++/NOMEM/NULL, valid, lifecycle "
            "LIVE->DYING->DEAD->FREE + illegal transitions, first reason wins, "
            "reap frees iff refs==0, REF_MAX BUSY, no release underflow, stale after "
-           "reuse, abandon, link LIVE-only, status, charge/uncharge identity, "
-           "used_count)\n");
+           "reuse, abandon refused when linked, link LIVE+unlinked only, reap clears "
+           "link fields, reason bound, status, LIVE-only charge, charge/uncharge "
+           "identity, used_count, NULL pool)\n");
     return 0;
 }

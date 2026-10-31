@@ -136,23 +136,13 @@ int main(void)
         assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, bit,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
 
     /* proc_status (op 15, ADR 0010 D4): h=RDI (must fit 32 bits), out=RSI,
-     * RDX..R9 reserved (0). syscall.h does not yet name a PROC_STATUS action
-     * (frozen header for this worker), so a valid decode is pinned as "OK and a
-     * real action, distinct from every existing one"; tighten to the named action
-     * once the enum gains it. The out pointer itself is checked by the glue's
-     * copy-out, not by decode. */
-    {
-        je_syscall_action a = dec(JE_SYS_PROC_STATUS, 0x00010000, 0x40002000,0,0,0,0,&st,&res);
-        assert(st==JE_ABI_OK && res==0);
-        assert(a!=JE_SYSCALL_RETURN && a!=JE_SYSCALL_YIELD && a!=JE_SYSCALL_EXIT
-               && a!=JE_SYSCALL_COPY_PROBE && a!=JE_SYSCALL_HANDLE_SELF
-               && a!=JE_SYSCALL_HANDLE_CLOSE && a!=JE_SYSCALL_HANDLE_QUERY
-               && a!=JE_SYSCALL_HANDLE_RIGHTS && a!=JE_SYSCALL_HANDLE_DUP
-               && a!=JE_SYSCALL_ENDPOINT_CREATE && a!=JE_SYSCALL_TRY_SEND
-               && a!=JE_SYSCALL_TRY_RECV);
-        /* the largest 32-bit handle is not wide */
-        assert(dec(JE_SYS_PROC_STATUS, UINT64_C(0xffffffff), 0x40002000,0,0,0,0,&st,&res)==a && st==JE_ABI_OK);
-    }
+     * RDX..R9 reserved (0). A clean call decodes to exactly the named action
+     * JE_SYSCALL_PROC_STATUS (syscall.h), not merely "some action": a decoder
+     * that routed op 15 to a neighbouring action must fail here. The out
+     * pointer itself is checked by the glue's copy-out, not by decode. */
+    assert(dec(JE_SYS_PROC_STATUS, 0x00010000, 0x40002000,0,0,0,0,&st,&res)==JE_SYSCALL_PROC_STATUS && st==JE_ABI_OK && res==0);
+    /* the largest 32-bit handle is not wide */
+    assert(dec(JE_SYS_PROC_STATUS, UINT64_C(0xffffffff), 0x40002000,0,0,0,0,&st,&res)==JE_SYSCALL_PROC_STATUS && st==JE_ABI_OK && res==0);
     /* wide handle (any of RDI[63:32]) -> INVALID before narrowing, result 0 */
     assert(dec(JE_SYS_PROC_STATUS, UINT64_C(0x100000000), 0x40002000,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID && res==0);
     assert(dec(JE_SYS_PROC_STATUS, UINT64_C(0x8000000000010000), 0x40002000,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID && res==0);

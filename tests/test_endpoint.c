@@ -385,9 +385,10 @@ static void test_ddev(void)
         assert(charge_of(B) == 1u);
         close_ok(&g_t, b0); close_ok(&g_t, b1);
         assert(charge_of(B) == 0u);
-        /* a stale creator identity cannot create (fail closed, see WORKER_NOTES) */
+        /* a stale creator identity cannot create: exactly JE_EP_INVALID (endpoint.h
+         * pinned, step 2), outs 0, nothing allocated, minted or charged */
         ddev_snap();
-        assert(cb(A, &c0, &c1) != JE_EP_OK && c0 == 0u && c1 == 0u);
+        assert(cb(A, &c0, &c1) == JE_EP_INVALID && c0 == 0u && c1 == 0u);
         ddev_unchanged();
     }
 
@@ -409,14 +410,17 @@ static void test_ddev(void)
     }
 
     /* 11. procs == NULL: charging disabled, any creator is uncharged. A creator
-     * at quota (limit 0) in a DETACHED proc pool still creates. */
+     * at quota (limit 0) in a DETACHED proc pool still creates, and the record
+     * stores creator NONE (endpoint.h pinned step 4: NONE when not charged). */
     ddev_fresh();
     {
         je_proc_id A = proc_new(0u);
         g_pool.procs = (je_proc_pool *)0;
         procs_snap();
         assert(cb(A, &a0, &a1) == JE_EP_OK);
+        assert(rec_of(&g_t, a0)->creator.index == 0u && rec_of(&g_t, a0)->creator.gen == 0u);
         assert(cb(A, &b0, &b1) == JE_EP_OK);
+        assert(rec_of(&g_t, b0)->creator.index == 0u && rec_of(&g_t, b0)->creator.gen == 0u);
         procs_unchanged();
         close_ok(&g_t, a0); close_ok(&g_t, a1);
         assert(je_endpoint_release_table(&g_pool, &g_t) == 2);
@@ -497,6 +501,89 @@ static void test_ddev(void)
         assert(charge_of(A) == 1u && charge_of(B) == 0u);
         close_ok(&g_t, b0); close_ok(&g_t, b1);
         assert(charge_of(A) == 0u);
+    }
+
+    /* 14. every invalid non-NONE creator -> exactly JE_EP_INVALID, outs 0, and no
+     * change to the endpoint pool, the proc pool or the table (endpoint.h pinned
+     * step 2). The pool has free records, so step 1 passes and step 2 decides. */
+    ddev_fresh();
+    {
+        je_proc_id Z = proc_new(4u);                  /* index 0, so {index, 0} below is not NONE */
+        je_proc_id L = proc_new(4u);                  /* a LIVE record with room, index 1 */
+        je_proc_id F = proc_new(4u);                  /* index 2, then freed */
+        assert(Z.index == 0u && L.index == 1u && F.index == 2u);
+        assert(je_proc_abandon(&g_procs, F) == JE_OK);
+        assert(cb(L, &a0, &a1) == JE_EP_OK && charge_of(L) == 1u);   /* non-empty state */
+        const je_proc_id bad[6] = {
+            mkid_proc_invalid(),                      /* never-issued generation */
+            { JE_PROC_REC_MAX, 1u },                  /* index out of range */
+            { 0xffffffffu, 0xffffffffu },
+            { L.index, 0u },                          /* gen 0 on a LIVE slot */
+            { L.index, L.gen + 1u },                  /* future generation of a LIVE slot */
+            F,                                        /* freed (abandoned) identity */
+        };
+        for (uint32_t i = 0; i < 6u; ++i) {
+            ddev_snap();
+            assert(cb(bad[i], &c0, &c1) == JE_EP_INVALID);
+            assert(c0 == 0u && c1 == 0u);
+            ddev_unchanged();
+        }
+        /* never-allocated slot: index 3 has gen 0 and was never issued */
+        {
+            je_proc_id never = { 3u, 1u };
+            ddev_snap();
+            assert(cb(never, &c0, &c1) == JE_EP_INVALID && c0 == 0u && c1 == 0u);
+            ddev_unchanged();
+        }
+        assert(charge_of(L) == 1u && je_endpoint_pool_allocated(&g_pool) == 1u);
+    }
+
+    /* 15. a DYING or DEAD creator (same identity, room left) -> JE_EP_INVALID, no
+     * change: creation charging requires LIVE (proc.h / endpoint.h pinned). */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(5u);
+        assert(cb(A, &a0, &a1) == JE_EP_OK && charge_of(A) == 1u);
+        assert(je_proc_retain(&g_procs, A) == JE_OK);         /* keep DEAD observable */
+        assert(je_proc_on_dying(&g_procs, A, 3u, 0u) == JE_OK);
+        ddev_snap();
+        assert(cb(A, &c0, &c1) == JE_EP_INVALID && c0 == 0u && c1 == 0u);   /* DYING */
+        ddev_unchanged();
+        assert(je_proc_on_reaped(&g_procs, A) == JE_OK);
+        assert(g_procs.rec[A.index].state == JE_PROC_DEAD);
+        ddev_snap();
+        assert(cb(A, &c0, &c1) == JE_EP_INVALID && c0 == 0u && c1 == 0u);   /* DEAD */
+        ddev_unchanged();
+        /* the channel created while LIVE still uncharges its DEAD creator once */
+        close_ok(&g_t, a0); close_ok(&g_t, a1);
+        assert(charge_of(A) == 0u);
+        je_proc_release(&g_procs, A);
+        assert(g_procs.rec[A.index].state == JE_PROC_FREE);
+    }
+
+    /* 16. a channel created while procs == NULL is uncharged for life: attaching
+     * the proc pool afterwards cannot make its destruction uncharge anything,
+     * even though the same creator holds a REAL charge from another channel
+     * (Codex P2-4: a stored live creator would be decremented on the wrong
+     * channel). */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(3u);
+        assert(cb(A, &a0, &a1) == JE_EP_OK && charge_of(A) == 1u);   /* charged */
+        je_ep_channel *ra = rec_of(&g_t, a0);
+        assert(ra->creator.index == A.index && ra->creator.gen == A.gen);
+        g_pool.procs = (je_proc_pool *)0;                            /* detach */
+        assert(cb(A, &b0, &b1) == JE_EP_OK);
+        je_ep_channel *rb = rec_of(&g_t, b0);
+        assert(rb->creator.index == 0u && rb->creator.gen == 0u);    /* uncharged: NONE */
+        assert(charge_of(A) == 1u);
+        g_pool.procs = &g_procs;                                     /* re-attach */
+        procs_snap();
+        close_ok(&g_t, b0); close_ok(&g_t, b1);                      /* uncharged channel dies */
+        procs_unchanged();
+        assert(charge_of(A) == 1u);
+        close_ok(&g_t, a0); close_ok(&g_t, a1);                      /* charged channel dies */
+        assert(charge_of(A) == 0u && je_endpoint_pool_allocated(&g_pool) == 0u);
     }
 
     /* restore the shared table for anything after this section */
