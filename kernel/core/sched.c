@@ -93,6 +93,16 @@ je_status je_sched_unregister_process(je_vm *vm, uint32_t index)
     return JE_OK;
 }
 
+bool je_sched_has_process(je_vm *vm, uint32_t index)
+{
+    if (!vm || index >= JE_VM_MAX_PROCESSES) return false;
+    for (unsigned i = 1u; i < JE_THREAD_MAX; ++i)
+        if (threads[i].kind == THREAD_USER && threads[i].vm == vm
+            && threads[i].vm_index == index)
+            return true;
+    return false;
+}
+
 je_status je_sched_current_proc_id(je_proc_id *out)
 {
     if (!out || !ready || threads[current].kind != THREAD_USER

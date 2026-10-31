@@ -9,6 +9,11 @@
 #include <jeios/endpoint_kern.h>
 #include <jeios/sched.h>   /* je_sched_wake_ipc for the blocking-recv bridge */
 #include <jeios/arch.h>
+#include <jeios/abi.h>
+
+#define JE_PROCESS_OBJ_TYPE 3u
+_Static_assert(JE_PROCESS_OBJ_TYPE == JE_ABI_OBJ_PROCESS,
+               "PROCESS object type must match the ABI");
 
 /* ADR 0010 D2 endpoint pool formula (needs both vm.h and endpoint.h). */
 _Static_assert(JE_EP_POOL_CAP >= 2u * (JE_VM_MAX_PROCESSES - 1u) + JE_BROKER_MAX + 1u + 2u
