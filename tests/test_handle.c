@@ -10,6 +10,7 @@
 #include <jeios/handle.h>
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 #define CAP 8u
 
@@ -290,6 +291,152 @@ static void test_dup(void)
     (void) b;
 }
 
+/* ADR 0010 D3: je_handle_resolve_any. Written from handle.h only. */
+
+/* Output sentinels: resolve_any must leave every output untouched on failure. */
+#define RA_TYPE_SENT   0xA5A5A5A5u
+#define RA_RIGHTS_SENT 0x5A5A5A5Au
+static int g_ra_sentinel_obj;
+
+/* Call resolve_any with sentinel-filled outputs; on any non-OK status assert the
+ * outputs were not written and the table is byte-identical to before. */
+static je_handle_status ra(const je_handle_table *t, je_handle h,
+                           uint32_t *type, uint32_t *rights, void **obj)
+{
+    je_handle_slot before[CAP];
+    uint32_t live_before = t->live;
+    memcpy(before, t->slots, sizeof before);
+    *type = RA_TYPE_SENT; *rights = RA_RIGHTS_SENT; *obj = &g_ra_sentinel_obj;
+    je_handle_status s = je_handle_resolve_any(t, h, type, rights, obj);
+    assert(memcmp(before, t->slots, sizeof before) == 0);   /* pure, read-only */
+    assert(t->live == live_before);
+    if (s != JE_HANDLE_OK)
+        assert(*type == RA_TYPE_SENT && *rights == RA_RIGHTS_SENT
+               && *obj == &g_ra_sentinel_obj);
+    return s;
+}
+
+/* For a status lookup and resolve_any share (BADINDEX/STALE), lookup with the
+ * slot's own type and no required rights must agree with resolve_any. */
+static void ra_same_as_lookup(const je_handle_table *t, je_handle h, uint32_t type_hint)
+{
+    uint32_t ty, r; void *o;
+    void *lo = &g_ra_sentinel_obj;
+    je_handle_status sa = ra(t, h, &ty, &r, &o);
+    je_handle_status sl = je_handle_lookup(t, h, type_hint, 0u, &lo);
+    assert(sa == sl);
+}
+
+static void test_resolve_any(void)
+{
+    je_handle_table t = mk(CAP);
+    int obj_self = 0, obj_ep = 0, obj_proc = 0;
+    je_handle h_self, h_ep, h_proc, h_null, h_odd;
+    uint32_t ty, r; void *o;
+
+    /* One live slot per object type (SELF 1, ENDPOINT 2, PROCESS 3), plus a NULL
+     * object and an arbitrary type: the pure table is type-agnostic. */
+    assert(je_handle_alloc(&t, &obj_self, JE_HANDLE_OBJ_SELF, 0x1u, &h_self) == JE_HANDLE_OK);
+    assert(je_handle_alloc(&t, &obj_ep, 2u, 0xFu, &h_ep) == JE_HANDLE_OK);
+    assert(je_handle_alloc(&t, &obj_proc, 3u, 0x11u, &h_proc) == JE_HANDLE_OK);
+    assert(je_handle_alloc(&t, (void *)0, 3u, 0x0u, &h_null) == JE_HANDLE_OK);
+    assert(je_handle_alloc(&t, &obj_self, 0x7fu, 0xffffffffu, &h_odd) == JE_HANDLE_OK);
+
+    /* OK: writes the slot's type, FULL rights and object for each type. */
+    assert(ra(&t, h_self, &ty, &r, &o) == JE_HANDLE_OK);
+    assert(ty == JE_HANDLE_OBJ_SELF && r == 0x1u && o == &obj_self);
+    assert(ra(&t, h_ep, &ty, &r, &o) == JE_HANDLE_OK);
+    assert(ty == 2u && r == 0xFu && o == &obj_ep);
+    assert(ra(&t, h_proc, &ty, &r, &o) == JE_HANDLE_OK);
+    assert(ty == 3u && r == 0x11u && o == &obj_proc);
+    assert(ra(&t, h_null, &ty, &r, &o) == JE_HANDLE_OK);     /* rights 0 still resolve */
+    assert(ty == 3u && r == 0x0u && o == (void *)0);           /* NULL object written */
+    assert(ra(&t, h_odd, &ty, &r, &o) == JE_HANDLE_OK);       /* rights not masked */
+    assert(ty == 0x7fu && r == 0xffffffffu && o == &obj_self);
+
+    /* No type and no rights check: where lookup says WRONGTYPE or DENIED,
+     * resolve_any says OK (that is the point of the any-type resolve). */
+    { void *lo;
+      assert(je_handle_lookup(&t, h_proc, 2u, 0u, &lo) == JE_HANDLE_WRONGTYPE);
+      assert(je_handle_lookup(&t, h_null, 3u, 0x1u, &lo) == JE_HANDLE_DENIED); }
+    assert(ra(&t, h_proc, &ty, &r, &o) == JE_HANDLE_OK);
+    assert(ra(&t, h_null, &ty, &r, &o) == JE_HANDLE_OK);
+
+    /* BADINDEX: handle 0; index == capacity; index far beyond capacity (the high
+     * index bits set; with a 32-bit total width there are no bits above the
+     * index+generation fields to set, the wide-RDI case is the decoder's). */
+    assert(ra(&t, 0u, &ty, &r, &o) == JE_HANDLE_BADINDEX);
+    assert(ra(&t, je_handle_encode(CAP, 1u), &ty, &r, &o) == JE_HANDLE_BADINDEX);
+    assert(ra(&t, je_handle_encode(JE_HANDLE_INDEX_MASK, 1u), &ty, &r, &o) == JE_HANDLE_BADINDEX);
+    assert(ra(&t, je_handle_encode(1u << (JE_HANDLE_INDEX_BITS - 1u), 1u), &ty, &r, &o)
+           == JE_HANDLE_BADINDEX);
+    /* index out of range wins over any generation, including gen 0 */
+    assert(ra(&t, je_handle_encode(CAP, 0u), &ty, &r, &o) == JE_HANDLE_BADINDEX);
+    assert(ra(&t, je_handle_encode(CAP, JE_HANDLE_GEN_MAX), &ty, &r, &o) == JE_HANDLE_BADINDEX);
+
+    /* STALE: a never-allocated FREE slot; wrong generation (+1 and 0) on a LIVE
+     * slot; a closed handle. */
+    assert(ra(&t, je_handle_encode(CAP - 1u, 1u), &ty, &r, &o) == JE_HANDLE_STALE);
+    { uint32_t i, g; je_handle_decode(h_ep, &i, &g);
+      if (g < JE_HANDLE_GEN_MAX)
+          assert(ra(&t, je_handle_encode(i, g + 1u), &ty, &r, &o) == JE_HANDLE_STALE);
+      assert(ra(&t, je_handle_encode(i, 0u), &ty, &r, &o) == JE_HANDLE_STALE); }
+    assert(je_handle_close(&t, h_ep) == JE_HANDLE_OK);
+    assert(ra(&t, h_ep, &ty, &r, &o) == JE_HANDLE_STALE);
+    /* reuse: the old handle stays STALE, the new one resolves to the new binding */
+    { je_handle h2;
+      assert(je_handle_alloc(&t, &obj_proc, 3u, 0x10u, &h2) == JE_HANDLE_OK);
+      assert(h2 != h_ep);
+      assert(ra(&t, h_ep, &ty, &r, &o) == JE_HANDLE_STALE);
+      assert(ra(&t, h2, &ty, &r, &o) == JE_HANDLE_OK && ty == 3u && r == 0x10u && o == &obj_proc);
+      assert(je_handle_close(&t, h2) == JE_HANDLE_OK); }
+
+    /* NULL table / NULL out pointers -> BADINDEX; checked before the handle, so
+     * even a valid live handle reports BADINDEX, and nothing is written. */
+    { uint32_t ty2 = RA_TYPE_SENT, r2 = RA_RIGHTS_SENT; void *o2 = &g_ra_sentinel_obj;
+      assert(je_handle_resolve_any((const je_handle_table *)0, h_self, &ty2, &r2, &o2) == JE_HANDLE_BADINDEX);
+      assert(ty2 == RA_TYPE_SENT && r2 == RA_RIGHTS_SENT && o2 == &g_ra_sentinel_obj);
+      assert(je_handle_resolve_any(&t, h_self, (uint32_t *)0, &r2, &o2) == JE_HANDLE_BADINDEX);
+      assert(r2 == RA_RIGHTS_SENT && o2 == &g_ra_sentinel_obj);
+      assert(je_handle_resolve_any(&t, h_self, &ty2, (uint32_t *)0, &o2) == JE_HANDLE_BADINDEX);
+      assert(ty2 == RA_TYPE_SENT && o2 == &g_ra_sentinel_obj);
+      assert(je_handle_resolve_any(&t, h_self, &ty2, &r2, (void **)0) == JE_HANDLE_BADINDEX);
+      assert(ty2 == RA_TYPE_SENT && r2 == RA_RIGHTS_SENT);
+      /* NULL out together with a stale handle: still BADINDEX (NULL first) */
+      assert(je_handle_resolve_any(&t, h_ep, &ty2, &r2, (void **)0) == JE_HANDLE_BADINDEX); }
+
+    /* Same precedence as lookup on every shared case. */
+    ra_same_as_lookup(&t, 0u, 1u);
+    ra_same_as_lookup(&t, je_handle_encode(CAP, 1u), 1u);
+    ra_same_as_lookup(&t, je_handle_encode(JE_HANDLE_INDEX_MASK, JE_HANDLE_GEN_MAX), 1u);
+    ra_same_as_lookup(&t, je_handle_encode(CAP - 1u, 1u), 1u);
+    ra_same_as_lookup(&t, h_ep, 2u);
+    ra_same_as_lookup(&t, h_self, JE_HANDLE_OBJ_SELF);   /* both OK */
+    ra_same_as_lookup(&t, h_proc, 3u);
+
+    /* RETIRED slot: close one slot until its generation saturates, then every
+     * generation naming it is STALE, never OK. GEN_MAX closes (65535 at the
+     * production width, 3 at the reduced width) are cheap. */
+    {
+        je_handle_table t3 = mk(CAP);
+        je_handle h3 = 0u, last = 0u;
+        int obj3 = 0;
+        for (uint32_t k = 0; k < JE_HANDLE_GEN_MAX; ++k) {
+            assert(je_handle_alloc(&t3, &obj3, 3u, 0x1u, &h3) == JE_HANDLE_OK);
+            { uint32_t i, g; je_handle_decode(h3, &i, &g); assert(i == 0u); }
+            assert(ra(&t3, h3, &ty, &r, &o) == JE_HANDLE_OK);
+            assert(je_handle_close(&t3, h3) == JE_HANDLE_OK);
+            last = h3;
+        }
+        assert(t3.slots[0].state == JE_HSLOT_RETIRED);
+        assert(ra(&t3, last, &ty, &r, &o) == JE_HANDLE_STALE);
+        assert(ra(&t3, je_handle_encode(0u, 1u), &ty, &r, &o) == JE_HANDLE_STALE);
+        assert(ra(&t3, je_handle_encode(0u, JE_HANDLE_GEN_MAX), &ty, &r, &o) == JE_HANDLE_STALE);
+        ra_same_as_lookup(&t3, last, 3u);
+    }
+    (void) h_odd;
+}
+
 int main(void)
 {
     test_encode_decode();
@@ -298,16 +445,18 @@ int main(void)
     test_init_rejections();
     test_rights_of();
     test_dup();
+    test_resolve_any();
 #ifdef JE_HANDLE_TEST_WIDTH
     test_saturation_and_retirement();
     test_noslots_via_retirement();
     printf("handle: PASS (encode/decode, alloc/lookup/close, quota, "
-           "saturation->retire, retired-capacity loss, noslots-via-retirement) "
+           "saturation->retire, retired-capacity loss, noslots-via-retirement, "
+           "resolve_any) "
            "[reduced width gen_bits=%u]\n", (unsigned)JE_HANDLE_GEN_BITS);
 #else
     test_production_boundaries();
     printf("handle: PASS (encode/decode, alloc/lookup/close, forged/stale/"
-           "wrongtype/denied, quota precedence) [production 16/16]\n");
+           "wrongtype/denied, quota precedence, resolve_any) [production 16/16]\n");
 #endif
     return 0;
 }

@@ -124,11 +124,61 @@ int main(void)
     assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, 1,0,0,&st,&res)==JE_SYSCALL_TRY_RECV && st==JE_ABI_OK); /* nonzero timeout OK */
     assert(dec(JE_SYS_TRY_RECV, 0x00010000, 0x40002000, 64, UINT64_C(0xffffffffffffffff),0,0,&st,&res)==JE_SYSCALL_TRY_RECV && st==JE_ABI_OK); /* huge timeout decodes; glue rejects */
     assert(dec(JE_SYS_TRY_RECV, UINT64_C(0x100000000), 0x40002000, 64, 0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* wide handle */
-    /* op 13 and up unknown. */
-    assert(dec(13, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
+    /* ADR 0010 D3: KILL (0x10) joins JE_ABI_RIGHTS_KNOWN in PR-B, so a DUP that
+     * names it is well-formed (the held-or-not decision, DENIED, is the glue's).
+     * Each still-unknown bit above KILL stays a malformed call -> INVALID. */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_KILL,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_INSPECT|JE_ABI_RIGHT_KILL,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHTS_KNOWN,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0x20u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* SPAWN: PR-C, unknown now */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_KILL|0x20u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* known+unknown */
+    for (uint32_t bit = 0x20u; bit != 0u; bit <<= 1)   /* every bit above KILL */
+        assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, bit,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+
+    /* proc_status (op 15, ADR 0010 D4): h=RDI (must fit 32 bits), out=RSI,
+     * RDX..R9 reserved (0). syscall.h does not yet name a PROC_STATUS action
+     * (frozen header for this worker), so a valid decode is pinned as "OK and a
+     * real action, distinct from every existing one"; tighten to the named action
+     * once the enum gains it. The out pointer itself is checked by the glue's
+     * copy-out, not by decode. */
+    {
+        je_syscall_action a = dec(JE_SYS_PROC_STATUS, 0x00010000, 0x40002000,0,0,0,0,&st,&res);
+        assert(st==JE_ABI_OK && res==0);
+        assert(a!=JE_SYSCALL_RETURN && a!=JE_SYSCALL_YIELD && a!=JE_SYSCALL_EXIT
+               && a!=JE_SYSCALL_COPY_PROBE && a!=JE_SYSCALL_HANDLE_SELF
+               && a!=JE_SYSCALL_HANDLE_CLOSE && a!=JE_SYSCALL_HANDLE_QUERY
+               && a!=JE_SYSCALL_HANDLE_RIGHTS && a!=JE_SYSCALL_HANDLE_DUP
+               && a!=JE_SYSCALL_ENDPOINT_CREATE && a!=JE_SYSCALL_TRY_SEND
+               && a!=JE_SYSCALL_TRY_RECV);
+        /* the largest 32-bit handle is not wide */
+        assert(dec(JE_SYS_PROC_STATUS, UINT64_C(0xffffffff), 0x40002000,0,0,0,0,&st,&res)==a && st==JE_ABI_OK);
+    }
+    /* wide handle (any of RDI[63:32]) -> INVALID before narrowing, result 0 */
+    assert(dec(JE_SYS_PROC_STATUS, UINT64_C(0x100000000), 0x40002000,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID && res==0);
+    assert(dec(JE_SYS_PROC_STATUS, UINT64_C(0x8000000000010000), 0x40002000,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID && res==0);
+    /* each reserved register nonzero -> INVALID (and never the status action) */
+    assert(dec(JE_SYS_PROC_STATUS, 0x00010000, 0x40002000,1,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID && res==0); /* RDX */
+    assert(dec(JE_SYS_PROC_STATUS, 0x00010000, 0x40002000,0,1,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID && res==0); /* R10 */
+    assert(dec(JE_SYS_PROC_STATUS, 0x00010000, 0x40002000,0,0,1,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID && res==0); /* R8 */
+    assert(dec(JE_SYS_PROC_STATUS, 0x00010000, 0x40002000,0,0,0,1,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID && res==0); /* R9 */
+    assert(dec(JE_SYS_PROC_STATUS, 0x00010000, 0x40002000,0,0,0,UINT64_C(0x8000000000000000),&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* R9 top bit */
+    /* wide handle AND a reserved arg together: still INVALID, never an action */
+    assert(dec(JE_SYS_PROC_STATUS, UINT64_C(0x100000000), 0x40002000,1,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+
+    /* Ops reserved by ADR 0010 for later PRs stay UNSUPPORTED (13 CLOCK_TICKS,
+     * 14 PROC_SPAWN, 16 PROC_KILL, 17-19 DEV_*), clean or dirty args alike. */
+    {
+        static const uint64_t later_ops[] = { 13u, 14u, 16u, 17u, 18u, 19u, 20u };
+        for (unsigned i = 0; i < sizeof later_ops / sizeof later_ops[0]; ++i) {
+            assert(dec(later_ops[i], 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
+            assert(dec(later_ops[i], 0x00010000,0x40002000,1,2,3,4,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
+        }
+    }
+    /* op 15 must not alias across the 64-bit op field */
+    assert(dec(UINT64_C(0x100000000) | JE_SYS_PROC_STATUS, 0x00010000,0x40002000,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
 
     printf("syscall: PASS (abi_query, yield, exit, copy_probe, handle self/close/query/rights/dup, "
-           "endpoint_create, try_send/try_recv decode, "
-           "reserved-arg, wide-handle, unknown-rights, full-width op, unsupported)\n");
+           "endpoint_create, try_send/try_recv decode, dup KILL known, proc_status decode, "
+           "reserved-arg, wide-handle, unknown-rights, full-width op, unsupported 13/14/16-20)\n");
     return 0;
 }
