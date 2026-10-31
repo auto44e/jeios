@@ -21,8 +21,13 @@
 #include <jeios/handle.h>
 #include <jeios/endpoint.h>
 #include <jeios/endpoint_kern.h>
+#include <jeios/proc.h>
 #include <jeios/arch.h>
+extern je_ep_status je_endpoint_kern_dup(je_vm *vm, uint32_t index, je_handle src,
+                                         uint32_t rights, je_handle *out);
+extern bool je_endpoint_kern_is_wired(const je_vm *vm);
 #endif
+
 
 /* Pure decode: given the operation and its six argument registers, decide the
  * action, the ABI status to return in RAX, and any scalar result for RDX. No
@@ -119,6 +124,12 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
         if ((r8 == 0u) != (r9 == 0u)) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_TRY_RECV;
+    case JE_SYS_PROC_STATUS:
+        /* proc_status(h=RDI, out_ptr=RSI): the handle is narrowed only after
+         * this decode check; all other registers are reserved. */
+        if (rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_PROC_STATUS;
 #ifdef JE_DEV_COPY_INJECT
     case JE_SYS_COPY_FIXUP_INJECT:
         /* dev-only: uaddr=RDI (an unmapped arena page); glue raw-copies to prove
@@ -139,12 +150,71 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
  * constant asserted to contain only known bits (no unknown bit can be minted). */
 #define JE_HANDLE_TYPE_SELF   JE_ABI_OBJ_SELF
 #define JE_HANDLE_RIGHTS_SELF JE_ABI_RIGHT_INSPECT
+#define JE_PROCESS_OBJ_TYPE   JE_ABI_OBJ_PROCESS
+#define JE_PROCESS_TYPE       JE_PROCESS_OBJ_TYPE
+_Static_assert(JE_PROCESS_OBJ_TYPE == JE_ABI_OBJ_PROCESS, "PROCESS type: ABI");
+_Static_assert(JE_PROC_FREE == 0u, "proc FREE ABI baseline");
+_Static_assert(JE_PROC_LIVE == JE_ABI_PROC_LIVE, "proc LIVE ABI");
+_Static_assert(JE_PROC_DYING == JE_ABI_PROC_DYING, "proc DYING ABI");
+_Static_assert(JE_PROC_DEAD == JE_ABI_PROC_DEAD, "proc DEAD ABI");
+_Static_assert(JE_DEATH_FAULT == JE_ABI_DEATH_FAULT, "death FAULT ABI");
+_Static_assert(JE_DEATH_EXIT == JE_ABI_DEATH_EXIT, "death EXIT ABI");
+_Static_assert(JE_DEATH_BAD_RETURN == JE_ABI_DEATH_BAD_RETURN,
+               "death BAD_RETURN ABI");
+_Static_assert(JE_DEATH_KILLED == JE_ABI_DEATH_KILLED, "death KILLED ABI");
+_Static_assert(JE_PROC_REASON_MAX == JE_DEATH_KILLED, "proc reason bound");
 _Static_assert((JE_HANDLE_RIGHTS_SELF & ~JE_ABI_RIGHTS_KNOWN) == 0u,
                "SELF must be minted only with known rights bits");
 /* The table's SELF-only dup gate uses JE_HANDLE_OBJ_SELF; it MUST equal the ABI
  * SELF type the glue mints/passes, or dup_self would reject legitimate SELF
  * handles (or the gate would be bypassable). Pin them together here. */
 _Static_assert(JE_HANDLE_OBJ_SELF == JE_ABI_OBJ_SELF, "SELF type: table vs ABI");
+_Static_assert(JE_ENDPOINT_OBJ_TYPE == JE_ABI_OBJ_ENDPOINT, "endpoint type: ABI");
+
+typedef enum {
+    JE_DUP_POLICY_DENIED = 0,
+    JE_DUP_POLICY_SELF,
+    JE_DUP_POLICY_ENDPOINT,
+    JE_DUP_POLICY_PROCESS
+} je_dup_policy;
+
+typedef struct {
+    uint32_t known_rights;
+    je_dup_policy dup;
+    uint32_t inspect_result;
+    je_status (*retain)(void *object);
+    void (*release)(void *object);
+} je_type_dispatch;
+
+static bool process_id_from_object(je_proc_pool *pool, void *object,
+                                   je_proc_id *out);
+static je_status dispatch_retain_process(void *object);
+static void dispatch_release_process(void *object);
+
+static const je_type_dispatch type_dispatch[JE_PROCESS_TYPE + 1u] = {
+    [JE_ABI_OBJ_SELF] = {
+        JE_ABI_RIGHT_INSPECT, JE_DUP_POLICY_SELF, JE_ABI_OBJ_SELF,
+        (je_status (*)(void *))0, (void (*)(void *))0
+    },
+    [JE_ABI_OBJ_ENDPOINT] = {
+        JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV
+            | JE_ABI_RIGHT_TRANSFER,
+        JE_DUP_POLICY_ENDPOINT, JE_ABI_OBJ_ENDPOINT,
+        (je_status (*)(void *))0, (void (*)(void *))0
+    },
+    [JE_ABI_OBJ_PROCESS] = {
+        JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL, JE_DUP_POLICY_PROCESS,
+        JE_ABI_OBJ_PROCESS, dispatch_retain_process, dispatch_release_process
+    }
+};
+
+static const je_type_dispatch *dispatch_for_type(uint32_t type)
+{
+    if (type == 0u || type > JE_PROCESS_TYPE
+        || type_dispatch[type].known_rights == 0u)
+        return (const je_type_dispatch *)0;
+    return &type_dispatch[type];
+}
 
 /* Exhaustive, single-point mapping of internal JE_HANDLE_* results to the v0
  * ABI status namespace (ADR 0008 D2: distinct, not collapsed). Keeping it here
@@ -171,6 +241,79 @@ static je_handle_table *current_htable(void)
     je_vm *vm; uint32_t index;
     if (je_sched_current_user(&vm, &index) != JE_OK) return (je_handle_table *)0;
     return &vm->procs[index].htable;
+}
+
+static je_proc_pool *process_pool(void)
+{
+    extern je_proc_pool *je_sched_proc_pool(void);
+    return je_sched_proc_pool();
+}
+
+static bool process_id_from_object(je_proc_pool *pool, void *object, je_proc_id *out)
+{
+    if (!pool || !out || !object) return false;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        if (object == (void *)&pool->rec[i] && pool->rec[i].state != JE_PROC_FREE) {
+            *out = (je_proc_id){i, pool->rec[i].gen};
+            return true;
+        }
+    }
+    return false;
+}
+
+static _Noreturn void syscall_invariant(const char *message)
+{
+    je_arch_console_write(message);
+    je_arch_halt();
+}
+
+static je_status dispatch_retain_process(void *object)
+{
+    je_proc_id id = JE_PROC_ID_NONE;
+    je_proc_pool *pool = process_pool();
+    if (!process_id_from_object(pool, object, &id))
+        syscall_invariant("JeiOS fatal: PROCESS retain invariant\r\n");
+    return je_proc_retain(pool, id);
+}
+
+static void dispatch_release_process(void *object)
+{
+    je_proc_id id = JE_PROC_ID_NONE;
+    je_proc_pool *pool = process_pool();
+    if (!process_id_from_object(pool, object, &id)
+        || pool->rec[id.index].handle_refs == 0u)
+        syscall_invariant("JeiOS fatal: PROCESS release invariant\r\n");
+    je_proc_release(pool, id);
+}
+
+je_status je_process_handle_mint(je_vm *vm, uint32_t index, je_proc_id id,
+                                 uint32_t rights, je_handle *out)
+{
+    if (out) *out = 0u;
+    if (!vm || index >= JE_VM_MAX_PROCESSES || !out
+        || !je_endpoint_kern_is_wired(vm) || !dispatch_for_type(JE_PROCESS_TYPE)
+        || (rights & ~JE_ABI_RIGHTS_KNOWN) != 0u
+        || (rights & ~type_dispatch[JE_PROCESS_TYPE].known_rights) != 0u)
+        return JE_ERR_INVALID;
+    je_proc_pool *pool = process_pool();
+    if (!pool || !je_proc_valid(pool, id)) return JE_ERR_INVALID;
+    je_status retain = type_dispatch[JE_PROCESS_TYPE].retain(
+        (void *)&pool->rec[id.index]);
+    if (retain != JE_OK) return retain;
+    je_handle h = 0u;
+    je_handle_status alloc = je_handle_alloc(&vm->procs[index].htable,
+                                             (void *)&pool->rec[id.index],
+                                             JE_PROCESS_TYPE, rights, &h);
+    if (alloc != JE_HANDLE_OK) {
+        type_dispatch[JE_PROCESS_TYPE].release((void *)&pool->rec[id.index]);
+        switch (alloc) {
+        case JE_HANDLE_QUOTA: return JE_ERR_DENIED;
+        case JE_HANDLE_NOSLOTS: return JE_ERR_NOMEM;
+        default: return JE_ERR_INVALID;
+        }
+    }
+    *out = h;
+    return JE_OK;
 }
 
 /* Resolve the current user process as (vm,index) for the endpoint ops, which
@@ -318,6 +461,42 @@ static void je_syscall_finish_blocked_recv(je_trap_frame *f, je_ep_channel *rec,
     f->rdx=(uint64_t)mlen | ((uint64_t)mcaps << 32);
 }
 
+static je_trap_frame *dispatch_proc_status(je_trap_frame *f)
+{
+    je_handle_table *t = current_htable();
+    if (!t) {
+        f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0;
+        return je_sched_return_to_user(f);
+    }
+    uint32_t type = 0u, rights = 0u; void *object = (void *)0;
+    je_handle_status resolve = je_handle_resolve_any(t, (je_handle)f->rdi,
+                                                      &type, &rights, &object);
+    if (resolve != JE_HANDLE_OK) {
+        f->rax=(uint64_t)handle_status_to_abi(resolve); f->rdx=0;
+        return je_sched_return_to_user(f);
+    }
+    if (type != JE_PROCESS_TYPE) {
+        f->rax=(uint64_t)JE_ABI_H_WRONGTYPE; f->rdx=0;
+        return je_sched_return_to_user(f);
+    }
+    if ((rights & JE_ABI_RIGHT_INSPECT) == 0u) {
+        f->rax=(uint64_t)JE_ABI_H_DENIED; f->rdx=0;
+        return je_sched_return_to_user(f);
+    }
+    je_proc_id id = JE_PROC_ID_NONE;
+    if (!process_id_from_object(process_pool(), object, &id)) {
+        syscall_invariant("JeiOS fatal: PROC_STATUS record invariant\r\n");
+    }
+    je_abi_proc_status snapshot;
+    if (je_proc_status(process_pool(), id, &snapshot.state, &snapshot.reason,
+                       &snapshot.code) != JE_OK) {
+        syscall_invariant("JeiOS fatal: PROC_STATUS snapshot invariant\r\n");
+    }
+    f->rax=(uint64_t)je_copy_to_user(f->rsi, &snapshot, sizeof snapshot);
+    f->rdx=0;
+    return je_sched_return_to_user(f);
+}
+
 /* Kernel glue. Returns the frame to iretq to (the caller for RETURN/invalid, a
  * live successor for YIELD/EXIT). Must only be called for a user-origin int 0x80
  * frame (je_trap_dispatch enforces cs&3==3; the scheduler helpers re-check the
@@ -345,6 +524,9 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
     uint64_t args[6] = { f->rdi, f->rsi, f->rdx, f->r10, f->r8, f->r9 };
     je_abi_status status; uint64_t result;
     je_syscall_action action = je_syscall_decode(f->rax, args, &status, &result);
+
+    if (action == JE_SYSCALL_PROC_STATUS)
+        return dispatch_proc_status(f);
 
     switch (action) {
     case JE_SYSCALL_YIELD:
@@ -389,24 +571,25 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
         je_handle_table *t = &vm->procs[index].htable;
         je_handle h = (je_handle)f->rdi;
-        uint32_t type = 0u; je_handle peek = 0u;
-        /* The decoder already rejected a wide handle (rdi>>32) as INVALID. Decode
-         * to an index and read the slot type via the read-only iterator, matching
-         * on the same generation by re-encoding and comparing. */
-        uint32_t di = 0u, dg = 0u; je_handle_decode(h, &di, &dg);
-        bool live = je_handle_live_at(t, di, &peek, &type) && peek == h;
-        if (live && type == JE_ABI_OBJ_ENDPOINT) {
+        uint32_t type = 0u, rights = 0u; void *object = (void *)0;
+        je_handle_status resolve = je_handle_resolve_any(t, h, &type, &rights, &object);
+        if (resolve != JE_HANDLE_OK) {
+            f->rax=(uint64_t)handle_status_to_abi(resolve); f->rdx=0;
+        } else if (type == JE_ABI_OBJ_ENDPOINT) {
             je_ep_status s = je_endpoint_kern_close(vm, index, h);
             f->rax = (uint64_t)ep_status_to_abi(s); f->rdx = 0;
-        } else if (live && type != JE_ABI_OBJ_SELF) {
-            /* A LIVE slot of a type that is neither ENDPOINT nor SELF must FAIL
-             * CLOSED (A3-3): routing it to raw je_handle_close would drop a ref a
-             * future typed object owns. Unreachable today (only SELF/ENDPOINT are
-             * minted), but the contract is enforced, not assumed. */
+        } else if (type == JE_ABI_OBJ_PROCESS) {
+            je_proc_id id = JE_PROC_ID_NONE;
+            if (!process_id_from_object(process_pool(), object, &id)
+                || process_pool()->rec[id.index].handle_refs == 0u)
+                syscall_invariant("JeiOS fatal: PROCESS close invariant\r\n");
+            if (je_handle_close(t, h) != JE_HANDLE_OK)
+                syscall_invariant("JeiOS fatal: PROCESS close mismatch\r\n");
+            dispatch_release_process(object);
+            f->rax=(uint64_t)JE_ABI_OK; f->rdx=0;
+        } else if (type != JE_ABI_OBJ_SELF) {
             f->rax = (uint64_t)JE_ABI_H_WRONGTYPE; f->rdx = 0;
         } else {
-            /* SELF, or a not-live handle (stale/forged/free/retired): raw close
-             * gives the exact OK/BADINDEX/STALE status. */
             je_handle_status s = je_handle_close(t, h);
             f->rax = (uint64_t)handle_status_to_abi(s); f->rdx = 0;
         }
@@ -419,11 +602,14 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
          * RDX = object type; otherwise RDX = 0. */
         je_handle_table *t = current_htable();
         if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        void *obj;
-        je_handle_status s = je_handle_lookup(t, (je_handle)f->rdi,
-                                              JE_HANDLE_TYPE_SELF, 0u, &obj);
+        uint32_t type = 0u, rights = 0u; void *object = (void *)0;
+        je_handle_status s = je_handle_resolve_any(t, (je_handle)f->rdi,
+                                                   &type, &rights, &object);
+        (void)rights; (void)object;
+        if (s == JE_HANDLE_OK && dispatch_for_type(type) == (const je_type_dispatch *)0)
+            s = JE_HANDLE_WRONGTYPE;
         f->rax = (uint64_t)handle_status_to_abi(s);
-        f->rdx = (s == JE_HANDLE_OK) ? (uint64_t)JE_HANDLE_TYPE_SELF : 0u;
+        f->rdx = (s == JE_HANDLE_OK) ? (uint64_t)type : 0u;
         return je_sched_return_to_user(f);
     }
     case JE_SYSCALL_HANDLE_RIGHTS: {
@@ -434,12 +620,17 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
          * M3b-s1 QEMU marker). */
         je_handle_table *t = current_htable();
         if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        uint32_t rights = 0;
-        je_handle_status s = je_handle_rights_of(t, (je_handle)f->rdi,
-                                                 JE_HANDLE_TYPE_SELF,
-                                                 JE_ABI_RIGHT_INSPECT, &rights);
+        uint32_t type = 0u, rights = 0u; void *object = (void *)0;
+        je_handle_status s = je_handle_resolve_any(t, (je_handle)f->rdi,
+                                                   &type, &rights, &object);
+        const je_type_dispatch *dispatch = (s == JE_HANDLE_OK)
+                                          ? dispatch_for_type(type)
+                                          : (const je_type_dispatch *)0;
+        if (s == JE_HANDLE_OK && !dispatch) s = JE_HANDLE_WRONGTYPE;
+        if (s == JE_HANDLE_OK && (rights & JE_ABI_RIGHT_INSPECT) == 0u)
+            s = JE_HANDLE_DENIED;
         f->rax = (uint64_t)handle_status_to_abi(s);
-        f->rdx = (s == JE_HANDLE_OK) ? (uint64_t)(rights & JE_ABI_RIGHTS_KNOWN) : 0u;
+        f->rdx = (s == JE_HANDLE_OK) ? (uint64_t)(rights & dispatch->known_rights) : 0u;
         return je_sched_return_to_user(f);
     }
     case JE_SYSCALL_HANDLE_DUP: {
@@ -452,11 +643,66 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
          * which handle_rights then returns DENIED. */
         je_handle_table *t = current_htable();
         if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        je_handle nh = 0;
-        je_handle_status s = je_handle_dup_self(t, (je_handle)f->rdi,
-                                                JE_HANDLE_TYPE_SELF,
-                                                (uint32_t)f->rsi, &nh);
-        f->rax = (uint64_t)handle_status_to_abi(s);
+        je_handle nh = 0u;
+        uint32_t type = 0u, source_rights = 0u; void *object = (void *)0;
+        je_handle_status resolve = je_handle_resolve_any(t, (je_handle)f->rdi,
+                                                          &type, &source_rights, &object);
+        const je_type_dispatch *dispatch = (resolve == JE_HANDLE_OK)
+                                          ? dispatch_for_type(type)
+                                          : (const je_type_dispatch *)0;
+        if (resolve != JE_HANDLE_OK) {
+            f->rax=(uint64_t)handle_status_to_abi(resolve); f->rdx=0;
+            return je_sched_return_to_user(f);
+        }
+        uint32_t new_rights = (uint32_t)f->rsi;
+        if (!dispatch) {
+            f->rax=(uint64_t)JE_ABI_H_WRONGTYPE; f->rdx=0;
+            return je_sched_return_to_user(f);
+        }
+        if ((new_rights & ~source_rights) != 0u) {
+            f->rax=(uint64_t)JE_ABI_H_DENIED; f->rdx=0;
+            return je_sched_return_to_user(f);
+        }
+        if (dispatch->dup == JE_DUP_POLICY_DENIED) {
+            f->rax=(uint64_t)JE_ABI_H_DENIED; f->rdx=0;
+            return je_sched_return_to_user(f);
+        }
+        if (dispatch->dup == JE_DUP_POLICY_SELF) {
+            je_handle_status s = je_handle_dup_self(t, (je_handle)f->rdi,
+                                                    JE_HANDLE_OBJ_SELF, new_rights, &nh);
+            f->rax = (uint64_t)handle_status_to_abi(s);
+        } else if (dispatch->dup == JE_DUP_POLICY_ENDPOINT) {
+            je_vm *vm; uint32_t index;
+            if (!current_vm_index(&vm, &index)) {
+                f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0;
+                return je_sched_return_to_user(f);
+            }
+            je_ep_status s = je_endpoint_kern_dup(vm, index, (je_handle)f->rdi,
+                                                  new_rights, &nh);
+            f->rax=(uint64_t)ep_status_to_abi(s);
+        } else {
+            je_proc_pool *pool = process_pool();
+            je_proc_id id = JE_PROC_ID_NONE;
+            if (!process_id_from_object(pool, object, &id)) {
+                syscall_invariant("JeiOS fatal: PROCESS dup invariant\r\n");
+            }
+            je_status retain = dispatch_retain_process(object);
+            if (retain == JE_ERR_BUSY) {
+                f->rax=(uint64_t)JE_ABI_H_REFOVERFLOW; f->rdx=0;
+                return je_sched_return_to_user(f);
+            }
+            if (retain != JE_OK) {
+                syscall_invariant("JeiOS fatal: PROCESS dup retain invariant\r\n");
+            }
+            je_handle_status a = je_handle_alloc(t, object, JE_PROCESS_TYPE,
+                                                  new_rights, &nh);
+            if (a != JE_HANDLE_OK) {
+                dispatch_release_process(object);
+                f->rax=(uint64_t)handle_status_to_abi(a); f->rdx=0;
+                return je_sched_return_to_user(f);
+            }
+            f->rax=(uint64_t)JE_ABI_OK;
+        }
         f->rdx = (uint64_t)nh;                /* 0 on failure (dup clears out) */
         return je_sched_return_to_user(f);
     }

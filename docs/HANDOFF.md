@@ -1,5 +1,15 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-B (#53) — PROCESS records + reaper + typed dispatch — observed 2026-10-31T03:30Z
+
+Branch `feat/m4b-process`, based on main `5dbd0d8` (#60 and #61 merged; main CI green at `5dbd0d8`).
+
+- **Implemented:** ADR 0010 D3, D4 and D-DEV. Details are in IMPLEMENTATION "M4 PR-B".
+- **Tested locally:** check, smoke, integration, the three x86 profiles and all four ARM modes. The new M4b-s1 markers appear on the NX profile.
+- **Planned:** PR-C, covering `CLOCK_TICKS`, LAUNCHER, `PROC_SPAWN`, the startup register ABI and spawn rollback. The code map and pre-wiring plan are ready.
+- **Blocked:** nothing.
+- **Recorded decision:** spawn's internal NOMEM/BUSY map to `H_NOSLOTS`, per ADR 0010 Consequences (no new statuses).
+
 ## M4 PR-A (#53) — capacity raise — observed 2026-10-31T02:11:09+00:00
 
 Branch `feat/m4a-capacity`. It is stacked on `docs/adr-0010-m4` (#60, ADR 0010), so #60 must merge first.

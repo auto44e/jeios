@@ -49,6 +49,547 @@ static void make_pair(je_handle *h0, je_handle *h1)
     assert(s == JE_EP_OK && *h0 != 0u && *h1 != 0u && *h0 != *h1);
 }
 
+/* ===== ADR 0010 D-DEV: endpoint creation quota (je_endpoint_channel_create_by).
+ * Written from endpoint.h + proc.h only. A REAL je_proc_pool is attached to the
+ * endpoint pool, so charge/uncharge go through proc.c's identity checks, not a
+ * fake. Every refusal is checked as "status AND no state change" by memcmp of
+ * the endpoint pool, the proc pool and the table(s). ======================== */
+static je_proc_pool     g_procs;
+static je_proc_pool     g_procs_snap;
+static je_endpoint_pool g_pool_snap;
+static je_handle_slot   g_t_snap_slots[CAP];
+static uint32_t         g_t_snap_live;
+static je_handle_slot   g_tb_slots[CAP];     /* a second process's table */
+static je_handle_table  g_tb;
+static je_handle_slot   g_tq_slots[CAP];     /* a small-quota table for mint failure */
+static je_handle_table  g_tq;
+static je_endpoint_pool g_pool2;             /* create == create_by(NONE) twin */
+static je_handle_slot   g_t2_slots[CAP];
+static je_handle_table  g_t2;
+
+static void ddev_fresh(void)
+{
+    fresh(QUOTA);
+    assert(g_pool.procs == (je_proc_pool *)0);   /* init leaves charging disabled */
+    je_proc_pool_init(&g_procs);
+    g_pool.procs = &g_procs;
+    assert(je_handle_table_init(&g_tb, g_tb_slots, CAP, QUOTA));
+}
+
+static void ddev_snap(void)
+{
+    memcpy(&g_pool_snap, &g_pool, sizeof g_pool);
+    memcpy(&g_procs_snap, &g_procs, sizeof g_procs);
+    memcpy(g_t_snap_slots, g_slots, sizeof g_slots);
+    g_t_snap_live = g_t.live;
+}
+
+static void ddev_unchanged(void)
+{
+    assert(memcmp(&g_pool_snap, &g_pool, sizeof g_pool) == 0);
+    assert(memcmp(&g_procs_snap, &g_procs, sizeof g_procs) == 0);
+    assert(memcmp(g_t_snap_slots, g_slots, sizeof g_slots) == 0);
+    assert(g_t.live == g_t_snap_live);
+}
+
+static void procs_snap(void) { memcpy(&g_procs_snap, &g_procs, sizeof g_procs); }
+static void procs_unchanged(void) { assert(memcmp(&g_procs_snap, &g_procs, sizeof g_procs) == 0); }
+
+static je_proc_id proc_new(uint32_t ep_limit)
+{
+    je_proc_id id = JE_PROC_ID_NONE;
+    assert(je_proc_alloc(&g_procs, ep_limit, false, &id) == JE_OK);
+    return id;
+}
+
+static uint32_t charge_of(je_proc_id id) { return g_procs.rec[id.index].ep_charge; }
+
+/* create_by with both ends in g_t; returns the status, outs preset to garbage so
+ * the "both *out are 0 on failure" rule is observable. */
+static je_ep_status cb(je_proc_id creator, je_handle *h0, je_handle *h1)
+{
+    *h0 = 0xdeadu; *h1 = 0xbeefu;
+    return je_endpoint_channel_create_by(&g_pool, creator, &g_t, JE_EP_RIGHTS_ALL,
+                                         &g_t, JE_EP_RIGHTS_ALL, h0, h1);
+}
+
+static je_ep_channel *rec_of(je_handle_table *t, je_handle h)
+{
+    je_ep_channel *rec; uint8_t side;
+    assert(je_endpoint_resolve(&g_pool, t, h, &rec, &side) == JE_EP_OK);
+    return rec;
+}
+
+static void close_ok(je_handle_table *t, je_handle h)
+{
+    assert(je_endpoint_handle_close(&g_pool, t, h) == JE_EP_OK);
+}
+
+/* Move end `h` (in g_t) to table `dst` as a capability over carrier (s0 in g_t,
+ * s1 in dst): send, peek, mint into dst, commit. Returns the minted handle. If
+ * `leave_queued` the cap is sent but NOT received (it stays in flight). */
+static je_handle move_cap(je_handle h, je_handle s0, je_handle s1, je_handle_table *dst,
+                          bool leave_queued)
+{
+    je_ep_channel *xr; uint8_t xs;
+    assert(je_endpoint_resolve(&g_pool, &g_t, h, &xr, &xs) == JE_EP_OK);
+    je_ep_capdesc d = { (uint16_t)(xr - &g_pool.rec[0]), xs, 0u, xr->generation, JE_EP_RIGHTS_ALL };
+    assert(je_endpoint_try_send_caps(&g_pool, &g_t, s0, (void *)0, 0, &d, 1) == JE_EP_OK);
+    if (leave_queued) return 0u;
+    uint8_t rb[JE_EP_MSG_MAX]; size_t rl = 0; uint8_t nc = 0;
+    je_ep_capdesc rc[JE_EP_MSG_CAPS_MAX]; je_ep_recv_lease lz;
+    assert(je_endpoint_recv_peek_caps(&g_pool, dst, s1, rb, sizeof rb, &rl, JE_EP_MSG_CAPS_MAX,
+                                      rc, &nc, &lz) == JE_EP_OK && nc == 1u);
+    je_ep_channel *mr; uint8_t ms;
+    assert(je_endpoint_capdesc_resolve(&g_pool, &rc[0], &mr, &ms) == JE_EP_OK);
+    assert(je_endpoint_capdesc_retain_handle(&g_pool, &rc[0]) == JE_EP_OK);
+    je_handle minted = 0u;
+    assert(je_handle_alloc(dst, (void *)&mr->end[ms], JE_ENDPOINT_OBJ_TYPE, rc[0].rights,
+                           &minted) == JE_HANDLE_OK);
+    assert(je_endpoint_recv_commit_caps(&g_pool, &lz) == JE_EP_OK);
+    return minted;
+}
+
+/* A carrier channel s0 (in g_t) <-> s1 (in dst), uncharged (kernel-style). */
+static void carrier(je_handle_table *dst, je_handle *s0, je_handle *s1)
+{
+    assert(je_endpoint_channel_create(&g_pool, &g_t, JE_EP_RIGHTS_ALL, dst, JE_EP_RIGHTS_ALL,
+                                      s0, s1) == JE_EP_OK);
+}
+
+/* A non-NONE identity that names no record: index in range, a generation this
+ * fresh proc pool has never issued. */
+static je_proc_id mkid_proc_invalid(void)
+{
+    je_proc_id id = { JE_PROC_REC_MAX - 1u, 0x7777u };
+    return id;
+}
+
+static void test_ddev(void)
+{
+    je_handle a0, a1, b0, b1, c0, c1;
+
+    /* 1. create_by charges the creator and records its identity; at quota ->
+     * QUOTA with NO state change; outs zeroed. */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(2u);
+        assert(cb(A, &a0, &a1) == JE_EP_OK && a0 != 0u && a1 != 0u);
+        assert(charge_of(A) == 1u && je_endpoint_pool_allocated(&g_pool) == 1u);
+        je_ep_channel *ra = rec_of(&g_t, a0);
+        assert(ra->creator.index == A.index && ra->creator.gen == A.gen);
+        assert(rec_of(&g_t, a1) == ra);
+        assert(cb(A, &b0, &b1) == JE_EP_OK);
+        assert(charge_of(A) == 2u && je_endpoint_pool_allocated(&g_pool) == 2u);
+        ddev_snap();
+        assert(cb(A, &c0, &c1) == JE_EP_QUOTA);
+        assert(c0 == 0u && c1 == 0u);
+        ddev_unchanged();
+        assert(cb(A, &c0, &c1) == JE_EP_QUOTA);              /* repeatable */
+        ddev_unchanged();
+
+        /* 2. destruction uncharges exactly once, on the LAST close only */
+        close_ok(&g_t, a0);
+        assert(charge_of(A) == 2u);                         /* record still alive */
+        close_ok(&g_t, a1);
+        assert(charge_of(A) == 1u && je_endpoint_pool_allocated(&g_pool) == 1u);
+        procs_snap();
+        assert(je_endpoint_handle_close(&g_pool, &g_t, a1) == JE_EP_STALE);  /* double close */
+        assert(je_endpoint_handle_close(&g_pool, &g_t, a0) == JE_EP_STALE);
+        procs_unchanged();
+        /* the freed charge is real room again */
+        assert(cb(A, &a0, &a1) == JE_EP_OK && charge_of(A) == 2u);
+        close_ok(&g_t, a0); close_ok(&g_t, a1);
+        close_ok(&g_t, b1); close_ok(&g_t, b0);
+        assert(charge_of(A) == 0u && je_endpoint_pool_allocated(&g_pool) == 0u);
+        /* limit 0 (an M4 child): the first create is QUOTA, no change */
+        je_proc_id K = proc_new(0u);
+        ddev_snap();
+        assert(cb(K, &c0, &c1) == JE_EP_QUOTA && c0 == 0u && c1 == 0u);
+        ddev_unchanged();
+        /* charges are per identity: K's refusal never touched A */
+        assert(charge_of(A) == 0u && g_procs.rec[A.index].ep_limit == 2u);
+    }
+
+    /* 3. pool full -> NOSLOTS BEFORE charging. Pinned order: a creator AT QUOTA on
+     * a full pool gets NOSLOTS (not QUOTA); a creator with room is not charged. */
+    ddev_fresh();
+    assert(je_handle_table_init(&g_pool_t, g_pool_slots, POOL_T_CAP, POOL_T_CAP));
+    {
+        je_proc_id B = proc_new(1u);       /* will be exactly at quota */
+        je_proc_id R = proc_new(5u);       /* has room */
+        je_handle p0, p1;
+        for (uint32_t i = 0; i + 1u < JE_EP_POOL_CAP; ++i)
+            assert(je_endpoint_channel_create(&g_pool, &g_pool_t, JE_EP_RIGHTS_ALL,
+                                              &g_pool_t, JE_EP_RIGHTS_ALL, &p0, &p1) == JE_EP_OK);
+        assert(je_endpoint_channel_create_by(&g_pool, B, &g_pool_t, JE_EP_RIGHTS_ALL,
+                                             &g_pool_t, JE_EP_RIGHTS_ALL, &p0, &p1) == JE_EP_OK);
+        assert(je_endpoint_pool_allocated(&g_pool) == JE_EP_POOL_CAP);
+        assert(charge_of(B) == 1u && charge_of(R) == 0u);
+        ddev_snap();
+        assert(cb(B, &c0, &c1) == JE_EP_NOSLOTS);            /* at quota AND full */
+        assert(c0 == 0u && c1 == 0u);
+        ddev_unchanged();
+        assert(cb(R, &c0, &c1) == JE_EP_NOSLOTS);            /* room, but full */
+        ddev_unchanged();
+        assert(charge_of(R) == 0u);                          /* never charged */
+        assert(cb(JE_PROC_ID_NONE, &c0, &c1) == JE_EP_NOSLOTS);
+        ddev_unchanged();
+        /* step 1 precedes the charge, so even a non-NONE invalid creator is NOSLOTS */
+        assert(cb(mkid_proc_invalid(), &c0, &c1) == JE_EP_NOSLOTS);
+        ddev_unchanged();
+        /* freeing B's channel (last pool record) uncharges B and makes room */
+        close_ok(&g_pool_t, p0); close_ok(&g_pool_t, p1);
+        assert(charge_of(B) == 0u);
+        assert(cb(R, &c0, &c1) == JE_EP_OK && charge_of(R) == 1u);
+    }
+
+    /* 4. mint failure (table quota) unwinds the record AND uncharges. */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(1u);
+        je_handle q0, q1;
+        /* second mint fails: a quota-1 table for both ends */
+        assert(je_handle_table_init(&g_tq, g_tq_slots, CAP, 1u));
+        procs_snap();
+        q0 = 0xdeadu; q1 = 0xbeefu;
+        assert(je_endpoint_channel_create_by(&g_pool, A, &g_tq, JE_EP_RIGHTS_ALL, &g_tq,
+                                             JE_EP_RIGHTS_ALL, &q0, &q1) == JE_EP_QUOTA);
+        assert(q0 == 0u && q1 == 0u);
+        assert(charge_of(A) == 0u && g_tq.live == 0u);
+        assert(je_endpoint_pool_allocated(&g_pool) == 0u);
+        for (uint32_t i = 0; i < JE_EP_POOL_CAP; ++i) assert(!g_pool.rec[i].allocated);
+        procs_unchanged();
+        /* first mint fails: a quota-0 table for end 0 */
+        assert(je_handle_table_init(&g_tq, g_tq_slots, CAP, 0u));
+        assert(je_endpoint_channel_create_by(&g_pool, A, &g_tq, JE_EP_RIGHTS_ALL, &g_t,
+                                             JE_EP_RIGHTS_ALL, &q0, &q1) == JE_EP_QUOTA);
+        assert(q0 == 0u && q1 == 0u && g_t.live == 0u);
+        procs_unchanged();
+        /* end 1 into the quota-0 table, end 0 into a good one */
+        assert(je_endpoint_channel_create_by(&g_pool, A, &g_t, JE_EP_RIGHTS_ALL, &g_tq,
+                                             JE_EP_RIGHTS_ALL, &q0, &q1) == JE_EP_QUOTA);
+        assert(q0 == 0u && q1 == 0u && g_t.live == 0u);
+        procs_unchanged();
+        assert(je_endpoint_pool_allocated(&g_pool) == 0u);
+        /* nothing leaked: A (limit 1) can still create exactly one channel */
+        assert(cb(A, &a0, &a1) == JE_EP_OK && charge_of(A) == 1u);
+        assert(cb(A, &b0, &b1) == JE_EP_QUOTA);
+        /* a capacity-1 table (second mint refused: QUOTA, QUOTA-before-NOSLOTS)
+         * also unwinds the charge */
+        je_proc_id W = proc_new(3u);
+        assert(je_handle_table_init(&g_tq, g_tq_slots, 1u, 1u));   /* capacity 1 */
+        procs_snap();
+        assert(je_endpoint_channel_create_by(&g_pool, W, &g_tq, JE_EP_RIGHTS_ALL, &g_tq,
+                                             JE_EP_RIGHTS_ALL, &q0, &q1) != JE_EP_OK);
+        assert(q0 == 0u && q1 == 0u && g_tq.live == 0u);
+        procs_unchanged();
+        assert(je_endpoint_pool_allocated(&g_pool) == 1u);
+    }
+
+    /* 5. the charge follows the RECORD, not the holder: it survives the creator's
+     * handles moving to another table and is released only at destruction. */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(2u);
+        je_handle s0, s1;
+        carrier(&g_tb, &s0, &s1);                            /* uncharged */
+        assert(charge_of(A) == 0u);
+        assert(cb(A, &a0, &a1) == JE_EP_OK && charge_of(A) == 1u);
+        je_handle m = move_cap(a1, s0, s1, &g_tb, false);    /* end 1 now also in tb */
+        close_ok(&g_t, a1);
+        close_ok(&g_t, a0);                                  /* creator holds nothing */
+        assert(charge_of(A) == 1u);                          /* tb keeps it alive */
+        assert(je_endpoint_pool_allocated(&g_pool) == 2u);
+        close_ok(&g_tb, m);                                  /* destruction */
+        assert(charge_of(A) == 0u && je_endpoint_pool_allocated(&g_pool) == 1u);
+
+        /* in-flight: a queued cap (inflight ref) keeps the record and the charge;
+         * dequeuing it destroys the record and uncharges once. */
+        assert(cb(A, &b0, &b1) == JE_EP_OK && charge_of(A) == 1u);
+        (void)move_cap(b1, s0, s1, &g_tb, true);
+        close_ok(&g_t, b0); close_ok(&g_t, b1);
+        assert(charge_of(A) == 1u && je_endpoint_pool_allocated(&g_pool) == 2u);
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl = 0; uint8_t nc = 0;
+        je_ep_capdesc rc[JE_EP_MSG_CAPS_MAX]; je_ep_recv_lease lz;
+        assert(je_endpoint_recv_peek_caps(&g_pool, &g_tb, s1, rb, sizeof rb, &rl,
+                                          JE_EP_MSG_CAPS_MAX, rc, &nc, &lz) == JE_EP_OK);
+        assert(nc == 1u && !je_endpoint_capdesc_live(&g_pool, &rc[0]));
+        assert(je_endpoint_recv_commit_caps(&g_pool, &lz) == JE_EP_OK);
+        assert(charge_of(A) == 0u && je_endpoint_pool_allocated(&g_pool) == 1u);
+        /* the HOLDER (tb's process) is never charged: a fresh proc for it is 0 */
+    }
+
+    /* 6. creator DYING (same identity) -> uncharged at destroy, including during
+     * its own release walk. */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(3u);
+        assert(cb(A, &a0, &a1) == JE_EP_OK);
+        assert(cb(A, &b0, &b1) == JE_EP_OK && charge_of(A) == 2u);
+        assert(je_proc_on_dying(&g_procs, A, 0u, 0u) == JE_OK);
+        close_ok(&g_t, a0); close_ok(&g_t, a1);
+        assert(charge_of(A) == 1u);
+        assert(je_endpoint_release_table(&g_pool, &g_t) == 2);   /* b0, b1 */
+        assert(charge_of(A) == 0u && je_endpoint_pool_allocated(&g_pool) == 0u);
+        assert(g_procs.rec[A.index].state == JE_PROC_DYING);
+    }
+
+    /* 7. creator DEAD with a handle open (same identity) -> uncharged at destroy;
+     * the record then frees normally on its last PROCESS-handle release. */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(1u);
+        assert(je_proc_retain(&g_procs, A) == JE_OK);
+        assert(cb(A, &a0, &a1) == JE_EP_OK && charge_of(A) == 1u);
+        assert(je_proc_on_dying(&g_procs, A, 1u, 7u) == JE_OK);
+        assert(je_proc_on_reaped(&g_procs, A) == JE_OK);
+        assert(g_procs.rec[A.index].state == JE_PROC_DEAD);
+        close_ok(&g_t, a0);
+        assert(charge_of(A) == 1u);
+        close_ok(&g_t, a1);
+        assert(charge_of(A) == 0u && g_procs.rec[A.index].state == JE_PROC_DEAD);
+        je_proc_release(&g_procs, A);
+        assert(g_procs.rec[A.index].state == JE_PROC_FREE);
+    }
+
+    /* 8. creator FREED -> destroy is a no-op on the proc pool. */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(1u);
+        assert(cb(A, &a0, &a1) == JE_EP_OK);
+        assert(je_proc_on_dying(&g_procs, A, 0u, 0u) == JE_OK);
+        assert(je_proc_on_reaped(&g_procs, A) == JE_OK);      /* refs 0 -> FREE */
+        assert(g_procs.rec[A.index].state == JE_PROC_FREE);
+        procs_snap();
+        close_ok(&g_t, a0); close_ok(&g_t, a1);
+        procs_unchanged();
+        assert(je_endpoint_pool_allocated(&g_pool) == 0u);
+    }
+
+    /* 9. creator REUSED -> the old channel's destroy never decrements the new
+     * identity (same index, next generation). */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(2u);
+        assert(cb(A, &a0, &a1) == JE_EP_OK);
+        assert(je_proc_on_dying(&g_procs, A, 0u, 0u) == JE_OK);
+        assert(je_proc_on_reaped(&g_procs, A) == JE_OK);
+        je_proc_id B = proc_new(2u);
+        assert(B.index == A.index && B.gen == A.gen + 1u);
+        assert(charge_of(B) == 0u);
+        assert(cb(B, &b0, &b1) == JE_EP_OK && charge_of(B) == 1u);
+        procs_snap();
+        close_ok(&g_t, a0); close_ok(&g_t, a1);              /* A's channel dies */
+        procs_unchanged();
+        assert(charge_of(B) == 1u);
+        close_ok(&g_t, b0); close_ok(&g_t, b1);
+        assert(charge_of(B) == 0u);
+        /* a stale creator identity cannot create: exactly JE_EP_INVALID (endpoint.h
+         * pinned, step 2), outs 0, nothing allocated, minted or charged */
+        ddev_snap();
+        assert(cb(A, &c0, &c1) == JE_EP_INVALID && c0 == 0u && c1 == 0u);
+        ddev_unchanged();
+    }
+
+    /* 10. NONE is uncharged even with procs attached. */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(0u);                          /* a record at index 0 */
+        (void)A;
+        procs_snap();
+        for (uint32_t i = 0; i < 3u; ++i) {
+            je_handle x0, x1;
+            assert(cb(JE_PROC_ID_NONE, &x0, &x1) == JE_EP_OK);
+            je_ep_channel *r = rec_of(&g_t, x0);
+            assert(r->creator.index == 0u && r->creator.gen == 0u);
+        }
+        procs_unchanged();                                    /* index 0 not charged */
+        assert(je_endpoint_release_table(&g_pool, &g_t) == 6);
+        procs_unchanged();
+    }
+
+    /* 11. procs == NULL: charging disabled, any creator is uncharged. A creator
+     * at quota (limit 0) in a DETACHED proc pool still creates, and the record
+     * stores creator NONE (endpoint.h pinned step 4: NONE when not charged). */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(0u);
+        g_pool.procs = (je_proc_pool *)0;
+        procs_snap();
+        assert(cb(A, &a0, &a1) == JE_EP_OK);
+        assert(rec_of(&g_t, a0)->creator.index == 0u && rec_of(&g_t, a0)->creator.gen == 0u);
+        assert(cb(A, &b0, &b1) == JE_EP_OK);
+        assert(rec_of(&g_t, b0)->creator.index == 0u && rec_of(&g_t, b0)->creator.gen == 0u);
+        procs_unchanged();
+        close_ok(&g_t, a0); close_ok(&g_t, a1);
+        assert(je_endpoint_release_table(&g_pool, &g_t) == 2);
+        procs_unchanged();
+        assert(je_endpoint_pool_allocated(&g_pool) == 0u);
+    }
+
+    /* 12. je_endpoint_channel_create(...) == create_by(pool, NONE, ...): the same
+     * sequence on two identically initialised pools gives identical handles,
+     * statuses and record arrays, and never touches the attached proc pool. */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(0u); (void)A;
+        assert(je_handle_table_init(&g_t2, g_t2_slots, CAP, QUOTA));
+        /* pool_init does not scrub queue payload bytes, so both twins start
+         * from zeroed storage (g_pool was used by earlier sections). */
+        memset(&g_pool, 0, sizeof g_pool);
+        memset(&g_pool2, 0, sizeof g_pool2);
+        je_endpoint_pool_init(&g_pool);
+        je_endpoint_pool_init(&g_pool2);
+        g_pool.procs = &g_procs;
+        g_pool2.procs = &g_procs;
+        procs_snap();
+        for (uint32_t i = 0; i < 4u; ++i) {
+            je_handle x0 = 1u, x1 = 1u, y0 = 2u, y1 = 2u;
+            je_ep_status sx = je_endpoint_channel_create(&g_pool, &g_t, JE_EP_RIGHTS_ALL,
+                                                         &g_t, JE_EP_RIGHT_RECV, &x0, &x1);
+            je_ep_status sy = je_endpoint_channel_create_by(&g_pool2, JE_PROC_ID_NONE, &g_t2,
+                                                            JE_EP_RIGHTS_ALL, &g_t2,
+                                                            JE_EP_RIGHT_RECV, &y0, &y1);
+            assert(sx == JE_EP_OK && sx == sy && x0 == y0 && x1 == y1);
+            if (i == 1u) {   /* destroy one to exercise free + reuse identically */
+                assert(je_endpoint_handle_close(&g_pool, &g_t, x0) == JE_EP_OK);
+                assert(je_endpoint_handle_close(&g_pool, &g_t, x1) == JE_EP_OK);
+                assert(je_endpoint_handle_close(&g_pool2, &g_t2, y0) == JE_EP_OK);
+                assert(je_endpoint_handle_close(&g_pool2, &g_t2, y1) == JE_EP_OK);
+            }
+        }
+        assert(memcmp(g_pool.rec, g_pool2.rec, sizeof g_pool.rec) == 0);
+        assert(g_pool.allocated_count == g_pool2.allocated_count);
+        procs_unchanged();
+        /* and both fail identically at table quota (QUOTA, outs zero) */
+        assert(je_handle_table_init(&g_tq, g_tq_slots, CAP, 1u));
+        je_handle x0, x1, y0, y1;
+        je_ep_status sx = je_endpoint_channel_create(&g_pool, &g_tq, JE_EP_RIGHTS_ALL,
+                                                     &g_tq, JE_EP_RIGHTS_ALL, &x0, &x1);
+        assert(je_handle_table_init(&g_tq, g_tq_slots, CAP, 1u));
+        je_ep_status sy = je_endpoint_channel_create_by(&g_pool2, JE_PROC_ID_NONE, &g_tq,
+                                                        JE_EP_RIGHTS_ALL, &g_tq,
+                                                        JE_EP_RIGHTS_ALL, &y0, &y1);
+        assert(sx == JE_EP_QUOTA && sy == JE_EP_QUOTA);
+        assert(x0 == 0u && x1 == 0u && y0 == 0u && y1 == 0u);
+        procs_unchanged();
+    }
+    /* 13. a reused pool record never carries a stale creator: A's freed record
+     * reused by an uncharged create (or by another creator) must not decrement A
+     * when it is destroyed, while A still holds a different charged channel. */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(2u), B = proc_new(2u);
+        assert(cb(A, &a0, &a1) == JE_EP_OK);                 /* record 0, charged to A */
+        je_ep_channel *r0 = rec_of(&g_t, a0);
+        assert(cb(A, &b0, &b1) == JE_EP_OK);                 /* record 1, charged to A */
+        close_ok(&g_t, a0); close_ok(&g_t, a1);              /* record 0 freed */
+        assert(charge_of(A) == 1u);
+        /* plain create reuses record 0 (lowest free) */
+        assert(je_endpoint_channel_create(&g_pool, &g_t, JE_EP_RIGHTS_ALL, &g_t,
+                                          JE_EP_RIGHTS_ALL, &c0, &c1) == JE_EP_OK);
+        assert(rec_of(&g_t, c0) == r0);
+        assert(r0->creator.index == 0u && r0->creator.gen == 0u);
+        close_ok(&g_t, c0); close_ok(&g_t, c1);
+        assert(charge_of(A) == 1u);                          /* not decremented */
+        /* B reuses record 0: destroying it charges/uncharges B only */
+        assert(cb(B, &c0, &c1) == JE_EP_OK && rec_of(&g_t, c0) == r0);
+        assert(r0->creator.index == B.index && r0->creator.gen == B.gen);
+        assert(charge_of(A) == 1u && charge_of(B) == 1u);
+        close_ok(&g_t, c0); close_ok(&g_t, c1);
+        assert(charge_of(A) == 1u && charge_of(B) == 0u);
+        close_ok(&g_t, b0); close_ok(&g_t, b1);
+        assert(charge_of(A) == 0u);
+    }
+
+    /* 14. every invalid non-NONE creator -> exactly JE_EP_INVALID, outs 0, and no
+     * change to the endpoint pool, the proc pool or the table (endpoint.h pinned
+     * step 2). The pool has free records, so step 1 passes and step 2 decides. */
+    ddev_fresh();
+    {
+        je_proc_id Z = proc_new(4u);                  /* index 0, so {index, 0} below is not NONE */
+        je_proc_id L = proc_new(4u);                  /* a LIVE record with room, index 1 */
+        je_proc_id F = proc_new(4u);                  /* index 2, then freed */
+        assert(Z.index == 0u && L.index == 1u && F.index == 2u);
+        assert(je_proc_abandon(&g_procs, F) == JE_OK);
+        assert(cb(L, &a0, &a1) == JE_EP_OK && charge_of(L) == 1u);   /* non-empty state */
+        const je_proc_id bad[6] = {
+            mkid_proc_invalid(),                      /* never-issued generation */
+            { JE_PROC_REC_MAX, 1u },                  /* index out of range */
+            { 0xffffffffu, 0xffffffffu },
+            { L.index, 0u },                          /* gen 0 on a LIVE slot */
+            { L.index, L.gen + 1u },                  /* future generation of a LIVE slot */
+            F,                                        /* freed (abandoned) identity */
+        };
+        for (uint32_t i = 0; i < 6u; ++i) {
+            ddev_snap();
+            assert(cb(bad[i], &c0, &c1) == JE_EP_INVALID);
+            assert(c0 == 0u && c1 == 0u);
+            ddev_unchanged();
+        }
+        /* never-allocated slot: index 3 has gen 0 and was never issued */
+        {
+            je_proc_id never = { 3u, 1u };
+            ddev_snap();
+            assert(cb(never, &c0, &c1) == JE_EP_INVALID && c0 == 0u && c1 == 0u);
+            ddev_unchanged();
+        }
+        assert(charge_of(L) == 1u && je_endpoint_pool_allocated(&g_pool) == 1u);
+    }
+
+    /* 15. a DYING or DEAD creator (same identity, room left) -> JE_EP_INVALID, no
+     * change: creation charging requires LIVE (proc.h / endpoint.h pinned). */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(5u);
+        assert(cb(A, &a0, &a1) == JE_EP_OK && charge_of(A) == 1u);
+        assert(je_proc_retain(&g_procs, A) == JE_OK);         /* keep DEAD observable */
+        assert(je_proc_on_dying(&g_procs, A, 3u, 0u) == JE_OK);
+        ddev_snap();
+        assert(cb(A, &c0, &c1) == JE_EP_INVALID && c0 == 0u && c1 == 0u);   /* DYING */
+        ddev_unchanged();
+        assert(je_proc_on_reaped(&g_procs, A) == JE_OK);
+        assert(g_procs.rec[A.index].state == JE_PROC_DEAD);
+        ddev_snap();
+        assert(cb(A, &c0, &c1) == JE_EP_INVALID && c0 == 0u && c1 == 0u);   /* DEAD */
+        ddev_unchanged();
+        /* the channel created while LIVE still uncharges its DEAD creator once */
+        close_ok(&g_t, a0); close_ok(&g_t, a1);
+        assert(charge_of(A) == 0u);
+        je_proc_release(&g_procs, A);
+        assert(g_procs.rec[A.index].state == JE_PROC_FREE);
+    }
+
+    /* 16. a channel created while procs == NULL is uncharged for life: attaching
+     * the proc pool afterwards cannot make its destruction uncharge anything,
+     * even though the same creator holds a REAL charge from another channel
+     * (Codex P2-4: a stored live creator would be decremented on the wrong
+     * channel). */
+    ddev_fresh();
+    {
+        je_proc_id A = proc_new(3u);
+        assert(cb(A, &a0, &a1) == JE_EP_OK && charge_of(A) == 1u);   /* charged */
+        je_ep_channel *ra = rec_of(&g_t, a0);
+        assert(ra->creator.index == A.index && ra->creator.gen == A.gen);
+        g_pool.procs = (je_proc_pool *)0;                            /* detach */
+        assert(cb(A, &b0, &b1) == JE_EP_OK);
+        je_ep_channel *rb = rec_of(&g_t, b0);
+        assert(rb->creator.index == 0u && rb->creator.gen == 0u);    /* uncharged: NONE */
+        assert(charge_of(A) == 1u);
+        g_pool.procs = &g_procs;                                     /* re-attach */
+        procs_snap();
+        close_ok(&g_t, b0); close_ok(&g_t, b1);                      /* uncharged channel dies */
+        procs_unchanged();
+        assert(charge_of(A) == 1u);
+        close_ok(&g_t, a0); close_ok(&g_t, a1);                      /* charged channel dies */
+        assert(charge_of(A) == 0u && je_endpoint_pool_allocated(&g_pool) == 0u);
+    }
+
+    /* restore the shared table for anything after this section */
+    fresh(QUOTA);
+}
+
 int main(void)
 {
     /* 1. Create: both ends OPEN, refs 1/1, one record allocated. */
@@ -841,11 +1382,15 @@ int main(void)
         assert(rl==2u && rb[0]==1 && rb[1]==2);
     }
 
+    test_ddev();
+
     printf("endpoint: PASS (create, split-ref close/destruction, dup "
            "acquire-before-commit, REFOVERFLOW, DENIED/WRONGTYPE, inflight keep-"
            "alive, pool-exhaustion + create-unwind, release-walk, data IPC "
            "send/recv/FIFO/QUEUE_FULL/SHORT_BUFFER/PEER_CLOSED/rights/zero-len, "
            "cap-transfer mint/dead-cap/cycle-reclaim, "
-           "waits register/arbitrate-CAS/reserved-head/release/release-by-id/peer-close-EMPTY)\n");
+           "waits register/arbitrate-CAS/reserved-head/release/release-by-id/peer-close-EMPTY, "
+           "D-DEV create_by charge/QUOTA/NOSLOTS-first/mint-unwind/transfer/dying/dead/"
+           "freed/reused/NONE/procs-NULL/create==create_by(NONE)/no stale creator on reuse)\n");
     return 0;
 }

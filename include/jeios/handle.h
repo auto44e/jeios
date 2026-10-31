@@ -161,6 +161,15 @@ je_handle_status je_handle_dup_self(je_handle_table *t, je_handle src,
  * stale/free/retired handle returns STALE and changes nothing. */
 je_handle_status je_handle_close(je_handle_table *t, je_handle h);
 
+/* ADR 0010 D3 typed dispatch: resolve a handle of ANY type. Same precedence as
+ * lookup minus the type and rights checks. A NULL t or out pointer is a caller bug and
+ * is reported as BADINDEX (the pure enum has no INVALID). Otherwise: index out of
+ * range -> BADINDEX; slot not LIVE or generation mismatch -> STALE. On OK, writes the
+ * slot's type, rights and object. On failure the outputs are left unchanged. Pure,
+ * read-only. */
+je_handle_status je_handle_resolve_any(const je_handle_table *t, je_handle h,
+                                       uint32_t *type, uint32_t *rights, void **obj);
+
 /* Read-only slot enumerator (M3c): if slot `index` is LIVE, write its current
  * handle (encode of index+generation) to *out_handle and its object type to
  * *out_type, and return true; otherwise return false and write nothing. Never

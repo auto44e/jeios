@@ -11,6 +11,16 @@
 #include <jeios/abi.h>
 #include <jeios/endpoint.h>
 #include <jeios/endpoint_kern.h>
+#include <jeios/proc.h>
+
+extern void je_sched_set_proc_pool(je_proc_pool *pool);
+extern je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id);
+extern je_status je_sched_unregister_process(je_vm *vm, uint32_t index);
+extern bool je_sched_has_process(je_vm *vm, uint32_t index);
+extern void je_kernel_idle_step(void);
+extern void je_endpoint_kern_set_proc_pool(je_proc_pool *pool);
+extern je_status je_process_handle_mint(je_vm *vm, uint32_t index, je_proc_id id,
+                                        uint32_t rights, je_handle *out);
 static je_boot_context boot;
 static _Noreturn void fail(const char *message)
 {
@@ -19,6 +29,8 @@ static _Noreturn void fail(const char *message)
 }
 static atomic_uint completed;
 static atomic_uint capacity_completed;
+static je_proc_pool process_pool;
+static je_proc_id vm_s3_proc_ids[JE_VM_MAX_PROCESSES];
 _Static_assert((1u + JE_M2_WORKERS) * 2u == 16u,
                "M2 preemption floor remains the T=8 floor");
 static void worker(void *argument)
@@ -93,6 +105,8 @@ static uint32_t vm_s2_build(uint64_t *out_root)
 
 /* ---- M3a #4 step 3/4: ring-3 entry + fault-local death proof -------------- */
 extern unsigned char je_user_demo_start[], je_user_demo_end[];
+extern unsigned char je_user_proc_exit7_start[], je_user_proc_exit7_end[];
+extern unsigned char je_user_m4b_start[], je_user_m4b_end[];
 extern unsigned char je_user_fp_start[], je_user_fp_end[];
 extern unsigned char je_user_fault_start[], je_user_fault_end[];
 extern unsigned char je_user_exit_start[], je_user_exit_end[];
@@ -111,12 +125,13 @@ extern unsigned char je_user_inject_start[], je_user_inject_end[];
 #endif
 extern unsigned char je_user_badrsp_start[], je_user_badrsp_end[];
 static je_vm vm_s3;
-static unsigned char vm_blob_s3[1024];
+static unsigned char vm_blob_s3[JE_PAGE_SIZE];
 typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_EXIT=3,
                PROG_SYSCALL=4, PROG_UNKNOWNOP=5, PROG_BADRSP=6, PROG_BADRET=7,
                PROG_COPYPROBE=8, PROG_INJECT=9, PROG_HANDLE=10,
                PROG_EPFAULT=11, PROG_EPIPC=12, PROG_EPRECV_TO=13,
-               PROG_PING=14, PROG_PONG=15 } user_prog;
+               PROG_PING=14, PROG_PONG=15, PROG_PROC_EXIT7=16,
+               PROG_M4B=17 } user_prog;
 static int vm_s3_inited;
 /* Initialize the shared step-3/4 vm once. The M3 fixture still uses two
  * processes, while the backing pool now has the M4 D2 capacity for later PRs. */
@@ -134,11 +149,13 @@ static void vm_s3_init_once(void)
 }
 /* Build one user process into the shared vm from the selected program (code at
  * arena 0, a heartbeat/scratch data page at 0x1000). Returns its index. */
-static uint32_t vm_s3_build(user_prog prog)
+static uint32_t vm_s3_build_quota(user_prog prog, uint32_t ep_limit)
 {
     vm_s3_init_once();
     unsigned char *start, *end;
     switch (prog) {
+    case PROG_PROC_EXIT7: start=je_user_proc_exit7_start; end=je_user_proc_exit7_end; break;
+    case PROG_M4B:        start=je_user_m4b_start;        end=je_user_m4b_end;        break;
     case PROG_FP:        start=je_user_fp_start;        end=je_user_fp_end;        break;
     case PROG_FAULT:     start=je_user_fault_start;     end=je_user_fault_end;     break;
     case PROG_EXIT:      start=je_user_exit_start;      end=je_user_exit_end;      break;
@@ -173,7 +190,55 @@ static uint32_t vm_s3_build(user_prog prog)
     if (je_vm_build(&vm_s3, &img, vm_blob_s3, sizeof vm_blob_s3, je_arch_has_nx(), &idx)!=JE_OK)
         fail("JeiOS fatal: s3 build\r\n");
     if (je_vm_audit(&vm_s3, idx)!=JE_OK) fail("JeiOS fatal: s3 audit\r\n");
+    je_proc_id id = JE_PROC_ID_NONE;
+    uint64_t flags = je_arch_irq_save();
+    je_status proc_alloc = je_proc_alloc(&process_pool, ep_limit, false, &id);
+    if (proc_alloc != JE_OK) {
+        je_arch_irq_restore(flags);
+        fail("JeiOS fatal: s3 process record\r\n");
+    }
+    vm_s3_proc_ids[idx] = id;
+    je_status register_status = je_sched_register_process(&vm_s3, idx, id);
+    je_arch_irq_restore(flags);
+    if (register_status != JE_OK)
+        fail("JeiOS fatal: s3 process register\r\n");
     return idx;
+}
+
+static uint32_t vm_s3_build(user_prog prog)
+{
+    return vm_s3_build_quota(prog, JE_EP_POOL_CAP);
+}
+
+static je_status vm_s3_destroy(uint32_t idx)
+{
+    if (idx >= JE_VM_MAX_PROCESSES) return JE_ERR_INVALID;
+    je_proc_id id = vm_s3_proc_ids[idx];
+    uint64_t flags = je_arch_irq_save();
+    if (je_sched_has_process(&vm_s3, idx)) {
+        je_arch_console_write("JeiOS fatal: s3 destroy has scheduler reference\r\n");
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
+    if (id.gen != 0u && je_proc_on_dying(&process_pool, id, JE_DEATH_KILLED, 0u) != JE_OK) {
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
+    if (je_vm_destroy(&vm_s3, idx) != JE_OK) {
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
+    if (id.gen != 0u && je_proc_on_reaped(&process_pool, id) != JE_OK) {
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
+    if (je_sched_unregister_process(&vm_s3, idx) != JE_OK) {
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
+    je_arch_irq_restore(flags);
+    vm_s3_proc_ids[idx] = JE_PROC_ID_NONE;
+    return JE_OK;
 }
 /* Read the heartbeat word of process idx by switching to its root at CPL0.
  * Interrupts must be disabled so the timer cannot dispatch mid-switch. */
@@ -277,6 +342,9 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
     je_arch_console_write("M2: allocator ready; free pages=");
     je_arch_console_hex(free_before);je_arch_console_write("\r\n");
     je_sched_init();
+    je_proc_pool_init(&process_pool);
+    je_sched_set_proc_pool(&process_pool);
+    je_endpoint_kern_set_proc_pool(&process_pool);
     if (je_thread_sleep(1)!=JE_ERR_DENIED) fail("JeiOS fatal: idle slept\r\n");
     for (uintptr_t i=1;i<=JE_M2_WORKERS;++i)
         if (je_thread_create(worker,(void *)i)!=JE_OK) fail("JeiOS fatal: thread creation\r\n");
@@ -431,7 +499,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
         je_arch_console_write("M3a-s3: CPL3 reached; survived preemption; heartbeat advanced\r\n");
         (void)je_arch_irq_save();
         if (je_sched_drop_user(&vm_s3, uidx)!=JE_OK) fail("JeiOS fatal: s3 drop_user\r\n");
-        if (je_vm_destroy(&vm_s3, uidx)!=JE_OK) fail("JeiOS fatal: s3 destroy\r\n");
+        if (vm_s3_destroy(uidx)!=JE_OK) fail("JeiOS fatal: s3 destroy\r\n");
 
         /* --- step-4 acceptance: fault-local death, peer survives --- */
         /* Build A (faults after a few heartbeats) and B (loops forever). */
@@ -540,7 +608,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (ystatus!=JE_ABI_OK) fail("JeiOS fatal: s5a yield result\r\n");
             (void)je_arch_irq_save();
             if (je_sched_drop_user(&vm_s3, S)!=JE_OK) fail("JeiOS fatal: s5a syscall drop\r\n");
-            if (je_vm_destroy(&vm_s3, S)!=JE_OK) fail("JeiOS fatal: s5a syscall destroy\r\n");
+            if (vm_s3_destroy(S)!=JE_OK) fail("JeiOS fatal: s5a syscall destroy\r\n");
             je_arch_console_write("M3a-s5a: abi_query returned OK+version; yield returned OK; B alive\r\n");
         }
         /* Unknown op must NOT terminate: the task records UNSUPPORTED and keeps
@@ -559,7 +627,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (vm_s3_scratch(U,JE_PAGE_SIZE+8)!=JE_ABI_UNSUPPORTED) fail("JeiOS fatal: s5a unknown status\r\n");
             (void)je_arch_irq_save();
             if (je_sched_drop_user(&vm_s3, U)!=JE_OK) fail("JeiOS fatal: s5a unknown drop\r\n");
-            if (je_vm_destroy(&vm_s3, U)!=JE_OK) fail("JeiOS fatal: s5a unknown destroy\r\n");
+            if (vm_s3_destroy(U)!=JE_OK) fail("JeiOS fatal: s5a unknown destroy\r\n");
             je_arch_console_write("M3a-s5a: unknown op -> UNSUPPORTED, task survived; B alive\r\n");
         }
         /* Bad-return THROUGH the syscall return path: corrupt RSP then make a
@@ -622,7 +690,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             }
             (void)je_arch_irq_save();
             if (je_sched_drop_user(&vm_s3, C)!=JE_OK) fail("JeiOS fatal: s5b copyprobe drop\r\n");
-            if (je_vm_destroy(&vm_s3, C)!=JE_OK) fail("JeiOS fatal: s5b copyprobe destroy\r\n");
+            if (vm_s3_destroy(C)!=JE_OK) fail("JeiOS fatal: s5b copyprobe destroy\r\n");
             je_arch_console_write("M3a-s5b: copy_probe valid+zero OK, null/kernel/len>256 INVALID, bytes moved; B alive\r\n");
         }
 #ifdef JE_DEV_COPY_INJECT
@@ -643,7 +711,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (vm_s3_scratch(I,0x1020)!=1u) fail("JeiOS fatal: s5b fixup did not recover\r\n");
             (void)je_arch_irq_save();
             if (je_sched_drop_user(&vm_s3, I)!=JE_OK) fail("JeiOS fatal: s5b inject drop\r\n");
-            if (je_vm_destroy(&vm_s3, I)!=JE_OK) fail("JeiOS fatal: s5b inject destroy\r\n");
+            if (vm_s3_destroy(I)!=JE_OK) fail("JeiOS fatal: s5b inject destroy\r\n");
             je_arch_console_write("M3a-s5b: exception-fixup recovered load+store copy-site #PF (dev inject); kernel alive\r\n");
         }
 #endif
@@ -730,7 +798,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (vm_s3_scratch(H,0x1098)!=14u)              fail("JeiOS fatal: s5c quota count != 14\r\n");
             (void)je_arch_irq_save();
             if (je_sched_drop_user(&vm_s3, H)!=JE_OK) fail("JeiOS fatal: s5c handle drop\r\n");
-            if (je_vm_destroy(&vm_s3, H)!=JE_OK) fail("JeiOS fatal: s5c handle destroy\r\n");
+            if (vm_s3_destroy(H)!=JE_OK) fail("JeiOS fatal: s5c handle destroy\r\n");
             je_arch_console_write("M3b-s1: handle self/query/rights/dup/close OK; attenuation drops INSPECT -> handle_rights DENIED (enforcement real); superset DENIED; unknown-right INVALID; reuse re-stales; BADINDEX at capacity restored; in-range-free STALE; default quota 15; B alive\r\n");
         }
         /* M3b intentionally preserves only the M3a survivor B. */
@@ -868,7 +936,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (vm_s3_scratch(P,0x1410)!=JE_ABI_H_PEER_CLOSED) fail("JeiOS fatal: s4 send to closed peer not PEER_CLOSED\r\n");
             /* Tear down P; its channel (h1 still live) must be reclaimed. */
             if (je_sched_drop_user(&vm_s3, P)!=JE_OK) fail("JeiOS fatal: s4 ipc drop\r\n");
-            if (je_vm_destroy(&vm_s3, P)!=JE_OK) fail("JeiOS fatal: s4 ipc destroy\r\n");
+            if (vm_s3_destroy(P)!=JE_OK) fail("JeiOS fatal: s4 ipc destroy\r\n");
             if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s4 ipc pool leak\r\n");
             je_arch_console_write("M3c-s4: ring-3 try_send/try_recv loopback OK (direction, SHORT_BUFFER, copy-out failure leaves msg queued -> delivered once, QUEUE_FULL, data-only reject, drain-then-PEER_CLOSED); channel reclaimed on exit\r\n");
         }
@@ -876,7 +944,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
         /* Tear down B; all step-3/4/5a pages must be back to the pre-s4 baseline. */
         (void)je_arch_irq_save();
         if (je_sched_drop_user(&vm_s3, B)!=JE_OK) fail("JeiOS fatal: s4 drop B\r\n");
-        if (je_vm_destroy(&vm_s3, B)!=JE_OK) fail("JeiOS fatal: s4 destroy B\r\n");
+        if (vm_s3_destroy(B)!=JE_OK) fail("JeiOS fatal: s4 destroy B\r\n");
         if (je_kernel_pages.free_count!=s3_free_before) fail("JeiOS fatal: s4 page leak\r\n");
         je_arch_console_write("M3a-s4: peer B torn down; page accounting restored\r\n");
 
@@ -948,8 +1016,8 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             /* Tear down both procs (no user thread was created — built only for
              * their tables). S + C must reclaim to baseline 0 via the release
              * walk in je_vm_destroy. */
-            if (je_vm_destroy(&vm_s3, XA)!=JE_OK) fail("JeiOS fatal: s5 XA destroy\r\n");
-            if (je_vm_destroy(&vm_s3, XB)!=JE_OK) fail("JeiOS fatal: s5 XB destroy\r\n");
+            if (vm_s3_destroy(XA)!=JE_OK) fail("JeiOS fatal: s5 XA destroy\r\n");
+            if (vm_s3_destroy(XB)!=JE_OK) fail("JeiOS fatal: s5 XB destroy\r\n");
             if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s5 pool leak after teardown\r\n");
             je_arch_console_write("M3c-s5: cross-table capability transfer OK (XA mints C, transfers C.e1 to XB via the kernel send/recv cap FORWARDERS over seeded S; XB mints it in its OWN table and messages XA on c0 across tables); S+C reclaimed. [syscall-decode/copy layer exercised by test_syscall decode + hosted tests; ring-3 two-process transfer deferred to step 7]\r\n");
         }
@@ -984,7 +1052,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (cstat!=0u) fail("JeiOS fatal: s6 create status != 0\r\n");
             if (rstat!=14u) fail("JeiOS fatal: s6 recv status != TIMED_OUT(14)\r\n");
             if (je_sched_drop_user(&vm_s3, R)!=JE_OK) fail("JeiOS fatal: s6 drop_user\r\n");
-            if (je_vm_destroy(&vm_s3, R)!=JE_OK) fail("JeiOS fatal: s6 destroy\r\n");
+            if (vm_s3_destroy(R)!=JE_OK) fail("JeiOS fatal: s6 destroy\r\n");
             if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s6 pool leak after teardown\r\n");
             je_arch_console_write("M3c-s6: blocking recv TIMED_OUT end-to-end (ring-3 thread parked, timer ISR stamped the terminal transition, continuation resumed with status 14, waiter released, channel reclaimed). [WOKEN/PEER_CLOSED/CANCELLED proven in the pure hosted tests + arbitrate CAS; the full two-process ring-3 WOKEN handshake rides on step 7's bootstrap fixture]\r\n");
         }
@@ -1101,12 +1169,163 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (je_endpoint_kernel_allocated()!=0u) fail("JeiOS fatal: s7 pool leak after teardown\r\n");
             je_arch_console_write("M3c-s7: bootstrap fixture OK (two ring-3 processes, kernel-seeded channel; B parked -> A's cap-carrying send WOKE it via the continuation; B minted the transferred end; A closed c1 BEFORE B used the mint; B's post-close send reached A's c0 (retained ownership); 4-round ping-pong; DONE teardown; both exited 0; pool reclaimed). The step-5 two-process transfer AND step-6 two-process WOKEN deferrals are now discharged end-to-end.\r\n");
         }
+        /* --- M4b-s1: PROCESS record status and typed dispatch. B exits first;
+         * A owns two PROCESS handles with different rights. The bootstrap reaps
+         * B between A's two status calls, proving the record outlives its VM slot. */
+        {
+            if (process_pool.used_count != 0u)
+                fail("JeiOS fatal: M4b process baseline\r\n");
+            uint32_t child = vm_s3_build_quota(PROG_PROC_EXIT7, JE_EP_CHILD_QUOTA_MAX);
+            uint32_t parent = vm_s3_build_quota(PROG_M4B, 1u);
+            je_handle inspect_kill = 0u, kill_only = 0u;
+            uint64_t mint_flags = je_arch_irq_save();
+            je_status mint_a = je_process_handle_mint(
+                &vm_s3, parent, vm_s3_proc_ids[child],
+                JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL, &inspect_kill);
+            je_status mint_b = je_process_handle_mint(
+                &vm_s3, parent, vm_s3_proc_ids[child], JE_ABI_RIGHT_KILL,
+                &kill_only);
+            je_arch_irq_restore(mint_flags);
+            if (mint_a != JE_OK || mint_b != JE_OK)
+                fail("JeiOS fatal: M4b process handle mint\r\n");
+            vm_s3_scratch_write(parent, 0x1600u, inspect_kill);
+            vm_s3_scratch_write(parent, 0x1608u, kill_only);
+            /* Baseline sampled BEFORE the child can run (round-4 review nit). */
+            uint64_t child_pool_flags = je_arch_irq_save();
+            uint32_t child_pool_before = je_endpoint_kernel_allocated();
+            je_arch_irq_restore(child_pool_flags);
+            if (je_thread_create_user(&vm_s3, child) != JE_OK)
+                fail("JeiOS fatal: M4b child thread\r\n");
+            bool child_quota_checked = false;
+            for (uint64_t child_spins = 0u; ; ) {
+                uint32_t child_state = JE_PROC_FREE;
+                uint32_t child_reason = 0u;
+                uint64_t child_code = 0u;
+                uint64_t child_flags = je_arch_irq_save();
+                je_status child_status = je_proc_status(
+                    &process_pool, vm_s3_proc_ids[child], &child_state,
+                    &child_reason, &child_code);
+                je_arch_irq_restore(child_flags);
+                if (child_status != JE_OK)
+                    fail("JeiOS fatal: M4b child status\r\n");
+                if (child_state == JE_PROC_DYING && !child_quota_checked) {
+                    if (vm_s3_scratch(child, 0x1768u) != 7u)
+                        fail("JeiOS fatal: M4b child endpoint quota not H_QUOTA\r\n");
+                    child_pool_flags = je_arch_irq_save();
+                    uint32_t child_pool_after = je_endpoint_kernel_allocated();
+                    je_arch_irq_restore(child_pool_flags);
+                    if (child_pool_after != child_pool_before)
+                        fail("JeiOS fatal: M4b child quota changed endpoint pool\r\n");
+                    child_quota_checked = true;
+                }
+                if (child_state == JE_PROC_DEAD) {
+                    if (!child_quota_checked)
+                        fail("JeiOS fatal: M4b child reaped before quota probe\r\n");
+                    break;
+                }
+                if (child_state != JE_PROC_LIVE && child_state != JE_PROC_DYING)
+                    fail("JeiOS fatal: M4b child reached invalid state\r\n");
+                if (++child_spins > 100000000ull)
+                    fail("JeiOS fatal: M4b child did not exit\r\n");
+                je_kernel_idle_step();
+            }
+            if (je_thread_create_user(&vm_s3, parent) != JE_OK)
+                fail("JeiOS fatal: M4b parent thread\r\n");
+            for (uint64_t parent_progress_spins = 0u; ; ) {
+                /* Lead fix (round-4 review, Claude P3): read progress and the record
+                 * status in ONE IF=0 section. Otherwise the parent can write progress
+                 * 1 and exit between the two reads, and a correct run is reported as
+                 * "died before progress 1". */
+                uint32_t parent_state = JE_PROC_FREE;
+                uint32_t parent_reason = 0u;
+                uint64_t parent_code = 0u;
+                uint64_t parent_flags = je_arch_irq_save();
+                uint64_t progress = vm_s3_scratch(parent, 0x1610u);
+                je_status parent_status = je_proc_status(
+                    &process_pool, vm_s3_proc_ids[parent], &parent_state,
+                    &parent_reason, &parent_code);
+                je_arch_irq_restore(parent_flags);
+                if (progress == 99u) fail("JeiOS fatal: M4b parent assertion\r\n");
+                if (progress >= 1u) break;
+                (void)parent_reason;
+                (void)parent_code;
+                if (parent_status != JE_OK)
+                    fail("JeiOS fatal: M4b parent record invalid before progress 1\r\n");
+                if (parent_state == JE_PROC_DYING || parent_state == JE_PROC_DEAD)
+                    fail("JeiOS fatal: M4b parent died before progress 1\r\n");
+                if (++parent_progress_spins > 100000000ull)
+                    fail("JeiOS fatal: M4b parent did not reach progress 1\r\n");
+                je_kernel_idle_step();
+            }
+            for (uint64_t parent_progress_spins = 0u; ; ) {
+                /* Lead fix (round-4 review, Claude P3): read progress and the record
+                 * status in ONE IF=0 section. Otherwise the parent can write progress
+                 * 2 and exit between the two reads, and a correct run is reported as
+                 * "died before progress 2". */
+                uint32_t parent_state = JE_PROC_FREE;
+                uint32_t parent_reason = 0u;
+                uint64_t parent_code = 0u;
+                uint64_t parent_flags = je_arch_irq_save();
+                uint64_t progress = vm_s3_scratch(parent, 0x1610u);
+                je_status parent_status = je_proc_status(
+                    &process_pool, vm_s3_proc_ids[parent], &parent_state,
+                    &parent_reason, &parent_code);
+                je_arch_irq_restore(parent_flags);
+                if (progress == 99u) fail("JeiOS fatal: M4b post-reap assertion\r\n");
+                if (progress >= 2u) break;
+                (void)parent_reason;
+                (void)parent_code;
+                if (parent_status != JE_OK)
+                    fail("JeiOS fatal: M4b parent record invalid before progress 2\r\n");
+                if (parent_state == JE_PROC_DYING || parent_state == JE_PROC_DEAD)
+                    fail("JeiOS fatal: M4b parent died before progress 2\r\n");
+                if (++parent_progress_spins > 100000000ull)
+                    fail("JeiOS fatal: M4b parent did not reach progress 2\r\n");
+                je_kernel_idle_step();
+            }
+            uint32_t parent_death_state = JE_PROC_FREE;
+            uint32_t parent_death_reason = 0u;
+            uint64_t parent_death_code = 0u;
+            for (uint64_t parent_death_spins = 0u; ; ) {
+                uint64_t parent_flags = je_arch_irq_save();
+                je_status parent_status = je_proc_status(
+                    &process_pool, vm_s3_proc_ids[parent], &parent_death_state,
+                    &parent_death_reason, &parent_death_code);
+                je_arch_irq_restore(parent_flags);
+                if (parent_status != JE_OK)
+                    fail("JeiOS fatal: M4b parent record unavailable before reap\r\n");
+                if (parent_death_state == JE_PROC_DYING) break;
+                if (parent_death_state == JE_PROC_DEAD)
+                    fail("JeiOS fatal: M4b parent reaped before death snapshot\r\n");
+                if (parent_death_state != JE_PROC_LIVE)
+                    fail("JeiOS fatal: M4b parent reached invalid death state\r\n");
+                if (++parent_death_spins > 100000000ull)
+                    fail("JeiOS fatal: M4b parent did not reach DYING\r\n");
+                je_kernel_idle_step();
+            }
+            if (parent_death_reason != JE_DEATH_EXIT || parent_death_code != 0u)
+                fail("JeiOS fatal: M4b parent death was not EXIT(0)\r\n");
+            uint64_t parent_spins = 0u;
+            for (;;) {
+                uint64_t used_flags = je_arch_irq_save();
+                uint32_t used = process_pool.used_count;
+                je_arch_irq_restore(used_flags);
+                if (used == 0u) break;
+                if (++parent_spins > 100000000ull)
+                    fail("JeiOS fatal: M4b parent did not reap\r\n");
+                je_kernel_idle_step();
+            }
+            if (je_endpoint_kernel_allocated() != 0u || process_pool.used_count != 0u)
+                fail("JeiOS fatal: M4b pool baseline not restored\r\n");
+            je_arch_console_write("M4b-s1: endpoint creation quota/charge release OK\r\n");
+            je_arch_console_write("M4b-s1: PROCESS record status/typed dispatch OK (Dying/Dead, rights, attenuation, stale close, endpoint query/dup)\r\n");
+        }
         /* M3c leaves no VM process intentionally live: B was torn down before
          * the cross-table, timeout, and bootstrap proofs. */
         vm_s3_assert_all_free("JeiOS fatal: M3c vm process leak\r\n");
     }
 
     je_arch_console_write("JeiOS: initialization complete; halted\r\n");
-    je_arch_halt();
+    for (;;) je_kernel_idle_step();
 }
 

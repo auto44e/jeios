@@ -9,6 +9,10 @@
 #include <jeios/endpoint_kern.h>
 #include <jeios/sched.h>   /* je_sched_wake_ipc for the blocking-recv bridge */
 #include <jeios/arch.h>
+#include <jeios/abi.h>
+
+_Static_assert(JE_EP_PROCESS_OBJ_TYPE == JE_ABI_OBJ_PROCESS,
+               "PROCESS object type must match the ABI");
 
 /* ADR 0010 D2 endpoint pool formula (needs both vm.h and endpoint.h). */
 _Static_assert(JE_EP_POOL_CAP >= 2u * (JE_VM_MAX_PROCESSES - 1u) + JE_BROKER_MAX + 1u + 2u
@@ -24,6 +28,12 @@ static bool g_kep_inited;
 static void kep_init_once(void)
 {
     if (!g_kep_inited) { je_endpoint_pool_init(&g_kep); g_kep_inited = true; }
+}
+
+void je_endpoint_kern_set_proc_pool(je_proc_pool *procs)
+{
+    kep_init_once();
+    g_kep.procs = procs;
 }
 /* Forward decl: peer-close wake helper (defined with the bridge functions). */
 static void kern_peer_close_wake(je_ep_channel *rec, uint8_t side);
@@ -50,6 +60,15 @@ static void kep_teardown(void *ctx, je_handle_table *t)
     }
 }
 
+bool je_endpoint_kern_is_wired(const je_vm *vm)
+{
+    return vm != (const je_vm *)0
+        && vm->teardown == kep_teardown
+        && vm->teardown_ctx == &g_kep
+        && vm->irq_save != (uint64_t (*)(void))0
+        && vm->irq_restore != (void (*)(uint64_t))0;
+}
+
 void je_endpoint_kern_install(je_vm *vm)
 {
     if (!vm) return;
@@ -71,14 +90,33 @@ je_ep_status je_endpoint_kern_create(je_vm *vm, uint32_t index,
      * death path will not reclaim it atomically. Require the FULL wiring — the
      * teardown hook AND the IRQ critical-section pair — not just the hook, so a
      * partially-wired vm cannot mint without the A3-1 critical section. */
-    if (vm->teardown != kep_teardown || vm->teardown_ctx != &g_kep
-        || vm->irq_save == (uint64_t (*)(void))0
-        || vm->irq_restore == (void (*)(uint64_t))0)
+    if (!je_endpoint_kern_is_wired(vm))
         return JE_EP_CORRUPT;
     kep_init_once();
     je_handle_table *t = &vm->procs[index].htable;
-    return je_endpoint_channel_create(&g_kep, t, JE_EP_RIGHTS_ALL,
-                                      t, JE_EP_RIGHTS_ALL, out0, out1);
+    je_proc_id creator = JE_PROC_ID_NONE;
+    extern je_status je_sched_current_proc_id(je_proc_id *out);
+    extern je_status je_sched_current_user(je_vm **out_vm, uint32_t *out_index);
+    je_vm *caller_vm = (je_vm *)0;
+    uint32_t caller_index = 0u;
+    if (je_sched_current_user(&caller_vm, &caller_index) == JE_OK) {
+        if (caller_vm != vm || caller_index != index
+            || je_sched_current_proc_id(&creator) != JE_OK
+            || creator.gen == 0u)
+            return JE_EP_CORRUPT;
+    }
+    return je_endpoint_channel_create_by(&g_kep, creator, t, JE_EP_RIGHTS_ALL,
+                                         t, JE_EP_RIGHTS_ALL, out0, out1);
+}
+
+je_ep_status je_endpoint_kern_dup(je_vm *vm, uint32_t index, je_handle src,
+                                  uint32_t rights, je_handle *out)
+{
+    if (out) *out = 0u;
+    if (!vm || index >= JE_VM_MAX_PROCESSES || !out) return JE_EP_BADINDEX;
+    if (!je_endpoint_kern_is_wired(vm)) return JE_EP_CORRUPT;
+    kep_init_once();
+    return je_endpoint_handle_dup(&g_kep, &vm->procs[index].htable, src, rights, out);
 }
 
 je_ep_status je_endpoint_kern_close(je_vm *vm, uint32_t index, je_handle h)
@@ -250,9 +288,7 @@ je_ep_status je_endpoint_kern_seed(je_vm *vm, uint32_t idxA, uint32_t idxB,
         || idxA == idxB || !outA || !outB) return JE_EP_BADINDEX;
     /* A5-4: both VMs must be hooked so the seeded ends are on a reclaiming death
      * path (the raw channel_create bypasses op-10's A3-2 hook check). */
-    if (vm->teardown != kep_teardown || vm->teardown_ctx != &g_kep
-        || vm->irq_save == (uint64_t (*)(void))0
-        || vm->irq_restore == (void (*)(uint64_t))0) return JE_EP_CORRUPT;
+    if (!je_endpoint_kern_is_wired(vm)) return JE_EP_CORRUPT;
     kep_init_once();
     return je_endpoint_channel_create(&g_kep, &vm->procs[idxA].htable,
                                       JE_EP_RIGHTS_ALL,

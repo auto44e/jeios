@@ -7,6 +7,7 @@
 #include <jeios/vm.h>
 #include <jeios/endpoint.h>
 #include <jeios/endpoint_kern.h>   /* je_endpoint_kern_waiter_release_by_id */
+#include <jeios/proc.h>
 #define STACK_PAGES 5u
 /* M3c A6-CLARIFY-1: the fixed length of the `int 0x80` syscall gate instruction
  * (`CD 80`), rewound on park so the woken thread re-executes it. Architecturally
@@ -47,16 +48,75 @@ typedef struct {
     uint64_t wait_rdi, wait_rsi, wait_rdx, wait_r8, wait_r9;
     uint64_t wait_deadline;      /* absolute tick; 0 = no deadline (shouldn't park) */
     uint64_t wait_post_int_rip;  /* f->rip at park (the instruction after int 0x80) */
+    je_proc_id proc_id;          /* PROCESS identity, or NONE for legacy callers */
 } thread;
 /* Death reasons (M3a #5). FAULT: synchronous user fault. EXIT: clean exit(code).
  * BAD_RETURN: a user frame failed je_uframe_check (invalid return state). */
-typedef enum { DEATH_FAULT = 0, DEATH_EXIT = 1, DEATH_BAD_RETURN = 2 } death_reason;
+typedef enum { DEATH_FAULT = 0, DEATH_EXIT = 1, DEATH_BAD_RETURN = 2,
+               DEATH_KILLED = 3 } death_reason;
 static thread threads[JE_THREAD_MAX];
+static je_proc_pool *process_pool;
+static je_vm *registered_vm[JE_VM_MAX_PROCESSES];
+static je_proc_id registered_proc[JE_VM_MAX_PROCESSES];
 static unsigned current;
 static bool ready;
 static uint64_t preemptions;
 static uint64_t user_cpl3_dispatches; /* M3a #4 step 3: times a THREAD_USER frame (cs&3==3) was seen */
 volatile uint64_t je_timer_ticks;
+
+void je_sched_set_proc_pool(je_proc_pool *pool)
+{
+    process_pool = pool;
+    for (uint32_t i = 0u; i < JE_VM_MAX_PROCESSES; ++i) {
+        registered_vm[i] = (je_vm *)0;
+        registered_proc[i] = JE_PROC_ID_NONE;
+    }
+}
+
+je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id)
+{
+    if (!process_pool || !vm || index >= JE_VM_MAX_PROCESSES
+        || !je_proc_valid(process_pool, id)
+        || (registered_vm[index] != (je_vm *)0 && registered_vm[index] != vm))
+        return JE_ERR_INVALID;
+    registered_vm[index] = vm;
+    registered_proc[index] = id;
+    return JE_OK;
+}
+
+je_status je_sched_unregister_process(je_vm *vm, uint32_t index)
+{
+    if (!vm || index >= JE_VM_MAX_PROCESSES) return JE_ERR_INVALID;
+    if (registered_vm[index] != vm) return JE_OK;
+    registered_vm[index] = (je_vm *)0;
+    registered_proc[index] = JE_PROC_ID_NONE;
+    return JE_OK;
+}
+
+bool je_sched_has_process(je_vm *vm, uint32_t index)
+{
+    if (!vm || index >= JE_VM_MAX_PROCESSES) return false;
+    for (unsigned i = 1u; i < JE_THREAD_MAX; ++i)
+        if (threads[i].kind == THREAD_USER && threads[i].vm == vm
+            && threads[i].vm_index == index)
+            return true;
+    return false;
+}
+
+je_status je_sched_current_proc_id(je_proc_id *out)
+{
+    if (!out || !ready || threads[current].kind != THREAD_USER
+        || threads[current].proc_id.gen == 0u)
+        return JE_ERR_INVALID;
+    *out = threads[current].proc_id;
+    return JE_OK;
+}
+
+je_proc_pool *je_sched_proc_pool(void)
+{
+    return process_pool;
+}
+
 static _Noreturn void abort_scheduler(void)
 {
     (void)je_arch_irq_save();
@@ -93,8 +153,14 @@ je_status je_thread_create(void (*entry)(void *),void *arg)
     *(uintptr_t *)rsp=(uintptr_t)je_thread_exit;
     je_trap_frame *f=(void *)(rsp-sizeof(*f));
     *f=(je_trap_frame){.rip=(uintptr_t)trampoline,.cs=8,.rflags=0x202,.rsp=rsp,.ss=16};
-    threads[slot]=(thread){READY,f,entry,arg,base,0,0,THREAD_KERNEL,0,0,0,0,0,0,0,0,0,0,0,
-                           false,0,0,0,0,0,0,0,0,0};
+    threads[slot] = (thread){0};
+    threads[slot].state = READY;
+    threads[slot].frame = f;
+    threads[slot].entry = entry;
+    threads[slot].argument = arg;
+    threads[slot].stack = base;
+    threads[slot].kind = THREAD_KERNEL;
+    threads[slot].proc_id = JE_PROC_ID_NONE;
     return JE_OK;
 }
 
@@ -129,8 +195,26 @@ je_status je_thread_create_user(je_vm *vm, uint32_t index)
     f->rip = JE_VM_ARENA_BASE + p->entry;
     f->rsp = JE_VM_ARENA_BASE + JE_VM_ARENA_SIZE;
     f->rflags = 0x202u; /* IF=1, bit1; validator re-sanitizes on every dispatch */
-    threads[slot]=(thread){READY,f,0,0,0,0,0,THREAD_USER,p->root,rsp0_top,vm,index,0,0,0,0,0,0,0,
-                           false,0,0,0,0,0,0,0,0,0};
+    threads[slot] = (thread){0};
+    threads[slot].state = READY;
+    threads[slot].frame = f;
+    threads[slot].kind = THREAD_USER;
+    threads[slot].root = p->root;
+    threads[slot].rsp0_top = rsp0_top;
+    threads[slot].vm = vm;
+    threads[slot].vm_index = index;
+    threads[slot].proc_id = JE_PROC_ID_NONE;
+    if (registered_vm[index] == vm && registered_proc[index].gen != 0u) {
+        threads[slot].proc_id = registered_proc[index];
+        uint64_t flags = je_arch_irq_save();
+        je_status link = je_proc_link(process_pool, threads[slot].proc_id, slot, index);
+        je_arch_irq_restore(flags);
+        if (link != JE_OK) {
+            (void)je_arch_page_restore((uintptr_t)kbase);
+            threads[slot] = (thread){0};
+            return JE_ERR_INVALID;
+        }
+    }
     return JE_OK;
 }
 /* M3a #4 step 4: mark a user thread DYING with a death record (never requeued;
@@ -144,6 +228,10 @@ static void mark_dying(unsigned slot, death_reason reason, uint64_t code,
      * (keyed on the thread slot = waiter_id). Safe no-op if the thread held none.
      * This is the one site that RELEASES; the reaper only asserts it is clear. */
     (void)je_endpoint_kern_waiter_release_by_id((uint32_t)slot);
+    if (threads[slot].proc_id.gen != 0u
+        && je_proc_on_dying(process_pool, threads[slot].proc_id,
+                            (uint32_t)reason, code) != JE_OK)
+        abort_scheduler();
     threads[slot].wait_pending=false;
     threads[slot].state=DYING;
     threads[slot].frame=0;
@@ -446,6 +534,7 @@ je_status je_sched_drop_user(je_vm *vm, uint32_t index)
                 je_status s=je_arch_page_restore((uintptr_t)kbase);
                 if (s!=JE_OK) return s;
             }
+            (void)je_sched_unregister_process(vm, index);
             threads[i]=(thread){0};
             return JE_OK;
         }
@@ -476,13 +565,24 @@ int je_sched_reap_dead(void)
         if (threads[i].root==active_cr3) return (int)JE_ERR_BUSY;    /* still the live address space */
         if (threads[i].rsp0_top==active_rsp0) return (int)JE_ERR_BUSY; /* still the live kernel stack */
         je_vm *vm=threads[i].vm; uint32_t idx=threads[i].vm_index;
+        je_proc_id proc_id = threads[i].proc_id;
         je_status s=je_sched_drop_user(vm, idx); /* restores the kstack guard, clears the slot */
         if (s!=JE_OK) return (int)s;
         s=je_vm_destroy(vm, idx);                /* frees the held kstack run + page tables */
-        if (s!=JE_OK) return (int)s;
+        if (s!=JE_OK) abort_scheduler();
+        if (proc_id.gen != 0u
+            && je_proc_on_reaped(process_pool, proc_id) != JE_OK)
+            abort_scheduler();
         ++reaped;
     }
     return reaped;
+}
+
+void je_kernel_idle_step(void)
+{
+    (void)je_arch_irq_save();
+    if (je_sched_reap_dead() < 0) abort_scheduler();
+    __asm__ volatile("sti; hlt":::"memory");
 }
 
 /* M3a #4 step 4 proof accessors: whether a DYING user slot exists and its death

@@ -44,6 +44,7 @@
  *   >> acceptable invariant and is why create stays kernel-only until then.
  */
 #include <jeios/handle.h>
+#include <jeios/proc.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -59,6 +60,10 @@
 #define JE_EP_CHILD_QUOTA_MAX 0u  /* M4: spawned children create no channels (D-DEV) */
 #define JE_EP_RESERVE        1u
 /* The D2 pool formula is asserted in endpoint_kern.c (it needs vm.h's P). */
+/* PROCESS handle-slot type, used by the typed release walk in endpoint.c. It must
+ * equal JE_ABI_OBJ_PROCESS; endpoint_kern.c asserts that. It is a literal here so the
+ * pure endpoint layer stays free of ABI includes. */
+#define JE_EP_PROCESS_OBJ_TYPE 3u
 _Static_assert(JE_BROKER_MAX <= 6u, "ADR 0010 D11 broker bound");
 #define JE_EP_QUEUE_DEPTH   4u    /* messages per end inbound queue */
 #define JE_EP_MAX_WAITERS   2u    /* waiters per end (unused this PR) */
@@ -206,6 +211,7 @@ typedef struct {
     bool     allocated;      /* record is in use */
     uint32_t generation;     /* bumped on free; internal only */
     je_ep_end end[2];
+    je_proc_id creator;      /* ADR 0010 D-DEV: charged identity, or NONE */
 } je_ep_channel;
 
 /* The pool. Caller-supplied storage (hostable): the kernel owns one static
@@ -213,10 +219,13 @@ typedef struct {
 typedef struct {
     je_ep_channel rec[JE_EP_POOL_CAP];
     uint32_t      allocated_count;  /* live records (accounting) */
+    je_proc_pool *procs;            /* ADR 0010 D-DEV: NULL = charging disabled */
 } je_endpoint_pool;
 
 /* Initialize a pool: every record FREE, generation 1 (never 0), counts zero.
  * MUST be called once per pool lifetime. */
+/* procs is set to NULL (charging disabled). Assign pool->procs after init to enable
+ * ADR 0010 D-DEV charging. */
 void je_endpoint_pool_init(je_endpoint_pool *pool);
 
 /* ---- Create (KERNEL-ONLY; no ring-3 route exists in this PR). ------------- */
@@ -232,6 +241,26 @@ je_ep_status je_endpoint_channel_create(je_endpoint_pool *pool,
                                         je_handle_table *t0, uint32_t rights0,
                                         je_handle_table *t1, uint32_t rights1,
                                         je_handle *out0, je_handle *out1);
+
+/* ADR 0010 D-DEV: identical to je_endpoint_channel_create, but the new record is
+ * charged to `creator` against pool->procs (je_proc_charge). Order:
+ *   1. find a free record (none -> NOSLOTS; nothing charged);
+ *   2. charge (at quota -> JE_EP_QUOTA; an invalid, stale or non-LIVE creator ->
+ *      JE_EP_INVALID; either way nothing is allocated or minted) [Claude A2];
+ *   3. mint both ends (a failure unwinds the record AND uncharges);
+ *   4. on success, record->creator = creator if the record was charged, otherwise
+ *      NONE (pool->procs NULL or creator NONE) [Claude A4, Codex P2-4].
+ * JE_EP_QUOTA deliberately covers BOTH "creator at creation quota" and "table
+ * live-slot quota". Both reach ring 3 as H_QUOTA, as ADR 0010 says: no new
+ * statuses [Claude A3].
+ * When the record is later freed, it uncharges `creator` exactly once (je_proc_uncharge
+ * checks the identity). creator NONE, or pool->procs NULL -> uncharged: the existing
+ * behaviour, used by the kernel fixture seed. je_endpoint_channel_create(...) ==
+ * je_endpoint_channel_create_by(pool, JE_PROC_ID_NONE, ...). */
+je_ep_status je_endpoint_channel_create_by(je_endpoint_pool *pool, je_proc_id creator,
+                                           je_handle_table *t0, uint32_t rights0,
+                                           je_handle_table *t1, uint32_t rights1,
+                                           je_handle *out0, je_handle *out1);
 
 /* ---- The endpoint-aware handle seam over the pure table. ------------------ */
 /* Close ONE endpoint handle: resolve it as an endpoint, invalidate the table
