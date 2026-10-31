@@ -805,6 +805,23 @@ choice and this scan is insufficient. Revisit trigger: any of (a) a watchdog/
 rescue path added, (b) reaping moved off a single slot-0 context, (c) a
 requirement to observe loss before the next monitor iteration.
 
+**Success-vs-loss signalling, and a planned second mechanism (owner, 2026-10-31).**
+Because a clean supervisor EXIT also leaves its record non-LIVE, the success path
+reads `phase == JE_SVC_PHASE_DONE` from the report to tell "finished cleanly" from
+"lost". The report therefore sits on the *success* decision (never on the loss
+decision, which stays fail-closed: a missing/garbage report always halts as loss).
+The owner accepted this as the PR-F mechanism and additionally directed that a
+**second, independent success signal be added down the line**: corroborate
+`phase == DONE` with the supervisor's **death record** — `reason == EXIT` and an
+agreed nonzero EXIT code — so success requires BOTH the report phase AND the
+kernel-observed exit, matching the "evidence, not attestation" rule already
+applied to the spoofer (D3 of the PR-F design notes). The report alone is
+untrusted; pairing it with the kernel-side exit code removes the last place a
+buggy/garbage report could, by itself, turn a loss into a reported success.
+Tracked as a follow-up; the `je_svc_report` layout and the EXIT path already carry
+everything needed, so it is additive (no contract change). Revisit trigger: adding
+it, or any change that makes the report the sole success signal.
+
 ### D13. Coding profile and evidence
 
 All M4 kernel code is in the **Critical** profile (CODING_STANDARD:20). So is the
