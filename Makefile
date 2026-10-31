@@ -19,7 +19,7 @@ CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c kernel/
 SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/handle.c kernel/core/endpoint.c kernel/core/endpoint_kern.c kernel/core/proc.c kernel/core/image.c kernel/core/spawn.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
 USER_WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
 USER_CFLAGS := -std=c11 -O2 $(USER_WARN) -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -m64 -march=x86-64 -mcmodel=small -mno-red-zone -mgeneral-regs-only -fno-tree-loop-distribute-patterns -Iuser/include -Iinclude
-USER_LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 -z noexecstack -Wl,--build-id=none -Wl,--orphan-handling=error
+USER_LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 -z noexecstack -Wl,--build-id=none
 USER_OBJECTS := $(BUILD)/user/crt0.o $(BUILD)/user/lib/mem.o $(BUILD)/user/services/hello.o
 USER_IMAGE := $(BUILD)/user/hello.elf
 USER_GENERATED := $(BUILD)/gen/image_c_hello.c

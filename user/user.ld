@@ -35,6 +35,17 @@ SECTIONS
         *(.comment)
         *(.eh_frame*)
         *(.gnu.property)
+        /* Some toolchains emit empty GOT/PLT/IRELATIVE sections even for a
+         * -static -no-pie -fno-pic freestanding link. They carry no entries
+         * here (verified: no dynamic relocations in the image), so discarding
+         * them keeps the three-segment W^X layout and avoids an unplaced-orphan
+         * link error on stricter linkers. If real GOT/PLT entries ever appear
+         * the discard would drop needed relocations -- check_user_image.py and
+         * the kernel validator re-verify segment flags, and a missing symbol
+         * would fault loudly at ring-3 entry. */
+        *(.got) *(.got.plt) *(.igot.plt)
+        *(.plt) *(.plt.*) *(.iplt)
+        *(.rela.*) *(.rel.*)
     }
 }
 
