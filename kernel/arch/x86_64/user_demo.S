@@ -435,8 +435,11 @@ m4c_parent_status_done:
 
     /* Phase 6 brackets every negative PROC_SPAWN below. The kernel takes its
      * baseline and acknowledges with 1b20=1 before these calls begin. */
+    /* Lead fix (verification review P2): no "movq $0, 0x40001b20" here. 1b20 is
+     * already zero, and clearing it after publishing phase 6 could overwrite the
+     * kernel's ack if a timer tick landed between the two stores (lost ack, which
+     * makes a correct run time out). */
     movq $6, 0x40001b10
-    movq $0, 0x40001b20
     movl $0x7fffffff, %ecx
 m4c_parent_negative_wait:
     cmpq $1, 0x40001b20

@@ -1732,6 +1732,26 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (!m4c_baseline_matches(spawner, grant_handles, &baseline))
                 fail("JeiOS fatal: M4c unfired grant baseline\r\n");
 
+            /* Lead fix (Codex mutant #6): prove spawn DISARMS an unfired failpoint at the
+             * end of every call. Arm grant index 1, spawn with only ONE grant (so it
+             * cannot fire), then spawn with TWO grants WITHOUT re-arming. If the
+             * end-of-call disarm were missing, the second spawn would fail at grant 1. */
+            je_spawn_failpoint_set(3u, 1u);
+            je_handle disarm_a = 0u;
+            if (je_proc_spawn(&vm_s3, spawner, launcher, 0u, valid_grants, 1u, 8u,
+                              JE_EP_CHILD_QUOTA_MAX, &disarm_a) != JE_ABI_OK
+                || disarm_a == 0u || je_spawn_failpoint_fired() != 0u)
+                fail("JeiOS fatal: M4c disarm probe (1 grant)\r\n");
+            m4c_discard_spawn(spawner, disarm_a);
+            je_handle disarm_b = 0u;
+            if (je_proc_spawn(&vm_s3, spawner, launcher, 0u, valid_grants, 2u, 8u,
+                              JE_EP_CHILD_QUOTA_MAX, &disarm_b) != JE_ABI_OK
+                || disarm_b == 0u || je_spawn_failpoint_fired() != 0u)
+                fail("JeiOS fatal: M4c failpoint not disarmed after spawn\r\n");
+            m4c_discard_spawn(spawner, disarm_b);
+            if (!m4c_baseline_matches(spawner, grant_handles, &baseline))
+                fail("JeiOS fatal: M4c disarm probe baseline\r\n");
+
             je_spawn_failpoint_set(9u, 0u);
             je_handle unfired_step = 0u;
             je_abi_status unfired_step_status = je_proc_spawn(
