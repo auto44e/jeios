@@ -1249,3 +1249,13 @@ step 7's subject; a spin-based two-stub proof races the single-CPU cooperative
 scheduler). The wake-on-send and wake-on-peer-close *kernel bridges* are wired and
 compiled; what step 7 adds is the ring-3 *scheduling* of two cooperating user
 processes to drive them end-to-end.
+
+## Superseded in part by ADR 0010 (2026-10-30, owner-approved)
+
+[ADR 0010](0010-m4-supervisor-and-devices.md) supersedes three things in this ADR:
+
+- the D1 scope limits "no general supervisor" and "more than two processes" (ADR 0010 D1/D2);
+- the A6-CLARIFY-2 annotation that the forced-kill path is "never in the production ABI": `PROC_KILL` (ADR 0010 D8) uses the same single release owner;
+- the D5 per-process creation quota, which was never implemented in M3c and is recorded as deviation ADR 0010 D-DEV (fixed in M4 PR-B, with its charge-release wording narrowed to the creator's own same-identity PROCESS record: LIVE, DYING or DEAD).
+
+A6-CLARIFY-1 is re-confirmed, not changed. Everything else is unchanged.

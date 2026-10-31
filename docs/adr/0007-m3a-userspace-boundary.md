@@ -386,3 +386,7 @@ ownership/alias/no-W+X, the exact-site fixup) is **firm** — it is the tested
 contract later ports must reproduce, not relax. Notably the D-level fixup design
 (exact-RIP keyed) is referenced by the ARM64 MP1 D5-3 trap frame (ELR-keyed), so a
 change here ripples cross-arch and needs a new ADR + owner sign-off.
+
+## Superseded in part by ADR 0010 (2026-10-30, owner-approved)
+
+[ADR 0010](0010-m4-supervisor-and-devices.md) widens D1 in three ways: the **process count** (2 to a measured M4 capacity, ADR 0010 D2), a ring-3 port-I/O device driver, and kernel-owned IRQ3 delivery (ADR 0010 D9). The security shape (D2, D3, D6, D8) is unchanged, and ADR 0010 maps no MMIO or shared memory into user space.

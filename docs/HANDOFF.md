@@ -1,5 +1,31 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 contract (#53) — ADR 0010 accepted — observed 2026-10-31T00:02:04+00:00
+
+Repo auto44e/jeios, branch `docs/adr-0010-m4`, based on main `dc41da5`. #52 is CLOSED
+(MP1 complete; remote ARM64 CI observed at `bf2ecd0` and post-merge at `dc41da5`).
+
+- **Implemented:** nothing at runtime. This is a documentation and contract PR.
+  - `docs/adr/0010-m4-supervisor-and-devices.md` (accepted).
+  - Back-pointers added to ADRs 0007, 0008 and 0009.
+  - Transcript `docs/adr/debates/m4-contract.md`: the design debate plus three ADR text-review rounds.
+- **Owner decisions:** D-OWNER-1 through D-OWNER-8 were approved on 2026-10-30. They cover:
+  - the capacity raise;
+  - PROCESS records and automatic reaping;
+  - `PROC_KILL` in the production ABI;
+  - typed `query`/`rights`/`dup`;
+  - the TSS I/O bitmap and kernel-owned IRQ3;
+  - supervisor loss as a fail-stop refusal;
+  - `CLOCK_TICKS`;
+  - recording and fixing the ADR 0009 D5 deviation.
+- **Recorded deviation:** ADR 0009 D5 requires a per-process endpoint creation quota. It was never implemented in M3c. It is fixed in M4 PR-B (ADR 0010 D-DEV).
+- **Tested:** not applicable. No code changed, so no emulator run was needed. `git diff --check` is clean.
+- **Planned:** PR-A through PR-I per ADR 0010 D-SEQ, then MP2 (mobile #2).
+  - **Next bounded task:** PR-A. It raises capacity, adds the per-table handle quota field, measures static sizes and re-baselines the M2/M3 assertions.
+  - **PR-A passes when:** `make check`, `smoke`, `integration`, the three x86 profiles (including 16 MiB) and remote CI are green, and every D2 formula is asserted.
+- **Blocked:** nothing.
+- **Known stale text, deferred:** the `abi.h` comment saying `cap_count` must be 0 (fixed in PR-B). ADR 0009's status line still says "proposed". ROADMAP still has lines saying M3c is in progress.
+
 ## MP1 completion (#52) — DTB parse + ARM64 CI job — observed 2026-10-30T02:29:52+00:00
 
 Repo auto44e/jeios, branch `feat/mp1-dtb-parse`, based on main `5f84ff7`. The full
