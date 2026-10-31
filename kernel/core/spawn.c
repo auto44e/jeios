@@ -24,6 +24,7 @@ typedef struct {
 } je_spawn_failpoint;
 
 static je_spawn_failpoint spawn_failpoint;
+static uint32_t spawn_failpoint_fires;
 
 static je_abi_status spawn_finish(je_abi_status status)
 {
@@ -37,6 +38,7 @@ static bool spawn_failpoint_hit(uint32_t step, uint32_t grant_index)
         || (step == 3u && spawn_failpoint.grant_index != grant_index))
         return false;
     spawn_failpoint = (je_spawn_failpoint){0};
+    spawn_failpoint_fires++;
     return true;
 }
 
@@ -44,9 +46,16 @@ void je_spawn_failpoint_set(uint32_t step, uint32_t grant_index)
 {
     if (step == 0u || step > 5u || grant_index >= JE_ABI_SPAWN_GRANTS_MAX) {
         spawn_failpoint = (je_spawn_failpoint){0};
+        spawn_failpoint_fires = 0u;
     } else {
         spawn_failpoint = (je_spawn_failpoint){step, grant_index};
+        spawn_failpoint_fires = 0u;
     }
+}
+
+uint32_t je_spawn_failpoint_fired(void)
+{
+    return spawn_failpoint_fires;
 }
 
 static je_abi_status endpoint_status_to_abi(je_ep_status status)
