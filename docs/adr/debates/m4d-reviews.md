@@ -93,3 +93,67 @@ Confirmed sound: self-kill, record-based idempotence, `wait_cancel` substitution
   - A1: `is_supervisor` stays true for DYING/DEAD records. Accepted as written.
   - A2: `sched.h` is authoritative. The /tmp code map was a scratch document, not repository text.
   - A3: accepted as written.
+
+## Verification round — Claude (fixture after round 3)
+
+Two findings are not really fixed. The supervisor-guard check can never fail, which also leaves Codex's P1 open. The new EXIT first-reason step races. Everything else checks out. Read-only, AI-assisted review at 84ec10d; nothing was built or run.
+
+## Round-1 findings
+
+| # | Verdict | Evidence |
+|---|---|---|
+| Mine P1-1 (READY check can't fail) | **FIXED** | Reads `0x1e00` and requires it to be above 0 before the gate (`main.c:2032-2043`). Holds heartbeat and `dispatches_of` steady for 0x40 ticks (`main.c:2070-2081`). |
+| Mine P2-1 (reaper race) | **FIXED** | No reaping until phase 3: `m4d_wait_interrupt` at `main.c:2120`; the killer waits for gate 3 after the reap (`user_demo.S:965-969`). |
+| Mine P2-2 (continuation unchecked) | **FIXED** | `0xdead` sentinel, `progress==1` and the dispatch snapshot (`main.c:2108-2113`). Waiter absent, cause NONE and inflight ref back to baseline (`main.c:2096-2101`). The baseline is a real check: register adds a ref and release removes it (`endpoint.c:298/361`). |
+| Mine P2-3 (WOKEN inferred) | **FIXED** | Counter must rise by exactly 1 (`main.c:2201`). It only counts when the released waiter was `cause==WOKEN && head_reserved` (`endpoint_kern.c:312-327`). A timer tick between send and kill is still a flake source, but it can only make the test fail, never pass falsely. |
+| Mine P3-1 (first reason) | **FIXED-BUT-WRONG** | See new P2-B. |
+| Mine P3-2 (DYING re-kill) | **FIXED**, conditional on P2-B | The EXIT victim is not reaped before the killer's kill, so it is DYING then. |
+| Mine P3-3 / Codex P1 (supervisor guard) | **NOT FIXED** (the test can never fail) | See new P1-A. |
+| Mine P3-4 (kernel nits) | **FIXED** | `vm_index` is now cross-checked (`sched.c:720,724`) and the `death_rip` comment is added (`sched.c:729-731`). |
+| Codex P2 (synchronous return) | **PARTIAL** | Checks `killer_dispatches == before+1`, but only for the READY kill (`main.c:2055`). The BLOCKED and WOKEN kills have no such check, yet the smoke marker says "synchronous-return" without qualification. |
+| Codex P3 (BLOCKED waiter release) | **FIXED** | `main.c:2085-2101`, read before any reap. |
+
+## New P1/P2
+
+**P1-A: the supervisor guard check can never fail (`main.c:1900-1906`, `user_demo.S:~1088`).**
+- The supervisor record is LIVE and was never linked to a thread.
+- If `je_proc_is_supervisor` is removed (`sched.c:708-711`), `je_proc_run_link` then fails and returns `JE_ERR_INVALID` (`sched.c:715-718`).
+- That is the same 2 the test expects, and the state stays LIVE. The "supervisor guard" claim in the marker is therefore not proven.
+- Fix: give the supervisor record a real linked thread, so removing the guard would actually kill it. Or add a unit-test check, as Codex proposed.
+
+**P2-B: the EXIT kill races the victim's exit (`main.c:2241-2256`, `user_demo.S:~1060`).**
+- The asm comment says the bootstrap waits until the EXIT victim is DYING. It does, but the killer never waits for that.
+- Right after gate 5, the killer runs the negative cases and then kills `0x1c58`.
+- If the killer is dispatched before the new EXIT victim (it was created last, at the tail of the run queue), the victim is still READY. The kill records KILLED, the killer fails, and the bootstrap times out.
+- This can't produce a false pass, but it can fail, possibly every time depending on queue order.
+- Fix: add a gate 6 that the bootstrap writes after it sees DYING/EXIT.
+
+**P2-C: the synchronous-return check can fail spuriously (`main.c:2035-2045`).**
+- `killer_dispatches_before` is captured, then IRQs are restored, then gate 1 is written.
+- A tick in that gap, or one between the kill and marker 2, gives a count of +2 and a spurious failure. It can only fail, never pass falsely.
+
+**WOKEN counter: something other than a kill can increment it.** It has two callers:
+- `mark_dying` (`sched.c:246`). That path also runs for exit and faults, not only kills.
+- `je_sched_drop_user` (`sched.c:547`). It runs on teardown of a non-dying thread, so tearing down a live thread that is WOKEN with a reservation also increments the counter.
+
+Inside the M4d snapshot window (`main.c:2163-2201`) nothing reaps or drops, and only the killer and the WOKEN victim can die. So the +1 check is sound for this fixture. The counter is not death-only in general, though: its comment and name should say "any release of a WOKEN+reserved waiter", or the drop path should be excluded. It also runs in every build and scans the pool on every thread death with IRQs off. That is bounded, but it is not dev-only.
+
+**Other categories you asked about:**
+- **No reads of a reaped victim:** every `vm_s3_scratch` and `htable` read happens before that victim's reap loop.
+- **No unbounded waits:** every wait is bounded by ticks, and `sti;hlt` is safe because of the one-instruction interrupt shadow.
+- **One unasserted value:** the "exit(42)" code is never checked.
+
+## Lead mutant runs (through `make smoke`, so the ISO is fresh)
+
+| Mutant | Result |
+|---|---|
+| `je_sched_kill` with no `mark_dying` | **killed** (`JeiOS fatal: M4d READY victim resumed after kill`) |
+| Supervisor guard removed | **survived**: the round-2 supervisor case was vacuous, because the record was unlinked and the next check returns the same INVALID. Claude reached the same conclusion independently (P1-A). |
+
+## Lead disposition
+
+- **P1-A and the surviving mutant:** round 4 links the supervisor record to a real thread.
+- **P2-B:** a gate is added and exit code 42 is asserted.
+- **P2-C and Codex P2:** the flaky dispatch-equality check is replaced. The stronger, deterministic proof is that the killer's very next syscall (PROC_STATUS) already reads DYING/KILLED, for every kill state.
+- **WOKEN counter:** its scope comment is corrected in `endpoint_kern.h` (any release path, not kill-only).
+- **pause-poll stall:** its root cause is **not determined**. It is recorded as an open hazard in HANDOFF.
