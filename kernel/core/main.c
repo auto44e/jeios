@@ -23,7 +23,8 @@ extern unsigned je_sched_user_thread_count(void);
 extern void je_kernel_idle_step(void);
 extern void je_endpoint_kern_set_proc_pool(je_proc_pool *pool);
 extern je_status je_process_handle_mint(je_vm *vm, uint32_t index, je_proc_id id,
-                                        uint32_t rights, je_handle *out);
+                                        uint32_t rights, je_handle *out,
+                                        je_handle_status *out_alloc_status);
 static je_boot_context boot;
 static _Noreturn void fail(const char *message)
 {
@@ -1197,10 +1198,11 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             uint64_t mint_flags = je_arch_irq_save();
             je_status mint_a = je_process_handle_mint(
                 &vm_s3, parent, vm_s3_proc_ids[child],
-                JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL, &inspect_kill);
+                JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL, &inspect_kill,
+                (je_handle_status *)0);
             je_status mint_b = je_process_handle_mint(
                 &vm_s3, parent, vm_s3_proc_ids[child], JE_ABI_RIGHT_KILL,
-                &kill_only);
+                &kill_only, (je_handle_status *)0);
             je_arch_irq_restore(mint_flags);
             if (mint_a != JE_OK || mint_b != JE_OK)
                 fail("JeiOS fatal: M4b process handle mint\r\n");
@@ -1370,6 +1372,8 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                         && rec->vm_index < JE_VM_MAX_PROCESSES
                         && i != vm_s3_proc_ids[spawner].index) {
                         if (!child_audited) {
+                            if (je_vm_audit(&vm_s3, rec->vm_index) != JE_OK)
+                                fail("JeiOS fatal: M4c spawned child audit\r\n");
                             if (vm_s3_scratch(rec->vm_index, 0x1830u) == 99u)
                                 fail_m4c_phase("JeiOS fatal: M4c child startup/rights phase=",
                                                rec->vm_index, 0x1b18u);
@@ -1412,14 +1416,6 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                 je_kernel_idle_step();
             }
 
-            uint64_t packed = vm_s3_scratch(spawner, 0x1820u);
-            je_handle source_a = (je_handle)(packed & UINT64_C(0xffffffff));
-            je_handle source_b = (je_handle)(packed >> 32);
-            je_abi_spawn_grant valid_grants[2] = {
-                { (uint32_t)source_a, JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_INSPECT },
-                { (uint32_t)source_b, JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV
-                                     | JE_ABI_RIGHT_INSPECT }
-            };
             uint32_t parent_live = vm_s3.procs[spawner].htable.live;
             size_t baseline_pages = je_kernel_pages.free_count;
             uint32_t baseline_endpoints = je_endpoint_kernel_allocated();
@@ -1428,6 +1424,78 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             uint32_t baseline_vms = 0u;
             for (uint32_t i = 0u; i < JE_VM_MAX_PROCESSES; ++i)
                 if (vm_s3.procs[i].state != JE_VM_FREE) ++baseline_vms;
+
+            /* The ring-3 fixture pauses immediately before the quota-invalid
+             * spawn. Acknowledge only after taking the complete baseline with
+             * IF=0, then verify that the rejected call changed no pool. */
+            uint64_t quota_probe_start = je_sched_ticks();
+            for (;;) {
+                uint64_t quota_probe_flags = je_arch_irq_save();
+                uint64_t quota_phase = vm_s3_scratch(spawner, 0x1b10u);
+                uint64_t quota_death_reason = 0u;
+                uint64_t quota_death_code = 0u;
+                bool quota_spawner_died = je_sched_death_reason(
+                    &vm_s3, spawner, &quota_death_reason,
+                    &quota_death_code) == JE_OK;
+                je_arch_irq_restore(quota_probe_flags);
+                if (quota_phase == 99u)
+                    fail("JeiOS fatal: M4c quota fixture assertion\r\n");
+                if (quota_phase == 9u) {
+                    uint64_t quota_ack_flags = je_arch_irq_save();
+                    vm_s3_scratch_write(spawner, 0x1b20u, 1u);
+                    je_arch_irq_restore(quota_ack_flags);
+                    break;
+                }
+                if (quota_spawner_died)
+                    fail_m4c_phase("JeiOS fatal: M4c spawner died before quota probe phase=",
+                                   spawner, 0x1b10u);
+                if (je_sched_ticks() - quota_probe_start > 200u)
+                    fail_m4c_phase("JeiOS fatal: M4c quota probe timeout phase=",
+                                   spawner, 0x1b10u);
+                je_kernel_idle_step();
+            }
+            uint64_t quota_done_start = je_sched_ticks();
+            for (;;) {
+                uint64_t quota_done_flags = je_arch_irq_save();
+                uint64_t quota_phase = vm_s3_scratch(spawner, 0x1b10u);
+                uint64_t quota_death_reason = 0u;
+                uint64_t quota_death_code = 0u;
+                bool quota_spawner_died = je_sched_death_reason(
+                    &vm_s3, spawner, &quota_death_reason,
+                    &quota_death_code) == JE_OK;
+                je_arch_irq_restore(quota_done_flags);
+                if (quota_phase == 10u) break;
+                if (quota_phase == 99u)
+                    fail("JeiOS fatal: M4c quota fixture assertion\r\n");
+                if (quota_spawner_died)
+                    fail_m4c_phase("JeiOS fatal: M4c spawner died after quota probe phase=",
+                                   spawner, 0x1b10u);
+                if (je_sched_ticks() - quota_done_start > 200u)
+                    fail_m4c_phase("JeiOS fatal: M4c quota probe completion timeout phase=",
+                                   spawner, 0x1b10u);
+                je_kernel_idle_step();
+            }
+            if (je_kernel_pages.free_count != baseline_pages
+                || je_endpoint_kernel_allocated() != baseline_endpoints
+                || process_pool.used_count != baseline_records
+                || vm_s3.procs[spawner].htable.live != parent_live
+                || je_sched_user_thread_count() != baseline_threads)
+                fail("JeiOS fatal: M4c quota-invalid spawn changed baseline\r\n");
+            uint32_t quota_vms = 0u;
+            for (uint32_t i = 0u; i < JE_VM_MAX_PROCESSES; ++i)
+                if (vm_s3.procs[i].state != JE_VM_FREE) ++quota_vms;
+            if (quota_vms != baseline_vms)
+                fail("JeiOS fatal: M4c quota-invalid VM baseline\r\n");
+            vm_s3_scratch_write(spawner, 0x1b20u, 2u);
+
+            uint64_t packed = vm_s3_scratch(spawner, 0x1820u);
+            je_handle source_a = (je_handle)(packed & UINT64_C(0xffffffff));
+            je_handle source_b = (je_handle)(packed >> 32);
+            je_abi_spawn_grant valid_grants[2] = {
+                { (uint32_t)source_a, JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_INSPECT },
+                { (uint32_t)source_b, JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV
+                                     | JE_ABI_RIGHT_INSPECT }
+            };
 
             uint64_t fail_matrix_flags = je_arch_irq_save();
             for (uint32_t step = 1u; step <= 5u; ++step) {
@@ -1533,7 +1601,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             }
             if (je_endpoint_kernel_allocated() != 0u || process_pool.used_count != 0u)
                 fail("JeiOS fatal: M4c final pool baseline\r\n");
-            je_arch_console_write("M4c-s1: spawn/LAUNCHER/startup-v1/CLOCK_TICKS OK; fail-Nth rollback OK (steps 1-5); spawn ticks=");
+            je_arch_console_write("M4c-s1: spawn/LAUNCHER/startup-v1/CLOCK_TICKS OK; quota-invalid baseline OK; fail-Nth rollback OK (steps 1-5); spawn ticks=");
             je_arch_console_hex(spawn_tick_end - spawn_tick_start);
             je_arch_console_write("\r\n");
         }
