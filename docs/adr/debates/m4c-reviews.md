@@ -183,3 +183,57 @@ No repository edits or `make`/QEMU execution performed. AI review, not human qua
 
 - **All of Claude's core round-1 items are FIXED.** P3-6 (no audit inside spawn) is recorded as a deliberate deviation: spawn runs at IF=0 and the audit is O(N²·pages), so the fixture audits the child afterwards.
 - **Fixture findings (Claude P2-A/B/C and P3s), plus Codex's three uncaught mutants (unfired-failpoint disarm, published handle rights, validation order): all accepted and sent to Codex round 4.** The flake risks are fixed by synchronised IF=0 baselines. The marker is narrowed to exactly what is proven.
+
+## Verification round — Claude (fixture after round 4)
+
+**Verdict:** 12 of 14 items are fixed. P3-8 is unchanged (it was harmless), and Codex #6 is still not caught. I found one new P2: a race in the phase-6 handshake that can fail a correct run but never pass a broken one. No new P1s. This is an AI review, read-only; I did not run `make` or QEMU.
+
+### My previous findings
+- **P2-A: FIXED.** Each baseline is now taken with IF=0 at the exact phase point:
+  - `main.c:1575-1580` and `:1599-1606` bracket the phase 6/7 negative spawns.
+  - `main.c:1631-1637` takes the phase-9 baseline before the ack.
+- **P2-B: FIXED.** The kernel waits (bounded) for `phase==8 && hold==1` under IF=0 (`main.c:1683-1690`). IF stays 0 through the matrix, both unfired-failpoint probes and the measured spawn, and is only restored at `:1769`.
+- **P2-C: FIXED.**
+  - Zero-fill: the full GPR OR-check is at `user_demo.S:305-318` for the parent and `:705-718` for the child. R11 is included, so all non-argument GPRs are covered.
+  - Negatives: every negative spawn now checks `RDX==0`. STALE (`:579-592`) and BADINDEX (`:594-604`) cases were added, and SELF moved inside the bracket.
+  - Still missing: a caller-table `H_QUOTA` case and a launcher that lacks SPAWN (unreachable from ring 3). The marker doesn't claim either.
+  - The "stale launcher" is really a closed endpoint DUP. It tests STALE-first precedence, not a stale LAUNCHER object.
+- **P3-1: FIXED.** The child's `0x1b08` zeroing is gone. The `0x1830==99` audit check is still mostly vacuous: the audit runs once `1b18!=0` (`main.c:1534`), so the real proof is still the parent seeing exit code 5.
+- **P3-2: FIXED.** Valid grants are restored before the probe (`user_demo.S:611-616`).
+- **P3-3: FIXED.** The measurement now uses `lfence; rdtsc` (`main.c:374-391`), and the unconditional `sti` was replaced by `irq_restore`.
+- **P3-4: FIXED.** The close must return OK and the record is released once (`main.c:420-423`).
+- **P3-5: FIXED.** Each matrix case checks `fired == 1` (`main.c:1707,1718`).
+- **P3-6: FIXED.** The endpoint `handle_refs` and `inflight_refs` are part of the baseline (`main.c:297-298,310-331`).
+- **P3-7: FIXED.** A non-zero CLOCK_TICKS argument must return INVALID with `RDX==0` (`user_demo.S:378-389`).
+- **P3-8: NOT FIXED.** The `0x1a10`/`0x1a00` overlap is unchanged; it is harmless. Scratch reuse of `0x1898`, `0x18b0`, `0x18c0` and `0x18d0` is likewise sequential and harmless.
+
+### Codex's uncaught mutants
+- **#6 (`spawn_finish` no longer disarms): NOT FIXED.** The fix only proves the failpoint did not fire. It never checks that the failpoint is disarmed afterwards:
+  - The `(3,2)` arm at `main.c:1724` can never fire when n=2.
+  - Every later spawn is preceded by a `set()` (`:1736`, `:1747`, matrix), which disarms or re-arms anyway.
+  - The quota probe's leftover `(1,0)` arm is likewise overwritten by the matrix.
+  - **Fix:** after the phase-10 quota probe, or after an unfired arm, do one direct spawn *without* calling `set()` and require OK with `fired==0`.
+- **#8 (PROCESS handle rights): FIXED.** `main.c:1756-1762` requires exactly `INSPECT|KILL`. `je_proc_spawn` mints the handle internally, so the syscall path is covered too.
+- **#9 (validation order): FIXED.** Step 1 is armed before the INVALID probe (`main.c:1634`), and `main.c:1654-1662` requires INVALID, `fired==0` and an unchanged baseline. If the check moved after VM construction, step 1 (`spawn.c:174`) would fire and return NOSLOTS, so the mutant is caught.
+
+### New finding
+**P2: lost-ack race at phase 6 (TOCTOU).**
+- `user_demo.S:438-439` stores `1b10=6` and then `1b20=0`.
+- If the timer preempts the parent between those two stores, the kernel sees phase 6, takes the baseline and acks `1b20=1` (`main.c:1578`).
+- The parent then resumes and overwrites the ack with 0.
+- The run then fails spuriously: the parent's ring-3 spin (bounded at `0x7fffffff`) gives up, or the kernel's phase-7 wait times out after 200 ticks (`main.c:1622`).
+- It cannot produce a false pass. The store is redundant, because `1b20` is already zeroed at `:324`.
+- **Fix:** delete `:439`, or move it before the phase store.
+
+### Checked and sound
+- Every new wait is bounded: kernel waits use 200 ticks, ring-3 waits use `ecx` counters.
+- The phase-8 path writes `1b20=0` before `phase=8` / `hold=1`, so that handshake has no race.
+- Each part of the marker (`smoke.py:26`) is backed by a check, except the unchecked disarm (#6), which it doesn't name.
+
+## Lead disposition (lead-authored fixes, `53ab125`)
+
+- **Phase-6 lost-ack race (P2): fixed by the lead.** The redundant store that cleared 1b20 after phase 6 was published is removed, because a timer tick between the two stores could overwrite the kernel's ack.
+- **Codex mutant #6 (end-of-call disarm removed) was still uncaught: fixed by the lead.** The new probe arms grant index 1, spawns with 1 grant (so it cannot fire), then spawns with 2 grants without re-arming.
+- **Mutant actually run.** The lead built the mutant in a scratch worktree. The first attempt booted a **stale ISO**: `make all` does not rebuild `build/0/jeios.iso`, so the mutant appeared to survive. Re-run through `make smoke`, which rebuilds it, the mutant fails as intended with `JeiOS fatal: M4c failpoint not disarmed after spawn`. Lesson recorded: mutant and profile runs must go through `make smoke` (or rebuild the ISO) before calling `tools/smoke.py` directly.
+- **Left as is:** P3-8 (sequential scratch reuse, harmless). Two cases are unreachable from ring 3 and the marker does not claim them: a launcher without SPAWN, and a caller-table H_QUOTA. The "stale launcher" negative is a closed endpoint handle, so it tests STALE-first precedence, not a stale LAUNCHER object.
+- **Not peer-reviewed:** these last two lead edits. They were verified by the full sweep plus the mutant run.
