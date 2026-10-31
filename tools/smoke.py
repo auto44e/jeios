@@ -24,7 +24,7 @@ if args.expect_nx:
         expected.append(b"M4b-s1: endpoint creation quota/charge release OK")
         expected.append(b"M4b-s1: PROCESS record status/typed dispatch OK")
         expected.append(b"M4c-s1: spawn/LAUNCHER/startup-v1/CLOCK_TICKS OK; negative baselines OK; quota validation order OK; fail-Nth rollback OK (steps 1-5); spawn cycles=")
-        expected.append(b"M4d-s1: PROC_KILL OK (READY, BLOCKED_IPC, WOKEN-reserved, EXIT first-reason, supervisor guard, self/after-death/unlinked/rights, synchronous-return)")
+        expected.append(b"M4d-s1: PROC_KILL OK (READY, BLOCKED_IPC, WOKEN-reserved, EXIT first-reason, supervisor guard, self/after-death/unlinked/rights, next-syscall PROC_STATUS)")
 print(boot(args.image, cpu=args.cpu, memory=args.memory, expected=expected))
 print("QEMU smoke: PASS")
 
