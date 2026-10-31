@@ -305,6 +305,8 @@ je_user_m4c_start:
     movq %rdi, 0x40001800
     movq %rsi, 0x40001808
     movq %rdx, 0x40001810
+    movq $1, 0x40001b10
+    movq $0, 0x40001b08
     cmpq $1, 0x40001800
     jne m4c_parent_fail
     cmpq $1, 0x40001808
@@ -317,6 +319,7 @@ je_user_m4c_start:
     int $0x80
     movq %rax, 0x40001818
     movq %rdx, 0x40001820
+    movq $2, 0x40001b10
     cmpq $0, %rax
     jne m4c_parent_fail
     movq 0x40001820, %rax
@@ -325,10 +328,10 @@ je_user_m4c_start:
     movl %eax, 0x40001830
     movl 0x40001828, %eax
     movl %eax, 0x40001900
-    movl $2, 0x40001904
+    movl $3, 0x40001904
     movl 0x40001830, %eax
     movl %eax, 0x40001908
-    movl $6, 0x4000190c
+    movl $7, 0x4000190c
 
     movq $14, %rax
     movq 0x40001810, %rdi
@@ -340,6 +343,7 @@ je_user_m4c_start:
     int $0x80
     movq %rax, 0x40001838
     movq %rdx, 0x40001840
+    movq $3, 0x40001b10
     cmpq $0, %rax
     jne m4c_parent_fail
     cmpq $0, 0x40001840
@@ -349,6 +353,7 @@ je_user_m4c_start:
     xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
     movq %rdx, 0x40001848
+    movq $4, 0x40001b10
     movq $13, %rax
     xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
@@ -371,8 +376,10 @@ je_user_m4c_start:
     jne m4c_parent_fail
     cmpb $0x5a, 0x40001a00
     jne m4c_parent_fail
+    movq $5, 0x40001b10
     movq $2, 0x40001b00
 
+    movl $0x01000000, %ecx
 m4c_parent_status:
     movq $15, %rax
     movq 0x40001840, %rdi
@@ -384,7 +391,11 @@ m4c_parent_status:
     jne m4c_parent_fail
     movl 0x40001a10, %eax
     cmpl $1, %eax
-    je m4c_parent_status
+    jne 1f
+    decl %ecx
+    jnz m4c_parent_status
+    jmp m4c_parent_fail
+1:
     cmpl $2, %eax
     je m4c_parent_status_done
     cmpl $3, %eax
@@ -394,6 +405,7 @@ m4c_parent_status_done:
     jne m4c_parent_fail
     cmpq $5, 0x40001a18
     jne m4c_parent_fail
+    movq $6, 0x40001b10
 
     /* Bad image, no TRANSFER, rights superset, count 5 and endpoint quota 1. */
     movq $14, %rax
@@ -468,6 +480,7 @@ m4c_parent_status_done:
     movq %rax, 0x400018a0
     cmpq $2, %rax
     jne m4c_parent_fail
+    movq $7, 0x40001b10
 
     /* SELF launcher -> WRONGTYPE. */
     movq $5, %rax
@@ -511,10 +524,16 @@ m4c_parent_status_done:
     jne m4c_parent_fail
     cmpq $4, %rdx
     jne m4c_parent_fail
+    movq $8, 0x40001b10
     movq $1, 0x40001b00
+    movl $0x7fffffff, %ecx
 m4c_parent_hold:
     cmpq $2, 0x40001b08
-    jne m4c_parent_hold
+    je 1f
+    decl %ecx
+    jnz m4c_parent_hold
+    jmp m4c_parent_fail
+1:
     movq $2, %rax
     xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
@@ -524,7 +543,7 @@ m4c_parent_fail:
     movq $2, %rax; movq $99, %rdi
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
-    jmp m4c_parent_fail
+    ud2
 je_user_m4c_end:
 
 /* M4c-s1 built-in spawn child. Startup ABI v1 is saved before the first
@@ -540,6 +559,8 @@ je_user_spawn_child_start:
     movq %rcx, 0x40001818
     movq %r8,  0x40001820
     movq %r9,  0x40001828
+    movq $1, 0x40001b18
+    movq $0, 0x40001b08
     cmpq $1, 0x40001800
     jne m4c_child_fail
     cmpq $2, 0x40001808
@@ -552,6 +573,7 @@ je_user_spawn_child_start:
     je m4c_child_fail
     cmpq $0, 0x40001818
     je m4c_child_fail
+    movq $2, 0x40001b18
 
     movq $7, %rax
     movq 0x40001810, %rdi
@@ -563,6 +585,7 @@ je_user_spawn_child_start:
     jne m4c_child_fail
     cmpq $2, %rdx
     jne m4c_child_fail
+    movq $3, 0x40001b18
 
     movq $8, %rax
     movq 0x40001810, %rdi
@@ -570,10 +593,20 @@ je_user_spawn_child_start:
     int $0x80
     movq %rax, 0x40001848
     movq %rdx, 0x40001850
+    cmpq $0, %rax
+    jne m4c_child_fail
+    cmpq $3, %rdx
+    jne m4c_child_fail
+    movq $4, 0x40001b18
+
+    movq $12, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001878
     cmpq $6, %rax
     jne m4c_child_fail
-    cmpq $0, %rdx
-    jne m4c_child_fail
+    movq $5, 0x40001b18
 
     movq $7, %rax
     movq 0x40001818, %rdi
@@ -585,6 +618,7 @@ je_user_spawn_child_start:
     jne m4c_child_fail
     cmpq $2, %rdx
     jne m4c_child_fail
+    movq $6, 0x40001b18
 
     movq $8, %rax
     movq 0x40001818, %rdi
@@ -592,10 +626,11 @@ je_user_spawn_child_start:
     int $0x80
     movq %rax, 0x40001868
     movq %rdx, 0x40001870
-    cmpq $6, %rax
+    cmpq $0, %rax
     jne m4c_child_fail
-    cmpq $0, %rdx
+    cmpq $7, %rdx
     jne m4c_child_fail
+    movq $6, 0x40001b18
 
     movb $0x5a, 0x40001900
     movq $11, %rax
@@ -604,19 +639,26 @@ je_user_spawn_child_start:
     movq $1, %rdx
     xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
-    movq %rax, 0x40001878
+    movq %rax, 0x40001880
     cmpq $0, %rax
     jne m4c_child_fail
+    movq $7, 0x40001b18
     movq $1, 0x40001b00
+    movl $0x7fffffff, %ecx
 m4c_child_hold:
     cmpq $2, 0x40001b08
-    jne m4c_child_hold
+    je 1f
+    decl %ecx
+    jnz m4c_child_hold
+    jmp m4c_child_fail
+1:
+    movq $7, 0x40001b18
     movq $1, 0x40001830
     movq $2, %rax
     movq $5, %rdi
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
-    jmp m4c_child_fail
+    ud2
 
 m4c_child_fail:
     movq $99, 0x40001830
@@ -624,7 +666,7 @@ m4c_child_fail:
     movq $99, %rdi
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
-    jmp m4c_child_fail
+    ud2
 je_user_spawn_child_end:
 
 /* M3a #4 step 3: a hostile-FP demo for the D7 enforcement proof. Executes an SSE
