@@ -520,6 +520,57 @@ re-stale-after-reuse assertion, the measured quota count, the softened per-proce
 wording, the ADR wide-handle amendment, and the pinned ABI static-asserts).
 AI-assisted review only; not independent human qualification.
 
+## M4 PR-D — synchronous PROC_KILL (ADR 0010 D8) — 2026-10-31
+
+Owner-approved as D-OWNER-3: kill enters the production ABI, and A6-CLARIFY-1 is re-confirmed.
+
+**What it does.**
+- **Op 16 `PROC_KILL`** needs KILL on a PROCESS handle.
+- **`je_sched_kill`** wraps the unchanged static `mark_dying`; the lead verified its body is byte-identical to main. It runs at IF=0 and checks, in the order fixed in `sched.h`:
+  1. invalid record;
+  2. self;
+  3. DYING or DEAD → OK, idempotent, decided from the record;
+  4. supervisor;
+  5. LIVE but unlinked → INVALID (fail closed);
+  6. slot invariants: anything unexpected is fail-stop;
+  7. `mark_dying(KILLED)`.
+- **Release:** the single release owner releases a WAITING waiter, or a WOKEN reservation (the head stays queued). The continuation never runs, and the victim never observes CANCELLED.
+- **New pure helpers:** `je_proc_run_link` and `je_proc_is_supervisor`.
+- **New counter:** `je_endpoint_kern_woken_reservations_released`. It is kernel-internal and counts any release of a WOKEN, head-reserved waiter, not kills only.
+
+**Honesty correction.** ADR 0009 A6-CLARIFY-2 describes a test-only forced-kill hook that was **never implemented**. ADR 0010 D8 now has a dated correction, and ADR 0009 a note. `PROC_KILL` is the first native evidence for killing non-current READY, BLOCKED_IPC and WOKEN-reserved user threads.
+
+**Evidence: QEMU M4d-s1 (NX profile).**
+
+| Case | What the fixture checks |
+|---|---|
+| READY | The heartbeat freezes, and dispatches stay unchanged for 0x40 ticks. |
+| BLOCKED_IPC | Before reaping: the sentinel is never written, progress and dispatches are unchanged, there is no waiter, the cause is NONE, and the inflight ref is back to baseline. |
+| WOKEN-reserved | The counter goes up by exactly 1, one message is still queued, and there is no waiter. |
+| After each kill | The killer's very next syscall, PROC_STATUS, already reads DYING/KILLED. |
+| EXIT | The first reason wins: re-killing after an EXIT(42) leaves the reason as EXIT. |
+| DYING | Re-killing a DYING process is idempotent. |
+| Supervisor guard | Uses a real run-linked supervisor thread. The kill returns INVALID, and the record stays LIVE. |
+| Other | self, after-death, unlinked, wrong-rights, wrong-type and stale cases. |
+
+Hosted tests: `run_link` / `is_supervisor` and the op-16 decode matrix. Mutation testing left 0 survivors.
+
+**Mutants run by the lead through `make smoke`:**
+- `mark_dying` removed from the kill path: caught.
+- Supervisor guard removed: caught. The round-2 version of the fixture let this mutant survive; that was fixed.
+
+**Provenance (worker mode; AI-assisted review, not human qualification).**
+
+| Part | Author | Adversarial reviewer |
+|---|---|---|
+| Headers and stubs; counter contract; honesty correction | lead | — |
+| Implementation and fixture | Codex (4 rounds) | Claude (2 reviews) and lead mutants |
+| Hosted tests | Claude (from headers only) | Codex (with mutants) |
+
+**Open hazards.**
+- **Unexplained stall.** The root cause of the round-2 stall is **not determined**. A slot-0 coordinator polling with `pause` and IF=1 stalled, with four user threads READY. Waits that use `sti; hlt` work. This is recorded so a later scheduler change does not hide a real bug.
+- **PR-F follow-up.** PR-F adds D12 supervisor-loss handling, so it must revisit this fixture's supervisor teardown.
+
 ## M4 PR-C — spawn, LAUNCHER, startup register ABI, CLOCK_TICKS (ADR 0010 D5/D6) — 2026-10-31
 
 Owner-approved under D-OWNER-7 (`CLOCK_TICKS`), with D5 as accepted in ADR 0010.

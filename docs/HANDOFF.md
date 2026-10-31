@@ -1,5 +1,18 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-D (#53) — PROC_KILL — observed 2026-10-31T16:56:37+00:00
+
+Branch `feat/m4d-kill`, based on main `62c0115` (#63 merged; main CI green).
+
+- **Implemented:** ADR 0010 D8. See IMPLEMENTATION "M4 PR-D".
+- **Tested (local):** check, smoke, integration, the three x86 profiles, NX ×5, and four ARM modes. Two mutants were run, and both were caught.
+- **Planned:** PR-E, the ring-3 C image path and host tool. The map is ready: plain host gcc plus a linker script is verified to produce deterministic, SSE-free, W^X images.
+- **Blocked:** nothing.
+
+**Open hazards:**
+1. A slot-0 `pause` poll stalled READY user threads in the round-2 fixture. The root cause is not determined; `sti; hlt` waits work.
+2. PR-F's D12 must revisit the M4d supervisor-guard fixture teardown.
+
 ## M4 PR-C (#53) — spawn/LAUNCHER/startup-v1/CLOCK_TICKS — observed 2026-10-31T13:20:28+00:00
 
 Branch `feat/m4c-spawn`, based on main `83782c0` (#62 merged; main CI green).
