@@ -206,3 +206,40 @@ confirmed sound
 - **Codex P1 (the M4b child fixture got the full pool as its creation quota, contradicting D-DEV's child maximum of 0): accepted.** The child now gets `JE_EP_CHILD_QUOTA_MAX`, and a ring-3 attempt asserts H_QUOTA. M3c fixture processes are not supervisor children and keep `JE_EP_POOL_CAP`.
 - **Claude P3s accepted:** bounded progress waits; the parent's own death reason is asserted; a static assert pins the PROCESS type literal; the scratch overlap is moved; `vm_s3_destroy` asserts that no scheduler slot still references the process. Claude's #10 note is recorded in the PR: the CLOSE path and the endpoint.c walk still call release directly rather than through the dispatch hook.
 - **All five Codex mutants are now killed.**
+
+## Round 4 — Claude verifying the round-4 fixes
+
+Round 4: four of the five round-3 items are fixed, and one is fixed but wrong (P3). There are no new P1s and one new P3. This was a read-only review: I did not build or run `make` or `smoke`.
+
+**Round-3 items**
+
+1. **Codex P1 (child quota): FIXED.** `main.c:1178` builds the child with `vm_s3_build_quota(PROG_PROC_EXIT7, JE_EP_CHILD_QUOTA_MAX)`, which is 0. `je_proc_charge` then denies it, because `ep_charge >= ep_limit` holds at 0 >= 0 (`proc.c:160`). The child records op-10's status at `user_demo.S:43-46`.
+   - The kernel asserts that status is 7 and that the endpoint pool did not change (`main.c:1210-1219`).
+   - The DYING observation is deterministic: reaping only happens at the start of `je_kernel_idle_step` (`sched.c:581-585`), and the status poll runs before the next reap. So "reaped before quota probe" can't fire falsely.
+   - Nit: `child_pool_before` is sampled after `je_thread_create_user` (`main.c:1195`). Sample it before the create so the baseline can't include anything the child did.
+2. **P3 #9 (PROCESS type pin): FIXED-BUT-WRONG.** `endpoint_kern.c:14-16` asserts its own copy of the literal `3u`. The value that actually controls the walk, `endpoint.c:10` (used at `:595/602/619/631`), is still unchecked, so an ABI change would not be caught.
+   - Fix: move it to `endpoint.h` as `JE_EP_PROCESS_OBJ_TYPE`, have `endpoint.c` use that, and keep the assert in `endpoint_kern.c` against the header constant.
+3. **P3 #13 (scratch overlap): FIXED.** The write moved to `0x1760` (`user_demo.S:248`), and the `0x1768` child slot is documented at `:24`.
+4. **P3 (unbounded waits): FIXED.** Both loops now have spin bounds plus a DYING/DEAD check (`main.c:1234-1279`).
+5. **P3 (parent death unasserted): FIXED.** The kernel waits for DYING before the reap and asserts EXIT(0) (`main.c:1280-1298`). It's race-free for the same reason as item 1.
+6. **P3 (`vm_s3_destroy` slot invariant): FIXED.** `main.c:218-222` checks `je_sched_has_process` with IF=0. Because `drop_user` zeroes the slot (`sched.c:545`), a stale match isn't possible.
+
+**New finding**
+
+- **P3: TOCTOU in the progress-2 loop can report a false fatal.** In `main.c:1257-1275`, progress is read first and status second, and IF is 1 between the two reads (`idle_step` leaves IF set after `sti; hlt`).
+  - The parent writes progress 2 and exits on the very next instruction (`user_demo.S:291-294`).
+  - So if a timer preemption lands between the two reads, the parent can do both. The kernel then sees DYING and prints "parent died before progress 2", even though the run was correct. The progress-1 loop has the same pattern, but the window is much smaller.
+  - Fix: when the state is DYING or DEAD, read the progress word again and fail only if it is still below the target. Alternatively, do both reads inside one `irq_save` section.
+
+**Confirmed sound**
+- No authority revival. The child holds no endpoint charge, and NONE vs charged uncharge is unchanged.
+- The scheduler-slot guard runs with IF=0 and restores IF on every return path.
+- The parent PROC_STATUS reap path is unchanged from round 3.
+- No refcount or record lifetime changes in this diff.
+
+## Lead disposition of round 4 (lead-authored fixes)
+
+- **TOCTOU in the progress waits (P3, but it could make a correct run fail falsely in CI): fixed by the lead.** Progress and record status are now read in one IF=0 section, in both loops. The NX profile ran 3 times consecutively with no flake.
+- **PROCESS type pin (fixed but wrong): fixed by the lead.** `JE_EP_PROCESS_OBJ_TYPE` is now defined in `endpoint.h` and used by the walk in endpoint.c, and endpoint_kern.c asserts it equals `JE_ABI_OBJ_PROCESS`.
+- **Baseline nit: fixed by the lead.** The child's pool baseline is now sampled before its thread is created.
+- These three edits are small and were checked by the lead plus the test runs. They were not re-reviewed by a peer, and the PR says so.

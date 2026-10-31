@@ -1190,11 +1190,12 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                 fail("JeiOS fatal: M4b process handle mint\r\n");
             vm_s3_scratch_write(parent, 0x1600u, inspect_kill);
             vm_s3_scratch_write(parent, 0x1608u, kill_only);
-            if (je_thread_create_user(&vm_s3, child) != JE_OK)
-                fail("JeiOS fatal: M4b child thread\r\n");
+            /* Baseline sampled BEFORE the child can run (round-4 review nit). */
             uint64_t child_pool_flags = je_arch_irq_save();
             uint32_t child_pool_before = je_endpoint_kernel_allocated();
             je_arch_irq_restore(child_pool_flags);
+            if (je_thread_create_user(&vm_s3, child) != JE_OK)
+                fail("JeiOS fatal: M4b child thread\r\n");
             bool child_quota_checked = false;
             for (uint64_t child_spins = 0u; ; ) {
                 uint32_t child_state = JE_PROC_FREE;
@@ -1231,17 +1232,21 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (je_thread_create_user(&vm_s3, parent) != JE_OK)
                 fail("JeiOS fatal: M4b parent thread\r\n");
             for (uint64_t parent_progress_spins = 0u; ; ) {
-                uint64_t progress = vm_s3_scratch(parent, 0x1610u);
-                if (progress == 99u) fail("JeiOS fatal: M4b parent assertion\r\n");
-                if (progress >= 1u) break;
+                /* Lead fix (round-4 review, Claude P3): read progress and the record
+                 * status in ONE IF=0 section. Otherwise the parent can write progress
+                 * 1 and exit between the two reads, and a correct run is reported as
+                 * "died before progress 1". */
                 uint32_t parent_state = JE_PROC_FREE;
                 uint32_t parent_reason = 0u;
                 uint64_t parent_code = 0u;
                 uint64_t parent_flags = je_arch_irq_save();
+                uint64_t progress = vm_s3_scratch(parent, 0x1610u);
                 je_status parent_status = je_proc_status(
                     &process_pool, vm_s3_proc_ids[parent], &parent_state,
                     &parent_reason, &parent_code);
                 je_arch_irq_restore(parent_flags);
+                if (progress == 99u) fail("JeiOS fatal: M4b parent assertion\r\n");
+                if (progress >= 1u) break;
                 (void)parent_reason;
                 (void)parent_code;
                 if (parent_status != JE_OK)
@@ -1253,17 +1258,21 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                 je_kernel_idle_step();
             }
             for (uint64_t parent_progress_spins = 0u; ; ) {
-                uint64_t progress = vm_s3_scratch(parent, 0x1610u);
-                if (progress == 99u) fail("JeiOS fatal: M4b post-reap assertion\r\n");
-                if (progress >= 2u) break;
+                /* Lead fix (round-4 review, Claude P3): read progress and the record
+                 * status in ONE IF=0 section. Otherwise the parent can write progress
+                 * 2 and exit between the two reads, and a correct run is reported as
+                 * "died before progress 2". */
                 uint32_t parent_state = JE_PROC_FREE;
                 uint32_t parent_reason = 0u;
                 uint64_t parent_code = 0u;
                 uint64_t parent_flags = je_arch_irq_save();
+                uint64_t progress = vm_s3_scratch(parent, 0x1610u);
                 je_status parent_status = je_proc_status(
                     &process_pool, vm_s3_proc_ids[parent], &parent_state,
                     &parent_reason, &parent_code);
                 je_arch_irq_restore(parent_flags);
+                if (progress == 99u) fail("JeiOS fatal: M4b post-reap assertion\r\n");
+                if (progress >= 2u) break;
                 (void)parent_reason;
                 (void)parent_code;
                 if (parent_status != JE_OK)

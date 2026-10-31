@@ -7,7 +7,6 @@
  */
 #include <jeios/endpoint.h>
 
-#define JE_PROCESS_OBJ_TYPE 3u
 
 /* Policy-bound pins (ADR 0009 D4): REF_MAX must admit every non-handle owning
  * ref (queue depth + waiters) and still be small enough to reach in a test, and
@@ -592,14 +591,14 @@ int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t)
         je_ep_status s;
         if (type == JE_ENDPOINT_OBJ_TYPE) {
             s = je_endpoint_handle_close(pool, t, h);
-        } else if (type == JE_PROCESS_OBJ_TYPE && pool->procs) {
+        } else if (type == JE_EP_PROCESS_OBJ_TYPE && pool->procs) {
             uint32_t resolved_type = 0u;
             uint32_t rights = 0u;
             void *object = (void *)0;
             je_handle_status hs = je_handle_resolve_any(t, h, &resolved_type,
                                                         &rights, &object);
             (void)rights;
-            if (hs != JE_HANDLE_OK || resolved_type != JE_PROCESS_OBJ_TYPE)
+            if (hs != JE_HANDLE_OK || resolved_type != JE_EP_PROCESS_OBJ_TYPE)
                 return -1;
             bool found = false;
             je_proc_id id = JE_PROC_ID_NONE;
@@ -616,7 +615,7 @@ int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t)
                 return -1;
             je_proc_release(pool->procs, id);
             s = JE_EP_OK;
-        } else if (type == JE_PROCESS_OBJ_TYPE) {
+        } else if (type == JE_EP_PROCESS_OBJ_TYPE) {
             return -1;
         } else {
             continue;
@@ -628,7 +627,7 @@ int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t)
     for (uint32_t i = 0; i < t->capacity; ++i) {
         je_handle h = 0u; uint32_t type = 0u;
         if (je_handle_live_at(t, i, &h, &type) &&
-            (type == JE_ENDPOINT_OBJ_TYPE || type == JE_PROCESS_OBJ_TYPE))
+            (type == JE_ENDPOINT_OBJ_TYPE || type == JE_EP_PROCESS_OBJ_TYPE))
             return -1;   /* a LIVE endpoint survived the walk -> fatal */
     }
     return released;

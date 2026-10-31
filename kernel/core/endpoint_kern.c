@@ -11,8 +11,7 @@
 #include <jeios/arch.h>
 #include <jeios/abi.h>
 
-#define JE_PROCESS_OBJ_TYPE 3u
-_Static_assert(JE_PROCESS_OBJ_TYPE == JE_ABI_OBJ_PROCESS,
+_Static_assert(JE_EP_PROCESS_OBJ_TYPE == JE_ABI_OBJ_PROCESS,
                "PROCESS object type must match the ABI");
 
 /* ADR 0010 D2 endpoint pool formula (needs both vm.h and endpoint.h). */
