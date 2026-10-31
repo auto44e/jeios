@@ -27,7 +27,6 @@ extern je_ep_status je_endpoint_kern_dup(je_vm *vm, uint32_t index, je_handle sr
                                          uint32_t rights, je_handle *out);
 #endif
 
-#define JE_SYSCALL_PROC_STATUS_ACTION 13u
 
 /* Pure decode: given the operation and its six argument registers, decide the
  * action, the ABI status to return in RAX, and any scalar result for RDX. No
@@ -129,7 +128,7 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
          * this decode check; all other registers are reserved. */
         if (rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
-        *out_status=JE_ABI_OK; return JE_SYSCALL_PROC_STATUS_ACTION;
+        *out_status=JE_ABI_OK; return JE_SYSCALL_PROC_STATUS;
 #ifdef JE_DEV_COPY_INJECT
     case JE_SYS_COPY_FIXUP_INJECT:
         /* dev-only: uaddr=RDI (an unmapped arena page); glue raw-copies to prove
@@ -475,7 +474,7 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
     je_abi_status status; uint64_t result;
     je_syscall_action action = je_syscall_decode(f->rax, args, &status, &result);
 
-    if ((uint32_t)action == JE_SYSCALL_PROC_STATUS_ACTION)
+    if (action == JE_SYSCALL_PROC_STATUS)
         return dispatch_proc_status(f);
 
     switch (action) {

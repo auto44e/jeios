@@ -31,7 +31,7 @@ $(BUILD)/%.o: %.S
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_fdt
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
@@ -42,6 +42,7 @@ test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm
 	./$(BUILD)/test_handle_rw
 	./$(BUILD)/test_endpoint
 	./$(BUILD)/test_proc
+	./$(BUILD)/test_proc_retire
 	./$(BUILD)/test_fdt
 check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
@@ -105,6 +106,11 @@ $(BUILD)/test_endpoint: tests/test_endpoint.c kernel/core/endpoint.c kernel/core
 $(BUILD)/test_proc: tests/test_proc.c kernel/core/proc.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_proc.c kernel/core/proc.c -o $@
+
+# ADR 0010 D4: generation retirement with a tiny JE_PROC_GEN_MAX (both TUs).
+$(BUILD)/test_proc_retire: tests/test_proc_retire.c kernel/core/proc.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -DJE_PROC_GEN_MAX=3u -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_proc_retire.c kernel/core/proc.c -o $@
 
 # Issue #52: hosted bounded-FDT parser suite (pure kernel/core/fdt.c, no arch
 # code), ASan+UBSan. Includes the generated real-QEMU fixture header.
