@@ -63,6 +63,9 @@ _Static_assert(JE_VM_SUP_HANDLE_NEED + 4u <= JE_VM_HANDLE_CAP - 1u, "ADR 0010 D2
  * the maximum). */
 #define JE_VM_HANDLE_QUOTA_DEFAULT 15u
 #define JE_VM_HANDLE_QUOTA_MAX     (JE_VM_HANDLE_CAP - 1u)
+_Static_assert(JE_VM_HANDLE_QUOTA_DEFAULT >= 1u &&
+               JE_VM_HANDLE_QUOTA_DEFAULT <= JE_VM_HANDLE_QUOTA_MAX,
+               "default handle quota is within the supported range");
 _Static_assert(JE_VM_QUOTA_PAGES == 73u, "admission quota");
 
 /* Frame kind and the single permitted leaf permission per kind:
