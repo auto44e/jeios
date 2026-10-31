@@ -833,6 +833,255 @@ m4c_child_fail:
     ud2
 je_user_spawn_child_end:
 
+/* M4d-s1 PROC_KILL victims and killer. The bootstrap writes PROCESS and
+ * endpoint handles into the killer's USER_DATA page before creating its thread.
+ * The phase/control words are handshakes with main.c; the killer never yields
+ * between the WOKEN send and PROC_KILL pair. */
+.globl je_user_m4d_ready_start
+.globl je_user_m4d_ready_end
+je_user_m4d_ready_start:
+    incq 0x40001e00
+    jmp je_user_m4d_ready_start
+je_user_m4d_ready_end:
+
+.globl je_user_m4d_blocked_start
+.globl je_user_m4d_blocked_end
+je_user_m4d_blocked_start:
+    movq $1, 0x40001e80
+    movq $12, %rax
+    movq 0x40001e88, %rdi
+    movq $0x40001e90, %rsi
+    movq $1, %rdx
+    xorq %r10,%r10
+    xorq %r8,%r8
+    xorq %r9,%r9
+    movq $0x10000000, %r10
+    int $0x80
+    movq %rax, 0x40001e98
+    movq %rdx, 0x40001ea0
+    movq $99, 0x40001e80
+1:
+    jmp 1b
+je_user_m4d_blocked_end:
+
+.globl je_user_m4d_woken_start
+.globl je_user_m4d_woken_end
+je_user_m4d_woken_start:
+    movq $1, 0x40001eb0
+    movq $12, %rax
+    movq 0x40001eb8, %rdi
+    movq $0x40001ec0, %rsi
+    movq $1, %rdx
+    xorq %r10,%r10
+    xorq %r8,%r8
+    xorq %r9,%r9
+    movq $0x10000000, %r10
+    int $0x80
+    movq %rax, 0x40001ec8
+    movq %rdx, 0x40001ed0
+    movq $99, 0x40001eb0
+1:
+    jmp 1b
+je_user_m4d_woken_end:
+
+.globl je_user_m4d_start
+.globl je_user_m4d_end
+je_user_m4d_start:
+    /* Startup-v1 is intentionally absent for this fixture: all GPRs start zero. */
+    orq %rax, %r11
+    orq %rbx, %r11
+    orq %rbp, %r11
+    orq %rcx, %r11
+    orq %r8,  %r11
+    orq %r9,  %r11
+    orq %r10, %r11
+    orq %r12, %r11
+    orq %r13, %r11
+    orq %r14, %r11
+    orq %r15, %r11
+    jnz m4d_fail
+    movq $1, 0x40001c00
+    movq $0, 0x40001bf8
+
+    /* READY victim: kill, then inspect the terminal record. */
+    movq $16, %rax
+    movq 0x40001c08, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001c80
+    cmpq $0, %rax
+    jne m4d_fail
+    movq $15, %rax
+    movq 0x40001c08, %rdi
+    movq $0x40001d00, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    cmpl $2, 0x40001d00
+    jne m4d_fail
+    cmpl $3, 0x40001d04
+    jne m4d_fail
+    movq $2, 0x40001c00
+m4d_wait_ready:
+    cmpq $1, 0x40001bf8
+    jne m4d_wait_ready
+
+    /* BLOCKED_IPC victim: mark_dying must release its waiter, not resume it. */
+    movq $16, %rax
+    movq 0x40001c18, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001c88
+    cmpq $0, %rax
+    jne m4d_fail
+    movq $15, %rax
+    movq 0x40001c18, %rdi
+    movq $0x40001d20, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    cmpl $2, 0x40001d20
+    jne m4d_fail
+    cmpl $3, 0x40001d24
+    jne m4d_fail
+    movq $6, %rax
+    movq 0x40001c48, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    movq $3, 0x40001c00
+m4d_wait_blocked:
+    cmpq $2, 0x40001bf8
+    jne m4d_wait_blocked
+
+    /* WOKEN reservation: try_send and PROC_KILL are adjacent syscalls. */
+    movq $4, 0x40001c00
+m4d_wait_woken_gate:
+    cmpq $3, 0x40001bf8
+    jne m4d_wait_woken_gate
+    movb $0x4b, 0x40001ed8
+    movq $11, %rax
+    movq 0x40001c40, %rdi
+    movq $0x40001ed8, %rsi
+    movq $1, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001c90
+    cmpq $0, %rax
+    jne m4d_fail
+    movq $16, %rax
+    movq 0x40001c20, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001c98
+    cmpq $0, %rax
+    jne m4d_fail
+    movq $15, %rax
+    movq 0x40001c20, %rdi
+    movq $0x40001d40, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    cmpl $2, 0x40001d40
+    jne m4d_fail
+    cmpl $3, 0x40001d44
+    jne m4d_fail
+    movq $5, 0x40001c00
+m4d_wait_woken:
+    cmpq $4, 0x40001bf8
+    jne m4d_wait_woken
+
+    /* Self, rights, wrong type and stale-handle negative cases. */
+    movq $16, %rax
+    movq 0x40001c28, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $2, %rax
+    jne m4d_fail
+    movq $16, %rax
+    movq 0x40001c10, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $6, %rax
+    jne m4d_fail
+    movq $5, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    movq %rdx, %r12
+    movq $16, %rax
+    movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $5, %rax
+    jne m4d_fail
+    movq $6, %rax
+    movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    movq $6, %rax
+    movq 0x40001c30, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    movq $16, %rax
+    movq 0x40001c30, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $3, %rax
+    jne m4d_fail
+
+    /* First reason wins and kill-after-death is idempotent. */
+    movq $16, %rax
+    movq 0x40001c08, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    movq $15, %rax
+    movq 0x40001c08, %rdi
+    movq $0x40001d60, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4d_fail
+    cmpl $3, 0x40001d60
+    jne m4d_fail
+    cmpl $3, 0x40001d64
+    jne m4d_fail
+
+    /* LIVE but unlinked is fail-closed and remains LIVE. */
+    movq $16, %rax
+    movq 0x40001c38, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $2, %rax
+    jne m4d_fail
+    movq $6, %rax
+    movq 0x40001c08, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001c9c
+    cmpq $0, %rax
+    jne m4d_fail
+    movq $7, 0x40001c00
+    movq $2, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    jmp m4d_fail
+m4d_fail:
+    movq $99, 0x40001c00
+    jmp m4d_fail
+je_user_m4d_end:
+
 /* M3a #4 step 3: a hostile-FP demo for the D7 enforcement proof. Executes an SSE
  * instruction at CPL3; with CR0.EM=1 (set by je_arch_cpu_policy_init) the CPU
  * raises #UD (vector 6) instead of executing it, proving D7 denies SIMD to ring
