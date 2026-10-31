@@ -59,7 +59,7 @@ $(BUILD)/kernel/core/image.o: kernel/core/image.c $(USER_GENERATED) $(wildcard i
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
@@ -72,6 +72,7 @@ test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm
 	./$(BUILD)/test_proc
 	./$(BUILD)/test_proc_retire
 	./$(BUILD)/test_fdt
+	./$(BUILD)/test_image
 check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
 	$(PYTHON) tools/mkimage.py --name c_hello --elf $(USER_IMAGE) --verify
@@ -148,6 +149,16 @@ $(BUILD)/test_proc_retire: tests/test_proc_retire.c kernel/core/proc.c $(wildcar
 $(BUILD)/test_fdt: tests/test_fdt.c kernel/core/fdt.c include/jeios/fdt.h $(wildcard tests/fixtures/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_fdt.c kernel/core/fdt.c -o $@
+
+# ADR 0010 D10 cross-check: a mkimage.py-GENERATED descriptor must pass the real
+# kernel validator (kernel/core/vm.c), and mutations of it must fail. The
+# generated .c is #included (JE_TEST_IMAGE_C, absolute path so the TU is location
+# independent), not linked; only the validator's own TUs are linked.
+$(BUILD)/test_image: tests/test_image.c $(USER_GENERATED) kernel/core/vm.c kernel/core/handle.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  -DJE_TEST_IMAGE_C='"$(abspath $(USER_GENERATED))"' -DJE_TEST_IMAGE_NAME=c_hello \
+	  tests/test_image.c kernel/core/vm.c kernel/core/handle.c -o $@
 
 
 # MP1 (ADR 0002): ARM64 (QEMU virt-8.2) build + smoke, kept fully separate from
