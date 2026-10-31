@@ -298,6 +298,335 @@ m4b_fail:
     jmp m4b_fail
 je_user_m4b_end:
 
+/* M4c-s1 kernel-seeded spawner. */
+.globl je_user_m4c_start
+.globl je_user_m4c_end
+je_user_m4c_start:
+    movq %rdi, 0x40001800
+    movq %rsi, 0x40001808
+    movq %rdx, 0x40001810
+    cmpq $1, 0x40001800
+    jne m4c_parent_fail
+    cmpq $1, 0x40001808
+    jne m4c_parent_fail
+    cmpq $0, 0x40001810
+    je m4c_parent_fail
+
+    movq $10, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001818
+    movq %rdx, 0x40001820
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    movq 0x40001820, %rax
+    movl %eax, 0x40001828
+    shrq $32, %rax
+    movl %eax, 0x40001830
+    movl 0x40001828, %eax
+    movl %eax, 0x40001900
+    movl $2, 0x40001904
+    movl 0x40001830, %eax
+    movl %eax, 0x40001908
+    movl $6, 0x4000190c
+
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi
+    movq $0x40001900, %rdx
+    movq $2, %r10
+    movq $8, %r8
+    xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001838
+    movq %rdx, 0x40001840
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    cmpq $0, 0x40001840
+    je m4c_parent_fail
+
+    movq $13, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rdx, 0x40001848
+    movq $13, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rdx, 0x40001850
+    cmpq 0x40001848, %rdx
+    jb m4c_parent_fail
+
+    movq $12, %rax
+    movl 0x40001830, %edi
+    movq $0x40001a00, %rsi
+    movq $64, %rdx
+    xorq %r8,%r8; xorq %r9,%r9
+    movq $0x1000, %r10
+    int $0x80
+    movq %rax, 0x40001858
+    movq %rdx, 0x40001860
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    cmpq $1, %rdx
+    jne m4c_parent_fail
+    cmpb $0x5a, 0x40001a00
+    jne m4c_parent_fail
+    movq $2, 0x40001b00
+
+m4c_parent_status:
+    movq $15, %rax
+    movq 0x40001840, %rdi
+    movq $0x40001a10, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001868
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    movl 0x40001a10, %eax
+    cmpl $1, %eax
+    je m4c_parent_status
+    cmpl $2, %eax
+    je m4c_parent_status_done
+    cmpl $3, %eax
+    jne m4c_parent_fail
+m4c_parent_status_done:
+    cmpl $1, 0x40001a14
+    jne m4c_parent_fail
+    cmpq $5, 0x40001a18
+    jne m4c_parent_fail
+
+    /* Bad image, no TRANSFER, rights superset, count 5 and endpoint quota 1. */
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    movq $99, %rsi
+    movq $0x40001900, %rdx
+    movq $2, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001870
+    cmpq $2, %rax
+    jne m4c_parent_fail
+
+    movq $9, %rax
+    movl 0x40001828, %edi
+    movq $2, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001878
+    movq %rdx, %r12
+    movl %r12d, 0x40001900
+    movl $2, 0x40001904
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $1, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001880
+    cmpq $6, %rax
+    jne m4c_parent_fail
+    movq $6, %rax; movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4c_parent_fail
+
+    movq $9, %rax
+    movl 0x40001828, %edi
+    movq $0xa, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001888
+    movq %rdx, %r12
+    movl %r12d, 0x40001900
+    movl $6, 0x40001904
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $1, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001890
+    cmpq $6, %rax
+    jne m4c_parent_fail
+    movq $6, %rax; movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4c_parent_fail
+
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $5, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001898
+    cmpq $2, %rax
+    jne m4c_parent_fail
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $2, %r10; movq $0x10008, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018a0
+    cmpq $2, %rax
+    jne m4c_parent_fail
+
+    /* SELF launcher -> WRONGTYPE. */
+    movq $5, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rdx, %r12
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    movq $14, %rax; movq %r12, %rdi
+    xorq %rsi,%rsi; movq $0x40001900, %rdx
+    movq $2, %r10; movq $8, %r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018a8
+    cmpq $5, %rax
+    jne m4c_parent_fail
+    movq $6, %rax; movq %r12, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4c_parent_fail
+
+    /* DUP and RIGHTS on LAUNCHER are DENIED; QUERY returns object type 4. */
+    movq $9, %rax; movq 0x40001810, %rdi; movq $0x20, %rsi
+    xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018b0
+    cmpq $6, %rax
+    jne m4c_parent_fail
+    movq $8, %rax; movq 0x40001810, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018b8
+    cmpq $6, %rax
+    jne m4c_parent_fail
+    movq $7, %rax; movq 0x40001810, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018c0
+    movq %rdx, 0x400018c8
+    cmpq $0, %rax
+    jne m4c_parent_fail
+    cmpq $4, %rdx
+    jne m4c_parent_fail
+    movq $1, 0x40001b00
+m4c_parent_hold:
+    cmpq $2, 0x40001b08
+    jne m4c_parent_hold
+    movq $2, %rax
+    xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    jmp m4c_parent_fail
+m4c_parent_fail:
+    movq $99, 0x40001b00
+    movq $2, %rax; movq $99, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    jmp m4c_parent_fail
+je_user_m4c_end:
+
+/* M4c-s1 built-in spawn child. Startup ABI v1 is saved before the first
+ * syscall: RDI=version, RSI=grant count, RDX/RCX/R8/R9=real handles. The
+ * child checks the two attenuated endpoint rights, sends one byte on RDX,
+ * and exits(5). Scratch is at 0x1800..0x1858 in USER_DATA. */
+.globl je_user_spawn_child_start
+.globl je_user_spawn_child_end
+je_user_spawn_child_start:
+    movq %rdi, 0x40001800
+    movq %rsi, 0x40001808
+    movq %rdx, 0x40001810
+    movq %rcx, 0x40001818
+    movq %r8,  0x40001820
+    movq %r9,  0x40001828
+    cmpq $1, 0x40001800
+    jne m4c_child_fail
+    cmpq $2, 0x40001808
+    jne m4c_child_fail
+    cmpq $0, 0x40001820
+    jne m4c_child_fail
+    cmpq $0, 0x40001828
+    jne m4c_child_fail
+    cmpq $0, 0x40001810
+    je m4c_child_fail
+    cmpq $0, 0x40001818
+    je m4c_child_fail
+
+    movq $7, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001838
+    movq %rdx, 0x40001840
+    cmpq $0, %rax
+    jne m4c_child_fail
+    cmpq $2, %rdx
+    jne m4c_child_fail
+
+    movq $8, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001848
+    movq %rdx, 0x40001850
+    cmpq $6, %rax
+    jne m4c_child_fail
+    cmpq $0, %rdx
+    jne m4c_child_fail
+
+    movq $7, %rax
+    movq 0x40001818, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001858
+    movq %rdx, 0x40001860
+    cmpq $0, %rax
+    jne m4c_child_fail
+    cmpq $2, %rdx
+    jne m4c_child_fail
+
+    movq $8, %rax
+    movq 0x40001818, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001868
+    movq %rdx, 0x40001870
+    cmpq $6, %rax
+    jne m4c_child_fail
+    cmpq $0, %rdx
+    jne m4c_child_fail
+
+    movb $0x5a, 0x40001900
+    movq $11, %rax
+    movq 0x40001810, %rdi
+    movq $0x40001900, %rsi
+    movq $1, %rdx
+    xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001878
+    cmpq $0, %rax
+    jne m4c_child_fail
+    movq $1, 0x40001b00
+m4c_child_hold:
+    cmpq $2, 0x40001b08
+    jne m4c_child_hold
+    movq $1, 0x40001830
+    movq $2, %rax
+    movq $5, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    jmp m4c_child_fail
+
+m4c_child_fail:
+    movq $99, 0x40001830
+    movq $2, %rax
+    movq $99, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    jmp m4c_child_fail
+je_user_spawn_child_end:
+
 /* M3a #4 step 3: a hostile-FP demo for the D7 enforcement proof. Executes an SSE
  * instruction at CPL3; with CR0.EM=1 (set by je_arch_cpu_policy_init) the CPU
  * raises #UD (vector 6) instead of executing it, proving D7 denies SIMD to ring
