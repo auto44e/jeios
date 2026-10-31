@@ -742,6 +742,52 @@ an automatic reboot is the "silent infinite reboot loop" INIT.md forbids.
 **Flex:** add a rescue image and watchdog when the platform has a watchdog, at M5a
 or later.
 
+#### D12 note — detection mechanism revised to a slot-0 scan (2026-10-31, owner-approved)
+
+Step 1 above says `mark_dying` sets a kernel `supervisor_lost` flag. During PR-F
+design this was found to be **unsafe to implement as written**, so the owner
+approved (2026-10-31) revising the *detection mechanism* while leaving the D12
+*policy* (refuse, kill-all, reap, verify baselines, halt) unchanged.
+
+**Decision.** The slot-0 monitor loop detects supervisor loss by **scanning the
+supervisor's PROCESS record for a DYING state before it reaps**, rather than by a
+hook inside `mark_dying`. The scan runs at the top of the single slot-0
+monitor/idle loop, before `je_sched_reap_dead()`, so it observes the DYING record
+while it still exists. `mark_dying` and `reap_dead` stay byte-identical to the
+tested M2/kill paths.
+
+**Why.** `mark_dying` (via `je_proc_on_dying`) is *also* on the normal
+kernel-forced teardown path: `vm_s3_destroy` and `spawn_undo` reach it for fixture
+teardown and failed-spawn rollback. A `supervisor_lost` flag set inside
+`mark_dying` would fire spuriously whenever a supervisor-flagged record is torn
+down for a benign reason, turning ordinary teardown and D-rollback into a false
+"supervisor lost" halt. The scan keys on the record actually being DYING in the
+registry at monitor time, which only happens when the supervisor truly died and
+has not yet been reaped — not during a synchronous forced teardown that reaps in
+the same slot-0 step.
+
+**If otherwise (rejected: the `mark_dying` hook).** Keeping the flag in
+`mark_dying` would require a guard distinguishing supervisor-loss from the forced
+teardown callers (an added argument or caller-context check threaded through a
+tested path), which is more invasive to already-qualified code and widens the
+blast radius of a mistake into the kill/teardown machinery. Predicted cost:
+re-qualifying `mark_dying`'s callers and the M4d supervisor-guard fixture, for a
+detection that the scan already provides without touching them.
+
+**Ordering constraint.** No other slot-0 reap may run between the supervisor's
+death and the monitor scan. This holds because slot 0 is the *only* context that
+reaps after seeding, and the monitor loop scans before each `reap_dead`.
+
+**Future flex (toward the original D12 wording / "option 2").** If a later design
+needs **synchronous** detection at the instant of death — e.g. a watchdog or a
+rescue image (D12 Flex above) that must act before the next slot-0 step, or a
+multi-core slot-0 where "only slot 0 reaps" no longer holds — revisit this and
+move detection into the death path with a proper forced-teardown-vs-loss
+discriminator. At that point the `mark_dying`-hook alternative becomes the right
+choice and this scan is insufficient. Revisit trigger: any of (a) a watchdog/
+rescue path added, (b) reaping moved off a single slot-0 context, (c) a
+requirement to observe loss before the next monitor iteration.
+
 ### D13. Coding profile and evidence
 
 All M4 kernel code is in the **Critical** profile (CODING_STANDARD:20). So is the
