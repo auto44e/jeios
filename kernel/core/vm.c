@@ -8,7 +8,8 @@
  */
 #include <jeios/vm.h>
 
-/* user_demo.S encodes JE_VM_HANDLE_CAP as an assembly-only boundary probe.
+/* user_demo.S encodes JE_VM_HANDLE_CAP (index 40, BADINDEX) and CAP-1 (index 39,
+ * in-range free slot, STALE) as assembly-only boundary probes.
  * Keep the literal coupled to the frozen production capacity rather than
  * allowing the ring-3 test to silently drift if the C header changes. */
 _Static_assert(JE_VM_HANDLE_CAP == 40u, "user demo handle-capacity probe");

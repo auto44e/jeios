@@ -263,7 +263,8 @@ je_user_badrsp_end:
  *   +0x40 close(live) status
  *   +0x48 query(closed) status   +0x50 close(closed) status
  *   +0x58 close(handle 0) status
- *   +0x60 query(index == capacity) status
+ *   +0x18 query(in-range FREE slot, index CAP-1 = 39) status (expect STALE)
+ *   +0x60 query(index == capacity, JE_VM_HANDLE_CAP = 40) status (expect BADINDEX)
  *   +0x68 query(wrong gen, live slot) status
  *   +0x70 close(wide handle) status
  *   +0x78 self#2 handle (slot reuse; must differ from self#1)

@@ -112,7 +112,8 @@ Formulas, with the **provisional** values PR-A must confirm:
 | Child endpoint creation quota | spawn parameter, 0 ≤ c ≤ `JE_EP_CHILD_QUOTA_MAX`. **`JE_EP_CHILD_QUOTA_MAX` = 0 in M4**, so spawn rejects any nonzero value with `INVALID`. | 0 |
 
 Per-process page quota stays at 73. The measured kernel page pool at the 16 MiB CI
-profile is 3104 pages, and P × 73 = 584.
+profile is 3104 pages (at `dc41da5`; 3067 after PR-A's larger static pools), and
+P × 73 = 584.
 
 **PR-A rule:** the numbers above are provisional. PR-A must do three things before
 any of them is frozen:

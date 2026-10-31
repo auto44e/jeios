@@ -1,5 +1,24 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-A (#53) — capacity raise — observed 2026-10-31T02:11:09+00:00
+
+Branch `feat/m4a-capacity`. It is stacked on `docs/adr-0010-m4` (#60, ADR 0010), so #60 must merge first.
+
+- **Implemented** (ADR 0010 D2):
+  - New limits: P = 8 processes, T = 16 threads (M2 workload kept at 7), E = 24 endpoint records, H = 40 handle slots.
+  - The capacity formulas are enforced by `_Static_assert`.
+  - `je_vm_build_quota` adds a per-table quota. `je_vm_build` keeps the old default of 15.
+  - M2 is restored exactly, with a new capacity-exhaustion phase.
+  - The ring-3 BADINDEX bound probe now tests index 40, and a new in-range-free probe expects STALE.
+  - Stale ROADMAP and ADR 0009 status text was refreshed.
+- **Tested, local only:**
+  - `make check`, `make smoke`, `make integration`, all three x86 profiles and all four ARM modes pass.
+  - Free pages at 16 MiB: 3067. M2 preemptions: 0x49, against a floor of 16.
+  - Remote CI results are recorded in the PR.
+- **Planned:** PR-B: PROCESS records, the automatic idle reaper, typed dispatch, the D-DEV quota and `PROC_STATUS`. The code map is prepared; see the PR-B notes in the PR.
+- **Blocked:** nothing.
+- **Owner check:** the M2 capacity phase is new code inside the previously tested M2 boot test. It was approved under D-OWNER-1, which includes "re-baselined assertions", and is flagged for your gate.
+
 ## M4 contract (#53) — ADR 0010 accepted — observed 2026-10-31T00:02:04+00:00
 
 Repo auto44e/jeios, branch `docs/adr-0010-m4`, based on main `dc41da5`. #52 is CLOSED

@@ -297,7 +297,8 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
         fail("JeiOS fatal: stack or heap resource leak\r\n");
     je_arch_console_write("M2: exited threads reaped; page accounting restored\r\n");
     /* M4 D2 capacity phase: after the original M2 workload has been reaped,
-     * create no-allocation probes with interrupts disabled until every
+     * create probes whose BODY allocates nothing (each je_thread_create still
+     * allocates its guarded stack) with interrupts disabled until every
      * non-idle scheduler slot is occupied. The failed next create must not
      * allocate or change page accounting. */
     atomic_store_explicit(&capacity_completed,0,memory_order_release);

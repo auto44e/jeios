@@ -520,6 +520,46 @@ re-stale-after-reuse assertion, the measured quota count, the softened per-proce
 wording, the ADR wide-handle amendment, and the pinned ABI static-asserts).
 AI-assisted review only; not independent human qualification.
 
+## M4 PR-A — capacity raise + per-table handle quota (ADR 0010 D2) — 2026-10-31
+
+ADR 0010 D2, owner-approved as D-OWNER-1. This is a tested-path change, and the owner gated it.
+
+**What changed**
+
+| Constant | Before | After |
+|---|---|---|
+| `JE_VM_MAX_PROCESSES` | 2 | 8 |
+| `JE_THREAD_MAX` | 8 | 16 (`JE_M2_WORKERS` = 7) |
+| `JE_EP_POOL_CAP` | 4 | 24 |
+| `JE_VM_HANDLE_CAP` | 16 | 40 |
+
+- The D2 formulas are pinned by `_Static_assert`s: supervisor handle need + 4 ≤ H − 1; the endpoint pool formula, asserted in `endpoint_kern.c` because it needs both headers; T ≥ 1 + 7 + P.
+- `je_vm_build_quota(..., handle_quota, ...)` checks the quota range **first** (0 or more than H − 1 → INVALID, no state change). It is the single build path. `je_vm_build` delegates to it with `JE_VM_HANDLE_QUOTA_DEFAULT` = 15, the M3b value, so every quota-at-15 assertion holds.
+- The M2 boot workload stays at exactly 7 workers. A no-allocation probe fills the other 8 thread slots, so the "next create returns NOMEM with `free_count` unchanged" rollback check still runs at the real capacity. The preemption floor is now 2 × `JE_M2_WORKERS`. The M3 dispatch budgets stay `JE_THREAD_MAX`-scaled, i.e. full passes over the slot table.
+- The ring-3 BADINDEX probe moved from index 16 to index `JE_VM_HANDLE_CAP` (40), so BADINDEX at the bound is still exercised at the new capacity.
+- Hosted tests:
+  - admission BUSY on build P + 1;
+  - P-way isolation;
+  - `je_vm_build_quota`: range checked first, crossed with every other failure class; exact admission at 1, the default and MAX; independence across P slots; fault-injection rollback;
+  - endpoint pool exhaustion at exactly E.
+
+**Static cost.** `.bss` 2,797,568 → 2,949,120 bytes (+151,552). Free kernel pages at the 16 MiB profile: 3104 → 3067. The cross-process `je_vm_audit` bound is at most pages × (P − 1) × pages ≈ 37k frame comparisons for a full process. That is fine at boot. A future spawn path must not run it for every spawn with IF=0 without measuring the latency (ADR 0010 D5 runs spawn under IF=0).
+
+**Provenance (worker mode; AI-assisted review, not human qualification)**
+
+| Part | Author | Adversarial reviewer |
+|---|---|---|
+| Header contract and fail-closed stub | lead | — |
+| Kernel implementation | Codex | Claude |
+| Hosted tests, written from the headers only | Claude | Codex |
+| BADINDEX probe restoration | lead | — |
+
+Notes: `docs/adr/debates/m4a-workers/`.
+
+**Evidence.** Local: `make check`, `smoke` and `integration`; the three x86 profiles; ARM normal and vector smoke. Remote CI is recorded in the PR.
+
+**Not yet.** No new runtime ability. PROCESS records, spawn and the supervisor arrive in PR-B onward.
+
 ## MP1 step 3 — bounded copied DTB parse + remote ARM64 CI job (QEMU virt-8.2) — 2026-10-30
 
 Issue #52 (finishes ARM64.md MP1). Not owner-gated in substance: new
