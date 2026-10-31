@@ -103,6 +103,14 @@ bool      je_handle_is_wellformed(je_handle h); /* nonzero, upper bits clear */
 bool je_handle_table_init(je_handle_table *t, je_handle_slot *slots,
                           uint32_t capacity, uint32_t quota);
 
+/* ADR 0010 D5 spawn step 0 (preflight; PR-C lead decision instead of a RESERVED slot
+ * state, which would change ADR 0008's frozen slot states). Pure and read-only: returns
+ * exactly the status je_handle_alloc would return right now (QUOTA before NOSLOTS, OK if
+ * an alloc would succeed), with no change. NULL t -> BADINDEX. Sound for spawn only
+ * because nothing touches the caller's table between this check and the publishing
+ * alloc (one CPU, IF=0 for the whole syscall). */
+je_handle_status je_handle_can_alloc(const je_handle_table *t);
+
 /* Allocate the lowest FREE slot, bind {object,type,rights}, return its handle.
  * `out` is REQUIRED (non-NULL): a NULL out returns BADINDEX and allocates
  * nothing, so a handle is never minted into a slot the caller cannot receive.

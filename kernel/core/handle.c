@@ -221,3 +221,10 @@ je_handle_status je_handle_resolve_any(const je_handle_table *t, je_handle h,
     *obj = s->object;
     return JE_HANDLE_OK;
 }
+
+/* ADR 0010 D5 pre-wiring STUB (lead): fails closed until PR-C. */
+je_handle_status je_handle_can_alloc(const je_handle_table *t)
+{
+    (void)t;
+    return JE_HANDLE_NOSLOTS;
+}

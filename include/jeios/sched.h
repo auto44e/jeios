@@ -20,6 +20,13 @@ je_status je_thread_create(void (*entry)(void *),void *argument);
 /* M3a #4 step 3: create a ring-3 thread for a READY vm process (see vm.h). The
  * process's held kernel stack becomes TSS.RSP0; requires NX (ADR 0007 D2). */
 je_status je_thread_create_user(je_vm *vm, uint32_t index);
+/* ADR 0010 D5 startup register ABI. Same as je_thread_create_user, but after the frame
+ * is zeroed RDI/RSI/RDX/RCX/R8/R9 are set from *st (NULL = all zero), and the chosen
+ * scheduler slot is written to *out_slot (may be NULL). No side effect on failure.
+ * je_thread_create_user(vm, i) == je_thread_create_user_start(vm, i, NULL, NULL). */
+typedef struct { uint64_t rdi, rsi, rdx, rcx, r8, r9; } je_user_startup;
+je_status je_thread_create_user_start(je_vm *vm, uint32_t index,
+                                      const je_user_startup *st, uint32_t *out_slot);
 /* M3a #4 step 3: remove a user thread (by owning vm process) from scheduling
  * before je_vm_destroy frees its kernel stack. Interrupts disabled; not the
  * running thread. */

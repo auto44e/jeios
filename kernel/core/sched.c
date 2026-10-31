@@ -644,3 +644,11 @@ uint64_t je_sched_min_dispatches(void)
     return min;
 }
 
+/* ADR 0010 D5 pre-wiring STUB (lead): only the all-zero startup is supported until PR-C. */
+je_status je_thread_create_user_start(je_vm *vm, uint32_t index,
+                                      const je_user_startup *st, uint32_t *out_slot)
+{
+    if (st) return JE_ERR_UNSUPPORTED;
+    if (out_slot) *out_slot = 0u;
+    return je_thread_create_user(vm, index);
+}
