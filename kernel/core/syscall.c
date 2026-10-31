@@ -146,6 +146,12 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
         if (rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_PROC_STATUS;
+    case JE_SYS_PROC_KILL:
+        /* proc_kill(h=RDI): the handle is narrowed only after this decode check;
+         * every other argument is reserved. */
+        if (rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_PROC_KILL;
 #ifdef JE_DEV_COPY_INJECT
     case JE_SYS_COPY_FIXUP_INJECT:
         /* dev-only: uaddr=RDI (an unmapped arena page); glue raw-copies to prove
@@ -520,6 +526,37 @@ static je_trap_frame *dispatch_proc_status(je_trap_frame *f)
     return je_sched_return_to_user(f);
 }
 
+static je_trap_frame *dispatch_proc_kill(je_trap_frame *f)
+{
+    je_handle_table *t = current_htable();
+    if (!t) {
+        f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0;
+        return je_sched_return_to_user(f);
+    }
+    uint32_t type = 0u, rights = 0u; void *object = (void *)0;
+    je_handle_status resolve = je_handle_resolve_any(t, (je_handle)f->rdi,
+                                                      &type, &rights, &object);
+    if (resolve != JE_HANDLE_OK) {
+        f->rax=(uint64_t)handle_status_to_abi(resolve); f->rdx=0;
+        return je_sched_return_to_user(f);
+    }
+    if (type != JE_PROCESS_TYPE) {
+        f->rax=(uint64_t)JE_ABI_H_WRONGTYPE; f->rdx=0;
+        return je_sched_return_to_user(f);
+    }
+    if ((rights & JE_ABI_RIGHT_KILL) == 0u) {
+        f->rax=(uint64_t)JE_ABI_H_DENIED; f->rdx=0;
+        return je_sched_return_to_user(f);
+    }
+    je_proc_id id = JE_PROC_ID_NONE;
+    if (!process_id_from_object(process_pool(), object, &id))
+        syscall_invariant("JeiOS fatal: PROC_KILL record invariant\r\n");
+    je_status killed = je_sched_kill(id);
+    f->rax=(uint64_t)((killed == JE_OK) ? JE_ABI_OK : JE_ABI_INVALID);
+    f->rdx=0;
+    return je_sched_return_to_user(f);
+}
+
 /* Kernel glue. Returns the frame to iretq to (the caller for RETURN/invalid, a
  * live successor for YIELD/EXIT). Must only be called for a user-origin int 0x80
  * frame (je_trap_dispatch enforces cs&3==3; the scheduler helpers re-check the
@@ -550,6 +587,8 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
 
     if (action == JE_SYSCALL_PROC_STATUS)
         return dispatch_proc_status(f);
+    if (action == JE_SYSCALL_PROC_KILL)
+        return dispatch_proc_kill(f);
 
     switch (action) {
     case JE_SYSCALL_YIELD:

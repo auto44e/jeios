@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <stdint.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <jeios/kheap.h>
 #include <jeios/sched.h>
 #include <jeios/arch.h>
@@ -11,6 +12,7 @@
 #include <jeios/abi.h>
 #include <jeios/endpoint.h>
 #include <jeios/endpoint_kern.h>
+#include <jeios/handle.h>
 #include <jeios/proc.h>
 #include <jeios/image.h>
 #include <jeios/spawn.h>
@@ -112,6 +114,10 @@ extern unsigned char je_user_demo_start[], je_user_demo_end[];
 extern unsigned char je_user_proc_exit7_start[], je_user_proc_exit7_end[];
 extern unsigned char je_user_m4b_start[], je_user_m4b_end[];
 extern unsigned char je_user_m4c_start[], je_user_m4c_end[];
+extern unsigned char je_user_m4d_start[], je_user_m4d_end[];
+extern unsigned char je_user_m4d_ready_start[], je_user_m4d_ready_end[];
+extern unsigned char je_user_m4d_blocked_start[], je_user_m4d_blocked_end[];
+extern unsigned char je_user_m4d_woken_start[], je_user_m4d_woken_end[];
 extern unsigned char je_user_fp_start[], je_user_fp_end[];
 extern unsigned char je_user_fault_start[], je_user_fault_end[];
 extern unsigned char je_user_exit_start[], je_user_exit_end[];
@@ -136,7 +142,8 @@ typedef enum { PROG_HEARTBEAT=0, PROG_FP=1, PROG_FAULT=2, PROG_EXIT=3,
                PROG_COPYPROBE=8, PROG_INJECT=9, PROG_HANDLE=10,
                PROG_EPFAULT=11, PROG_EPIPC=12, PROG_EPRECV_TO=13,
                PROG_PING=14, PROG_PONG=15, PROG_PROC_EXIT7=16,
-               PROG_M4B=17, PROG_M4C=18 } user_prog;
+               PROG_M4B=17, PROG_M4C=18, PROG_M4D=19, PROG_M4D_READY=20,
+               PROG_M4D_BLOCKED=21, PROG_M4D_WOKEN=22 } user_prog;
 static int vm_s3_inited;
 /* Initialize the shared step-3/4 vm once. The M3 fixture still uses two
  * processes, while the backing pool now has the M4 D2 capacity for later PRs. */
@@ -162,6 +169,10 @@ static uint32_t vm_s3_build_quota(user_prog prog, uint32_t ep_limit)
     case PROG_PROC_EXIT7: start=je_user_proc_exit7_start; end=je_user_proc_exit7_end; break;
     case PROG_M4B:        start=je_user_m4b_start;        end=je_user_m4b_end;        break;
     case PROG_M4C:        start=je_user_m4c_start;        end=je_user_m4c_end;        break;
+    case PROG_M4D:        start=je_user_m4d_start;        end=je_user_m4d_end;        break;
+    case PROG_M4D_READY:  start=je_user_m4d_ready_start;  end=je_user_m4d_ready_end;  break;
+    case PROG_M4D_BLOCKED:start=je_user_m4d_blocked_start;end=je_user_m4d_blocked_end;break;
+    case PROG_M4D_WOKEN:  start=je_user_m4d_woken_start;  end=je_user_m4d_woken_end;  break;
     case PROG_FP:        start=je_user_fp_start;        end=je_user_fp_end;        break;
     case PROG_FAULT:     start=je_user_fault_start;     end=je_user_fault_end;     break;
     case PROG_EXIT:      start=je_user_exit_start;      end=je_user_exit_end;      break;
@@ -1802,6 +1813,284 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             je_arch_console_write("M4c-s1: spawn/LAUNCHER/startup-v1/CLOCK_TICKS OK; negative baselines OK; quota validation order OK; fail-Nth rollback OK (steps 1-5); spawn cycles=");
             je_arch_console_hex(spawn_cycles_end - spawn_cycles_start);
             je_arch_console_write("\r\n");
+        }
+        /* --- M4d-s1: synchronous PROC_KILL. The bootstrap is the fixture
+         * coordinator; all ring-3 authority is held by K in PROCESS and endpoint
+         * handles minted through the existing kernel-only helpers. Reaping is
+         * performed only by je_kernel_idle_step. */
+        {
+            if (process_pool.used_count != 0u || je_endpoint_kernel_allocated() != 0u)
+                fail("JeiOS fatal: M4d baseline\r\n");
+            uint32_t killer = vm_s3_build_quota(PROG_M4D, JE_EP_POOL_CAP);
+            uint32_t ready_victim = vm_s3_build_quota(PROG_M4D_READY, JE_EP_POOL_CAP);
+            uint32_t blocked_victim = vm_s3_build_quota(PROG_M4D_BLOCKED, JE_EP_POOL_CAP);
+            uint32_t woken_victim = vm_s3_build_quota(PROG_M4D_WOKEN, JE_EP_POOL_CAP);
+            uint32_t unlinked = vm_s3_build_quota(PROG_M4D_READY, JE_EP_POOL_CAP);
+            je_handle h_ready_kill = 0u, h_ready_inspect = 0u, h_ready_stale = 0u;
+            je_handle h_blocked_kill = 0u, h_woken_kill = 0u, h_self = 0u;
+            je_handle h_unlinked = 0u, h_blocked_peer = 0u, h_woken_peer = 0u;
+            je_handle h_blocked_victim_end = 0u, h_woken_victim_end = 0u;
+            je_handle_status alloc_status = JE_HANDLE_OK;
+            uint64_t setup_flags = je_arch_irq_save();
+            if (je_process_handle_mint(
+                    &vm_s3, killer, vm_s3_proc_ids[ready_victim],
+                    JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL,
+                    &h_ready_kill, &alloc_status) != JE_OK
+                || je_process_handle_mint(
+                    &vm_s3, killer, vm_s3_proc_ids[ready_victim],
+                    JE_ABI_RIGHT_INSPECT, &h_ready_inspect, &alloc_status) != JE_OK
+                || je_process_handle_mint(
+                    &vm_s3, killer, vm_s3_proc_ids[ready_victim],
+                    JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL,
+                    &h_ready_stale, &alloc_status) != JE_OK
+                || je_process_handle_mint(
+                    &vm_s3, killer, vm_s3_proc_ids[blocked_victim],
+                    JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL,
+                    &h_blocked_kill, &alloc_status) != JE_OK
+                || je_process_handle_mint(
+                    &vm_s3, killer, vm_s3_proc_ids[woken_victim],
+                    JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL,
+                    &h_woken_kill, &alloc_status) != JE_OK
+                || je_process_handle_mint(
+                    &vm_s3, killer, vm_s3_proc_ids[killer],
+                    JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL,
+                    &h_self, &alloc_status) != JE_OK
+                || je_process_handle_mint(
+                    &vm_s3, killer, vm_s3_proc_ids[unlinked],
+                    JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL,
+                    &h_unlinked, &alloc_status) != JE_OK
+                || je_endpoint_kern_seed(&vm_s3, killer, blocked_victim,
+                                         &h_blocked_peer, &h_blocked_victim_end) != JE_EP_OK
+                || je_endpoint_kern_seed(&vm_s3, killer, woken_victim,
+                                         &h_woken_peer, &h_woken_victim_end) != JE_EP_OK) {
+                je_arch_irq_restore(setup_flags);
+                fail("JeiOS fatal: M4d capability setup\r\n");
+            }
+            je_arch_irq_restore(setup_flags);
+            vm_s3_scratch_write(killer, 0x1c08u, h_ready_kill);
+            vm_s3_scratch_write(killer, 0x1c10u, h_ready_inspect);
+            vm_s3_scratch_write(killer, 0x1c18u, h_blocked_kill);
+            vm_s3_scratch_write(killer, 0x1c20u, h_woken_kill);
+            vm_s3_scratch_write(killer, 0x1c28u, h_self);
+            vm_s3_scratch_write(killer, 0x1c30u, h_ready_stale);
+            vm_s3_scratch_write(killer, 0x1c38u, h_unlinked);
+            vm_s3_scratch_write(killer, 0x1c48u, h_blocked_peer);
+            vm_s3_scratch_write(killer, 0x1c40u, h_woken_peer);
+            vm_s3_scratch_write(blocked_victim, 0x1e88u, h_blocked_victim_end);
+            vm_s3_scratch_write(woken_victim, 0x1eb8u, h_woken_victim_end);
+            if (je_thread_create_user(&vm_s3, ready_victim) != JE_OK
+                || je_thread_create_user(&vm_s3, blocked_victim) != JE_OK
+                || je_thread_create_user(&vm_s3, woken_victim) != JE_OK
+                || je_thread_create_user(&vm_s3, killer) != JE_OK) {
+                fail("JeiOS fatal: M4d thread setup\r\n");
+            }
+            __asm__ volatile("sti" ::: "memory");
+
+            uint64_t park_start = je_sched_ticks();
+            uint64_t park_spins = 0u;
+            for (;;) {
+                uint64_t flags = je_arch_irq_save();
+                uint64_t phase = vm_s3_scratch(killer, 0x1c00u);
+                uint64_t blocked_progress = vm_s3_scratch(blocked_victim, 0x1e80u);
+                uint64_t woken_progress = vm_s3_scratch(woken_victim, 0x1eb0u);
+                je_arch_irq_restore(flags);
+                if (phase == 99u) {
+                    fail("JeiOS fatal: M4d killer assertion before park\r\n");
+                }
+                if (blocked_progress == 1u && woken_progress == 1u) break;
+                if (je_sched_ticks() - park_start > 300u || ++park_spins > 100000u)
+                    fail("JeiOS fatal: M4d victims did not reach recv\r\n");
+                __asm__ volatile("pause");
+            }
+            /* A parked receiver cannot be dispatched or write its completion
+             * status. Hold the killer at its phase-2 gate while the bootstrap
+             * lets at least 0x40 timer ticks pass without invoking the reaper. */
+            uint64_t blocked_dispatches = je_sched_dispatches_of(&vm_s3, blocked_victim);
+            uint64_t woken_dispatches = je_sched_dispatches_of(&vm_s3, woken_victim);
+            uint64_t parked_start = je_sched_ticks();
+            while (je_sched_ticks() - parked_start < 0x40u) {
+                uint64_t flags = je_arch_irq_save();
+                uint64_t phase = vm_s3_scratch(killer, 0x1c00u);
+                uint64_t blocked_progress = vm_s3_scratch(blocked_victim, 0x1e80u);
+                uint64_t woken_progress = vm_s3_scratch(woken_victim, 0x1eb0u);
+                uint64_t blocked_status = vm_s3_scratch(blocked_victim, 0x1e98u);
+                uint64_t woken_status = vm_s3_scratch(woken_victim, 0x1ec8u);
+                je_arch_irq_restore(flags);
+                if (phase != 2u || blocked_progress != 1u || woken_progress != 1u
+                    || blocked_status == JE_ABI_H_TIMED_OUT
+                    || blocked_status == JE_ABI_H_CANCELLED
+                    || woken_status == JE_ABI_H_TIMED_OUT
+                    || woken_status == JE_ABI_H_CANCELLED
+                    || je_sched_dispatches_of(&vm_s3, blocked_victim) != blocked_dispatches
+                    || je_sched_dispatches_of(&vm_s3, woken_victim) != woken_dispatches)
+                    fail("JeiOS fatal: M4d receiver was not parked\r\n");
+                __asm__ volatile("pause");
+            }
+            uint64_t ready_before = vm_s3_heartbeat(ready_victim);
+            uint64_t ready_ticks = je_sched_ticks();
+            while (je_sched_ticks() - ready_ticks < 0x40u) {
+                if (vm_s3_heartbeat(ready_victim) != ready_before)
+                    fail("JeiOS fatal: M4d READY victim heartbeat continued\r\n");
+                __asm__ volatile("pause");
+            }
+            uint64_t ready_after = vm_s3_heartbeat(ready_victim);
+            if (ready_after != ready_before)
+                fail("JeiOS fatal: M4d READY heartbeat changed after kill\r\n");
+            vm_s3_scratch_write(killer, 0x1bf8u, 1u);
+
+            uint64_t blocked_death_start = je_sched_ticks();
+            for (;;) {
+                uint64_t flags = je_arch_irq_save();
+                uint64_t phase = vm_s3_scratch(killer, 0x1c00u);
+                uint64_t recv_status = vm_s3_scratch(blocked_victim, 0x1e98u);
+                uint32_t state = JE_PROC_FREE, reason = 0u; uint64_t code = 0u;
+                je_status status = je_proc_status(
+                    &process_pool, vm_s3_proc_ids[blocked_victim],
+                    &state, &reason, &code);
+                je_arch_irq_restore(flags);
+                if (phase == 99u)
+                    fail("JeiOS fatal: M4d blocked-kill assertion\r\n");
+                if (phase == 3u) {
+                    if (status != JE_OK || state != JE_PROC_DYING
+                        || reason != JE_DEATH_KILLED
+                        || recv_status == JE_ABI_H_TIMED_OUT
+                        || recv_status == JE_ABI_H_CANCELLED)
+                        fail("JeiOS fatal: M4d blocked waiter completion\r\n");
+                    break;
+                }
+                if (je_sched_ticks() - blocked_death_start > 300u)
+                    fail("JeiOS fatal: M4d blocked kill timeout\r\n");
+                je_kernel_idle_step();
+            }
+            while (je_sched_has_process(&vm_s3, blocked_victim)) {
+                if (je_sched_ticks() - blocked_death_start > 400u)
+                    fail("JeiOS fatal: M4d blocked victim reap timeout\r\n");
+                je_kernel_idle_step();
+            }
+            if (je_endpoint_kernel_allocated() != 1u)
+                fail("JeiOS fatal: M4d blocked endpoint was not reclaimed\r\n");
+            vm_s3_scratch_write(killer, 0x1bf8u, 2u);
+
+            uint64_t woken_park_start = je_sched_ticks();
+            for (;;) {
+                uint64_t flags = je_arch_irq_save();
+                uint64_t phase = vm_s3_scratch(killer, 0x1c00u);
+                uint64_t progress = vm_s3_scratch(woken_victim, 0x1eb0u);
+                uint64_t recv_status = vm_s3_scratch(woken_victim, 0x1ec8u);
+                je_arch_irq_restore(flags);
+                if (phase == 99u)
+                    fail("JeiOS fatal: M4d woken preparation assertion\r\n");
+                if (phase == 4u && progress == 1u
+                    && recv_status != JE_ABI_H_TIMED_OUT
+                    && recv_status != JE_ABI_H_CANCELLED)
+                    break;
+                if (je_sched_ticks() - woken_park_start > 300u)
+                    fail("JeiOS fatal: M4d WOKEN victim did not park\r\n");
+                __asm__ volatile("pause");
+            }
+            woken_dispatches = je_sched_dispatches_of(&vm_s3, woken_victim);
+            uint64_t woken_start = je_sched_ticks();
+            while (je_sched_ticks() - woken_start < 0x40u) {
+                uint64_t flags = je_arch_irq_save();
+                uint64_t progress = vm_s3_scratch(woken_victim, 0x1eb0u);
+                uint64_t recv_status = vm_s3_scratch(woken_victim, 0x1ec8u);
+                je_arch_irq_restore(flags);
+                if (progress != 1u || recv_status == JE_ABI_H_TIMED_OUT
+                    || recv_status == JE_ABI_H_CANCELLED
+                    || je_sched_dispatches_of(&vm_s3, woken_victim) != woken_dispatches)
+                    fail("JeiOS fatal: M4d WOKEN victim was not parked\r\n");
+                __asm__ volatile("pause");
+            }
+            vm_s3_scratch_write(killer, 0x1bf8u, 3u);
+
+            uint64_t woken_death_start = je_sched_ticks();
+            for (;;) {
+                uint64_t flags = je_arch_irq_save();
+                uint64_t phase = vm_s3_scratch(killer, 0x1c00u);
+                uint32_t state = JE_PROC_FREE, reason = 0u; uint64_t code = 0u;
+                je_status status = je_proc_status(
+                    &process_pool, vm_s3_proc_ids[woken_victim],
+                    &state, &reason, &code);
+                uint32_t type = 0u, rights = 0u; void *object = (void *)0;
+                je_handle_status resolved = je_handle_resolve_any(
+                    &vm_s3.procs[killer].htable, h_woken_peer,
+                    &type, &rights, &object);
+                bool queue_ok = false;
+                if (resolved == JE_HANDLE_OK && type == JE_ABI_OBJ_ENDPOINT
+                    && object != (void *)0) {
+                    je_ep_end *sender = (je_ep_end *)object;
+                    uintptr_t channel_address = (uintptr_t)sender
+                        - offsetof(je_ep_channel, end)
+                        - (uintptr_t)sender->side * sizeof(je_ep_end);
+                    je_ep_channel *channel = (je_ep_channel *)channel_address;
+                    je_ep_end *receiver = &channel->end[sender->side ^ 1u];
+                    queue_ok = !receiver->waiter.present
+                        && !receiver->waiter.head_reserved
+                        && receiver->inbound.count == 1u
+                        && receiver->state == JE_EP_END_OPEN;
+                }
+                je_arch_irq_restore(flags);
+                if (phase == 99u)
+                    fail("JeiOS fatal: M4d WOKEN kill assertion\r\n");
+                if (phase == 5u) {
+                    if (status != JE_OK || state != JE_PROC_DYING
+                        || reason != JE_DEATH_KILLED || !queue_ok
+                        || je_sched_dispatches_of(&vm_s3, woken_victim)
+                               != woken_dispatches)
+                        fail("JeiOS fatal: M4d reserved-head release\r\n");
+                    break;
+                }
+                if (je_sched_ticks() - woken_death_start > 300u)
+                    fail("JeiOS fatal: M4d WOKEN kill timeout\r\n");
+                __asm__ volatile("pause");
+            }
+            uint64_t woken_close_flags = je_arch_irq_save();
+            je_ep_status woken_close = je_endpoint_kern_close(
+                &vm_s3, killer, h_woken_peer);
+            je_arch_irq_restore(woken_close_flags);
+            if (woken_close != JE_EP_OK)
+                fail("JeiOS fatal: M4d WOKEN peer close\r\n");
+            while (je_sched_has_process(&vm_s3, woken_victim)) {
+                if (je_sched_ticks() - woken_death_start > 400u)
+                    fail("JeiOS fatal: M4d WOKEN victim reap timeout\r\n");
+                je_kernel_idle_step();
+            }
+            if (je_endpoint_kernel_allocated() != 0u)
+                fail("JeiOS fatal: M4d WOKEN endpoint was not reclaimed\r\n");
+            vm_s3_scratch_write(killer, 0x1bf8u, 4u);
+
+            uint64_t done_start = je_sched_ticks();
+            for (;;) {
+                uint64_t flags = je_arch_irq_save();
+                uint64_t phase = vm_s3_scratch(killer, 0x1c00u);
+                uint32_t state = JE_PROC_FREE, reason = 0u; uint64_t code = 0u;
+                je_status status = je_proc_status(
+                    &process_pool, vm_s3_proc_ids[unlinked],
+                    &state, &reason, &code);
+                je_arch_irq_restore(flags);
+                if (phase == 99u) {
+                    fail("JeiOS fatal: M4d negative assertion\r\n");
+                }
+                if (phase == 7u) {
+                    if (status != JE_OK || state != JE_PROC_LIVE)
+                        fail("JeiOS fatal: M4d unlinked record changed\r\n");
+                    break;
+                }
+                if (je_sched_ticks() - done_start > 300u)
+                    fail("JeiOS fatal: M4d completion timeout\r\n");
+                __asm__ volatile("pause");
+            }
+            while (je_sched_has_process(&vm_s3, killer)) {
+                if (je_sched_ticks() - done_start > 400u)
+                    fail("JeiOS fatal: M4d killer reap timeout\r\n");
+                je_kernel_idle_step();
+            }
+            if (vm_s3_destroy(unlinked) != JE_OK)
+                fail("JeiOS fatal: M4d unlinked cleanup\r\n");
+            if (je_endpoint_kernel_allocated() != 0u || process_pool.used_count != 0u)
+                fail("JeiOS fatal: M4d final pool baseline\r\n");
+            je_arch_console_write(
+                "M4d-s1: PROC_KILL OK (READY, BLOCKED_IPC, WOKEN-reserved, self/after-death/unlinked/rights)\r\n");
         }
         /* M3c leaves no VM process intentionally live: B was torn down before
          * the cross-table, timeout, and bootstrap proofs. */
