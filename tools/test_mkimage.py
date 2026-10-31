@@ -477,6 +477,42 @@ def reject_cases(h):
     E("E10 entry below base", "E10", entry=BASE - 1)
     E("E10 entry near 2^64", "E10", entry=U64)
 
+    # Rule-ordering precedence: when two rules are violated at once, the LOWEST
+    # rule number must be reported. These pair cases guard against an
+    # implementation that checks segments (or rules) in the wrong order and so
+    # reports whichever violation it hits first. Each case is constructed to
+    # break exactly the two named rules and assert the lower one. (A naive
+    # per-segment loop that merges E6+E7 or E8+E9 would report the higher rule
+    # for the second segment -- this is the regression these cases catch.)
+    E("precedence E2<E3 (phentsize bad + PT_INTERP)", "E2",
+      default_phdrs() + [seg(PT_INTERP, PF_R)], phentsize=64)
+    E("precedence E3<E4 (PT_NOTE + GNU_STACK X)", "E3",
+      default_phdrs()[:3] + [seg(PT_NOTE, PF_R), gnu_stack(PF_X)])
+    E("precedence E3<E5 (nine PT_LOAD + PT_INTERP)", "E3",
+      [load(BASE, PF_R | PF_X, 0x10)] + [load(BASE + PAGE * i, PF_R, 0x10) for i in range(1, 9)]
+      + [seg(PT_INTERP, PF_R)])
+    E("precedence E5<E6 (nine PT_LOAD, one below base)", "E5",
+      [load(BASE - PAGE, PF_R, 0x10)] + [load(BASE + PAGE * i, PF_R | PF_X, 0x10) for i in range(9)]),
+    # E6 on a LATER segment vs E7 on an EARLIER segment: a per-segment loop that
+    # checks E7 before E6 within each segment would report E7 (seg 0) first.
+    # Lowest-rule-wins requires E6 (seg 1) to win.
+    E("precedence E6<E7 (seg0 W|X, seg1 unaligned vaddr)", "E6",
+      [load(BASE, PF_R | PF_W | PF_X, 0x20), load(BASE + PAGE + 0x10, PF_R, 0x10)],
+      entry=BASE),
+    # E7 on a later segment vs a clean earlier one, with an E6 violation only on
+    # the earlier one: here the lower rule E6 is on seg 0, so E6 wins regardless.
+    E("precedence E6<E7 (seg0 unaligned, seg1 W|X)", "E6",
+      [load(BASE + 0x10, PF_R | PF_X, 0x20), load(BASE + PAGE, PF_R | PF_W | PF_X, 0x10)],
+      entry=BASE + 0x10),
+    # E8 on an earlier pair vs E9 on the total: overlap must be reported before
+    # the page-budget total, which a merged loop computes as it walks.
+    E("precedence E8<E9 (overlap + 65-page total)", "E8",
+      [load(BASE, PF_R | PF_X, 0x20), load(BASE, PF_R | PF_W, 0x8, 60 * PAGE)]),
+    # E9 vs E10: an over-budget image whose entry is also invalid must report E9.
+    E("precedence E9<E10 (65 pages + bad entry)", "E9",
+      [load(BASE, PF_R | PF_X, 0x20), load(BASE + PAGE, PF_R | PF_W, 0x8, 60 * PAGE)],
+      entry=BASE + 0x2100),
+
 
 def accept_cases(h):
     def A(tag, phdrs, entry=BASE, name="t", deep=True, cross=False, **kw):

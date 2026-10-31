@@ -19,7 +19,7 @@ CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c kernel/
 SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/handle.c kernel/core/endpoint.c kernel/core/endpoint_kern.c kernel/core/proc.c kernel/core/image.c kernel/core/spawn.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
 USER_WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
 USER_CFLAGS := -std=c11 -O2 $(USER_WARN) -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -m64 -march=x86-64 -mcmodel=small -mno-red-zone -mgeneral-regs-only -fno-tree-loop-distribute-patterns -Iuser/include -Iinclude
-USER_LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 -z noexecstack -Wl,--build-id=none
+USER_LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 -z noexecstack -Wl,--build-id=none -Wl,--orphan-handling=error
 USER_OBJECTS := $(BUILD)/user/crt0.o $(BUILD)/user/lib/mem.o $(BUILD)/user/services/hello.o
 USER_IMAGE := $(BUILD)/user/hello.elf
 USER_GENERATED := $(BUILD)/gen/image_c_hello.c
@@ -40,7 +40,7 @@ $(BUILD)/user/%.o: user/%.c
 	$(CC) $(USER_CFLAGS) -MMD -MP -c $< -o $@
 $(BUILD)/user/%.o: user/%.S
 	@mkdir -p $(@D)
-	$(CC) -Iuser/include -Iinclude -m64 -ffreestanding -fno-pie -fcf-protection=none -c $< -o $@
+	$(CC) -Iuser/include -Iinclude -m64 -ffreestanding -fno-pie -fcf-protection=none -MMD -MP -c $< -o $@
 $(USER_IMAGE): $(USER_OBJECTS) user/user.ld
 	@mkdir -p $(@D)
 	$(CC) $(USER_LDFLAGS) -T user/user.ld -o $@ $(USER_OBJECTS)
@@ -52,6 +52,7 @@ $(USER_IMAGE_OBJECT): $(USER_GENERATED)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 $(BUILD)/kernel/core/image.o: kernel/core/image.c $(USER_GENERATED) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
+	set -e; \
 	blob_sha256=$$(sed -n 's/.*blob_sha256=\([0-9a-f][0-9a-f]*\).*/\1/p' $(USER_GENERATED)); \
 	test "$${blob_sha256#????????????????????????????????????????????????????????????????}" != "$$blob_sha256"; \
 	short_sha256=$$(printf '%.16s' "$$blob_sha256"); \
@@ -92,7 +93,9 @@ smoke: iso
 	$(PYTHON) tools/smoke.py $(BUILD)/jeios.iso
 clean:
 	rm -rf build
+.DELETE_ON_ERROR:
 -include $(OBJECTS:.o=.d)
+-include $(USER_OBJECTS:.o=.d)
 .PHONY: integration
 integration:
 	$(PYTHON) tools/integration.py

@@ -108,6 +108,31 @@ static void check_generated(const je_vm_image *d, size_t len)
         running += g->source_size;
     }
     CHECK(running == len, "blob length == sum of source_size (concatenation)");
+
+    /* Independent content pin: a structurally valid descriptor whose blob was
+     * zeroed (or otherwise degenerate) would still validate, because the
+     * validator does not inspect blob bytes. Guard against that class of
+     * wrong-but-valid artifact: the entry's RX segment must carry real code, so
+     * its initialized bytes cannot be all-zero (x86-64 all-zero decodes to
+     * `add [rax],al` and would never be a sane entry). This is a weak but
+     * genuinely independent oracle over the embedded c_hello image. */
+    {
+        const uint32_t rx = first_rx(d);
+        if (rx < d->segment_count) {
+            const je_vm_segment *g = &d->segments[rx];
+            int any_nonzero = 0;
+            for (uint64_t i = 0; i < g->source_size; ++i)
+                if (IMG_BLOB[g->source_offset + i] != 0u) { any_nonzero = 1; break; }
+            CHECK(g->source_size == 0u || any_nonzero,
+                  "entry RX segment blob bytes are not all zero (non-degenerate image)");
+            /* The entry offset must land on an actual byte within that code. */
+            if (g->source_size > 0u)
+                CHECK(d->entry_offset >= g->target_offset &&
+                          d->entry_offset < g->target_offset + g->source_size,
+                      "entry lands inside the RX segment's initialized bytes");
+        }
+    }
+
     for (uint32_t s = d->segment_count; s < JE_VM_MAX_SEGMENTS; ++s)
         CHECK(memcmp(&d->segments[s], &zero_seg, sizeof zero_seg) == 0, "unused slot all zero");
 
@@ -226,20 +251,26 @@ static void check_mutations(const je_vm_image *d, size_t len)
     CHECK(validate(&m, len) == JE_ERR_UNSUPPORTED, "version 2 -> JE_ERR_UNSUPPORTED");
     m = *d; m.reserved = 1u;
     CHECK(validate(&m, len) != JE_OK, "descriptor reserved != 0 rejected");
-    m = *d; m.segments[0].reserved = 1u;
-    CHECK(validate(&m, len) != JE_OK, "segment reserved != 0 rejected");
     m = *d; m.segment_count = 0u;
     CHECK(validate(&m, len) != JE_OK, "segment_count 0 rejected");
     m = *d; m.segment_count = JE_VM_MAX_SEGMENTS + 1u;
     CHECK(validate(&m, len) != JE_OK, "segment_count 9 rejected");
-    m = *d; m.segments[0].memory_size += 1u;
-    CHECK(validate(&m, len) != JE_OK, "unaligned memory_size rejected");
-    m = *d; m.segments[0].target_offset += 1u;
-    CHECK(validate(&m, len) != JE_OK, "unaligned target_offset rejected");
-    m = *d; m.segments[0].source_size = m.segments[0].memory_size + 1u;
-    CHECK(validate(&m, len) != JE_OK, "source_size > memory_size rejected");
-    m = *d; m.segments[0].source_offset = (uint64_t)len + 1u;
-    CHECK(validate(&m, len) != JE_OK, "source_offset beyond blob rejected");
+
+    /* Per-segment field mutations applied to EVERY segment, not just seg 0: a
+     * validator that only checks reserved/alignment/source bounds for segment 0
+     * (or stops early) must be caught on segments 1..n-1 too. */
+    for (uint32_t s = 0; s < n; ++s) {
+        m = *d; m.segments[s].reserved = 1u;
+        CHECK(validate(&m, len) != JE_OK, "segment reserved != 0 rejected (any seg)");
+        m = *d; m.segments[s].memory_size += 1u;
+        CHECK(validate(&m, len) != JE_OK, "unaligned memory_size rejected (any seg)");
+        m = *d; m.segments[s].target_offset += 1u;
+        CHECK(validate(&m, len) != JE_OK, "unaligned target_offset rejected (any seg)");
+        m = *d; m.segments[s].source_size = m.segments[s].memory_size + 1u;
+        CHECK(validate(&m, len) != JE_OK, "source_size > memory_size rejected (any seg)");
+        m = *d; m.segments[s].source_offset = (uint64_t)len + 1u;
+        CHECK(validate(&m, len) != JE_OK, "source_offset beyond blob rejected (any seg)");
+    }
 }
 
 int main(void)

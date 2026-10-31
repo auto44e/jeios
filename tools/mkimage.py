@@ -59,8 +59,10 @@ bytes; no timestamps.
 import sys
 import argparse
 import hashlib
+import os
 import re
 import struct
+import tempfile
 
 FILE_LIMIT = 1024 * 1024
 PAGE_SIZE = 4096
@@ -141,8 +143,14 @@ def parse_elf(data):
     if len(loads) < 1 or len(loads) > MAX_SEGMENTS:
         reject("E5", "PT_LOAD count must be 1..8")
 
+    # Each rule is reported lowest-number-first. Because a later segment can
+    # violate a lower-numbered rule than an earlier segment violates, every rule
+    # runs as its OWN complete pass over all loads before the next rule begins
+    # (E6 over all loads, then E7 over all loads, then E8 over the sorted list,
+    # then E9 on the total, then E10). Merging two rules into one per-segment
+    # loop would report whichever segment comes first, not the lowest rule.
     for header in loads:
-        _p_type, flags, offset, vaddr, _paddr, filesz, memsz, _align = header
+        _p_type, _flags, offset, vaddr, _paddr, filesz, memsz, _align = header
         if vaddr % PAGE_SIZE != 0:
             reject("E6", "PT_LOAD virtual address is not page-aligned")
         if vaddr < BASE:
@@ -155,6 +163,9 @@ def parse_elf(data):
             reject("E6", "PT_LOAD memsz must be nonzero")
         if offset > len(data) or filesz > len(data) - offset:
             reject("E6", "PT_LOAD file range is outside the file")
+
+    for header in loads:
+        flags = header[1]
         if flags & ~0x7:
             reject("E7", "PT_LOAD has unknown permission bits")
         je_perm = ((1 if flags & PF_R else 0)
@@ -164,11 +175,10 @@ def parse_elf(data):
             reject("E7", "PT_LOAD permissions are not RX, R, or RW")
 
     ordered = sorted(loads, key=lambda header: header[3])
+    # E8 (overlap/guard) is a full pass before E9 (total budget) runs at all.
     previous_end = 0
-    total_pages = STACK_PAGES
-    segments = []
     for header in ordered:
-        _p_type, flags, offset, vaddr, _paddr, filesz, memsz, _align = header
+        _p_type, _flags, _offset, vaddr, _paddr, _filesz, memsz, _align = header
         target_offset = vaddr - BASE
         memory_size = round_up(memsz)
         end = target_offset + memory_size
@@ -177,6 +187,13 @@ def parse_elf(data):
         if end > GUARD:
             reject("E8", "PT_LOAD reaches the guard page or stack")
         previous_end = end
+
+    total_pages = STACK_PAGES
+    segments = []
+    for header in ordered:
+        _p_type, flags, offset, vaddr, _paddr, filesz, memsz, _align = header
+        target_offset = vaddr - BASE
+        memory_size = round_up(memsz)
         total_pages += memory_size // PAGE_SIZE
         if total_pages > MAX_USER_PAGES:
             reject("E9", "image exceeds the user-page budget")
@@ -271,13 +288,13 @@ def main(argv):
     except SystemExit as exc:
         return 1 if exc.code else 0
     if not NAME_RE.fullmatch(args.name):
-        sys.stderr.write("mkimage: reject: usage: invalid NAME\n")
+        sys.stderr.write("mkimage: usage: invalid NAME\n")
         return 1
     if args.verify and args.out is not None:
-        sys.stderr.write("mkimage: reject: usage: --verify and --out are exclusive\n")
+        sys.stderr.write("mkimage: usage: --verify and --out are exclusive\n")
         return 1
     if not args.verify and args.out is None:
-        sys.stderr.write("mkimage: reject: usage: --out is required\n")
+        sys.stderr.write("mkimage: usage: --out is required\n")
         return 1
     try:
         with open(args.elf, "rb") as input_file:
@@ -285,8 +302,25 @@ def main(argv):
         entry_offset, segments = parse_elf(data)
         if not args.verify:
             output = make_output(args.name, data, entry_offset, segments)
-            with open(args.out, "w", encoding="ascii", newline="\n") as output_file:
-                output_file.write(output)
+            # Validation has already succeeded, so a descriptor WILL be written.
+            # Write it atomically: a crash or I/O error mid-write must not leave a
+            # truncated OUT.c with a fresh mtime that make would treat as current,
+            # and a pre-existing OUT.c must only ever be replaced by a whole, good
+            # one. Reject (exit 2) returns before this, so OUT.c is never touched
+            # on reject (the "no OUT.c on reject" contract).
+            out_dir = os.path.dirname(os.path.abspath(args.out))
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=out_dir, prefix=".mkimage.", suffix=".tmp")
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="ascii", newline="\n") as tmp:
+                    tmp.write(output)
+                os.replace(tmp_path, args.out)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
     except Reject as exc:
         sys.stderr.write("mkimage: reject: {}: {}\n".format(
             exc.rule, exc.detail))
