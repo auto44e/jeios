@@ -168,3 +168,22 @@ void je_proc_uncharge(je_proc_pool *pool, je_proc_id id)
     if (!rec || rec->ep_charge == 0u) return;
     rec->ep_charge--;
 }
+
+je_status je_proc_run_link(const je_proc_pool *pool, je_proc_id id,
+                           uint32_t *thread_slot, uint32_t *vm_index)
+{
+    const je_proc_rec *rec = record_for_const(pool, id);
+    if (!rec || !thread_slot || !vm_index
+        || (rec->state != JE_PROC_LIVE && rec->state != JE_PROC_DYING)
+        || !rec->run_linked)
+        return JE_ERR_INVALID;
+    *thread_slot = rec->thread_slot;
+    *vm_index = rec->vm_index;
+    return JE_OK;
+}
+
+bool je_proc_is_supervisor(const je_proc_pool *pool, je_proc_id id)
+{
+    const je_proc_rec *rec = record_for_const(pool, id);
+    return rec != (const je_proc_rec *)0 && rec->supervisor;
+}

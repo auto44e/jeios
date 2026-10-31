@@ -696,6 +696,227 @@ static void test_two_pools(void)
     assert(g_pool.rec[a.index].ep_charge == 0u && other.used_count == 0u);
 }
 
+/* ---- ADR 0010 D8: je_proc_run_link / je_proc_is_supervisor ------------------
+ * Written from proc.h only. run_link: JE_OK iff the id is valid, LIVE or DYING, and
+ * run-linked, writing both outputs exactly; anything else -> JE_ERR_INVALID with
+ * BOTH outputs untouched (sentinels) and the pool unchanged ("Pure", so the pool is
+ * unchanged on success too). These run LAST in main so every pre-existing case has
+ * already passed if the D8 stubs make one of them abort. ------------------------ */
+#define RL_SENT_SLOT 0xa5a5a5a5u
+#define RL_SENT_VM   0x5a5a5a5au
+
+/* run_link must reject `id` with sentinels and pool untouched. */
+static void assert_run_link_invalid(je_proc_id id)
+{
+    uint32_t ts = RL_SENT_SLOT, vi = RL_SENT_VM;
+    snap();
+    assert(je_proc_run_link(&g_pool, id, &ts, &vi) == JE_ERR_INVALID);
+    assert(ts == RL_SENT_SLOT && vi == RL_SENT_VM);
+    assert_unchanged();
+}
+
+/* run_link must report exactly {slot, vm}, and change nothing in the pool. */
+static void assert_run_link_is(je_proc_id id, uint32_t slot, uint32_t vm)
+{
+    uint32_t ts = RL_SENT_SLOT, vi = RL_SENT_VM;
+    snap();
+    assert(je_proc_run_link(&g_pool, id, &ts, &vi) == JE_OK);
+    assert(ts == slot && vi == vm);
+    assert_unchanged();
+}
+
+static void assert_not_supervisor(je_proc_id id)
+{
+    snap();
+    assert(!je_proc_is_supervisor(&g_pool, id));
+    assert_unchanged();
+}
+
+static void test_run_link(void)
+{
+    fresh();
+    /* LIVE linked -> OK, outputs exact. Distinct values so a swapped pair fails. */
+    je_proc_id a = alloc_ok(0u, false);                 /* index 0 */
+    assert(je_proc_link(&g_pool, a, 11u, 12u) == JE_OK);
+    assert_run_link_is(a, 11u, 12u);
+    assert_run_link_is(a, 11u, 12u);                    /* repeatable: pure */
+
+    /* A link of {0, 0} is still a link: OK with both outputs overwritten to 0. A
+     * reader that keyed "linked" on nonzero fields would return INVALID here. */
+    je_proc_id z = alloc_ok(0u, false);                 /* index 1 */
+    assert(je_proc_link(&g_pool, z, 0u, 0u) == JE_OK);
+    assert_run_link_is(z, 0u, 0u);
+
+    /* Large values are returned unnarrowed. */
+    je_proc_id big = alloc_ok(0u, false);               /* index 2 */
+    assert(je_proc_link(&g_pool, big, 0xfffffffeu, 0x80000001u) == JE_OK);
+    assert_run_link_is(big, 0xfffffffeu, 0x80000001u);
+
+    /* LIVE unlinked -> INVALID (the case D8 step 5 relies on). */
+    je_proc_id u = alloc_ok(0u, false);                 /* index 3 */
+    assert_run_link_invalid(u);
+
+    /* DYING linked -> OK, same outputs. */
+    assert(je_proc_on_dying(&g_pool, a, 3u, 0u) == JE_OK);
+    assert(state_of(a) == JE_PROC_DYING);
+    assert_run_link_is(a, 11u, 12u);
+
+    /* DYING but never linked -> INVALID ("run-linked" is required in DYING too). */
+    assert(je_proc_on_dying(&g_pool, u, 3u, 0u) == JE_OK);
+    assert(state_of(u) == JE_PROC_DYING);
+    assert_run_link_invalid(u);
+
+    /* DEAD (held by a PROCESS handle so the record stays) -> INVALID: on_reaped
+     * cleared the link. The record is valid, so this is the state check, not the
+     * identity check. */
+    assert(je_proc_retain(&g_pool, a) == JE_OK);
+    assert(je_proc_on_reaped(&g_pool, a) == JE_OK);
+    assert(state_of(a) == JE_PROC_DEAD && je_proc_valid(&g_pool, a));
+    assert_run_link_invalid(a);
+    /* White-box: proc.h makes "DEAD and linked" unreachable (on_reaped is the only
+     * writer of the link), so the state test above cannot tell "checks LIVE/DYING"
+     * from "checks run_linked only". Forge the impossible record to pin the literal
+     * "LIVE or DYING, AND run-linked" contract, then restore it. */
+    {
+        je_proc_rec saved = g_pool.rec[a.index];
+        g_pool.rec[a.index].run_linked = true;
+        g_pool.rec[a.index].thread_slot = 7u;
+        g_pool.rec[a.index].vm_index = 8u;
+        assert_run_link_invalid(a);
+        g_pool.rec[a.index] = saved;
+    }
+
+    /* FREE after the last release -> INVALID (stale identity). */
+    je_proc_release(&g_pool, a);
+    assert(state_of(a) == JE_PROC_FREE);
+    assert_run_link_invalid(a);
+
+    /* Stale after reuse: index 0 is reallocated at generation 2 and linked to new
+     * values. The old identity stays INVALID (outputs untouched); the new one
+     * reports the NEW link, never the old {11, 12}. */
+    je_proc_id a2 = alloc_ok(0u, false);
+    assert(a2.index == a.index && a2.gen == a.gen + 1u);
+    assert_run_link_invalid(a2);                        /* LIVE, not yet linked */
+    assert(je_proc_link(&g_pool, a2, 21u, 22u) == JE_OK);
+    assert_run_link_is(a2, 21u, 22u);
+    assert_run_link_invalid(a);
+    /* a future generation of the same index is not valid either */
+    assert_run_link_invalid(mkid(a2.index, a2.gen + 1u));
+
+    /* Abandoned (spawn rollback): FREE with the generation kept -> INVALID. */
+    je_proc_id ab = alloc_ok(0u, false);
+    assert(je_proc_abandon(&g_pool, ab) == JE_OK);
+    assert(state_of(ab) == JE_PROC_FREE);
+    assert_run_link_invalid(ab);
+
+    /* Never allocated, generation 0, NONE, and out of range -> INVALID. */
+    assert_run_link_invalid(mkid(40u, 1u));
+    assert_run_link_invalid(mkid(z.index, 0u));
+    assert_run_link_invalid(JE_PROC_ID_NONE);
+    assert_run_link_invalid(mkid(JE_PROC_REC_MAX, 1u));
+    assert_run_link_invalid(mkid(0xffffffffu, 1u));
+    assert_run_link_invalid(mkid(0xffffffffu, 0xffffffffu));
+
+    /* NULL pool / NULL outputs with an otherwise-OK id (z is LIVE linked): INVALID,
+     * the non-NULL output untouched, pool unchanged. */
+    {
+        uint32_t ts = RL_SENT_SLOT, vi = RL_SENT_VM;
+        snap();
+        assert(je_proc_run_link((const je_proc_pool *)0, z, &ts, &vi) == JE_ERR_INVALID);
+        assert(ts == RL_SENT_SLOT && vi == RL_SENT_VM);
+        assert(je_proc_run_link(&g_pool, z, (uint32_t *)0, &vi) == JE_ERR_INVALID);
+        assert(vi == RL_SENT_VM);
+        assert(je_proc_run_link(&g_pool, z, &ts, (uint32_t *)0) == JE_ERR_INVALID);
+        assert(ts == RL_SENT_SLOT);
+        assert(je_proc_run_link(&g_pool, z, (uint32_t *)0, (uint32_t *)0) == JE_ERR_INVALID);
+        assert(je_proc_run_link((const je_proc_pool *)0, z, (uint32_t *)0, (uint32_t *)0) == JE_ERR_INVALID);
+        assert_unchanged();
+    }
+    /* still fine afterwards */
+    assert_run_link_is(z, 0u, 0u);
+
+    /* Pool isolation: an identity from g_pool is not linked in another pool. */
+    {
+        static je_proc_pool other;
+        uint32_t ts = RL_SENT_SLOT, vi = RL_SENT_VM;
+        je_proc_pool_init(&other);
+        assert(je_proc_run_link(&other, z, &ts, &vi) == JE_ERR_INVALID);
+        assert(ts == RL_SENT_SLOT && vi == RL_SENT_VM);
+    }
+}
+
+static void test_is_supervisor(void)
+{
+    fresh();
+    je_proc_id sup = alloc_ok(0u, true);                /* index 0 */
+    je_proc_id ord = alloc_ok(0u, false);               /* index 1 */
+
+    snap();
+    assert(je_proc_is_supervisor(&g_pool, sup));
+    assert_unchanged();
+    assert_not_supervisor(ord);
+
+    /* The flag is a property of the identity, not of the run link. */
+    assert(je_proc_link(&g_pool, sup, 1u, 0u) == JE_OK);
+    assert(je_proc_is_supervisor(&g_pool, sup));
+
+    /* Literal proc.h reading: "valid" = non-FREE with that generation, so a DYING
+     * or DEAD supervisor record still answers true (see WORKER_NOTES ambiguity). */
+    assert(je_proc_on_dying(&g_pool, sup, 1u, 0u) == JE_OK);
+    assert(je_proc_is_supervisor(&g_pool, sup));
+    assert(je_proc_retain(&g_pool, sup) == JE_OK);
+    assert(je_proc_on_reaped(&g_pool, sup) == JE_OK);
+    assert(state_of(sup) == JE_PROC_DEAD);
+    assert(je_proc_is_supervisor(&g_pool, sup));
+
+    /* FREE -> false. */
+    je_proc_release(&g_pool, sup);
+    assert(state_of(sup) == JE_PROC_FREE);
+    assert_not_supervisor(sup);
+
+    /* Reuse by a non-supervisor at the same index: old and new identities false. */
+    je_proc_id s2 = alloc_ok(0u, false);
+    assert(s2.index == sup.index && s2.gen == sup.gen + 1u);
+    assert_not_supervisor(s2);
+    assert_not_supervisor(sup);
+
+    /* The reverse, which a slot-keyed check would get wrong: an ORDINARY identity
+     * whose slot is reused by a supervisor record. The stale ordinary id must stay
+     * false even though rec[index].supervisor is now true. */
+    kill_and_reap(ord, 1u, 0u);
+    assert(state_of(ord) == JE_PROC_FREE);
+    je_proc_id ord2 = alloc_ok(0u, true);
+    assert(ord2.index == ord.index && ord2.gen == ord.gen + 1u);
+    assert(g_pool.rec[ord.index].supervisor);
+    assert(je_proc_is_supervisor(&g_pool, ord2));
+    assert_not_supervisor(ord);
+    assert_not_supervisor(mkid(ord.index, 0u));
+    assert_not_supervisor(mkid(ord.index, ord2.gen + 1u));
+
+    /* Abandoned supervisor record (FREE, generation kept) -> false. */
+    je_proc_id ab = alloc_ok(0u, true);
+    assert(je_proc_is_supervisor(&g_pool, ab));
+    assert(je_proc_abandon(&g_pool, ab) == JE_OK);
+    assert_not_supervisor(ab);
+
+    /* Never allocated, NONE, out of range, NULL pool -> false. */
+    assert_not_supervisor(mkid(40u, 1u));
+    assert_not_supervisor(JE_PROC_ID_NONE);
+    assert_not_supervisor(mkid(JE_PROC_REC_MAX, 1u));
+    assert_not_supervisor(mkid(0xffffffffu, 1u));
+    snap();
+    assert(!je_proc_is_supervisor((const je_proc_pool *)0, ord2));
+    assert(!je_proc_is_supervisor((const je_proc_pool *)0, JE_PROC_ID_NONE));
+    assert_unchanged();
+
+    /* Pool isolation. */
+    {
+        static je_proc_pool other;
+        je_proc_pool_init(&other);
+        assert(!je_proc_is_supervisor(&other, ord2));
+    }
+}
+
 int main(void)
 {
     test_init();
@@ -710,11 +931,14 @@ int main(void)
     test_used_count();
     test_null_pool();
     test_two_pools();
+    test_run_link();
+    test_is_supervisor();
     printf("proc: PASS (init, alloc lowest-free/gen++/NOMEM/NULL, valid, lifecycle "
            "LIVE->DYING->DEAD->FREE + illegal transitions, first reason wins, "
            "reap frees iff refs==0, REF_MAX BUSY, no release underflow, stale after "
            "reuse, abandon refused when linked, link LIVE+unlinked only, reap clears "
            "link fields, reason bound, status, LIVE-only charge, charge/uncharge "
-           "identity, used_count, NULL pool)\n");
+           "identity, used_count, NULL pool, D8 run_link LIVE/DYING-linked exact + "
+           "unlinked/DEAD/FREE/stale/NULL INVALID untouched, is_supervisor identity-keyed)\n");
     return 0;
 }

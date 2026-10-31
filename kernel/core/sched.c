@@ -668,3 +668,70 @@ unsigned je_sched_user_thread_count(void)
             ++count;
     return count;
 }
+
+/* ADR 0010 D8: synchronously kill a non-current user process. The PROCESS record
+ * is the authority for identity/state; the scheduler link is checked only after
+ * the record-level checks. mark_dying remains the one release owner for waiters,
+ * reservations, VM teardown metadata, and the terminal reason. */
+je_status je_sched_kill(je_proc_id victim)
+{
+    uint64_t flags = je_arch_irq_save();
+    if ((flags & (UINT64_C(1) << 9)) != 0u) abort_scheduler(); /* IF must be 0 */
+
+    uint32_t victim_state = JE_PROC_FREE;
+    uint32_t victim_reason = 0u;
+    uint64_t victim_code = 0u;
+    if (!process_pool
+        || je_proc_status(process_pool, victim, &victim_state, &victim_reason,
+                          &victim_code) != JE_OK) {
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
+
+    je_proc_id caller = JE_PROC_ID_NONE;
+    if (je_sched_current_proc_id(&caller) != JE_OK) {
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
+    if (caller.index == victim.index && caller.gen == victim.gen) {
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
+    if (victim_state == JE_PROC_DYING || victim_state == JE_PROC_DEAD) {
+        je_arch_irq_restore(flags);
+        return JE_OK;
+    }
+    if (victim_state != JE_PROC_LIVE) {
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
+    if (je_proc_is_supervisor(process_pool, victim)) {
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
+
+    uint32_t slot = 0u;
+    uint32_t vm_index = 0u;
+    if (je_proc_run_link(process_pool, victim, &slot, &vm_index) != JE_OK) {
+        je_arch_irq_restore(flags);
+        return JE_ERR_INVALID;
+    }
+    if (slot == 0u || slot >= JE_THREAD_MAX
+        || vm_index >= JE_VM_MAX_PROCESSES
+        || threads[slot].kind != THREAD_USER
+        || threads[slot].proc_id.index != victim.index
+        || threads[slot].proc_id.gen != victim.gen
+        || threads[slot].vm_index != vm_index
+        || (threads[slot].state != READY && threads[slot].state != BLOCKED_IPC)
+        || threads[slot].frame == (je_trap_frame *)0)
+        abort_scheduler();
+
+    /* mark_dying clears the frame pointer; snapshot the user return metadata first.
+     * For BLOCKED_IPC, block_current rewound frame->rip by JE_INT80_LEN so this
+     * diagnostic RIP names the int 0x80 instruction, not the post-gate RIP. */
+    uint64_t rip = threads[slot].frame->rip;
+    uint64_t cs = threads[slot].frame->cs;
+    mark_dying(slot, DEATH_KILLED, 0u, 0u, 0u, rip, cs, 0u);
+    je_arch_irq_restore(flags);
+    return JE_OK;
+}
