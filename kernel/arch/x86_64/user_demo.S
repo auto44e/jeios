@@ -833,6 +833,148 @@ m4c_child_fail:
     ud2
 je_user_spawn_child_end:
 
+/* M4e-s1 kernel-seeded C-image spawner. The parent creates a fresh channel,
+ * grants only its SEND end to the ring-3 C image, receives the exact READY
+ * record on the other end, and waits for the kernel to audit/reap the child. */
+.globl je_user_m4e_start
+.globl je_user_m4e_end
+je_user_m4e_start:
+    orq %rax, %r11
+    orq %rbx, %r11
+    orq %rbp, %r11
+    orq %r10, %r11
+    orq %r12, %r11
+    orq %r13, %r11
+    orq %r14, %r11
+    orq %r15, %r11
+    jnz m4e_fail
+    movq %rdi, 0x40001f00
+    movq %rsi, 0x40001f08
+    movq %rdx, 0x40001f10
+    cmpq $1, %rdi
+    jne m4e_fail
+    cmpq $1, %rsi
+    jne m4e_fail
+    cmpq $0, %rdx
+    je m4e_fail
+
+    movq $10, %rax
+    xorq %rdi, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4e_fail
+    movq %rdx, 0x40001f18
+    movl %edx, 0x40001f20
+    shrq $32, %rdx
+    movl %edx, 0x40001f24
+    movl 0x40001f20, %eax
+    movl %eax, 0x40001f80
+    movl $2, 0x40001f84
+    movq $0, 0x40001f28
+
+    movq $14, %rax
+    movq 0x40001f10, %rdi
+    movq $1, %rsi
+    movq $0x40001f80, %rdx
+    movq $1, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4e_fail
+    movq %rdx, 0x40001f30
+    cmpq $0, %rdx
+    je m4e_fail
+    movq $6, %rax
+    movl 0x40001f20, %edi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4e_fail
+    movq $1, 0x40001f00
+
+    movq $12, %rax
+    movl 0x40001f24, %edi
+    movq $0x40001f40, %rsi
+    movq $8, %rdx
+    xorq %r8, %r8
+    xorq %r9, %r9
+    movq $0x10000000, %r10
+    int $0x80
+    cmpq $0, %rax
+    jne m4e_fail
+    cmpq $8, %rdx
+    jne m4e_fail
+    cmpl $0x59444552, 0x40001f40
+    jne m4e_fail
+    cmpl $0, 0x40001f44
+    jne m4e_fail
+    movq $2, 0x40001f00
+m4e_wait_audit:
+    cmpq $1, 0x40001f28
+    je m4e_wait_reaped
+    cmpq $99, 0x40001f28
+    je m4e_fail
+    jmp m4e_wait_audit
+m4e_wait_reaped:
+    movq $15, %rax
+    movq 0x40001f30, %rdi
+    movq $0x40001f60, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4e_fail
+    cmpl $3, 0x40001f60
+    jne m4e_wait_reaped
+    cmpl $1, 0x40001f64
+    jne m4e_fail
+    cmpq $0, 0x40001f68
+    jne m4e_fail
+    movq $3, 0x40001f00
+    movq $6, %rax
+    movl 0x40001f24, %edi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    cmpq $0, %rax
+    jne m4e_fail
+    movq $2, %rax
+    xorq %rdi, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    ud2
+m4e_fail:
+    movq $99, 0x40001f00
+    movq $2, %rax
+    movq $99, %rdi
+    xorq %rsi, %rsi
+    xorq %rdx, %rdx
+    xorq %r10, %r10
+    xorq %r8, %r8
+    xorq %r9, %r9
+    int $0x80
+    ud2
+je_user_m4e_end:
+
 /* M4d-s1 PROC_KILL victims and killer. The bootstrap writes PROCESS and
  * endpoint handles into the killer's USER_DATA page before creating its thread.
  * The phase/control words are handshakes with main.c. For each READY,

@@ -1,5 +1,34 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-E (#53) — ring-3 C image path + `mkimage.py` — observed 2026-10-31T20:59:44Z
+
+Branch `feat/m4e-cimage`, based on main `1413ed8` (#64 merged; main CI green);
+pre-wiring `1df911a`, head `8748bac` (PR #65).
+
+- **Implemented:** ADR 0010 D10. The first real ring-3 C program (`c_hello`) built
+  by a host cross-compile, validated + embedded by `tools/mkimage.py`, booted
+  through startup-v1. See IMPLEMENTATION "M4 PR-E".
+- **Tested (local):** `make check` (test_image 88, test_mkimage 562), smoke
+  (M4e-s1, blob sha256=351bc37034ee86c3), integration (11 fault modes), the three
+  x86 NX profiles ×11, and ARM64 base + 3 fault variants. Two lead mutants caught.
+  Cross-lineage adversarial review (Claude on impl, Codex on tests) found one
+  frozen-spec defect (lowest-rule-wins) and several hardening gaps, all fixed;
+  see `docs/adr/debates/m4e-reviews.md`.
+- **Remote CI (observed):** bootstrap + aarch64 **green** @ `8748bac`. A first
+  push (`34c43e9`) failed bootstrap because `--orphan-handling=error` turned the
+  CI linker's empty GOT/PLT orphans into an error; fixed in `8748bac` by
+  discarding that section family in `user.ld` (image byte-identical).
+- **Planned:** PR-F, the supervisor (D11/D12 supervisor-loss handling). Map ready
+  at the lead's `/tmp/m4f/map.md`.
+- **Blocked:** nothing.
+
+**Open hazards:**
+1. M4e-s1 does not assert which image the child ran (only READY + exit 0); image
+   id is hard-coded in the launch asm. Revisit if PR-F selects images dynamically.
+2. A slot-0 `pause` poll stalled READY user threads in the PR-D round-2 fixture.
+   Root cause undetermined; `sti; hlt` waits work.
+3. PR-F's D12 must revisit the M4d supervisor-guard fixture teardown.
+
 ## M4 PR-D (#53) — PROC_KILL — observed 2026-10-31T16:56:37+00:00
 
 Branch `feat/m4d-kill`, based on main `62c0115` (#63 merged; main CI green).

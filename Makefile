@@ -17,7 +17,14 @@ endif
 CFLAGS := -std=c11 -O2 -g $(WARN) -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -m64 -march=x86-64 -mno-red-zone -mgeneral-regs-only
 CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c kernel/core/boot.c kernel/core/alloc.c
 SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/handle.c kernel/core/endpoint.c kernel/core/endpoint_kern.c kernel/core/proc.c kernel/core/image.c kernel/core/spawn.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
-OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o $(BUILD)/kernel/arch/x86_64/trap_entry.o $(BUILD)/kernel/arch/x86_64/register_probe.o $(BUILD)/kernel/arch/x86_64/user_demo.o $(BUILD)/kernel/arch/x86_64/usercopy.o
+USER_WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
+USER_CFLAGS := -std=c11 -O2 $(USER_WARN) -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -m64 -march=x86-64 -mcmodel=small -mno-red-zone -mgeneral-regs-only -fno-tree-loop-distribute-patterns -Iuser/include -Iinclude
+USER_LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 -z noexecstack -Wl,--build-id=none
+USER_OBJECTS := $(BUILD)/user/crt0.o $(BUILD)/user/lib/mem.o $(BUILD)/user/services/hello.o
+USER_IMAGE := $(BUILD)/user/hello.elf
+USER_GENERATED := $(BUILD)/gen/image_c_hello.c
+USER_IMAGE_OBJECT := $(BUILD)/gen/image_c_hello.o
+OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o $(BUILD)/kernel/arch/x86_64/trap_entry.o $(BUILD)/kernel/arch/x86_64/register_probe.o $(BUILD)/kernel/arch/x86_64/user_demo.o $(BUILD)/kernel/arch/x86_64/usercopy.o $(USER_IMAGE_OBJECT)
 .PHONY: all check test iso smoke clean
 all: $(BUILD)/jeios.elf
 $(BUILD)/jeios.elf: $(OBJECTS) kernel/arch/x86_64/linker.ld
@@ -28,10 +35,32 @@ $(BUILD)/%.o: %.c
 $(BUILD)/%.o: %.S
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -m64 -ffreestanding -fno-pie -c $< -o $@
+$(BUILD)/user/%.o: user/%.c
+	@mkdir -p $(@D)
+	$(CC) $(USER_CFLAGS) -MMD -MP -c $< -o $@
+$(BUILD)/user/%.o: user/%.S
+	@mkdir -p $(@D)
+	$(CC) -Iuser/include -Iinclude -m64 -ffreestanding -fno-pie -fcf-protection=none -MMD -MP -c $< -o $@
+$(USER_IMAGE): $(USER_OBJECTS) user/user.ld
+	@mkdir -p $(@D)
+	$(CC) $(USER_LDFLAGS) -T user/user.ld -o $@ $(USER_OBJECTS)
+$(USER_GENERATED): $(USER_IMAGE) tools/mkimage.py
+	@mkdir -p $(@D)
+	$(PYTHON) tools/mkimage.py --name c_hello --elf $(USER_IMAGE) --out $@
+$(USER_IMAGE_OBJECT): $(USER_GENERATED)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
+$(BUILD)/kernel/core/image.o: kernel/core/image.c $(USER_GENERATED) $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	set -e; \
+	blob_sha256=$$(sed -n 's/.*blob_sha256=\([0-9a-f][0-9a-f]*\).*/\1/p' $(USER_GENERATED)); \
+	test "$${blob_sha256#????????????????????????????????????????????????????????????????}" != "$$blob_sha256"; \
+	short_sha256=$$(printf '%.16s' "$$blob_sha256"); \
+	$(CC) $(CPPFLAGS) $(CFLAGS) '-DJE_C_HELLO_BLOB_SHA256="'"$$short_sha256"'"' -MMD -MP -c $< -o $@
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
@@ -44,8 +73,12 @@ test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm
 	./$(BUILD)/test_proc
 	./$(BUILD)/test_proc_retire
 	./$(BUILD)/test_fdt
+	./$(BUILD)/test_image
 check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
+	$(PYTHON) tools/mkimage.py --name c_hello --elf $(USER_IMAGE) --verify
+	$(PYTHON) tools/check_user_image.py $(USER_IMAGE)
+	$(PYTHON) tools/test_mkimage.py
 	@echo "ABI isolation: abi.h must not include the internal status.h or handle.h"
 	@! grep -qE '^[[:space:]]*#[[:space:]]*include.*(status|handle)\.h' include/jeios/abi.h
 	@echo "Dev-inject isolation: the fixup-injection path must be absent from the default kernel"
@@ -60,7 +93,9 @@ smoke: iso
 	$(PYTHON) tools/smoke.py $(BUILD)/jeios.iso
 clean:
 	rm -rf build
+.DELETE_ON_ERROR:
 -include $(OBJECTS:.o=.d)
+-include $(USER_OBJECTS:.o=.d)
 .PHONY: integration
 integration:
 	$(PYTHON) tools/integration.py
@@ -117,6 +152,16 @@ $(BUILD)/test_proc_retire: tests/test_proc_retire.c kernel/core/proc.c $(wildcar
 $(BUILD)/test_fdt: tests/test_fdt.c kernel/core/fdt.c include/jeios/fdt.h $(wildcard tests/fixtures/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_fdt.c kernel/core/fdt.c -o $@
+
+# ADR 0010 D10 cross-check: a mkimage.py-GENERATED descriptor must pass the real
+# kernel validator (kernel/core/vm.c), and mutations of it must fail. The
+# generated .c is #included (JE_TEST_IMAGE_C, absolute path so the TU is location
+# independent), not linked; only the validator's own TUs are linked.
+$(BUILD)/test_image: tests/test_image.c $(USER_GENERATED) kernel/core/vm.c kernel/core/handle.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  -DJE_TEST_IMAGE_C='"$(abspath $(USER_GENERATED))"' -DJE_TEST_IMAGE_NAME=c_hello \
+	  tests/test_image.c kernel/core/vm.c kernel/core/handle.c -o $@
 
 
 # MP1 (ADR 0002): ARM64 (QEMU virt-8.2) build + smoke, kept fully separate from

@@ -520,6 +520,77 @@ re-stale-after-reuse assertion, the measured quota count, the softened per-proce
 wording, the ADR wide-handle amendment, and the pinned ABI static-asserts).
 AI-assisted review only; not independent human qualification.
 
+## M4 PR-E — ring-3 C image path + host tool `mkimage.py` (ADR 0010 D10) — 2026-10-31
+
+The first real ring-3 C program (`c_hello`) built by a plain host cross-compile,
+validated and embedded by a host tool, and booted through the startup-v1 ABI.
+
+**What it does.**
+- **`tools/mkimage.py`** converts a user ELF into the checked C descriptor + blob
+  the kernel embeds, rejecting anything `je_vm_image_validate` (kernel/core/vm.c)
+  would reject plus stricter host-only rules. Its docstring is the **frozen spec**
+  (rules E1–E10). Exit 0 accept, 2 reject (`mkimage: reject: <RULE-ID>: `, lowest
+  violated rule), 1 usage/IO. Output is deterministic: no path, timestamp or
+  hostname reaches the generated `.c`, build id is stripped, and the write is
+  atomic (tempfile + `os.replace`) so a reject never touches `OUT.c` and a crash
+  mid-write cannot leave a half-file with a fresh mtime.
+- **`user/`**: `crt0.S` (startup-v1 entry: ORs every non-argument GPR and `ud2`s
+  if any promised-zero register is nonzero, calls `je_main`, routes its return
+  value into the EXIT syscall), `user.ld` (W^X segment layout, linked with
+  `--orphan-handling=error` so no section lands silently in an RX segment),
+  `lib/mem.c`, `services/hello.c`.
+- **Kernel**: `image.c` carries the generated `c_hello` descriptor; `main.c`
+  re-validates both built-in images at init and boots `c_hello` as the M4e-s1
+  scenario (startup v1 → rodata/data/bss → CLOCK_TICKS → READY → exit 0). The
+  compile-time `JE_C_HELLO_BLOB_SHA256` guard pins the embedded blob.
+
+**Logic / invariants.**
+- **Lowest-rule-wins.** Each rule is a complete pass over all loads in rule order
+  (E6, then E7, then E8 on the sorted list, then E9 on the total, then E10), so a
+  later segment's low-numbered violation always beats an earlier segment's
+  high-numbered one. The earlier merged E6/E7 and E8/E9 loops violated this.
+- **Validator parity.** Every rule the kernel enforces is enforced by the tool;
+  the tool is additionally stricter (requires R, `vaddr ≥ BASE`, aligned offsets).
+  `tests/test_image.c` ties the two together by running the GENERATED descriptor
+  through the real C validator plus ~90 mutations.
+- **W^X.** User segments are never W&X; the built ELF is RX `.text`, R `.rodata`,
+  RW `.data`+`.bss`. The kernel builds the user stack RW+NX itself.
+
+**Evidence (local).** `make check`: PASS — `test_image` 88 checks (image=c_hello,
+blob=613 bytes, 3 segments), `test_mkimage` 562 checks (E1–E10 + CLI + output),
+plus the full hosted suite. `make smoke`: M4e-s1 PASS, image
+sha256=`351bc37034ee86c363684c013917239855cc62a43fd68f3898b245829484b8a3` (short
+`351bc37034ee86c3`); blob 613 bytes, ELF 13,280 bytes, deterministic. `make
+integration`: 11 fault modes PASS, M4e-s1 present. NX ×11 across the three
+profiles and ARM64 base + 3 fault variants: PASS. Local evidence only; remote CI
+reported separately on the PR.
+
+**Mutants run by the lead through the real build.**
+- Swap W↔X in the ELF→JE perm mapping → generated code segment becomes RW →
+  entry no longer in an RX segment → `make` fails at generation with E10. Caught.
+- Disable the E8 overlap check → `test_mkimage.py` fails on the E8 cases and the
+  new `E8<E9` precedence case reports E9. Caught.
+
+**Provenance (worker mode; AI-assisted review, not human qualification).**
+
+| Part | Author | Adversarial reviewer |
+|---|---|---|
+| Frozen headers + mkimage spec + fail-closed stubs (`1df911a`) | lead | — |
+| mkimage.py, crt0/user.ld, user lib/service, kernel wiring | Codex | Claude (review) + lead mutants |
+| test_mkimage.py, test_image.c | Claude (from headers/spec only) | Codex (review) + lead mutants |
+| Lowest-rule-wins fix, atomic output, Makefile/test hardening | lead (from the reviews) | A/B regression check |
+
+The two cross-lineage reviews and the decisions taken (and declined) are in
+`docs/adr/debates/m4e-reviews.md`; the worker notes are in
+`docs/adr/debates/m4e-workers/`.
+
+**Open hazards.**
+- The M4e-s1 proof does not assert which image the child ran (only READY + exit
+  0); the image id is hard-coded in the launch asm. Revisit if PR-F selects
+  images dynamically.
+- PR-D's unexplained slot-0 `pause` stall and the PR-F supervisor-teardown
+  follow-up still stand.
+
 ## M4 PR-D — synchronous PROC_KILL (ADR 0010 D8) — 2026-10-31
 
 Owner-approved as D-OWNER-3: kill enters the production ABI, and A6-CLARIFY-1 is re-confirmed.
