@@ -263,7 +263,8 @@ je_user_badrsp_end:
  *   +0x40 close(live) status
  *   +0x48 query(closed) status   +0x50 close(closed) status
  *   +0x58 close(handle 0) status
- *   +0x60 query(bound index) status
+ *   +0x18 query(in-range FREE slot, index CAP-1 = 39) status (expect STALE)
+ *   +0x60 query(index == capacity, JE_VM_HANDLE_CAP = 40) status (expect BADINDEX)
  *   +0x68 query(wrong gen, live slot) status
  *   +0x70 close(wide handle) status
  *   +0x78 self#2 handle (slot reuse; must differ from self#1)
@@ -375,13 +376,21 @@ je_user_handle_start:
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
     movq %rax, 0x40001058
-    /* query(index == capacity 16, gen 1) -> status@+0x60 (expect BADINDEX).
-     * encode(16,1) = (1<<16)|16 = 0x10010. */
+    /* query(index == capacity 40, gen 1) -> status@+0x60 (expect BADINDEX).
+     * encode(40,1) = (1<<16)|40 = 0x10028. vm.c pins this literal to the
+     * production JE_VM_HANDLE_CAP so this boundary probe cannot drift silently. */
     movq $7, %rax
-    movq $0x10010, %rdi
+    movq $0x10028, %rdi
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
     movq %rax, 0x40001060
+    /* query an in-range FREE slot (index 39, gen 1) -> status@+0x18
+     * (expect STALE). This is separate from index==capacity BADINDEX. */
+    movq $7, %rax
+    movq $0x10027, %rdi
+    xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x40001018
     /* self#2 (slot 0 reused at gen 2) -> status@+0x88, handle@+0x78, kept in r10 */
     movq $5, %rax
     xorq %rdi,%rdi; xorq %rsi,%rsi; xorq %rdx,%rdx
@@ -416,10 +425,10 @@ je_user_handle_start:
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
     int $0x80
     movq %rax, 0x40001070
-    /* quota: self#2 holds 1 live; quota = CAP-1 = 15, so exactly 14 more mints
-     * succeed and the 15th acquisition returns QUOTA. Count the SUCCESSES (r12)
-     * so the kernel can assert exactly 14 — proving QUOTA (not NOSLOTS) ends the
-     * loop at CAP-1. r13 bounds the loop so a bug can't spin forever. */
+    /* quota: self#2 holds 1 live; the default quota is 15 (the table capacity
+     * is H=40), so exactly 14 more mints succeed and the next acquisition
+     * returns QUOTA. Count the SUCCESSES (r12) so the kernel can assert exactly
+     * 14. r13 bounds the loop so a bug cannot spin forever. */
     xorq %r12, %r12            /* success counter */
     movq $64, %r13             /* loop bound > quota */
 9:

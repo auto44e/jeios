@@ -42,17 +42,30 @@
 #define JE_VM_GUARD_OFFSET (JE_VM_STACK_OFFSET - JE_PAGE_SIZE)                   /* 0x1fb000 */
 
 /* Admission bounds (ADR D4). 73-page quota = 4 table + <=64 user + 5 kstack. */
-#define JE_VM_MAX_PROCESSES   2u
+/* ADR 0010 D2 (owner-approved D-OWNER-1): P = 5 M4 demo actors + 1 DYING-overlap
+ * spare + 2 headroom. Was 2 (ADR 0007 D1, superseded in part). */
+#define JE_VM_MAX_PROCESSES   8u
 #define JE_VM_TABLE_PAGES     4u   /* PML4, PDPT, user PD, user PT (one extent) */
 #define JE_VM_MAX_USER_PAGES  64u  /* image + stack, per process */
 #define JE_VM_KSTACK_PAGES    5u   /* reserved+held here, allocated in #4 */
 #define JE_VM_MAX_SEGMENTS    8u
 #define JE_VM_QUOTA_PAGES (JE_VM_TABLE_PAGES + JE_VM_MAX_USER_PAGES + JE_VM_KSTACK_PAGES)
-/* M3b: per-process handle-table capacity (ADR 0008). Kept small deliberately —
- * the table is inline in je_vm_process and SELF is the only object kind so far.
- * REVISIT (docs): revisit this cap and the struct-size budget as object kinds
- * and reference semantics arrive in later M3b/M3c PRs. */
-#define JE_VM_HANDLE_CAP      16u
+/* Per-process handle-table capacity (ADR 0008; resized by ADR 0010 D2). The
+ * table is inline in je_vm_process. H = 40 so the supervisor's need
+ * SUP = 3(P-1) + 2 sleep ends + SELF + LAUNCHER + DEVICE admin + 4 launch staging
+ * + 2 broker transient, plus 4 inbound-cap headroom, fits its quota H-1. */
+#define JE_VM_HANDLE_CAP      40u
+#define JE_VM_SUP_HANDLE_NEED (3u * (JE_VM_MAX_PROCESSES - 1u) + 2u + 1u + 1u + 1u + 4u + 2u)
+_Static_assert(JE_VM_SUP_HANDLE_NEED + 4u <= JE_VM_HANDLE_CAP - 1u, "ADR 0010 D2 supervisor handle budget");
+/* Per-table live-handle quota (ADR 0010 D2). Default for je_vm_build = 15, the M3b
+ * value, so every existing quota-at-15 assertion is unchanged. Valid range for
+ * je_vm_build_quota: 1 .. JE_VM_HANDLE_CAP-1 (the kernel-seeded supervisor will use
+ * the maximum). */
+#define JE_VM_HANDLE_QUOTA_DEFAULT 15u
+#define JE_VM_HANDLE_QUOTA_MAX     (JE_VM_HANDLE_CAP - 1u)
+_Static_assert(JE_VM_HANDLE_QUOTA_DEFAULT >= 1u &&
+               JE_VM_HANDLE_QUOTA_DEFAULT <= JE_VM_HANDLE_QUOTA_MAX,
+               "default handle quota is within the supported range");
 _Static_assert(JE_VM_QUOTA_PAGES == 73u, "admission quota");
 
 /* Frame kind and the single permitted leaf permission per kind:
@@ -280,6 +293,15 @@ je_status je_vm_image_validate(const je_vm_image *image, size_t blob_len);
  * slot is left non-FREE. Publication per ADR D3. */
 je_status je_vm_build(je_vm *vm, const je_vm_image *image, const void *blob,
                       size_t blob_len, int nx_available, uint32_t *out_index);
+
+/* ADR 0010 D2: identical to je_vm_build, but the new process's handle table gets
+ * live-slot quota `handle_quota` instead of JE_VM_HANDLE_QUOTA_DEFAULT.
+ * handle_quota == 0 or > JE_VM_HANDLE_QUOTA_MAX -> JE_ERR_INVALID, checked FIRST
+ * (before the NX check and any other validation), with no state change.
+ * je_vm_build(...) == je_vm_build_quota(..., JE_VM_HANDLE_QUOTA_DEFAULT, ...). */
+je_status je_vm_build_quota(je_vm *vm, const je_vm_image *image, const void *blob,
+                            size_t blob_len, int nx_available, uint32_t handle_quota,
+                            uint32_t *out_index);
 
 /* Tear down a READY process, reverse of publication; releases the held kstack
  * run. Returns JE_ERR_INVALID only for a bad index/non-READY slot; backend undo

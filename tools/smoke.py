@@ -11,7 +11,8 @@ parser.add_argument("--expect-nx", choices=("present", "absent"))
 args = parser.parse_args()
 expected = [b"JeiOS: entered C kernel", b"M1: traps ready", b"M1: boot map validated", b"M1: protected mappings",
             b"M2: preemption/GPR/sleep/heap checks passed",
-            b"M2: exited threads reaped; page accounting restored"]
+            b"M2: exited threads reaped; page accounting restored",
+            b"M2: thread capacity exhausted at T="]
 if args.expect_nx:
     expected.append(b"CPU: NX enforced" if args.expect_nx == "present"
                     else b"CPU: legacy profile, NX absent")

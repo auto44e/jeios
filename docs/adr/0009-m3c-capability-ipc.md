@@ -1,6 +1,6 @@
 # ADR 0009: Freeze the M3c bounded-capability-IPC contract
 
-Status: **proposed**, 2026-10-18. Scope: M3c only (issue
+Status: **proposed**, 2026-10-18. *Status note (2026-10-31): every decision here, and every amendment below, was implemented and merged with owner approval (M3c PRs #40–#48, #8 closed). Read this ADR as an accepted contract, superseded in part by ADR 0010 (see the end). The original status text is kept as history.* Scope: M3c only (issue
 [#8](https://github.com/auto44e/jeios/issues/8)). No kernel code accompanies this
 ADR; it converts the M3c proposals into reviewed decisions that a sequence of
 small PRs implements and tests against, exactly as ADR 0007 fronted M3a and ADR

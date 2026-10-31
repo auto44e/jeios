@@ -8,6 +8,12 @@
  */
 #include <jeios/vm.h>
 
+/* user_demo.S encodes JE_VM_HANDLE_CAP (index 40, BADINDEX) and CAP-1 (index 39,
+ * in-range free slot, STALE) as assembly-only boundary probes.
+ * Keep the literal coupled to the frozen production capacity rather than
+ * allowing the ring-3 test to silently drift if the C header changes. */
+_Static_assert(JE_VM_HANDLE_CAP == 40u, "user demo handle-capacity probe");
+
 /* Builder-side _Noreturn panic wrapper over the backend hook (the header hook
  * cannot be _Noreturn as a struct member). A returning hook is itself a fatal
  * contract violation, so we loop. */
@@ -261,9 +267,14 @@ static je_status build_page(je_vm *vm, uint32_t idx, uint32_t ex, uint32_t page,
     return JE_OK;
 }
 
-je_status je_vm_build(je_vm *vm, const je_vm_image *image, const void *blob,
-                      size_t blob_len, int nx_available, uint32_t *out_index)
+je_status je_vm_build_quota(je_vm *vm, const je_vm_image *image, const void *blob,
+                            size_t blob_len, int nx_available, uint32_t handle_quota,
+                            uint32_t *out_index)
 {
+    /* This is deliberately the first check: an invalid build parameter must
+     * fail before any other validation or state change. */
+    if (handle_quota == 0u || handle_quota > JE_VM_HANDLE_QUOTA_MAX)
+        return JE_ERR_INVALID;
     if (!vm || !vm->ops || !image || !out_index) return JE_ERR_INVALID;
     const je_vm_ops *o = vm->ops;
 
@@ -359,17 +370,16 @@ je_status je_vm_build(je_vm *vm, const je_vm_image *image, const void *blob,
         if (s != JE_OK) { unwind(vm, idx); return s; }
     }
 
-    /* M3b: initialize the per-process handle table over the inline slot storage
-     * before publishing READY (ADR 0008). Capacity is JE_VM_HANDLE_CAP; quota is
-     * kept BELOW capacity so a handle_self loop hits QUOTA (not NOSLOTS) — the
-     * two are reported distinctly. Compile-time-sized, so init cannot fail here;
-     * the teardown/unwind zeroing (which sets capacity 0 -> every lookup
-     * BADINDEX) reclaims it, and re-init on slot reuse prevents a stale LIVE
-     * entry from surviving into a reused process slot. */
+    /* M3b/M4: initialize the per-process handle table over the inline slot
+     * storage before publishing READY (ADR 0008/0010). The per-table quota is
+     * below capacity by contract, so exhaustion reports QUOTA before NOSLOTS.
+     * Compile-time-sized storage makes init infallible for a validated quota;
+     * teardown/unwind zeroing reclaims it and re-init on slot reuse prevents
+     * stale LIVE entries from surviving into a reused process slot. */
     if (!je_handle_table_init(&p->htable, p->hslots, JE_VM_HANDLE_CAP,
-                              JE_VM_HANDLE_CAP - 1u)) {
+                              handle_quota)) {
         unwind(vm, idx);
-        return JE_ERR_INVALID;   /* unreachable: capacity/quota are compile-time */
+        return JE_ERR_INVALID;   /* unreachable after the range check above */
     }
 
     /* publish. */
@@ -377,6 +387,13 @@ je_status je_vm_build(je_vm *vm, const je_vm_image *image, const void *blob,
     p->state = JE_VM_READY;
     *out_index = idx;
     return JE_OK;
+}
+
+je_status je_vm_build(je_vm *vm, const je_vm_image *image, const void *blob,
+                      size_t blob_len, int nx_available, uint32_t *out_index)
+{
+    return je_vm_build_quota(vm, image, blob, blob_len, nx_available,
+                             JE_VM_HANDLE_QUOTA_DEFAULT, out_index);
 }
 
 /* ---- destroy -------------------------------------------------------------- */

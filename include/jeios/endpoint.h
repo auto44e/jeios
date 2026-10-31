@@ -51,7 +51,15 @@
 /* ---- Configured policy bounds (ADR 0009 D4/D5). Small ON PURPOSE so overflow
  * and exhaustion are reachable in hosted tests; these are POLICY, never hardware
  * limits. Pinned by _Static_assert in endpoint.c. -------------------------- */
-#define JE_EP_POOL_CAP      4u    /* channel records in a pool */
+/* ADR 0010 D2: E >= supervisor need 2(P-1) + broker pairs JE_BROKER_MAX + 1 sleep
+ * channel, + 2 kept M3 fixtures, + (P-1) * JE_EP_CHILD_QUOTA_MAX, + JE_EP_RESERVE.
+ * Was 4. JE_BROKER_MAX moves to a kernel/supervisor-shared header in PR-F. */
+#define JE_EP_POOL_CAP      24u   /* channel records in a pool */
+#define JE_BROKER_MAX        6u
+#define JE_EP_CHILD_QUOTA_MAX 0u  /* M4: spawned children create no channels (D-DEV) */
+#define JE_EP_RESERVE        1u
+/* The D2 pool formula is asserted in endpoint_kern.c (it needs vm.h's P). */
+_Static_assert(JE_BROKER_MAX <= 6u, "ADR 0010 D11 broker bound");
 #define JE_EP_QUEUE_DEPTH   4u    /* messages per end inbound queue */
 #define JE_EP_MAX_WAITERS   2u    /* waiters per end (unused this PR) */
 /* M3c step 5: max payload BYTES per message (a policy bound, newly chosen here —
@@ -65,8 +73,11 @@
 #define JE_EP_MSG_CAPS_MAX  2u
 /* Each ref counter must admit every non-handle owning ref the design can force
  * (queued caps + waiters) without spuriously overflowing a legitimate acquire,
- * AND be small enough to hit in a test. handle_refs is bounded by table slots;
- * inflight_refs by queue depth + waiters. One shared max covers both. */
+ * AND be small enough to hit in a test. handle_refs has an explicit POLICY
+ * bound of JE_EP_REF_MAX (REFOVERFLOW); it is no longer implied by table slots
+ * now that H=40. ADR 0010's supervisor design must keep <= JE_EP_REF_MAX
+ * handle refs per end. inflight_refs is bounded by queue depth + waiters.
+ * One shared max covers both. */
 #define JE_EP_REF_MAX       8u
 
 /* ENDPOINT object type tag carried in a handle slot. Type 0 is reserved; SELF is
