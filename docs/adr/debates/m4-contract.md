@@ -703,3 +703,368 @@ Owner-gated items: capacity/tested-path changes; PROCESS death records and autom
 ## Lead verification after round 2
 
 Codex's C3 claim checked: ADR 0009 D5 (lines 143-154) requires a per-process endpoint creation quota whose charge is released at record destruction. No creator/charge field exists in `kernel/core/endpoint.c` / `include/jeios/endpoint.h` / `endpoint_kern.c` (grep for quota/charge/creator finds only the handle-table quota). Not recorded as a deviation in IMPLEMENTATION.md or M3C_RETRO.md. Pre-existing gap in merged M3c code; escalated to the owner.
+
+---
+
+## ADR 0010 text reviews (2026-10-30, AI-assisted; not human qualification)
+
+After the owner approved D-OWNER-1..8, the lead drafted ADR 0010. Both peers reviewed the text adversarially in parallel, for three rounds, read-only against the repo. Every finding was applied by the lead. Outputs are verbatim.
+
+### Round 1 — Claude
+
+The ADR needs fixes before PR-A starts. I found 4 must-fix issues: one arithmetic contradiction, one PR-ordering contradiction, and two soundness holes. There are also 9 should-fix issues and 5 nits. All checks were read-only against `dc41da5` plus the working-tree ADR diffs.
+
+## P1: must fix
+
+**1. The supervisor's handle budget is larger than its quota (D2).** The formula adds up to 3·7+2+1+1+1+4+2 = **32**, but the supervisor's quota is H−1 = **31**. The current code fixes quota at `JE_VM_HANDLE_CAP - 1u` (`kernel/core/vm.c:369-370`). The transcript's earlier sum was 30 (`m4-contract.md:486`); LAUNCHER and DEVICE admin were added later without rechecking the quota.
+- *Fix:* "H = 40 (or another value with headroom ≥ 4); supervisor quota = H − 1 ≥ formula + 4 for inbound caps (see #4). PR-A adds a per-table quota field; `_Static_assert(SUP_NEED <= H-1)`."
+
+**2. D-DEV lands in PR-A, but PROCESS records only arrive in PR-B (D-DEV vs D-SEQ).** D-DEV stores "creator's PROCESS record index and generation" in PR-A. There are no PROCESS records until PR-B, and D4's field list has no "generation" field (only a launch serial).
+- *Fix:* "Creator identity = (PROCESS record index, launch serial). D-DEV moves to PR-B, or PR-A keys on (VM slot, per-slot build serial) and PR-B rekeys it." Also add a "record generation/serial" bullet to D4's field list.
+
+**3. The creation quota does not stop the starvation it was added to prevent (D-DEV, D2 E).** Six untrusted children × default quota 2 = 12 channels. The supervisor needs 2(P−1)+B+1 = 21 of a 24-record pool. 12 + 21 > 24, so hostile children can still make a launch or broker step fail.
+- *Fix:* "E ≥ supervisor need + Σ child creation quotas + fixtures, asserted. M4 children default to creation quota **0**; nothing in the demo needs a child to create channels, because the broker creates them."
+- Also correct the arithmetic: 14+6+1+2 = **23**, not 24. Either state the +1 headroom or change the value.
+
+**4. A child can push capabilities into the supervisor over its readiness channel (D7).** Carrying a cap needs TRANSFER on the *carried* handle (`endpoint.h:338-343`), not on B. So a child sending through B with SEND only can attach its own all-rights endpoints. Two consequences:
+- If the supervisor receives with hcap = 0, the head message returns SHORT_BUFFER and is never dequeued (`endpoint.c:829`), so it stays stuck at the front.
+- If the supervisor does accept the caps, they use up its quota (see #1).
+- The queued caps also keep pool records alive after the creator dies (D-DEV drops the charge, but the record stays).
+- *Fix (add to D7):* "The supervisor receives from A with hcap = 0. SHORT_BUFFER, or any first message other than exact READY, is a failed start, and the supervisor **closes A without draining it**. Closing A destroys the queue and releases the queued caps. A is also closed on every death or restart of that generation. The same applies to every control and broker channel the supervisor reads."
+
+## P2: should fix
+
+**5. PROC_SPAWN mutates the caller's table, and that step can fail after the point of no return (D5).** "The caller's table is never mutated by spawn" contradicts returning a PROCESS handle in the caller's table. The rollback list has no step that allocates that handle, so publishing can fail with H_QUOTA after the thread slot exists.
+- *Fix:* "Step 0: reserve the caller's PROCESS slot (QUOTA/NOSLOTS checked first). Publish = commit the reserved slot, which cannot fail. The only mutation of the caller's table is that one slot."
+
+**6. A PROCESS record must reach the live thread, but D4 says it never points at the VM slot.** "Never point at it" (D4 Why) conflicts with PROC_KILL and D9, which must find the victim's thread. Today death data is keyed only by thread slot (`sched.c:139-156`, `:503-526`).
+- *Fix:* "A LIVE/DYING record holds (thread slot, vm index), cleared by the reaper in the same IF=0 section that sets DEAD. A DEAD record holds no slot link."
+
+**7. Driver death is not wired to device detach (D9 vs D4).** `mark_dying` only releases the waiter (`sched.c:139-156`); the handle drain happens at reap, inside `je_vm_destroy`.
+- *Fix:* "`mark_dying` runs D9 revoke steps 1–6 synchronously when the slot is the bound driver."
+- The binding should name (record index, serial), and the bitmap byte 0x5F opens only when it matches the dispatched thread's record. Otherwise slot or record reuse could open COM2 to a different process.
+
+**8. DEVICE authority comes from the binding, not the handle (D9/D3).** Nothing uses the PIO right: the bitmap opens on "bound driver dispatched". A driver that closes its DEVICE handle keeps port access. Also, "make the driver's DEVICE handle stale" (step 5) has no mechanism: handle slots hold only object, type and rights (`handle.h:72-78`). Nor is it said what DEVICE `release` does.
+- *Fix:* "The DEVICE handle's slot records the binding generation. Ops check handle-gen == record-gen, else STALE. Closing the bound driver's last PIO handle runs revoke. The PIO right is what gates the bitmap: the bitmap opens only if the bound PROCESS still holds a live PIO handle."
+
+**9. The IRQ path has no defined first unmask, and assign preconditions are missing (D9).**
+- *Fix:* "DEV_ASSIGN unmasks IRQ3 after the mint and sets last_unmask = now. DEV_ASSIGN requires KILL on `process_h` and a LIVE record, else STALE. DEV_REVOKE with no binding returns OK (idempotent). A stale IRR edge latched from a prior binding may produce one pending event for the new driver; the driver must tolerate it."
+
+**10. The superseded-ADR lists disagree.**
+- ADR 0010's Consequences omits **ADR 0009 D5**. The 0009 back-pointer lists it, and D-DEV changes D5's "released at record destroy regardless of holder" to dropping the charge when the creator dies.
+- ADR 0010 also omits **ADR 0008 D7** and **ADR 0008's SELF-only dup/query**. Both are listed as blocking contracts, but no back-pointer was added to 0008 (the diff touches only 0007 and 0009).
+- ADR 0007's pointer says "process count only", but ADR 0007 D1 also scopes out a ring-3 device and assumes a kernel-only PIC. D9 changes that.
+- *Fix:* list all of these under "Superseded in part", and add a back-pointer to 0008.
+
+**11. The service state machine is incomplete (D11).** `failed-start` has no outgoing edge, and `backoff` is used but is not a state. `stopped` is terminal with no restart edge.
+- *Fix:* add rows "failed-start → backoff | failed-terminal", "backoff → starting", "stopped → starting (operator)".
+
+**12. D13 and D-DEV lack ADR 0000 parts.** Neither has Why, If otherwise, or Flex.
+- *Fix (D-DEV):* "If otherwise: charging the holder leaks on transfer (0009 D5). Flex: revisit with per-service pools."
+- *Fix (D13):* "If otherwise: Standard profile for the supervisor understates reaper authority. Flex: drop the supervisor to Standard once policy/mechanism are split (INIT.md:12)."
+
+**13. D12 cannot reap from where supervisor death happens.** The reaper requires `current == 0` (`sched.c:466`), but supervisor death happens on the supervisor's own syscall or fault path.
+- *Fix:* "Supervisor death sets a kernel flag. The slot-0 idle loop performs the kill-all, reap, and pool check, then halts."
+
+## P3: nits
+
+**14. "Bits are globally unique across types" is false (D3).** INSPECT 0x1 is shared by SELF, ENDPOINT and PROCESS.
+- *Fix:* "Bits are unique across types, except INSPECT, which is common."
+- Also note that LAUNCHER and DEVICE lack INSPECT, so RIGHTS on them always returns DENIED.
+
+**15. "ENDPOINT (retain-before-commit as today)" overstates what ring 3 can do today (D3).** Ring-3 dup and query are SELF-typed (`syscall.c:423-457`), so ring 3 gets WRONGTYPE on an endpoint today. Endpoint dup exists only in-kernel (`endpoint.h:252`). Say this exposes a new ring-3 behaviour.
+
+**16. D4's reap order contradicts the transcript without explanation.** The transcript says "release walk → death record → slot FREE" (`m4-contract.md:213`); D4 says record → drop_user → destroy. Record which order was chosen and why. Both are unobservable under IF=0.
+
+**17. The quota packing layout is not defined (D5).** Specify it, e.g. `quotas[15:0] = handle quota`, `[31:16] = creation quota`, `[63:32] = 0, else INVALID`.
+
+**18. Two small precision gaps in D8 and D9.**
+- D8's victim table should say that SLEEPING is unreachable for user threads (`sched.c:387`) and that RUNNING is impossible on one CPU.
+- D9 should say "master spurious IRQ7: no EOI", and IRQ gates 32–47 must stay DPL0.
+
+## Confirmed sound
+
+- **Op and constant numbers** are consistent across the D-sections and Consequences: ops 13–19, rights 0x10–0x100, and KILLED = 3 after FAULT 0, EXIT 1, BAD_RETURN 2 (`sched.h`).
+- **D9 I/O-bitmap arithmetic is correct:** 0x2F8/8 = 0x5F; 96 bytes cover ports 0–0x2FF; the 0xFF terminator is required; iomap = 104 equals the current `sizeof(tss64)` (`trap.c:22,45`).
+- **D9 IRQ facts match the code:** the PIC remap to 0x20 gives IRQ3 = vector 35 and IRQ7 = 39 on the master (`platform.c`). PIT divisor 11932 gives about 100 Hz.
+- **D5 startup registers are safe:** `je_uframe_check` leaves GPRs alone and forces IF=1 with IOPL and the other flags cleared (`uframe.c`). The initial frame is zeroed (`sched.c:124`).
+- **D6:** `je_sched_ticks()` exists. The hosted test asserting op 13 returns UNSUPPORTED is real (`tests/test_syscall.c:128`).
+- **D4 reaper:** slot 0 is always READY and cannot sleep, so round-robin visits it every round, and `reap_dead` enforces IF=0 (`sched.c:466-470`).
+- **D8 kill:** `mark_dying` is the single release owner (`sched.c:145`), and it clears `wait_pending`.
+- **D7 readiness authentication:** closing the supervisor's B is required for A to see PEER_CLOSED, and because the child's B has no TRANSFER it cannot be forwarded. It holds once #4 is fixed.
+- **D2 records and pages:** R = P+H is enough even with dup, because dup creates no records. 584 of 3104 pages matches the transcript's measurement (`m4-contract.md:132`).
+- **D9 profile:** the "legacy no-DMA PIO" refusal follows AGENTS rule 5.
+
+### Round 1 — Codex
+
+1. **P1 — PROCESS-record incarnation is underspecified.** D4 lists only a launch serial, while D-DEV requires `(record index, generation)` to distinguish a reused creator. Current endpoint records have their own generation, but no PROCESS-record generation exists (`docs/adr/0010-m4-supervisor-and-devices.md:179-185,591-595`; `include/jeios/endpoint.h:185-198`).
+   **Fix text:** “Each PROCESS record has a non-wrapping record generation. D-DEV stores `(record_index, record_generation)` and decrements charge only on an exact match; exhausted generations retire the record slot.”
+
+2. **P1 — DEVICE revoke does not define how a live driver handle becomes stale.** D9 says “make the driver’s DEVICE handle stale,” but revocation is initiated by the supervisor against another process’s table. Current close only mutates the current/specified table (`kernel/core/syscall.c:381-412`). Driver death currently releases only IPC waiters (`kernel/core/sched.c:139-152`).
+   **Fix text:** “The DEVICE binding owns the exact child-table slot/generation. Revoke atomically closes that slot, releases the DEVICE reference, masks IRQ, cancels re-arm, clears IOPB authority, and only then clears ownership. Driver death invokes the same path before table destruction. Define lookup result as `STALE`.”
+
+3. **P1 — Supervisor-loss cleanup has no defined authority registry.** D12 requires killing every launched process, but D4/D5 define no kernel-owned supervisor identity, child list, or launch registry. Current reaping only scans scheduler slots and requires slot 0 (`kernel/core/sched.c:464-485`); callers explicitly poll it from `main.c` (`kernel/core/main.c:354-376`).
+   **Fix text:** “The kernel maintains a bounded launch registry keyed by PROCESS-record identity, marks the first process as supervisor, and uses it on supervisor death. Cleanup scans at most `P` records/threads; failure to clean any entry is fail-stop.”
+
+4. **P2 — D4 overstates current implementation of automatic reaping.** The ADR says the slot-0 idle loop calls the reaper every iteration, but no such call exists; current calls are test-harness polling only (`docs/adr/0010-m4-supervisor-and-devices.md:200-203`; `kernel/core/main.c:354-376,412-521`; `kernel/core/sched.c:455-485`).
+   **Fix text:** “Planned in PR-B; not implemented at the reviewed baseline. PR-B must add and test the slot-0 idle-loop call.”
+
+5. **P2 — Capacity formulas do not equal their provisional values.** At `P=8,B=6`, the endpoint formula is `14+6+1+2=23`, not 24. The PROCESS formula says records are bounded by the supervisor quota, but computes `P+H=40` while the stated supervisor quota is `H−1=31` (`docs/adr/0010-m4-supervisor-and-devices.md:103-110`).
+   **Fix text:** “Set `E=23` plus one explicitly named reserve, or change the formula. Set `R=P+Q_supervisor` with `Q_supervisor=H−1`, or explicitly account for the extra slot.”
+
+6. **P2 — “Globally unique rights bits” is false.** D3 assigns PROCESS `INSPECT=0x1`, while `INSPECT=0x1` is already shared by SELF and ENDPOINT (`docs/adr/0010-m4-supervisor-and-devices.md:140-145`; `include/jeios/endpoint.h:80-88`; `include/jeios/abi.h:192-207`).
+   **Fix text:** “Rights meanings are globally shared; new rights bits are globally unique. `INSPECT` is intentionally reused across object types.”
+
+7. **P2 — Spawn rollback calls are not valid for every failure point.** `drop_user` requires an existing scheduler user thread, while `je_vm_destroy` requires VM state `READY` (`kernel/core/sched.c:433-452`; `kernel/core/vm.c:375-401`). The stated “drop_user/je_vm_destroy” rollback is therefore incomplete for failures before thread creation.
+   **Fix text:** “Use a journal with `thread_created`/`vm_ready` flags: call `drop_user` only after thread creation; destroy the READY VM independently; release grants and PROCESS record in reverse order.”
+
+8. **P2 — Startup-register ABI contradicts the retained transcript.** ADR D5 specifies `RDI=version, RSI=count, RDX..R9=handles`; transcript C4 specifies `RDI=count, RSI..R8=handles, R9=version` (`docs/adr/0010-m4-supervisor-and-devices.md:241-250`; `docs/adr/debates/m4-contract.md:492-507`).
+   **Fix text:** “Record why C4 was rejected and update the transcript/ADR to one canonical layout, including required zero values for unused registers.”
+
+9. **P2 — Spawn input bounds are incomplete.** `grants_ptr` has no specified byte span/overflow check, and `quotas` has no bit layout, minimums, defaults, or zero semantics (`docs/adr/0010-m4-supervisor-and-devices.md:223-239`).
+   **Fix text:** “Define fixed-width grant/quota layouts; reject `grant_count>4`, multiplication overflow, invalid pointers, unknown quota bits, and out-of-range values before any mutation.”
+
+10. **P2 — D12 silently diverges from INIT’s critical-failure contract.** INIT requires a rescue/watchdog path once supported; D12 chooses halt for M4 but does not list this as a supersession/explicit profile exception (`docs/INIT.md:93-96`; `docs/adr/0010-m4-supervisor-and-devices.md:534-557`).
+    **Fix text:** “Add to Consequences: ‘M4 explicitly defines a fail-stop refusal profile and does not claim INIT rescue/recovery; the INIT rescue requirement remains planned for M5a+.’”
+
+11. **P2 — D-DEV lacks ADR 0000 decision-record parts.** It has impact, resolution, and tests, but no explicit Why, If otherwise, or Flex despite the ADR-wide requirement (`docs/adr/0010-m4-supervisor-and-devices.md:18-20,579-601`).
+    **Fix text:** Add all three headings and record the rejected creator-quota alternatives.
+
+12. **P3 — Current ABI comments contradict implemented capability transfer.** `abi.h` says cap_count must remain zero until a later step, while decoder/tests and dispatch already accept and process caps (`include/jeios/abi.h:115-145`; `kernel/core/syscall.c:479-520`; `tests/test_syscall.c:108-116`).
+    **Fix text:** Update the stale comments to the current M3c transfer contract.
+
+### Confirmed sound
+
+- Fresh readiness channel, SEND-only child end, closing the supervisor’s B alias, and exact first-message validation are sound for authenticating sender generation—not health (`docs/adr/0010-m4-supervisor-and-devices.md:308-337`).
+- Kill releasing blocked waiters/reservations through `mark_dying` and not delivering `CANCELLED` matches the current scheduler/IPC contract (`kernel/core/sched.c:139-152`; `docs/adr/0009-m3c-capability-ipc.md:883-904`).
+- ABI op numbers 13–19 are internally sequential.
+- TSS geometry is arithmetically correct: offset 104, 96 bitmap bytes, one terminator; COM2 maps to bitmap byte `0x5f`, and current frame sanitization forces IOPL=0 (`kernel/arch/x86_64/trap.c:16-49`; `kernel/core/uframe.c:29-41`).
+### Round 2 — Claude
+
+# ADR 0010 round-2 review
+
+Most round-1 findings are fixed. One revoke-path bug is new and must be fixed before PR-H. I read the working tree only, against `dc41da5` plus the diffs; nothing was edited or built.
+
+## Round-1 findings (Claude)
+
+1. **FIXED.** H = 40, Qs = 39, SUP 32 + 4 = 36 ≤ 39, and the assert is stated (§D2, lines 108–123).
+2. **FIXED.** The record generation is added (lines 197–201), and D-DEV moves to PR-B (lines 709, 750).
+3. **FIXED.** Children default to quota 0, and E = 21 + 2 + 0 + 1 = 24 (lines 107, 722). The formula still cannot be checked at build time; see N3.
+4. **FIXED.** The supervisor receives with `hcap = 0` and closes A without draining it, on every channel it reads (lines 377–394). This matches `endpoint.c:829`: SHORT_BUFFER means no dequeue.
+5. **FIXED-BUT-WRONG.** Step 0 reserves and step 5 commits (lines 302–308). But line 279–280 still says "The caller's table is never mutated by spawn", which contradicts lines 257–258.
+6. **FIXED.** The run link is cleared when the record becomes DEAD (lines 202–204).
+7. **FIXED-BUT-WRONG.** `mark_dying` does run revoke (lines 215, 521), but revoke step 5 closes the handle only "if the driver is still LIVE". A dying driver is DYING, so its DEVICE handle survives until reap. See N1.
+8. **FIXED-BUT-WRONG.** Line 478 says "the binding generation **in the handle**". A handle slot holds only state, generation, object, type and rights (`handle.h:74-80`). The 0008 back-pointer says the generation is "not encoded in the handle". The mechanism is still undefined. See N2.
+9. **FIXED.** Assign now requires KILL and a LIVE target, then unmasks; revoke on an unbound device is idempotent; one spurious event is tolerated (lines 481–492, 533).
+10. **FIXED.** Consequences lines 799–805 list every superseded item; 0008 now has a back-pointer; the 0007 pointer covers the ring-3 device and the PIC.
+11. **FIXED, with a gap.** The table now has all the edges (lines 588–597). But line 602 says failed-terminal "stays until the operator acts", and the table has no edge out of failed-terminal.
+12. **FIXED.** D13 has its parts at lines 688–695 and D-DEV at lines 730–740. "Service" is the correct profile name (CODING_STANDARD line 21).
+13. **FIXED.** Supervisor death sets `supervisor_lost`, and slot 0 does the cleanup (lines 643–645).
+14. **FIXED** (lines 154–157).
+15. **FIXED** (lines 174–176).
+16. **FIXED.** The chosen reap order and its reason are recorded (lines 217–222).
+17. **FIXED** (lines 264–267).
+18. **FIXED** (lines 429–430, 513–516).
+
+## Round-1 findings (Codex)
+
+1. **FIXED** (lines 197–201, 711–715).
+2. **FIXED-BUT-WRONG.** Same cause as Claude #7: the "still LIVE" guard skips the close on the death path, which is the one path Codex named.
+3. **FIXED.** The PROCESS pool doubles as the launch registry, so D12 scans at most R records (lines 210–211, 647).
+4. **FIXED** (lines 231–235).
+5. **FIXED** (lines 107–110).
+6. **FIXED** (lines 154–157).
+7. **FIXED.** The journal uses `thread_created` and `vm_ready` flags (lines 310–316).
+8. **FIXED.** The rejected C4 layout and the reason are recorded (lines 294–297). The new text has a register defect; see N4.
+9. **FIXED** (lines 260–267). With `grant_count` ≤ 4, `grant_count × 8` cannot overflow.
+10. **FIXED** (lines 808–810).
+11. **FIXED** (lines 730–740).
+12. **FIXED as planned work.** The `abi.h` comment fix is scheduled in PR-B (line 750); `abi.h` itself is not changed yet.
+
+## New defects
+
+**N1 (P1): a stale DEVICE release can revoke a new binding.**
+- *Scenario:* the driver dies, and `mark_dying` revokes, skipping step 5 because the driver is now DYING. The supervisor can run before slot 0 in the same round. It respawns the driver and calls `DEV_ASSIGN`, which creates binding gen+1. The reaper's release walk then closes the old DEVICE handle. The release hook "runs revoke" (line 488) and tears down the **new** driver's binding.
+- Closing the exact slot inside revoke (step 5) also re-enters the release hook.
+- *Fix:* "Step 5: if the driver's table still exists (LIVE or DYING), close the recorded slot, but only if the slot's handle generation matches. The DEVICE `release` hook runs revoke only if the closed slot equals the record's recorded (owner identity, slot index, handle generation) **and** a binding is active. Otherwise it only drops the reference. Revoke clears the recorded slot before step 5, so the re-entry is a no-op."
+
+**N2 (P2): the binding check has no storage and would break the admin handle.**
+- No slot field can hold "binding generation in the handle".
+- "Every DEVICE op checks" it, including ops on the supervisor's ASSIGN handle. The first assign bumps the generation, so `DEV_REVOKE` on the admin handle would then return `H_STALE`.
+- *Fix:* "PIO/IRQ ops check that (caller's record identity, handle index, handle generation) equal the record's recorded driver slot; otherwise `H_STALE`. ASSIGN-handle ops are exempt from the binding check." Then line 478 and the 0008 back-pointer say the same thing.
+
+**N3 (P2): the endpoint formula cannot be asserted at build time.** Σ child quotas is a runtime spawn parameter, so `_Static_assert(E >= 21 + 2 + Σ + 1)` (line 123) is not expressible.
+- *Fix:* "Assert `E >= 24 + (P−1)·JE_EP_CHILD_QUOTA_MAX`. Alternatively, spawn rejects a creation quota c when the outstanding child quotas plus c exceed the reserve, returning `H_QUOTA`." Also name the "+1 reserve", or drop the word "named".
+
+**N4 (P2): "every other GPR is zero" includes RSP.** RSP must be the initial user stack top. It is also unstated that handle registers beyond n are zero.
+- *Fix:* "RSP = the image stack top. Handle registers beyond n are zero. All other GPRs are zero."
+
+**N5 (P2): broker channels can drain the supervisor's creation quota.**
+- Charges follow the creator until the record is destroyed. A client that keeps its dead (PEER_CLOSED) end keeps that record alive.
+- Each re-request creates another supervisor-charged channel. Over repeated restarts, this exceeds the supervisor's 21-channel quota, and then a readiness channel cannot be created.
+- *Fix:* "The broker issues at most one channel per (client, service generation). B is counted as clients × (restart_limit + 1), or the broker refuses beyond B with a v0 broker error."
+
+**N6 (P3): context-switch lookup is missing.** The bitmap check (line 463) needs a mapping from thread slot to record identity, but only record → thread is defined.
+- *Fix:* add a back-link from the thread to its record, set at spawn and cleared at reap.
+
+**N7 (P3): the IRQ rate bound needs `last_unmask` updated.** The "one handler run per tick" bound only holds if `last_unmask` is set at every unmask, including the timer-sweep re-arm. Also, `DEV_IRQ_ACK` with `pending` clear should not schedule a re-arm.
+
+**N8 (P3): small wording gaps.**
+- `DEV_ASSIGN` into a full child table should be listed as `H_QUOTA`.
+- D-DEV says "live creator", but the creator is DYING during its own release walk. State that charges are dropped then.
+
+## Confirmed sound
+
+- The arithmetic now holds:
+  - E = 14 + 6 + 1 + 2 + 0 + 1 = 24;
+  - SUP = 21 + 2 + 1 + 1 + 1 + 4 + 2 = 32, and 32 + 4 ≤ 39;
+  - R = 8 + 39 = 47, rounded to 48.
+- Only the supervisor can hold PROCESS handles: they are no-send, and LAUNCHER cannot be duplicated. So the R bound by Qs is valid.
+- Closing A without draining it, combined with `hcap = 0`, closes the cap-injection and stuck-head holes.
+- Keying the bitmap on record identity defeats both slot reuse and record reuse.
+- Stale re-arms are cancelled by the generation check, and the kernel is the only code that unmasks.
+- Spawn rollback is ordered so each undo step is valid at its failure point, and it matches the reap order.
+- The state-machine edges are complete apart from the failed-terminal exit (Claude #11).
+- The supersession list and the three back-pointers are consistent with each other.
+
+This is AI-assisted review, not independent human qualification.
+
+### Round 2 — Codex
+
+## Round-1 dispositions
+
+Claude:
+
+1. **FIXED** — H=40, Qs=39, and `SUP+4 ≤ H−1` are explicit. `docs/adr/0010-m4-supervisor-and-devices.md:108-109`
+2. **FIXED** — PROCESS identity is `(index, record generation)`; D-DEV is PR-B. `:194-201,709-715`
+3. **FIXED** — child creation quota defaults to 0; E arithmetic includes the named reserve. `:107,112,721-725`
+4. **FIXED** — `hcap=0`, failed-start closure, queued-cap release, and all supervisor-read channels are covered. `:377-394`
+5. **FIXED-BUT-WRONG** — reserved caller slot is correctly added, but “caller’s table is never mutated” still contradicts the returned PROCESS slot. `:255-258,274-280`
+6. **FIXED** — LIVE/DYING records retain `{thread slot, vm index}` and DEAD records clear it. `:197-204`
+7. **FIXED** — death invokes synchronous device revoke and binding identity is generation-keyed. `:214-216,471-480`
+8. **FIXED** — authority is gated by binding generation and live PIO handle; release revokes. `:463-490`
+9. **FIXED** — assign preconditions, first unmask, `last_unmask`, idempotent revoke, and IRR behavior are specified. `:481-492,533-534`
+10. **FIXED** — Consequences and all three ADR back-pointers now enumerate the supersessions. `:798-807`; `docs/adr/0008-m3b-typed-handles.md:452-459`
+11. **FIXED** — failed-start, backoff, and operator restart edges are present. `:588-597`
+12. **FIXED** — D13 and D-DEV now include Why, If otherwise, and Flex. `:688-695,730-740`
+13. **FIXED** — supervisor-loss flag plus slot-0 cleanup is defined. `:639-657`
+14. **FIXED** — shared INSPECT and LAUNCHER/DEVICE denial are explicit. `:153-157`
+15. **FIXED** — new ring-3 endpoint behavior is distinguished from current WRONGTYPE behavior. `:171-176`
+16. **FIXED** — reap order and rationale are explicitly frozen. `:217-222`
+17. **FIXED** — quota bit layout and zero semantics are specified. `:260-267`
+18. **FIXED** — SLEEPING/RUNNING and spurious IRQ7/DPL constraints are stated. `:421-430,513-516`
+
+Codex:
+
+1. **FIXED** — non-wrapping PROCESS-record generation is defined. `:194-201`
+2. **FIXED** — exact driver-table slot/generation, synchronous revoke, and H_STALE are defined. `:471-531`
+3. **FIXED** — PROCESS pool is the bounded launch registry and supervisor flag identifies the first process. `:206-211`
+4. **FIXED** — automatic reaping is explicitly planned, not claimed at baseline. `:231-235`
+5. **FIXED** — E=24 and R=48 are arithmetically reconciled. `:103-110`
+6. **FIXED** — rights-bit wording is corrected. `:153-157`
+7. **FIXED** — rollback uses `thread_created`/`vm_ready` journal flags. `:301-320`
+8. **FIXED** — ADR 0010 rejects and explains the transcript’s C4 layout. `:285-299`
+9. **FIXED** — fixed grant width, count bound, checked copy, quota packing, defaults, and reserved bits are specified. `:260-283`
+10. **FIXED** — M4’s fail-stop exception to INIT rescue is explicit. `:808-810`
+11. **FIXED** — D-DEV has all ADR-record parts. `:730-740`
+12. **NOT FIXED** — ADR only schedules the stale `abi.h` comment for PR-B; current source still says cap transfer “MUST be 0 until step 5.” `:749-751`; `include/jeios/abi.h:119-122`
+
+## New or newly exposed defects
+
+- **P1 — `DEV_ASSIGN` is not transactional.** Minting the child DEVICE handle can fail due to quota/slots, but the text says binding occurs before minting and gives no rollback. Fix: reserve the child slot first; on any mint failure leave binding, IRQ mask, bitmap, and ownership unchanged; unmask only after commit. `:481-485`
+
+- **P2 — revoke recursion is unspecified.** Supervisor revoke closes the exact DEVICE slot, while closing that slot invokes the DEVICE release hook, which invokes revoke again. Fix: add an idempotent `revoking` guard/shared internal revoke path; bump binding generation exactly once. `:488-490,518-531`
+
+- **P2 — dynamic child endpoint quotas can exceed the fixed E budget.** The formula contains `Σ child quotas`, but spawn has no cumulative reservation/admission rule. Fix: reserve quota against `E−fixed overhead`, or reject every nonzero child quota in M4. `:107,264-267,721-725`
+
+- **P2 — binding-generation storage is ambiguous.** ADR 0008 says object generations are not encoded in handles, while D9 says the generation is “in the handle.” Fix: state that DEVICE slot metadata stores `binding_generation`; the 32-bit handle encoding remains unchanged. `:478-480`; `docs/adr/0008-m3b-typed-handles.md:459`
+
+- **P2 — `failed-terminal` says the operator can act but has no outgoing transition.** Fix: add `failed-terminal → starting` only after explicit operator reset/budget reset. `:593,602`
+
+## confirmed sound
+
+Readiness cap injection, PROCESS identity/reaping, capacity arithmetic, IRQ7 handling, D12 fail-stop cleanup, and requested state-machine additions are now internally consistent. Read-only review only; no build or tests run.
+### Round 3 — Claude
+
+## Round 3 verdict on 0010 at the working tree: all 13 items are fixed, none wrongly
+
+**Claude items**
+
+| # | Verdict | Where |
+|---|---|---|
+| N1 | FIXED | :513-522 (exact-slot + active + not-revoking release guard), :561-570 (step 0 clears the recorded slot, step 5 checks the generation). This is sound: ADR 0008 :170 bumps the generation on close, so step 5 is a no-op on the driver-close path. |
+| N2 | FIXED | :491-499 (object-side check, admin handle exempt); 0008 back-pointer :459 agrees. |
+| N3 | FIXED | :122-125. `JE_EP_RESERVE` is now named; :26 and :276 force child quota to 0. A P3 remains, below. |
+| N4 | FIXED | :296-302 |
+| N5 | FIXED for the bound | :662-668. It adds a new P2, below. |
+| N6 | FIXED | :217-218 |
+| N7 | FIXED | :537-543 |
+| N8 | FIXED | :503 (`H_QUOTA`/`H_NOSLOTS`) and :763-764 (DYING during the release walk). |
+
+**Codex items**
+
+| # | Verdict | Where |
+|---|---|---|
+| ASSIGN transactional | FIXED | :500-511. Only step 1 can fail, and unmask happens after commit. |
+| Revoke recursion | FIXED | :559-571 (`revoking` flag; the generation is bumped once, at step 2). |
+| Dynamic child E | FIXED | :26 and :276 (`JE_EP_CHILD_QUOTA_MAX` = 0, nonzero → `INVALID`). |
+| Binding-generation storage | FIXED | :491 and 0008 :459 |
+| failed-terminal exit | FIXED | :638 |
+
+## New defects introduced by these edits
+
+**P2: the broker cap contradicts the new operator reset and the sliding restart window.**
+- :663 caps each client at `restart_limit + 1` per service. It doesn't say whether that is a lifetime count or a per-window count.
+- If it is a lifetime count: after an operator reset (:638), or once the restart window slides, the service can legitimately restart again. A well-behaved client that closed its old ends is then refused with `BROKER_EXHAUSTED` forever.
+- If the counter resets with the budget: a client that keeps its dead ends breaks B ≤ 6 again, which reopens N5.
+- *Fix text:* "The per-(client, service) broker counter counts for the client's whole life. Operator reset and window expiry do not reset it. A client that reaches `BROKER_EXHAUSTED` recovers only by its own restart. A new client record identity starts a fresh counter, and its predecessor's death destroys its ends and releases the supervisor's charges (D-DEV)."
+
+**P3: the endpoint assert at :124 hard-codes 21.** 21 is 2(P−1) + B + 1. If P or B changes, the assert silently stops tracking the formula, which defeats it.
+- *Fix text:* "`E >= 2*(P−1) + JE_BROKER_MAX + 1 + 2 + (P−1)*JE_EP_CHILD_QUOTA_MAX + JE_EP_RESERVE`, with `_Static_assert(JE_BROKER_MAX <= 6)`."
+- It is also worth stating that `JE_BROKER_MAX` lives in a header shared by the kernel and the supervisor image. Otherwise the B assert promised at :129 has nothing to check against.
+
+**P3: the D-DEV wording disagrees with itself.**
+- :762-764 releases the charge against the creator's record in any state, including DEAD. :769 says "only ever against the creator's own live record". The 0009 back-pointer repeats "live".
+- :774 still says "Σ child quotas" and leaves out the reserve.
+- *Fix:* change "live" to "same-identity (LIVE, DYING or DEAD)" in both places, and make :774 quote the D2 formula.
+
+**P3 (optional): IRQ rate bound.** Revoking and then assigning within one tick allows two unmasks in that tick (:506 and the sweep). Only the trusted supervisor can do this, so either add "the bound holds per binding" at :545 or have assign also respect `last_unmask + 1`.
+
+Nothing else in D2, D4, D5, D9, D11 or D-DEV regressed. This is AI-assisted review, not independent human qualification.
+
+### Round 3 — Codex
+
+N1 — **FIXED** — D9 L513–521, L559–571: exact owner/slot/generation match, cleared recorded slot, and `revoking` guard prevent stale release from revoking a new binding.
+
+N2 — **FIXED** — D9 L485–499: binding metadata is stored in the DEVICE record; PIO/IRQ checks are distinct from exempt ASSIGN-handle operations.
+
+N3 — **FIXED** — D2 L107–129; D5 L274–277: M4 fixes child endpoint quota max at zero and asserts the compile-time reserve formula.
+
+N4 — **FIXED** — D5 L296–302: RSP is the image stack top, handles beyond `n` are zero, and all other GPRs are zero.
+
+N5 — **FIXED** — D11 L657–668: one channel per client/service generation, per-client restart cap, and bounded `BROKER_EXHAUSTED`.
+
+N6 — **FIXED** — D4 L217–218: thread-to-PROCESS back-link is set at spawn and cleared at reap.
+
+N7 — **FIXED** — D9 L537–543: no re-arm when `pending` is clear; every unmask updates `last_unmask`.
+
+N8 — **FIXED** — D9 L500–506 lists `H_QUOTA`; D-DEV L762–778 explicitly handles LIVE, DYING, and DEAD creators.
+
+Codex P1 — **FIXED-BUT-WRONG** — D9 L500–510 reserves the slot before binding and delays unmasking, but only failure at step 1 is specified as rollback-safe. It does not state that post-reservation mint/commit is infallible or provide rollback for such failure. Fix text: “After slot reservation, steps 2–4 are infallible; if any can fail, undo the binding, reserved slot, generation, mask, bitmap, and ownership before returning.”
+
+Codex P2 (revoke recursion) — **FIXED** — D9 L559–571.
+
+Codex P2 (dynamic endpoint quota) — **FIXED** — D2 L107–125; D5 L274–277; D-DEV L771–778.
+
+Codex P2 (generation storage) — **FIXED** — D9 L485–499; ADR 0008 L452–459.
+
+Codex P2 (`failed-terminal`) — **FIXED** — D11 L628–638.
+
+New P1/P2 introduced by these edits:
+
+- **P1 — `any → failed-terminal` can bypass cleanup.** D11 L637 permits a ready service to become terminal without D11 L640–643’s stopping/revoke/kill/reap sequence. Fix: remove the unrestricted edge; require live-service policy failures to enter `stopping`, then transition to `failed-terminal` only after authority revocation and reap.
+
+- **P2 — DEVICE binding-generation exhaustion is unspecified.** D9 L487–488 and L504/L564 require non-wrapping increment but define no max-value behavior. Fix: on `UINT32_MAX`, retire the DEVICE (cancel re-arms, reject future `DEV_ASSIGN` with `H_QUOTA`) rather than incrementing or wrapping.
+### Lead disposition of round 3
+
+All round-3 items were applied: broker counter counted over the client's whole life; endpoint assert written in terms of P and `JE_BROKER_MAX`; D-DEV and ADR 0009 wording changed from "live" to "same-identity (LIVE, DYING or DEAD)"; IRQ rate bound holds across bindings (assign waits for `last_unmask + 1`); DEV_ASSIGN steps 2–4 stated infallible; `any → failed-terminal` replaced by `stopping` then failed-terminal after the full stopping sequence; binding-generation exhaustion retires the DEVICE. Round 3 raised one new P1 (Codex: the `any → failed-terminal` edge could bypass the stopping cleanup) and several P2/P3 items. The lead applied each reviewer's own fix text. No round 4 was run, so these last edits were checked by the lead only, not re-reviewed by a peer. The PR records this.

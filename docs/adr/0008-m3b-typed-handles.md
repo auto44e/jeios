@@ -448,3 +448,12 @@ width + refcount model are `FLEX (planning review)` at those milestones. The
 Option-A restart model is firm for M3b; the recorded "Future consideration" of a
 hybrid A+B is the explicit revisit hook. The 32-bit encoding and STALE/retire
 semantics are **firm** (owner-signed ABI).
+
+## Superseded in part by ADR 0010 (2026-10-30, owner-approved)
+
+[ADR 0010](0010-m4-supervisor-and-devices.md) changes two things in this ADR:
+
+- **D7**, the owner-gated death path, gains PROCESS death records, an automatic slot-0 reaper and `PROC_KILL` (ADR 0010 D4/D8), all through the existing single release owner.
+- The SELF-only `query`/`rights`/`dup` ops become **typed** over SELF, ENDPOINT, PROCESS, LAUNCHER and DEVICE (ADR 0010 D3). Every existing SELF behaviour is preserved.
+
+The D2 handle encoding, rights-bit values and Option A restart model are unchanged. Object-side generations (PROCESS record, DEVICE binding) are checked by the object, not encoded in the handle.
