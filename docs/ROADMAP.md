@@ -119,7 +119,7 @@ owner requirements remain active.
 
 ## Additional owner requirements (2026-10-13)
 
-These design additions do not change the current implementation focus (M3b, then M3c).
+These design additions do not change the current implementation focus. (Updated 2026-10-31: M3 is complete; the focus is M4 per ADR 0010, then MP2. The earlier text named M3b, then M3c.)
 
 - M3c/M4: [INIT.md](INIT.md), configurable supervisor with good defaults,
   generation-safe readiness, bounded restarts, recovery and explicit authority.
@@ -151,7 +151,7 @@ These design additions do not change the current implementation focus (M3b, then
 
 Apache-2.0 is selected for original project code; see ADR 0005.
 [M3A.md](M3A.md) supplies a proposed implementation sequence, not a completed gate.
-M3a and M3b are complete; M3c IPC/init is in progress (ADR 0009; endpoint lifecycle landed). The ARM64 MP track runs alongside (MP1 booted).
+M3a, M3b and M3c are complete (ADR 0009; #8 closed). M4 is under way: its contract is ADR 0010. The ARM64 MP track runs alongside: MP1 is complete, with remote ARM64 CI (#52 closed). (Updated 2026-10-31; the earlier text said M3c was in progress.)
 
 [ACCELERATORS.md](ACCELERATORS.md) defines open-standards-first GPU/NPU support
 across planned platforms, qualified per device. M4 supplies device/buffer/DMA
@@ -173,7 +173,7 @@ These requirements extend the later backlog; M3a remains the next kernel task.
 [MOBILE.md](MOBILE.md) links auto44e/jeios-mobile: MP0 ARM64 contract, MP1-MP3
 native virtual execution/isolation, MP4 Pixel feasibility, MP5-MP6 physical mobile
 bring-up/services, AC0-AC2 future Android compatibility. Fresh C kernel remains
-shared; no AOSP/Linux host or lunch target. (M3a and M3b are complete; M3c is in progress; ARM64 MP1 booted.)
+shared; no AOSP/Linux host or lunch target. (M3 is complete; M4 is under way; ARM64 MP1 is complete. Updated 2026-10-31.)
 
 ## Zero trust throughout the ecosystem — 2026-10-14
 
