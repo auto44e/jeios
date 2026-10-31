@@ -307,6 +307,7 @@ je_user_m4c_start:
     movq %rdx, 0x40001810
     movq $1, 0x40001b10
     movq $0, 0x40001b08
+    movq $0, 0x40001b20
     cmpq $1, 0x40001800
     jne m4c_parent_fail
     cmpq $1, 0x40001808
@@ -481,6 +482,41 @@ m4c_parent_status_done:
     cmpq $2, %rax
     jne m4c_parent_fail
     movq $7, 0x40001b10
+
+    /* The kernel takes a complete IF=0 baseline before this deliberately
+     * invalid spawn. One handle slot cannot hold two startup grants, so the
+     * frozen precedence requires INVALID before any allocation or VM change. */
+    movq $9, 0x40001b10
+    movl $0x7fffffff, %ecx
+m4c_parent_quota_wait:
+    cmpq $1, 0x40001b20
+    je m4c_parent_quota_call
+    decl %ecx
+    jnz m4c_parent_quota_wait
+    jmp m4c_parent_fail
+m4c_parent_quota_call:
+    movq $14, %rax
+    movq 0x40001810, %rdi
+    xorq %rsi,%rsi
+    movq $0x40001900, %rdx
+    movq $2, %r10
+    movq $1, %r8
+    xorq %r9,%r9
+    int $0x80
+    movq %rax, 0x400018d0
+    cmpq $2, %rax
+    jne m4c_parent_fail
+    cmpq $0, %rdx
+    jne m4c_parent_fail
+    movq $10, 0x40001b10
+    movl $0x7fffffff, %ecx
+m4c_parent_quota_done_wait:
+    cmpq $2, 0x40001b20
+    je 1f
+    decl %ecx
+    jnz m4c_parent_quota_done_wait
+    jmp m4c_parent_fail
+1:
 
     /* SELF launcher -> WRONGTYPE. */
     movq $5, %rax
