@@ -835,9 +835,11 @@ je_user_spawn_child_end:
 
 /* M4d-s1 PROC_KILL victims and killer. The bootstrap writes PROCESS and
  * endpoint handles into the killer's USER_DATA page before creating its thread.
- * The phase/control words are handshakes with main.c; marker 1/2 brackets the
- * READY PROC_KILL with no other syscall between them. The killer never yields
- * between the WOKEN send and PROC_KILL pair. */
+ * The phase/control words are handshakes with main.c. For each READY,
+ * BLOCKED_IPC and WOKEN kill, the next syscall in this image after PROC_KILL is
+ * PROC_STATUS on that same victim; marker writes and phase waits are plain
+ * user-memory coordination, not syscalls. The killer never yields between the
+ * WOKEN send and PROC_KILL pair. */
 .globl je_user_m4d_ready_start
 .globl je_user_m4d_ready_end
 je_user_m4d_ready_start:
@@ -1055,6 +1057,13 @@ m4d_wait_woken:
     cmpq $3, %rax
     jne m4d_fail
 
+    /* The bootstrap writes gate 6 only after it observed EXIT/42 as DYING.
+     * This orders the first-reason race before the killer's idempotent kill. */
+    movq $6, 0x40001c00
+m4d_wait_exit_gate:
+    cmpq $6, 0x40001bf8
+    jne m4d_wait_exit_gate
+
     /* EXIT first-reason-wins: the bootstrap waits until this record is DYING
      * from exit(42), and PROC_KILL must be OK without changing reason EXIT=1. */
     movq $16, %rax
@@ -1077,6 +1086,8 @@ m4d_wait_woken:
 2:
     cmpl $1, 0x40001d84
     jne m4d_fail
+    cmpq $42, 0x40001d88
+    jne m4d_fail
     movq $6, %rax
     movq 0x40001c58, %rdi
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9
@@ -1084,8 +1095,9 @@ m4d_wait_woken:
     cmpq $0, %rax
     jne m4d_fail
 
-    /* Supervisor guard: this kernel-seeded record has no real thread, so the
-     * record-level guard must reject it before run-link or D12 loss handling. */
+    /* Supervisor guard: this LIVE record is run-linked to a real heartbeat
+     * thread. Removing the record-level guard would therefore kill that
+     * thread instead of failing at the later unlinked-record check. */
     movq $16, %rax
     movq 0x40001c50, %rdi
     xorq %rsi,%rsi; xorq %rdx,%rdx; xorq %r10,%r10; xorq %r8,%r8; xorq %r9,%r9

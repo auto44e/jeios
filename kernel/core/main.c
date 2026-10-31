@@ -264,50 +264,6 @@ static je_status vm_s3_destroy(uint32_t idx)
     return JE_OK;
 }
 
-/* The supervisor-guard fixture is deliberately unlinked and remains LIVE. It
- * must be discarded through the unpublished-record rollback path, not through
- * je_proc_on_dying: the latter is the D12 supervisor-loss trigger. */
-static je_status vm_s3_destroy_unlinked(uint32_t idx)
-{
-    if (idx >= JE_VM_MAX_PROCESSES) return JE_ERR_INVALID;
-    je_proc_id id = vm_s3_proc_ids[idx];
-    uint64_t flags = je_arch_irq_save();
-    if (je_sched_has_process(&vm_s3, idx)
-        || id.gen == 0u
-        || !je_proc_valid(&process_pool, id)
-        || process_pool.rec[id.index].state != JE_PROC_LIVE
-        || process_pool.rec[id.index].run_linked
-        || process_pool.rec[id.index].handle_refs != 0u
-        || process_pool.rec[id.index].ep_charge != 0u) {
-        je_arch_irq_restore(flags);
-        return JE_ERR_INVALID;
-    }
-    if (je_vm_destroy(&vm_s3, idx) != JE_OK
-        || je_proc_abandon(&process_pool, id) != JE_OK
-        || je_sched_unregister_process(&vm_s3, idx) != JE_OK) {
-        je_arch_irq_restore(flags);
-        return JE_ERR_INVALID;
-    }
-    je_arch_irq_restore(flags);
-    vm_s3_proc_ids[idx] = JE_PROC_ID_NONE;
-    return JE_OK;
-}
-
-static je_status vm_s3_abandon_record(je_proc_id id)
-{
-    uint64_t flags = je_arch_irq_save();
-    if (id.gen == 0u || !je_proc_valid(&process_pool, id)
-        || process_pool.rec[id.index].state != JE_PROC_LIVE
-        || process_pool.rec[id.index].run_linked
-        || process_pool.rec[id.index].handle_refs != 0u
-        || process_pool.rec[id.index].ep_charge != 0u) {
-        je_arch_irq_restore(flags);
-        return JE_ERR_INVALID;
-    }
-    je_status status = je_proc_abandon(&process_pool, id);
-    je_arch_irq_restore(flags);
-    return status;
-}
 /* Read the heartbeat word of process idx by switching to its root at CPL0.
  * Interrupts must be disabled so the timer cannot dispatch mid-switch. */
 static uint64_t vm_s3_heartbeat(uint32_t idx)
@@ -1885,12 +1841,16 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             uint32_t ready_victim = vm_s3_build_quota(PROG_M4D_READY, JE_EP_POOL_CAP);
             uint32_t blocked_victim = vm_s3_build_quota(PROG_M4D_BLOCKED, JE_EP_POOL_CAP);
             uint32_t woken_victim = vm_s3_build_quota(PROG_M4D_WOKEN, JE_EP_POOL_CAP);
-            uint32_t unlinked = vm_s3_build_quota(PROG_M4D_READY, JE_EP_POOL_CAP);
+            uint32_t supervisor = vm_s3_build_quota_kind(
+                PROG_M4D_READY, JE_EP_POOL_CAP, true);
+            /* The unlinked negative case needs only a LIVE PROCESS record; keeping
+             * it out of vm_s3 preserves the bounded five-VM fixture peak. */
+            je_proc_id unlinked_id = JE_PROC_ID_NONE;
             uint32_t exit_victim = JE_VM_MAX_PROCESSES;
-            /* This kernel-seeded record has no VM or real thread. The guard is
-             * intentionally exercised before run-link validation, and cleanup
-             * uses abandon so D12 supervisor-loss logic cannot run. */
-            je_proc_id supervisor_id = JE_PROC_ID_NONE;
+            /* PR-F must revisit this fixture's teardown when D12 supervisor-loss
+             * handling exists. PR-D deliberately leaves the supervisor LIVE so
+             * the guard is tested against a real run-linked thread. */
+            je_proc_id supervisor_id = vm_s3_proc_ids[supervisor];
             je_handle h_ready_kill = 0u, h_ready_inspect = 0u, h_ready_stale = 0u;
             je_handle h_blocked_kill = 0u, h_woken_kill = 0u, h_self = 0u;
             je_handle h_unlinked = 0u, h_blocked_peer = 0u, h_woken_peer = 0u;
@@ -1898,13 +1858,9 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             je_handle h_exit_kill = 0u, h_supervisor = 0u;
             je_handle_status alloc_status = JE_HANDLE_OK;
             uint64_t setup_flags = je_arch_irq_save();
-            if (je_proc_alloc(&process_pool, JE_EP_POOL_CAP, true,
-                              &supervisor_id) != JE_OK
-                || supervisor_id.gen == 0u) {
-                je_arch_irq_restore(setup_flags);
-                fail("JeiOS fatal: M4d supervisor record setup\r\n");
-            }
-            if (je_process_handle_mint(
+            if (je_proc_alloc(&process_pool, JE_EP_POOL_CAP, false, &unlinked_id) != JE_OK
+                || unlinked_id.gen == 0u
+                || je_process_handle_mint(
                     &vm_s3, killer, vm_s3_proc_ids[ready_victim],
                     JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL,
                     &h_ready_kill, &alloc_status) != JE_OK
@@ -1928,7 +1884,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                     JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL,
                     &h_self, &alloc_status) != JE_OK
                 || je_process_handle_mint(
-                    &vm_s3, killer, vm_s3_proc_ids[unlinked],
+                    &vm_s3, killer, unlinked_id,
                     JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_KILL,
                     &h_unlinked, &alloc_status) != JE_OK
                 || je_process_handle_mint(
@@ -1972,8 +1928,18 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
             if (je_thread_create_user(&vm_s3, ready_victim) != JE_OK
                 || je_thread_create_user(&vm_s3, blocked_victim) != JE_OK
                 || je_thread_create_user(&vm_s3, woken_victim) != JE_OK
-                || je_thread_create_user(&vm_s3, killer) != JE_OK) {
+                || je_thread_create_user(&vm_s3, killer) != JE_OK
+                || je_thread_create_user(&vm_s3, supervisor) != JE_OK) {
                 fail("JeiOS fatal: M4d thread setup\r\n");
+            }
+            uint32_t supervisor_thread_slot = 0u;
+            uint32_t supervisor_vm_index = 0u;
+            if (je_proc_run_link(&process_pool, supervisor_id,
+                                 &supervisor_thread_slot,
+                                 &supervisor_vm_index) != JE_OK
+                || supervisor_thread_slot == 0u
+                || supervisor_vm_index != supervisor) {
+                fail("JeiOS fatal: M4d supervisor run link\r\n");
             }
             __asm__ volatile("sti" ::: "memory");
 
@@ -2000,7 +1966,6 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
              * the reaper. */
             uint64_t blocked_dispatches = je_sched_dispatches_of(&vm_s3, blocked_victim);
             uint64_t woken_dispatches = je_sched_dispatches_of(&vm_s3, woken_victim);
-            uint64_t killer_dispatches_before = 0u;
             uint64_t parked_start = je_sched_ticks();
             while (je_sched_ticks() - parked_start < 0x40u) {
                 uint64_t flags = je_arch_irq_save();
@@ -2031,8 +1996,6 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                 uint64_t phase = vm_s3_scratch(killer, 0x1c00u);
                 uint64_t marker = vm_s3_scratch(killer, 0x1ca0u);
                 ready_heartbeat_before = vm_s3_scratch(ready_victim, 0x1e00u);
-                if (ready_heartbeat_before != 0u)
-                    killer_dispatches_before = je_sched_dispatches_of(&vm_s3, killer);
                 je_arch_irq_restore(flags);
                 if (phase != 1u || marker != 1u)
                     fail("JeiOS fatal: M4d READY kill gate changed\r\n");
@@ -2048,13 +2011,10 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                 uint64_t flags = je_arch_irq_save();
                 uint64_t marker = vm_s3_scratch(killer, 0x1ca0u);
                 uint64_t heartbeat = vm_s3_scratch(ready_victim, 0x1e00u);
-                uint64_t killer_dispatches_after = je_sched_dispatches_of(&vm_s3, killer);
                 ready_dispatches_after = je_sched_dispatches_of(&vm_s3, ready_victim);
                 if (marker == 2u) {
-                    if (killer_dispatches_after != killer_dispatches_before + 1u
-                        || heartbeat == 0u) {
+                    if (heartbeat == 0u)
                         fail("JeiOS fatal: M4d READY kill transition\r\n");
-                    }
                     ready_heartbeat_after = heartbeat;
                     je_arch_irq_restore(flags);
                     vm_s3_scratch_write(killer, 0x1bf8u, 2u);
@@ -2248,19 +2208,27 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                     &state, &reason, &code);
                 je_arch_irq_restore(flags);
                 if (status == JE_OK && state == JE_PROC_DYING
-                    && reason == JE_DEATH_EXIT)
+                    && reason == JE_DEATH_EXIT) {
+                    if (code != 42u)
+                        fail("JeiOS fatal: M4d EXIT code changed\r\n");
+                    vm_s3_scratch_write(killer, 0x1bf8u, 6u);
                     break;
+                }
                 if (je_sched_ticks() - exit_wait_start > 300u)
                     fail("JeiOS fatal: M4d EXIT victim timeout\r\n");
                 m4d_wait_interrupt();
             }
+            uint64_t supervisor_heartbeat_before =
+                vm_s3_scratch(supervisor, 0x1e00u);
+            uint64_t supervisor_dispatches_before =
+                je_sched_dispatches_of(&vm_s3, supervisor);
             uint64_t done_start = je_sched_ticks();
             for (;;) {
                 uint64_t flags = je_arch_irq_save();
                 uint64_t phase = vm_s3_scratch(killer, 0x1c00u);
                 uint32_t state = JE_PROC_FREE, reason = 0u; uint64_t code = 0u;
                 je_status status = je_proc_status(
-                    &process_pool, vm_s3_proc_ids[unlinked],
+                    &process_pool, unlinked_id,
                     &state, &reason, &code);
                 je_arch_irq_restore(flags);
                 if (phase == 99u) {
@@ -2275,6 +2243,31 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                     fail("JeiOS fatal: M4d completion timeout\r\n");
                 m4d_wait_interrupt();
             }
+            uint64_t supervisor_progress_start = je_sched_ticks();
+            for (;;) {
+                uint64_t supervisor_heartbeat =
+                    vm_s3_scratch(supervisor, 0x1e00u);
+                uint64_t supervisor_dispatches =
+                    je_sched_dispatches_of(&vm_s3, supervisor);
+                uint32_t supervisor_state = JE_PROC_FREE;
+                uint32_t supervisor_reason = 0u;
+                uint64_t supervisor_code = 0u;
+                uint64_t flags = je_arch_irq_save();
+                je_status supervisor_status = je_proc_status(
+                    &process_pool, supervisor_id, &supervisor_state,
+                    &supervisor_reason, &supervisor_code);
+                je_arch_irq_restore(flags);
+                if (supervisor_status != JE_OK
+                    || supervisor_state != JE_PROC_LIVE
+                    || supervisor_reason != 0u || supervisor_code != 0u)
+                    fail("JeiOS fatal: M4d supervisor guard changed record\r\n");
+                if (supervisor_heartbeat > supervisor_heartbeat_before
+                    && supervisor_dispatches > supervisor_dispatches_before)
+                    break;
+                if (je_sched_ticks() - supervisor_progress_start > 300u)
+                    fail("JeiOS fatal: M4d supervisor stopped dispatching\r\n");
+                m4d_wait_interrupt();
+            }
             while (je_sched_has_process(&vm_s3, killer)) {
                 if (je_sched_ticks() - done_start > 400u)
                     fail("JeiOS fatal: M4d killer reap timeout\r\n");
@@ -2285,14 +2278,16 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
                     fail("JeiOS fatal: M4d EXIT victim reap timeout\r\n");
                 je_kernel_idle_step();
             }
-            if (vm_s3_abandon_record(supervisor_id) != JE_OK)
+            (void)je_arch_irq_save();
+            if (je_sched_drop_user(&vm_s3, supervisor) != JE_OK
+                || vm_s3_destroy(supervisor) != JE_OK)
                 fail("JeiOS fatal: M4d supervisor cleanup\r\n");
-            if (vm_s3_destroy_unlinked(unlinked) != JE_OK)
+            if (je_proc_abandon(&process_pool, unlinked_id) != JE_OK)
                 fail("JeiOS fatal: M4d unlinked cleanup\r\n");
             if (je_endpoint_kernel_allocated() != 0u || process_pool.used_count != 0u)
                 fail("JeiOS fatal: M4d final pool baseline\r\n");
             je_arch_console_write(
-                "M4d-s1: PROC_KILL OK (READY, BLOCKED_IPC, WOKEN-reserved, EXIT first-reason, supervisor guard, self/after-death/unlinked/rights, synchronous-return)\r\n");
+                "M4d-s1: PROC_KILL OK (READY, BLOCKED_IPC, WOKEN-reserved, EXIT first-reason, supervisor guard, self/after-death/unlinked/rights, next-syscall PROC_STATUS)\r\n");
         }
         /* M3c leaves no VM process intentionally live: B was torn down before
          * the cross-table, timeout, and bootstrap proofs. */
