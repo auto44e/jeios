@@ -72,15 +72,24 @@ static uint32_t vm_s3_live_count(void);
 
 typedef struct {
     bool active;
+    bool service_side;
+    bool receiver_was_live;
     je_proc_id receiver;
+    je_proc_id creator;
     uint32_t endpoint_generation;
     uint16_t endpoint_index;
     uint8_t endpoint_side;
+    uint8_t order;
 } m4g_delivery;
 static m4g_delivery m4g_deliveries[JE_BROKER_MAX];
+static m4g_delivery m4g_service_deliveries[JE_BROKER_MAX];
 static uint32_t m4g_delivery_used;
+static uint32_t m4g_service_delivery_used;
 static uint32_t m4g_delivery_count[JE_PROC_REC_MAX];
 static je_proc_id m4g_delivery_identity[JE_PROC_REC_MAX];
+static uint32_t m4g_request_count[JE_PROC_REC_MAX];
+static bool m4g_third_request_seen;
+static uint32_t m4g_supervisor_ep_charge_peak;
 static bool m4g_delivery_bad;
 #if JE_TEST_MODE == 13
 typedef struct {
@@ -99,71 +108,185 @@ static bool m4g_table_holds_object(uint32_t vm_index, const void *object);
 static void m4g_delivery_reset(void)
 {
     for (uint32_t i = 0u; i < JE_BROKER_MAX; ++i)
+    {
         m4g_deliveries[i] = (m4g_delivery){0};
+        m4g_service_deliveries[i] = (m4g_delivery){0};
+    }
     m4g_delivery_used = 0u;
+    m4g_service_delivery_used = 0u;
     for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
         m4g_delivery_count[i] = 0u;
         m4g_delivery_identity[i] = JE_PROC_ID_NONE;
+        m4g_request_count[i] = 0u;
 #if JE_TEST_MODE == 13
         m4g_client_audits[i] = (m4g_client_audit){0};
 #endif
     }
+    m4g_third_request_seen = false;
+    m4g_supervisor_ep_charge_peak = 0u;
     m4g_delivery_bad = false;
 }
 
 /*
- * Called after the endpoint layer has minted a received cap. Spawn grants are
+ * Called after the receive transaction has committed and the endpoint layer has
+ * minted a received cap. Spawn grants are
  * deliberately ignored because je_proc_record_image() is published only after
  * the spawn transaction commits. In mode 13, the only later SEND|RECV cap
  * deliveries into a broker client are the supervisor's broker grants.
  */
+#if JE_TEST_MODE == 13
 void je_m4g_record_cap_delivery(je_vm *vm, uint32_t index,
                                 const je_ep_capdesc *descriptor)
 {
-#if JE_TEST_MODE == 13
     if (!vm || !descriptor || index >= JE_VM_MAX_PROCESSES
-        || !m4f_ledger_enabled || descriptor->rights
-            != (JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV))
+        || !m4f_ledger_enabled)
         return;
-    (void)vm;
     je_proc_id receiver = JE_PROC_ID_NONE;
+    bool receiver_live = false;
     for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
         const je_proc_rec *record = &process_pool.rec[i];
         if ((record->state == JE_PROC_LIVE || record->state == JE_PROC_DYING)
             && record->run_linked && record->vm_index == index) {
             receiver = (je_proc_id){i, record->gen};
+            receiver_live = record->state == JE_PROC_LIVE;
             break;
         }
     }
+    if (receiver.gen == 0u) return;
+    je_proc_id creator = JE_PROC_ID_NONE;
+    const je_ep_end *peer = (const je_ep_end *)0;
+    je_ep_end_state state = JE_EP_END_FREE;
+    if ((descriptor->rights & JE_ABI_RIGHT_SEND) != 0u
+        && descriptor->rights != (JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV)) {
+        m4g_delivery_bad = true;
+        return;
+    }
+    if (descriptor->rights != (JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV))
+        return;
+    if (!je_endpoint_kern_inspect_descriptor(descriptor, &creator, &peer,
+                                             &state)
+        || !peer || state == JE_EP_END_CLOSED)
+    {
+        m4g_delivery_bad = true;
+        return;
+    }
+    (void)peer;
+    const m4f_child_identity *receiver_child = (const m4f_child_identity *)0;
     for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
         m4f_child_identity *child = &m4f_children[i];
-        if (!child->active || child->image_id != JE_IMAGE_BROKER_CLI
-            || !m4f_id_equal(child->id, receiver))
+        if (!child->active || !m4f_id_equal(child->id, receiver))
             continue;
-        if (m4g_delivery_count[index] == 0u)
-            m4g_delivery_identity[index] = child->id;
-        if (!m4f_id_equal(m4g_delivery_identity[index], child->id)
-            || m4g_delivery_count[index] >= JE_BROKER_MAX) {
+        receiver_child = child;
+        break;
+    }
+    if (!receiver_child) return;
+    if (receiver_child->image_id == JE_IMAGE_BROKER_CLI) {
+        uint32_t id_index = receiver.index;
+        if (id_index >= JE_PROC_REC_MAX || m4g_delivery_used >= JE_BROKER_MAX
+            || m4g_delivery_count[id_index] >= JE_BROKER_MAX) {
             m4g_delivery_bad = true;
             return;
         }
-        uint32_t slot = m4g_delivery_used;
-        m4g_delivery_count[index]++;
-        if (slot < JE_BROKER_MAX) {
-            m4g_deliveries[slot] = (m4g_delivery){
-                true, child->id, descriptor->generation,
-                descriptor->rec_index, descriptor->side
-            };
-            m4g_delivery_used++;
+        if (m4g_delivery_count[id_index] == 0u)
+            m4g_delivery_identity[id_index] = receiver;
+        if (!m4f_id_equal(m4g_delivery_identity[id_index], receiver)) {
+            m4g_delivery_bad = true;
+            return;
         }
+        uint32_t slot = m4g_delivery_used++;
+        ++m4g_delivery_count[id_index];
+        m4g_deliveries[slot] = (m4g_delivery){
+            true, false, receiver_live, receiver, creator,
+            descriptor->generation, descriptor->rec_index, descriptor->side,
+            (uint8_t)(slot)
+        };
         return;
     }
-#else
-    (void)vm;
-    (void)index;
-    (void)descriptor;
-#endif
+    if (receiver_child->image_id == JE_IMAGE_BROKER_SVC) {
+        if (m4g_service_delivery_used >= JE_BROKER_MAX) {
+            m4g_delivery_bad = true;
+            return;
+        }
+        uint32_t slot = m4g_service_delivery_used++;
+        m4g_service_deliveries[slot] = (m4g_delivery){
+            true, true, receiver_live, receiver, creator,
+            descriptor->generation, descriptor->rec_index, descriptor->side,
+            (uint8_t)(slot)
+        };
+    }
 }
+
+void je_m4g_record_endpoint_create(je_proc_id creator)
+{
+    if (!m4f_ledger_enabled || creator.index >= JE_PROC_REC_MAX
+        || creator.gen == 0u)
+        return;
+    const je_proc_rec *record = &process_pool.rec[creator.index];
+    if (record->gen != creator.gen || record->state == JE_PROC_FREE) return;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        if (m4f_children[i].active
+            && m4f_children[i].image_id == JE_IMAGE_SUPERVISOR
+            && m4f_id_equal(m4f_children[i].id, creator)) {
+            if (record->ep_charge > m4g_supervisor_ep_charge_peak)
+                m4g_supervisor_ep_charge_peak = record->ep_charge;
+            if (m4g_supervisor_ep_charge_peak > JE_SVC_EP_LIMIT)
+                m4g_delivery_bad = true;
+            return;
+        }
+    }
+}
+
+void je_m4g_record_control_receive(je_vm *vm, uint32_t index,
+                                   const je_ep_recv_lease *lease,
+                                   const void *message, size_t length,
+                                   uint8_t cap_count)
+{
+    if (!vm || !lease || !message || index >= JE_VM_MAX_PROCESSES
+        || cap_count != 0u || length != JE_SVC_BROKER_REQUEST_LEN)
+        return;
+    je_proc_id receiver = JE_PROC_ID_NONE;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        const je_proc_rec *record = &process_pool.rec[i];
+        if (record->state == JE_PROC_LIVE && record->run_linked
+            && record->vm_index == index) {
+            receiver = (je_proc_id){i, record->gen};
+            break;
+        }
+    }
+    bool is_supervisor = false;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i)
+        if (m4f_children[i].active
+            && m4f_children[i].image_id == JE_IMAGE_SUPERVISOR
+            && m4f_id_equal(m4f_children[i].id, receiver))
+            is_supervisor = true;
+    if (!is_supervisor || !lease->rec || lease->side > 1u) return;
+    const je_ep_end *peer = &lease->rec->end[lease->side ^ 1u];
+    je_proc_id client = JE_PROC_ID_NONE;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        const m4f_child_identity *child = &m4f_children[i];
+        const je_proc_rec *record = &process_pool.rec[i];
+        if (!child->active || child->image_id != JE_IMAGE_BROKER_CLI
+            || (record->state != JE_PROC_LIVE
+                && record->state != JE_PROC_DYING)
+            || !record->run_linked)
+            continue;
+        if (m4g_table_holds_object(record->vm_index, peer)) {
+            client = child->id;
+            break;
+        }
+    }
+    if (client.gen == 0u || client.index >= JE_PROC_REC_MAX) return;
+    je_svc_broker_request request = {0};
+    const uint8_t *bytes = (const uint8_t *)message;
+    uint8_t *request_bytes = (uint8_t *)&request;
+    for (uint32_t i = 0u; i < sizeof request; ++i)
+        request_bytes[i] = bytes[i];
+    if (request.op != JE_SVC_OP_BROKER_REQUEST) return;
+    ++m4g_request_count[client.index];
+    if (m4g_request_count[client.index] >= 3u)
+        m4g_third_request_seen = true;
+}
+#endif
 
 static bool m4f_id_equal(je_proc_id left, je_proc_id right)
 {
@@ -1004,7 +1127,10 @@ static bool m4g_corroborate(je_proc_id supervisor,
         || m4f_terminal_count[JE_IMAGE_BROKER_CLI] != 2u
         || m4f_death_count[JE_IMAGE_BROKER_SVC][JE_DEATH_FAULT] != 1u
         || m4f_death_count[JE_IMAGE_BROKER_CLI][JE_DEATH_EXIT] != 2u
-        || m4g_delivery_bad || m4g_delivery_used != 3u)
+        || m4g_delivery_bad || m4g_delivery_used != 3u
+        || m4g_service_delivery_used != 3u
+        || !m4g_third_request_seen
+        || m4g_supervisor_ep_charge_peak > JE_SVC_EP_LIMIT)
         return false;
     const m4f_child_identity *client_a = m4g_find_client(
         JE_BROKER_TEST_BIT_READY | JE_BROKER_TEST_BIT_GRANTS
@@ -1020,6 +1146,7 @@ static bool m4g_corroborate(je_proc_id supervisor,
     if (!client_a || !client_b || client_a == client_b
         || m4g_delivery_count[client_a->id.index] != 2u
         || m4g_delivery_count[client_b->id.index] != 1u
+        || m4g_request_count[client_a->id.index] < 3u
         || !m4f_id_equal(m4g_delivery_identity[client_a->id.index],
                           client_a->id)
         || !m4f_id_equal(m4g_delivery_identity[client_b->id.index],
@@ -1029,7 +1156,8 @@ static bool m4g_corroborate(je_proc_id supervisor,
         if (!m4g_deliveries[i].active
             || m4g_deliveries[i].endpoint_index >= JE_EP_POOL_CAP
             || m4g_deliveries[i].endpoint_side > 1u
-            || m4g_deliveries[i].endpoint_generation == 0u)
+            || m4g_deliveries[i].endpoint_generation == 0u
+            || !m4f_id_equal(m4g_deliveries[i].creator, supervisor))
             return false;
 
     const je_proc_rec *sup = &process_pool.rec[supervisor.index];
@@ -1045,7 +1173,50 @@ static bool m4g_corroborate(je_proc_id supervisor,
         || m4g_endpoint_count(client_b, supervisor, supervisor_vm,
                               JE_VM_MAX_PROCESSES, false) != 1u)
         return false;
-    je_arch_console_write("M4g: EXHAUSTED observed and kernel-delivery count corroborated\r\n");
+    /*
+     * Every client delivery must have a matching service-side delivery of the
+     * opposite end. This proves the supervisor-created endpoint and the
+     * service identity that minted it, including B's first grant while that
+     * service instance was live. The client-delivery order is A(gen1),
+     * B(gen1), A(gen2).
+     */
+    if (!m4g_deliveries[0].active || !m4g_deliveries[1].active
+        || !m4g_deliveries[2].active
+        || !m4f_id_equal(m4g_deliveries[0].receiver, client_a->id)
+        || !m4f_id_equal(m4g_deliveries[1].receiver, client_b->id)
+        || !m4f_id_equal(m4g_deliveries[2].receiver, client_a->id)
+        || !m4f_id_equal(m4g_deliveries[0].creator, supervisor)
+        || !m4f_id_equal(m4g_deliveries[1].creator, supervisor)
+        || !m4f_id_equal(m4g_deliveries[2].creator, supervisor))
+        return false;
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        bool matched = false;
+        for (uint32_t j = 0u; j < 3u; ++j) {
+            const m4g_delivery *service_delivery =
+                &m4g_service_deliveries[j];
+            if (!service_delivery->active
+                || !service_delivery->receiver_was_live
+                || !m4f_id_equal(service_delivery->creator, supervisor)
+                || service_delivery->endpoint_generation
+                    != m4g_deliveries[i].endpoint_generation
+                || service_delivery->endpoint_index
+                    != m4g_deliveries[i].endpoint_index
+                || service_delivery->endpoint_side
+                    == m4g_deliveries[i].endpoint_side)
+                continue;
+            if (i < 2u && !m4f_id_equal(service_delivery->receiver,
+                                         m4g_service_deliveries[0].receiver))
+                return false;
+            if (i == 2u && m4f_id_equal(service_delivery->receiver,
+                                        m4g_service_deliveries[0].receiver))
+                return false;
+            matched = true;
+            break;
+        }
+        if (!matched) return false;
+    }
+    je_arch_console_write(
+        "M4g: client-reported EXHAUSTED; kernel delivery count A=2 corroborated\r\n");
     return true;
 }
 #endif

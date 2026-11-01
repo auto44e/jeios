@@ -85,9 +85,9 @@ output = boot(Path("build/13/jeios.iso"),
                         b"M4g: supervisor phase=0x0000000000000002",
                         b"M4g-s1: broker scenario completed",
                         b"M4g: zero-leak identity baseline verified",
-                        b"EXHAUSTED"])
+                        b"M4g: client-reported EXHAUSTED; kernel delivery count A=2 corroborated"])
 assert "JeiOS fatal:" not in output, f"mode 13 broker scenario failed:\n{output}"
-assert "M4f: supervisor lost" not in output, \
+assert "M4g: supervisor lost" not in output, \
     "mode 13 unexpectedly took the mode-12 supervisor-loss path"
 print(f"broker mode 13 (D11): PASS\n{output}")
 

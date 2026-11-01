@@ -9,9 +9,12 @@ static volatile uint32_t broker_service_data
     __attribute__((used, section(".data"))) = UINT32_C(0x31415926);
 
 static uint32_t recv_control(uint64_t control, void *message, uint64_t cap,
-                             uint32_t *hbuf, uint64_t hcap)
+                             uint32_t *hbuf, uint64_t hcap,
+                             uint32_t *out_length, uint32_t *out_caps)
 {
     uint64_t meta = 0u;
+    if (out_length) *out_length = 0u;
+    if (out_caps) *out_caps = 0u;
     uint64_t status = je_try_recv_caps(control, message, cap, hbuf, hcap,
                                        0u, &meta);
     if (status == JE_ABI_H_EMPTY) return 0u;
@@ -19,6 +22,8 @@ static uint32_t recv_control(uint64_t control, void *message, uint64_t cap,
     if (status != JE_ABI_OK || (meta & UINT64_C(0xffffffff)) == 0u
         || (meta >> 32) > hcap)
         return UINT32_MAX - 1u;
+    if (out_length) *out_length = (uint32_t)meta;
+    if (out_caps) *out_caps = (uint32_t)(meta >> 32);
     return 1u;
 }
 
@@ -67,24 +72,32 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t h0, uint64_t h1,
     for (;;) {
         je_svc_service_bind bind = {0};
         uint32_t minted[1] = {0u};
+        uint32_t length = 0u;
+        uint32_t cap_count = 0u;
         uint32_t control = recv_control(h0, control_bytes, sizeof control_bytes,
-                                        minted, 1u);
+                                        minted, 1u, &length, &cap_count);
         if (control == UINT32_MAX) return 63;
         if (control == UINT32_MAX - 1u) return 64;
         if (control == 1u) {
             memcpy(&bind, control_bytes, sizeof bind);
-            if (bind.op == JE_SVC_OP_SERVICE_BIND
+            if (length == JE_SVC_SERVICE_BIND_LEN
+                && cap_count == 1u
+                && bind.op == JE_SVC_OP_SERVICE_BIND
                 && minted[0] != 0u
                 && broker_count < JE_BROKER_MAX) {
                 broker_handles[broker_count] = minted[0];
                 broker_generations[broker_count] = bind.service_generation;
                 ++broker_count;
-                je_svc_broker_reply ack = { JE_SVC_OP_BROKER_ACK, 0u };
+                je_svc_broker_reply ack = {
+                    JE_SVC_OP_BROKER_ACK, bind.transaction
+                };
                 if (je_try_send(h0, &ack, sizeof ack) != JE_ABI_OK)
                     return 65;
             } else if (bind.op == JE_SVC_OP_CONFIG) {
                 je_svc_config config = {0};
                 memcpy(&config, control_bytes, sizeof config);
+                if (sizeof config != JE_SVC_CONFIG_LEN || cap_count != 0u)
+                    return 66;
                 if (config.incarnation < config.crash_before)
                     __asm__ volatile("ud2");
                 return 66;

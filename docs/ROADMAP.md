@@ -68,7 +68,8 @@ evidence for one focused supervisor-policy scenario, not completion of the
 whole M4 gate: device graph, buffer grants, DMA containment, and production
 service-registry guarantees remain planned. The next bounded implementation
 task after PR-G is PR-H (TSS I/O bitmap / DEVICE / IRQ3), subject to owner
-review and the remaining verification gates.
+review and the remaining verification gates. PR-G's bounded ledger is keyed by
+supervisor-owned PROCESS handles; the frozen PROC_STATUS ABI remains unchanged.
 
 ### Historical M3 implementation sequence
 

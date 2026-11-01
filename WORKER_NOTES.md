@@ -1,22 +1,51 @@
-# PR-G worker notes
+# PR-G FIX pass — worker notes
 
-Observation date: `2026-11-01T07:28:13Z`. Branch: `wip/m4g-impl`. Base
-inspected commit: `fb740ad5d772b1d534974619b0ed6a9010eb105f`. Changes are
-intentionally uncommitted for lead integration.
+Observation time: `2026-11-01T08:04:50Z`. Repository: `jeios`; branch:
+`wip/m4g-impl`; exact inspected commit:
+`f704111f1ba17b6a0e75da19621993ab588b466b`. The changes are intentionally
+uncommitted for lead integration.
+
+State: **implemented / tested / planned / not blocked**. Remote CI and
+independent human qualification were not observed. AI-assisted review is not
+human qualification.
 
 ## Decisions and reasoning
 
-- The broker remains ring-3 supervisor policy. No kernel ABI status or service
-  identity was added.
-- Capability delivery is service-first, client-second. Source handles close only
-  after the corresponding receiver ACK; any failed phase closes both sources,
-  leaves no delivered lifetime increment, and preserves the service-side minted
-  endpoint for normal both-dead ledger cleanup.
-- The ledger uses client PROCESS identity `(index,generation)`, service id and
-  service generation. It does not use a VM slot or handle value. A's third
-  request is checked against the delivered lifetime cap before the live
-  per-generation duplicate rule, so `EXHAUSTED` is observed independently of
-  the generation-2 live entry.
+- The broker remains ring-3 supervisor policy. No broker status or service
+  identity was added to the kernel. The frozen `PROC_STATUS` ABI remains
+  unchanged: successful status returns RDX = 0.
+- `SERVICE_BIND` and `BROKER_GRANT` are now 12-byte records with a
+  supervisor-minted transaction id. ACK detail must equal that transaction;
+  stale or mismatched ACKs are consumed and discarded until the bounded
+  deadline.
+- Capability delivery remains service-first, client-second. Source handles close
+  only after the corresponding receiver ACK. Failed delivery leaves a pending
+  ledger entry when the service may already have minted its end, so both-dead
+  collection can reclaim it safely.
+- The ledger is keyed by the supervisor-owned client and service PROCESS handle
+  values, service id, and service generation. It never uses a VM slot or a
+  supervisor-reported identity. Collection requires exact DEAD observations for
+  both processes; an uninspectable stale status handle clears the bounded entry
+  so it cannot pin the table forever. A referenced PROCESS handle remains open
+  until teardown or after its ledger entries are collected, preventing
+  handle-value reuse while the key is live.
+- Lifetime exhaustion and duplicate/PENDING checks happen before any service
+  restart side effect. A generation-wrap restart is refused terminally.
+- The kernel cap-delivery audit is recorded only after
+  `je_endpoint_kern_recv_commit` succeeds. Failed later-cap mint or user-copy
+  paths therefore cannot inflate the proof. Mode-13-only hooks are compiled
+  out of normal IPC builds.
+- Malformed or unexpected supervisor control messages are dropped or close the
+  offending channel as appropriate; they do not call `failed()`. Control
+  lengths and cap counts are exact per operation, and the client/supervisor
+  waits use clock ticks with the client grant deadline at least twice the ACK
+  deadline.
+- Kernel corroboration requires exactly three client-side and three service-side
+  brokered deliveries, the A/B/A endpoint sequence, live service state for the
+  service-side proof, exact brokered rights, the observed third request with no
+  third A delivery, and the supervisor endpoint-charge peak at or below
+  `JE_SVC_EP_LIMIT`. It uses the kernel child ledger and endpoint inspection,
+  never a supervisor-reported process identity.
 - A and B report exercise completion over their control channels before the
   supervisor faults service generation 1. This makes the echo proof causal:
   the deliberate restart cannot interrupt B's first brokered round trip.
@@ -28,6 +57,10 @@ intentionally uncommitted for lead integration.
   broker channels plus three control channels and the private sleep pair
   (`7` supervisor-created channels), below both limits; teardown observes
   endpoint allocation and charge return to zero.
+- M5 gap retained honestly: A's `EXHAUSTED` request occurs while a live
+  generation-2 entry also exists. This proves the lifetime-check ordering but
+  does not prove the duplicate-free cap in this scenario; a host unit test is
+  still needed. No stronger claim is made.
 
 ## Verification record
 
@@ -35,11 +68,12 @@ Commands run locally (exact commands; results are recorded only when observed):
 
 - `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=13` — PASS.
 - `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=0` — PASS.
-- `ASAN_OPTIONS=detect_leaks=0 make smoke` — PASS. Mode 0 reached
+- `make smoke` — PASS. Mode 0 reached
   `M4f-s1`, zero-leak baseline, and `QEMU smoke: PASS`.
 - `make integration` — PASS. Modes 1–12 retained their existing results;
-  mode 13 reached `M4g-s1`, `EXHAUSTED observed and kernel-delivery count
-  corroborated`, and zero-leak baseline with no fatal marker.
+  mode 13 reached `M4g-s1`,
+  `M4g: client-reported EXHAUSTED; kernel delivery count A=2 corroborated`,
+  and zero-leak baseline with no `M4g: supervisor lost` marker.
 - `python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M
   --expect-nx absent` — PASS.
 - `python3 tools/smoke.py build/0/jeios.iso --memory 1536M --expect-nx
@@ -47,6 +81,12 @@ Commands run locally (exact commands; results are recorded only when observed):
 - `make aarch64 && make smoke-aarch64 ARM_REQUIRE=1` — PASS. The existing
   ARM linker RWX warning remained; `QEMU aarch64 smoke: PASS`.
 - `git diff --check` — PASS.
+
+An earlier exploratory `make smoke TEST_MODE=13` returned the smoke wrapper's
+default-mode marker mismatch because that target invokes `tools/smoke.py`
+without a mode-13 expectation. It was not used as mode-13 evidence; the
+mode-13 ISO was rebuilt and passed through `make integration` and the direct
+mode-13 QEMU boot.
 
 Remote CI and independent human qualification are not observed.
 
@@ -59,6 +99,30 @@ Remote CI and independent human qualification are not observed.
 - Triggering service death immediately after both grant ACKs allowed B's echo
   to race the deliberate fault. The explicit exercise-complete control record
   closes that race without weakening the bounded scenario.
+
+## PR-G identity re-key fix — 2026-11-01
+
+- Observation: `2026-11-01T10:33:58Z`; repository `jeios`; branch
+  `wip/m4g-impl`; exact inspected commit
+  `f704111f1ba17b6a0e75da19621993ab588b466b`. Changes remain uncommitted.
+- Decision: revert the unapproved additive `PROC_STATUS` identity result and
+  key the broker ledger on the stable PROCESS handles already owned by the
+  supervisor. This preserves the frozen D4 ABI and avoids exporting record
+  identity solely for this scenario.
+- Ownership invariant: a PROCESS handle named by any live or PENDING ledger
+  entry is not closed or reused while that entry exists. The restart path keeps
+  the dead service PROCESS handle open across service-generation replacement;
+  teardown closes the remaining supervisor-owned handles.
+- Alternatives rejected: retaining `(index,generation)` would require an ABI
+  extension; closing the old service handle at restart would permit handle-value
+  reuse while ledger entries still reference it.
+- Verification: `ASAN_OPTIONS=detect_leaks=0 make check` — PASS;
+  `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=13` — PASS, including
+  `test_syscall` proc-status decode; `make smoke` — PASS; `make integration` —
+  PASS for modes 1–13, including `M4g: client-reported EXHAUSTED; kernel
+  delivery count A=2 corroborated`, `M4g-s1`, and zero-leak; the 16 MiB
+  no-NX and 1536 MiB NX direct smoke profiles — PASS; `make aarch64 && make
+  smoke-aarch64 ARM_REQUIRE=1` — PASS; `git diff --check` — PASS.
 
 ## Historical records preserved from the pre-PR-G file
 

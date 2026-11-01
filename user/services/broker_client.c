@@ -9,23 +9,38 @@ static volatile uint32_t broker_client_data
     __attribute__((used, section(".data"))) = UINT32_C(0x27182818);
 
 static uint32_t wait_control(uint64_t control, void *message, uint64_t cap,
-                             uint32_t *hbuf, uint64_t hcap)
+                             uint32_t *hbuf, uint64_t hcap,
+                             uint32_t expected_length,
+                             uint32_t expected_caps)
 {
-    for (uint32_t ticks = 0u; ticks < JE_SVC_BROKER_ACK_DEADLINE; ++ticks) {
+    uint64_t start = 0u;
+    if (je_clock_ticks(&start) != JE_ABI_OK) return UINT32_MAX - 1u;
+    for (;;) {
         uint64_t meta = 0u;
         uint64_t status = je_try_recv_caps(control, message, cap, hbuf, hcap,
                                            0u, &meta);
         if (status == JE_ABI_OK) {
-            if ((meta & UINT64_C(0xffffffff)) != cap
-                || (meta >> 32) > hcap)
+            if ((meta & UINT64_C(0xffffffff)) != expected_length
+                || (meta >> 32) != expected_caps) {
+                if (hbuf && hcap != 0u)
+                    for (uint32_t i = 0u; i < hcap; ++i)
+                        if (hbuf[i] != 0u) (void)je_handle_close(hbuf[i]);
+                (void)je_handle_close(control);
                 return UINT32_MAX - 1u;
+            }
             return 1u;
         }
         if (status == JE_ABI_H_PEER_CLOSED) return UINT32_MAX;
-        if (status != JE_ABI_H_EMPTY) return UINT32_MAX - 1u;
+        if (status != JE_ABI_H_EMPTY) {
+            (void)je_handle_close(control);
+            return UINT32_MAX - 1u;
+        }
+        uint64_t now = 0u;
+        if (je_clock_ticks(&now) != JE_ABI_OK
+            || now - start >= JE_SVC_BROKER_CLIENT_WAIT_DEADLINE)
+            return 0u;
         if (je_yield() != JE_ABI_OK) return UINT32_MAX - 1u;
     }
-    return 0u;
 }
 
 static uint32_t exercise(uint32_t broker, uint32_t *bits, uint32_t sequence)
@@ -41,7 +56,9 @@ static uint32_t exercise(uint32_t broker, uint32_t *bits, uint32_t sequence)
     *bits |= JE_BROKER_TEST_BIT_NO_TRANSFER;
     if (je_try_send(broker, &message, sizeof message) != JE_ABI_OK)
         return 0u;
-    for (uint32_t ticks = 0u; ticks < JE_SVC_BROKER_ACK_DEADLINE; ++ticks) {
+    uint64_t start = 0u;
+    if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
+    for (;;) {
         je_broker_test_echo response = {0};
         uint64_t meta = 0u;
         uint64_t status = je_try_recv(broker, &response, sizeof response,
@@ -57,9 +74,12 @@ static uint32_t exercise(uint32_t broker, uint32_t *bits, uint32_t sequence)
         }
         if (status == JE_ABI_H_PEER_CLOSED) return 0u;
         if (status != JE_ABI_H_EMPTY) return 0u;
+        uint64_t now = 0u;
+        if (je_clock_ticks(&now) != JE_ABI_OK
+            || now - start >= JE_SVC_BROKER_CLIENT_WAIT_DEADLINE)
+            return 0u;
         if (je_yield() != JE_ABI_OK) return 0u;
     }
-    return 0u;
 }
 
 static uint32_t request(uint64_t control, uint32_t *broker,
@@ -76,13 +96,16 @@ static uint32_t request(uint64_t control, uint32_t *broker,
     je_svc_broker_grant grant = {0};
     uint32_t received[1] = {0u};
     uint32_t result = wait_control(control, &grant, sizeof grant,
-                                   received, 1u);
-    if (result != 1u || (grant.op != expected_op)
-        || received[0] == 0u)
+                                   received, 1u,
+                                   JE_SVC_BROKER_GRANT_LEN, 1u);
+    if (result != 1u || (grant.op != expected_op) || received[0] == 0u) {
+        if (received[0] != 0u) (void)je_handle_close(received[0]);
+        (void)je_handle_close(control);
         return 0u;
+    }
     *broker = received[0];
     *generation = grant.service_generation;
-    je_svc_broker_reply ack = { JE_SVC_OP_BROKER_ACK, 0u };
+    je_svc_broker_reply ack = { JE_SVC_OP_BROKER_ACK, grant.transaction };
     if (je_try_send(control, &ack, sizeof ack) != JE_ABI_OK)
         return 0u;
     return exercise(*broker, bits, *generation);
@@ -98,7 +121,9 @@ static uint32_t report_exercised(uint64_t control)
 
 static uint32_t observe_peer_closed(uint32_t broker, uint32_t *bits)
 {
-    for (uint32_t ticks = 0u; ticks < JE_SVC_SCENARIO_DEADLINE; ++ticks) {
+    uint64_t start = 0u;
+    if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
+    for (;;) {
         uint64_t meta = 0u;
         uint64_t status = je_try_recv(broker, (void *)0, 0u, 0u, &meta);
         if (status == JE_ABI_H_PEER_CLOSED) {
@@ -107,9 +132,12 @@ static uint32_t observe_peer_closed(uint32_t broker, uint32_t *bits)
             return 1u;
         }
         if (status != JE_ABI_H_EMPTY) return 0u;
+        uint64_t now = 0u;
+        if (je_clock_ticks(&now) != JE_ABI_OK
+            || now - start >= JE_SVC_SCENARIO_DEADLINE)
+            return 0u;
         if (je_yield() != JE_ABI_OK) return 0u;
     }
-    return 0u;
 }
 
 int64_t je_main(uint64_t version, uint64_t n, uint64_t h0, uint64_t h1,
@@ -130,7 +158,7 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t h0, uint64_t h1,
 
     je_svc_config role_message = {0};
     if (wait_control(h0, &role_message, sizeof role_message,
-                     (uint32_t *)0, 0u) != 1u
+                     (uint32_t *)0, 0u, JE_SVC_CONFIG_LEN, 0u) != 1u
         || role_message.op != JE_SVC_OP_CONFIG
         || role_message.crash_before != 0u
         || role_message.reserved != 0u)
@@ -148,7 +176,8 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t h0, uint64_t h1,
         for (;;) {
             je_svc_config finish = {0};
             uint32_t received = wait_control(h0, &finish, sizeof finish,
-                                             (uint32_t *)0, 0u);
+                                             (uint32_t *)0, 0u,
+                                             JE_SVC_CONFIG_LEN, 0u);
             if (received == UINT32_MAX) return (int64_t)bits;
             if (received == 1u && finish.op == JE_SVC_OP_CONFIG
                 && finish.incarnation == JE_BROKER_TEST_FINISH)
@@ -174,7 +203,8 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t h0, uint64_t h1,
     je_svc_broker_reply exhausted = {0};
     uint32_t no_caps[1] = {0u};
     uint32_t received = wait_control(h0, &exhausted, sizeof exhausted,
-                                     no_caps, 1u);
+                                     no_caps, 1u,
+                                     JE_SVC_BROKER_REPLY_LEN, 0u);
     if (received != 1u || exhausted.op != JE_SVC_OP_BROKER_EXHAUSTED
         || no_caps[0] != 0u)
         return (int64_t)bits;

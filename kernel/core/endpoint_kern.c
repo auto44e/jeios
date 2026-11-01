@@ -106,8 +106,12 @@ je_ep_status je_endpoint_kern_create(je_vm *vm, uint32_t index,
             || creator.gen == 0u)
             return JE_EP_CORRUPT;
     }
-    return je_endpoint_channel_create_by(&g_kep, creator, t, JE_EP_RIGHTS_ALL,
-                                         t, JE_EP_RIGHTS_ALL, out0, out1);
+    je_ep_status status = je_endpoint_channel_create_by(
+        &g_kep, creator, t, JE_EP_RIGHTS_ALL, t, JE_EP_RIGHTS_ALL, out0, out1);
+#if JE_TEST_MODE == 13
+    if (status == JE_EP_OK) je_m4g_record_endpoint_create(creator);
+#endif
+    return status;
 }
 
 je_ep_status je_endpoint_kern_dup(je_vm *vm, uint32_t index, je_handle src,
@@ -267,7 +271,6 @@ je_ep_status je_endpoint_kern_mint_recv_cap(je_vm *vm, uint32_t index,
         }
     }
     *out = nh;
-    je_m4g_record_cap_delivery(vm, index, d);
     return JE_EP_OK;
 }
 
@@ -299,6 +302,23 @@ bool je_endpoint_kern_inspect_end(const void *object, je_proc_id *creator,
         }
     }
     return false;
+}
+
+bool je_endpoint_kern_inspect_descriptor(const je_ep_capdesc *descriptor,
+                                         je_proc_id *creator,
+                                         const je_ep_end **peer,
+                                         je_ep_end_state *state)
+{
+    if (!descriptor || !creator || !peer || !state) return false;
+    je_ep_channel *record = (je_ep_channel *)0;
+    uint8_t side = 0u;
+    if (je_endpoint_capdesc_resolve(&g_kep, descriptor, &record, &side)
+        != JE_EP_OK)
+        return false;
+    *creator = record->creator;
+    *peer = &record->end[side ^ 1u];
+    *state = record->end[side].state;
+    return true;
 }
 
 je_ep_status je_endpoint_kern_seed(je_vm *vm, uint32_t idxA, uint32_t idxB,

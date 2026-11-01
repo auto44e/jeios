@@ -187,6 +187,7 @@ typedef struct {
     uint32_t role;
     uint32_t delivered;
     uint32_t exercised;
+    uint32_t closed;
 } broker_client_state;
 
 typedef struct {
@@ -202,11 +203,15 @@ typedef struct {
     uint32_t service_id;
     uint32_t service_generation;
     uint32_t state;
+    uint32_t client_dead_observed;
+    uint32_t service_dead_observed;
 } broker_ledger_entry;
 
 #define BROKER_LEDGER_FREE    0u
 #define BROKER_LEDGER_PENDING 1u
 #define BROKER_LEDGER_LIVE    2u
+
+static uint32_t broker_next_transaction = 1u;
 
 static uint32_t broker_reply(uint64_t control, uint32_t op, uint32_t detail)
 {
@@ -214,27 +219,54 @@ static uint32_t broker_reply(uint64_t control, uint32_t op, uint32_t detail)
     return je_try_send(control, &reply, sizeof reply) == JE_ABI_OK;
 }
 
-static uint32_t broker_wait_ack(uint64_t control, uint64_t self_recv)
+static uint32_t broker_wait_ack(uint64_t control, uint64_t self_recv,
+                                uint32_t transaction)
 {
     uint64_t start = 0u;
     uint64_t now = 0u;
     if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
     for (;;) {
+        uint8_t bytes[JE_SVC_CONFIG_LEN] = {0u};
+        uint32_t received[1] = {0u};
         je_svc_broker_reply reply = {0};
         uint64_t meta = 0u;
-        uint64_t status = je_try_recv_caps(control, &reply, sizeof reply,
-                                           (uint32_t *)0, 0u, 0u, &meta);
-        if (status == JE_ABI_OK)
-            return (meta & UINT64_C(0xffffffff)) == JE_SVC_BROKER_REPLY_LEN
-                && (meta >> 32) == 0u
-                && reply.op == JE_SVC_OP_BROKER_ACK;
+        uint64_t status = je_try_recv_caps(control, bytes, sizeof bytes,
+                                           received, 1u, 0u, &meta);
+        if (status == JE_ABI_OK) {
+            uint32_t length = (uint32_t)meta;
+            uint32_t cap_count = (uint32_t)(meta >> 32);
+            if (cap_count != 0u) {
+                (void)je_handle_close(control);
+                if (received[0] != 0u) (void)je_handle_close(received[0]);
+                return 0u;
+            }
+            if (length != JE_SVC_BROKER_REPLY_LEN) continue;
+            memcpy(&reply, bytes, sizeof reply);
+            if (reply.op == JE_SVC_OP_BROKER_ACK
+                && reply.detail == transaction)
+                return 1u;
+            /* A stale ACK, or another no-cap control record, is consumed and
+             * discarded. It cannot satisfy this transaction. */
+            continue;
+        }
         if (status == JE_ABI_H_PEER_CLOSED) return 0u;
-        if (status != JE_ABI_H_EMPTY
-            || je_clock_ticks(&now) != JE_ABI_OK
+        if (status != JE_ABI_H_EMPTY) {
+            (void)je_handle_close(control);
+            return 0u;
+        }
+        if (je_clock_ticks(&now) != JE_ABI_OK
             || now - start >= JE_SVC_BROKER_ACK_DEADLINE)
             return 0u;
         if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
     }
+}
+
+static uint32_t broker_alloc_transaction(uint32_t *out)
+{
+    if (!out || broker_next_transaction == 0u) return 0u;
+    *out = broker_next_transaction++;
+    if (*out == 0u) return 0u;
+    return 1u;
 }
 
 static uint32_t broker_ledger_find(const broker_ledger_entry *ledger,
@@ -257,13 +289,38 @@ static void broker_ledger_collect(broker_ledger_entry *ledger)
         if (ledger[i].state == BROKER_LEDGER_FREE) continue;
         je_abi_proc_status client = {0};
         je_abi_proc_status service = {0};
-        if (je_proc_status(ledger[i].client_process, &client) != JE_ABI_OK
-            || je_proc_status(ledger[i].service_process, &service) != JE_ABI_OK)
+        if (ledger[i].client_dead_observed == 0u
+            && je_proc_status(ledger[i].client_process, &client) != JE_ABI_OK) {
+            /* A stale INSPECT handle cannot be allowed to pin a bounded
+             * ledger forever. The corresponding process identity is no longer
+             * inspectable by this supervisor. */
+            ledger[i] = (broker_ledger_entry){0};
             continue;
-        if (client.state != JE_ABI_PROC_LIVE
-            && service.state != JE_ABI_PROC_LIVE)
+        }
+        if (ledger[i].client_dead_observed == 0u
+            && client.state == JE_ABI_PROC_DEAD)
+            ledger[i].client_dead_observed = 1u;
+        if (ledger[i].service_dead_observed == 0u
+            && je_proc_status(ledger[i].service_process, &service) != JE_ABI_OK) {
+            ledger[i] = (broker_ledger_entry){0};
+            continue;
+        }
+        if (ledger[i].service_dead_observed == 0u
+            && service.state == JE_ABI_PROC_DEAD)
+            ledger[i].service_dead_observed = 1u;
+        if (ledger[i].client_dead_observed != 0u
+            && ledger[i].service_dead_observed != 0u)
             ledger[i] = (broker_ledger_entry){0};
     }
+}
+
+static void broker_ledger_mark_service_dead(broker_ledger_entry *ledger,
+                                            uint64_t service_process)
+{
+    for (uint32_t i = 0u; i < JE_BROKER_MAX; ++i)
+        if (ledger[i].state != BROKER_LEDGER_FREE
+            && ledger[i].service_process == service_process)
+            ledger[i].service_dead_observed = 1u;
 }
 
 static uint32_t broker_ledger_live(const broker_ledger_entry *ledger)
@@ -284,7 +341,7 @@ static uint32_t broker_ledger_reserve(broker_ledger_entry *ledger,
         if (ledger[i].state == BROKER_LEDGER_FREE) {
             ledger[i] = (broker_ledger_entry){
                 client_process, service_process, service_id, generation,
-                BROKER_LEDGER_PENDING
+                BROKER_LEDGER_PENDING, 0u, 0u
             };
             return i;
         }
@@ -299,10 +356,21 @@ static uint32_t broker_send_channel(broker_service_state *service,
                                     uint32_t service_id,
                                     uint32_t response_op)
 {
+    /*
+     * PROCESS handle values are the stable broker-ledger keys. The supervisor
+     * keeps every referenced PROCESS handle open until teardown or after all
+     * ledger entries referencing it have been collected, so the value cannot
+     * be reused for another child instance while an entry is live or pending.
+     */
     uint32_t ledger_slot = broker_ledger_reserve(
         ledger, client->process, service->process, service_id,
         service->generation);
     if (ledger_slot >= JE_BROKER_MAX) {
+        return 0u;
+    }
+    uint32_t transaction = 0u;
+    if (!broker_alloc_transaction(&transaction)) {
+        ledger[ledger_slot] = (broker_ledger_entry){0};
         return 0u;
     }
 
@@ -316,7 +384,7 @@ static uint32_t broker_send_channel(broker_service_state *service,
     uint64_t service_cap = service_end
         | ((uint64_t)(JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV) << 32);
     je_svc_service_bind bind = {
-        JE_SVC_OP_SERVICE_BIND, service->generation
+        JE_SVC_OP_SERVICE_BIND, service->generation, transaction
     };
     if (je_try_send_caps(service->control, &bind, sizeof bind,
                          &service_cap, 1u) != JE_ABI_OK) {
@@ -325,23 +393,24 @@ static uint32_t broker_send_channel(broker_service_state *service,
         ledger[ledger_slot] = (broker_ledger_entry){0};
         return 0u;
     }
-    if (!broker_wait_ack(service->control, self_recv)) {
+    if (!broker_wait_ack(service->control, self_recv, transaction)) {
         (void)je_handle_close(service_end);
         (void)je_handle_close(client_end);
-        ledger[ledger_slot] = (broker_ledger_entry){0};
         return 0u;
     }
 
     uint64_t client_cap = client_end
         | ((uint64_t)(JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV) << 32);
-    je_svc_broker_grant grant = { response_op, service->generation };
+    je_svc_broker_grant grant = {
+        response_op, service->generation, transaction
+    };
     if (je_try_send_caps(client->control, &grant, sizeof grant,
                          &client_cap, 1u) != JE_ABI_OK) {
         (void)je_handle_close(service_end);
         (void)je_handle_close(client_end);
         return 0u;
     }
-    if (!broker_wait_ack(client->control, self_recv)) {
+    if (!broker_wait_ack(client->control, self_recv, transaction)) {
         (void)je_handle_close(service_end);
         (void)je_handle_close(client_end);
         return 0u;
@@ -355,15 +424,38 @@ static uint32_t broker_send_channel(broker_service_state *service,
 }
 
 static uint32_t broker_restart_service(broker_service_state *service,
-                                        uint64_t launcher, uint64_t self_recv)
+                                        uint64_t launcher, uint64_t self_recv,
+                                        broker_ledger_entry *ledger)
 {
     je_abi_proc_status status = {0};
     if (je_proc_status(service->process, &status) != JE_ABI_OK
         || status.state == JE_ABI_PROC_LIVE
-        || service->restarts >= JE_SVC_RESTART_LIMIT)
+        || service->restarts >= JE_SVC_RESTART_LIMIT
+        || service->generation == UINT32_MAX)
         return 0u;
     (void)je_proc_kill(service->process);
+    uint64_t old_process = service->process;
     (void)je_handle_close(service->control);
+    uint64_t old_start = 0u;
+    if (je_clock_ticks(&old_start) != JE_ABI_OK) return 0u;
+    for (;;) {
+        if (je_proc_status(old_process, &status) != JE_ABI_OK) return 0u;
+        if (status.state == JE_ABI_PROC_DEAD) break;
+        uint64_t now = 0u;
+        if (je_clock_ticks(&now) != JE_ABI_OK
+            || now - old_start >= JE_SVC_BROKER_ACK_DEADLINE)
+            return 0u;
+        if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
+    }
+    /*
+     * Keep old_process open: live or PENDING ledger entries still use this
+     * supervisor-owned handle value as their stable process-instance key.
+     * Teardown owns the final close unless a later collection proves that no
+     * entry references it.
+     */
+    broker_ledger_mark_service_dead(ledger, old_process);
+    service->process = 0u;
+    service->control = 0u;
     uint64_t process = 0u;
     uint64_t control = 0u;
     if (!spawn_one(launcher, JE_IMAGE_BROKER_SVC, 0u,
@@ -371,8 +463,12 @@ static uint32_t broker_restart_service(broker_service_state *service,
                    &process, &control))
         return 0u;
     if (wait_ready(control, process, self_recv, JE_SVC_READY_DEADLINE)
-        != WAIT_OK)
+        != WAIT_OK) {
+        (void)je_proc_kill(process);
+        (void)je_handle_close(control);
+        (void)je_handle_close(process);
         return 0u;
+    }
     service->process = process;
     service->control = control;
     service->generation++;
@@ -390,17 +486,6 @@ static uint32_t broker_handle_request(broker_service_state *service,
     if (request->service_id >= JE_SVC_BROKER_SERVICE_COUNT)
         return broker_reply(client->control, JE_SVC_OP_BROKER_UNAVAIL,
                             JE_SVC_UNAVAIL_BAD_SERVICE);
-    je_abi_proc_status service_status = {0};
-    if (je_proc_status(service->process, &service_status) != JE_ABI_OK)
-        return broker_reply(client->control, JE_SVC_OP_BROKER_UNAVAIL,
-                            JE_SVC_UNAVAIL_NOT_READY);
-    if (service_status.state != JE_ABI_PROC_LIVE) {
-        if (!broker_restart_service(service, launcher, self_recv))
-            return broker_reply(client->control, JE_SVC_OP_BROKER_UNAVAIL,
-                                service->restarts >= JE_SVC_RESTART_LIMIT
-                                    ? JE_SVC_UNAVAIL_TERMINAL
-                                    : JE_SVC_UNAVAIL_NOT_READY);
-    }
     if (client->delivered >= JE_SVC_BROKER_CLIENT_CAP) {
         if (client->role == JE_BROKER_TEST_ROLE_A) *a_exhausted = 1u;
         return broker_reply(client->control, JE_SVC_OP_BROKER_EXHAUSTED, 0u);
@@ -408,12 +493,23 @@ static uint32_t broker_handle_request(broker_service_state *service,
     uint32_t existing = broker_ledger_find(
         ledger, client->process, request->service_id, service->generation);
     if (existing < JE_BROKER_MAX
-        && ledger[existing].state == BROKER_LEDGER_LIVE)
+        && ledger[existing].state != BROKER_LEDGER_FREE)
         return broker_reply(client->control, JE_SVC_OP_BROKER_ALREADY, 0u);
     broker_ledger_collect(ledger);
     if (broker_ledger_live(ledger) >= JE_BROKER_MAX)
         return broker_reply(client->control, JE_SVC_OP_BROKER_UNAVAIL,
                             JE_SVC_UNAVAIL_NOT_READY);
+    je_abi_proc_status service_status = {0};
+    if (je_proc_status(service->process, &service_status) != JE_ABI_OK)
+        return broker_reply(client->control, JE_SVC_OP_BROKER_UNAVAIL,
+                            JE_SVC_UNAVAIL_NOT_READY);
+    if (service_status.state != JE_ABI_PROC_LIVE) {
+        if (!broker_restart_service(service, launcher, self_recv, ledger))
+            return broker_reply(client->control, JE_SVC_OP_BROKER_UNAVAIL,
+                                service->restarts >= JE_SVC_RESTART_LIMIT
+                                    ? JE_SVC_UNAVAIL_TERMINAL
+                                    : JE_SVC_UNAVAIL_NOT_READY);
+    }
     uint32_t response = service->generation == 1u
         ? JE_SVC_OP_BROKER_GRANT : JE_SVC_OP_BROKER_RESTARTED;
     if (!broker_send_channel(service, client, self_recv, ledger,
@@ -430,28 +526,40 @@ static uint32_t broker_poll_client(broker_service_state *service,
                                    uint32_t *a_exhausted)
 {
     uint8_t bytes[JE_SVC_CONFIG_LEN] = {0u};
+    uint32_t received_caps[1] = {0u};
     uint64_t meta = 0u;
     uint64_t status = je_try_recv_caps(client->control, bytes, sizeof bytes,
-                                       (uint32_t *)0, 0u, 0u, &meta);
+                                       received_caps, 1u, 0u, &meta);
     if (status == JE_ABI_H_EMPTY) return 1u;
     if (status == JE_ABI_H_PEER_CLOSED) return 2u;
-    if (status != JE_ABI_OK) return 3u;
-    if ((meta >> 32) != 0u) return 4u;
+    if (status != JE_ABI_OK) {
+        (void)je_handle_close(client->control);
+        client->closed = 1u;
+        return 2u;
+    }
+    if ((meta >> 32) != 0u) {
+        if (received_caps[0] != 0u) (void)je_handle_close(received_caps[0]);
+        (void)je_handle_close(client->control);
+        client->closed = 1u;
+        return 2u;
+    }
     if ((meta & UINT64_C(0xffffffff)) == sizeof(je_svc_config)) {
         je_svc_config progress = {0};
         memcpy(&progress, bytes, sizeof progress);
         if (progress.op == JE_SVC_OP_CONFIG
-            && progress.incarnation == JE_BROKER_TEST_EXERCISED) {
+            && progress.incarnation == JE_BROKER_TEST_EXERCISED
+            && progress.crash_before == 0u && progress.reserved == 0u) {
             client->exercised = 1u;
             return 4u;
         }
-        return 5u;
+        return 1u;
     }
     if ((meta & UINT64_C(0xffffffff)) != JE_SVC_BROKER_REQUEST_LEN)
-        return 5u;
+        return 1u;
     je_svc_broker_request request = {0};
     memcpy(&request, bytes, sizeof request);
-    if (request.op != JE_SVC_OP_BROKER_REQUEST) return 6u;
+    if (request.op == JE_SVC_OP_BROKER_ACK) return 1u;
+    if (request.op != JE_SVC_OP_BROKER_REQUEST) return 1u;
     return broker_handle_request(service, client, launcher, self_recv,
                                  ledger, &request, a_exhausted);
 }
@@ -461,7 +569,7 @@ static int64_t broker_mode13(uint64_t launcher, uint64_t self_recv,
 {
     broker_service_state service = {0};
     broker_client_state clients[2] = {0};
-    broker_ledger_entry ledger[JE_BROKER_MAX] = {{0}};
+    broker_ledger_entry ledger[JE_BROKER_MAX] = {0};
     uint32_t a_exhausted = 0u;
     uint32_t finish_sent = 0u;
     uint64_t start = 0u;
@@ -498,21 +606,23 @@ static int64_t broker_mode13(uint64_t launcher, uint64_t self_recv,
 
     for (;;) {
         broker_ledger_collect(ledger);
+        if (broker_ledger_live(ledger) > JE_BROKER_MAX)
+            return failed(report_values, JE_SVC_FAIL_READINESS);
         je_abi_proc_status service_status = {0};
         if (je_proc_status(service.process, &service_status) != JE_ABI_OK)
             return failed(report_values, JE_SVC_FAIL_RESTART);
         if (service_status.state != JE_ABI_PROC_LIVE) {
             if (!a_exhausted || service.restarts >= JE_SVC_RESTART_LIMIT
-                || !broker_restart_service(&service, launcher, self_recv))
+                || !broker_restart_service(&service, launcher, self_recv, ledger))
                 return failed(report_values, JE_SVC_FAIL_RESTART);
             ++report_values->restarts;
         }
         for (uint32_t i = 0u; i < 2u; ++i) {
+            if (clients[i].closed != 0u) continue;
             uint32_t result = broker_poll_client(
                 &service, &clients[i], launcher, self_recv, ledger,
                 &a_exhausted);
-            if (result == 0u || result == 3u || result == 5u
-                || result == 6u) {
+            if (result == 0u) {
                 report_values->crash_attempts = 0x100u + result;
                 return failed(report_values, JE_SVC_FAIL_READINESS);
             }
