@@ -20,6 +20,79 @@ This file records current contracts and execution evidence as gates are built.
 DESIGN.md describes the broader target architecture. No entry below implies
 userspace isolation, SMP safety, driver containment or production readiness.
 
+## M4 PR-H — D9 COM2 DEVICE / TSS I/O bitmap / IRQ3 — 2026-11-01
+
+PR-H adds the first direct ring-3 hardware-port authority. The device is a
+single kernel-seeded COM2 record (16550 ports `0x2F8`–`0x2FF`, IRQ3); the kernel
+continues to use COM1 only for its console and never touches COM2.
+
+The TSS is now one packed object containing the 104-byte architectural TSS, a
+96-byte I/O bitmap, and a one-byte terminator. Before `LTR`, every bitmap byte
+and the terminator are filled with `0xFF`, the bitmap offset is 104, and the
+descriptor limit is 200. The only dynamic byte is `iobm[0x5F]`, which is
+written `0x00` only after user-frame validation when the selected thread is
+the live owner and its exact recorded DEVICE slot is live, generation-matched,
+and PIO-authorized. Kernel dispatch writes deny. The TSS page remains
+kernel-only in user page tables.
+
+IRQ3 is handled at vector 35 without touching UART state: the master PIC masks
+IRQ3, records pending, sends EOI, and returns through the normal scheduler
+interrupt path. ACK clears pending and schedules a generation-tagged re-arm;
+timer processing performs at most one delayed unmask per tick subject to
+`max(ack_tick+1,last_unmask+1)`. IRQ7 vector 39 reads the master ISR after
+selecting ISR mode, restores IRR mode, EOIs only a real IRQ7, and handles a
+spurious IRQ7 by masking/re-arming IRQ3 when needed. A real IRQ7 observed while
+masked is fatal.
+
+The DEVICE syscall contract is transactional: ASSIGN resolves the admin
+DEVICE and KILL-capability target, performs `je_handle_can_alloc` as the only
+fallible preflight, commits the owner/generation/recorded slot, and schedules
+the first delayed unmask. REVOKE and driver close/death all use one guarded
+sequence that masks IRQ3, advances generation, clears bitmap authority and
+pending/re-arm state, raw-closes only the copied exact slot if still matching,
+and clears ownership. IRQ_ACK is O(1) against the recorded VM/table/slot/gen
+identity. A stale late close therefore cannot revoke a newer binding.
+
+The owner-aware VM teardown callback carries process identity into the existing
+endpoint release walk. Mark-dying performs synchronous revoke before process
+death publication; teardown fails closed if the recorded active slot survived
+that point and drains other DEVICE references without changing endpoint/PROCESS
+behavior. The supervisor receives startup `n=2` with LAUNCHER and DEVICE admin
+handles. The ring-3 UART image resets/drains/enables COM2, proves all eight
+authorized ports, ACKs IRQ3, reports and refuses a missing UART, and uses
+fault-local #GP death for forbidden-port and width/crossing probes.
+
+**Evidence at observation `2026-11-01T20:24:32Z`, exact inspected commit
+`b4e51542d1795e84057b114df5890046a13668c0` on branch `wip/m4h-impl`
+(changes uncommitted):**
+
+- `ASAN_OPTIONS=detect_leaks=0 make check` — PASS; all hosted sanitizer,
+  syscall ABI, VM teardown, endpoint, handle, process, ELF and image checks
+  passed.
+- `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=14` — PASS.
+- `make smoke` — PASS; mode 0 retained the M4F supervisor and zero-leak
+  markers.
+- `make integration` — PASS for fault modes 1–11, supervisor-loss mode 12,
+  broker mode 13, and device mode 14. Mode 14 printed the five markers
+  recorded in HANDOFF.md.
+- The three explicit x86 profiles — default NX-present, `qemu64,-nx`, and
+  `qemu64,-nx --memory 16M` plus `--memory 1536M --expect-nx present` — PASS.
+- `make smoke-aarch64` — PASS on QEMU virt 8.2 with the expected DTB length,
+  CRC32, RAM and EL1 markers; the existing linker RWX warning remained.
+- `git diff --check` — PASS.
+
+The mode-14 run used fourteen fresh driver bindings. One normal driver
+generated the observed COM2 IRQ3 and the hostile driver generated the second
+delivery, never ACKed, left its UART source enabled, and was revoked after the
+supervisor advanced through timer sleeps; the supervisor then reached the
+completion marker, proving scheduler progress while IRQ3 was masked. The
+admin-revoke driver also issued a stale ACK after revoke; it could not reopen
+the binding. This evidence still does not claim runtime coverage of real
+versus spurious IRQ7: the code path is implemented but the current QEMU
+scenario did not synthesize those PIC conditions. It also does not claim
+remote CI, independent human review, all hardware, DMA, SMP safety, dynamic
+loading, or release qualification.
+
 ## M4 PR-G — D11 broker / TEST_MODE 13 — 2026-11-01
 
 The broker is entirely ring-3 supervisor policy over the existing M3c

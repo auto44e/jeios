@@ -91,3 +91,20 @@ assert "M4g: supervisor lost" not in output, \
     "mode 13 unexpectedly took the mode-12 supervisor-loss path"
 print(f"broker mode 13 (D11): PASS\n{output}")
 
+# Mode 14 is the D9 privilege-sensitive device scenario. It creates COM2 as a
+# second QEMU 16550 so the ring-3 driver can generate a real IRQ3 through UART
+# loopback. The scenario then observes the width/crossing and forbidden-port
+# #GP deaths, admin revoke, self-close, stale authority, bounded IRQ delivery,
+# and deny-by-default bitmap after teardown.
+result = subprocess.run(["make", "iso", "TEST_MODE=14"], stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True)
+assert result.returncode == 0, result.stdout
+output = boot(Path("build/14/jeios.iso"),
+              terminal=b"M4h: zero-leak identity baseline verified",
+              expected=[b"M4h: IRQ3 deliveries=", b"M4h: TSS page U=0 in user CR3",
+                        b"M4h: ring-3 #GP isolation",
+                        b"M4h-s1: D9 device scenario completed"],
+              timeout=30, serial2="null")
+assert "JeiOS fatal:" not in output, f"mode 14 D9 scenario failed:\n{output}"
+print(f"device mode 14 (D9): PASS\n{output}")
+

@@ -496,9 +496,10 @@ static void test_rollback(void)
 static int hook_calls, irq_saves, irq_restores, hook_saw_live_table;
 static uint64_t fake_irq_save(void) { irq_saves++; return 0x1234u; }
 static void fake_irq_restore(uint64_t f) { assert(f == 0x1234u); irq_restores++; }
-static void fake_teardown(void *ctx, je_handle_table *t)
+static void fake_teardown(void *ctx, je_handle_table *t, je_proc_id owner)
 {
     (void)ctx;
+    (void)owner;
     hook_calls++;
     /* The hook must run while the process is still intact: its handle table is
      * still initialized (capacity nonzero), i.e. unwind()'s *p={0} has NOT run

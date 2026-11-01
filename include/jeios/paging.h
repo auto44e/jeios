@@ -33,6 +33,7 @@ je_status je_user_alias_get(uint64_t phys, je_paging_alias *out);
 uint64_t je_arch_cr3_read(void);
 void     je_arch_cr3_load(uint64_t root_phys);
 uint64_t je_arch_kernel_root_phys(void);
+bool je_arch_page_user_accessible(uint64_t root_phys, uintptr_t address);
 
 extern unsigned char __kernel_start[], __kernel_end[], __text_end[], __rodata_end[];
 extern unsigned char je_boot_guard[];

@@ -18,6 +18,7 @@
 #include <jeios/spawn.h>
 #include <jeios/svc.h>
 #include <jeios/broker_test.h>
+#include <jeios/device.h>
 
 extern void je_sched_set_proc_pool(je_proc_pool *pool);
 extern je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id);
@@ -46,7 +47,7 @@ static je_proc_id vm_s3_proc_ids[JE_VM_MAX_PROCESSES];
  * terminal facts are retained in fixed per-image counters so corroboration can
  * still distinguish a reaped predecessor from its replacement.
  */
-#define M4F_IMAGE_COUNT 9u
+#define M4F_IMAGE_COUNT 10u
 typedef struct {
     bool active;
     bool terminal_seen;
@@ -580,8 +581,16 @@ static uint32_t m4f_seed_supervisor(je_proc_id *out_id)
         je_arch_irq_restore(flags);
         fail("JeiOS fatal: M4f launcher allocation\r\n");
     }
+    je_handle admin = 0u;
+    alloc = je_handle_alloc(&vm_s3.procs[index].htable,
+                            je_device_object(je_kernel_device()),
+                            JE_ABI_OBJ_DEVICE, JE_ABI_RIGHT_ASSIGN, &admin);
+    if (alloc != JE_HANDLE_OK) {
+        je_arch_irq_restore(flags);
+        fail("JeiOS fatal: M4f device admin allocation\r\n");
+    }
     je_user_startup startup = {
-        JE_ABI_STARTUP_V1, 1u, launcher, 0u, 0u, 0u
+        JE_ABI_STARTUP_V1, 2u, launcher, admin, 0u, 0u
     };
     if (je_thread_create_user_start(&vm_s3, index, &startup, (uint32_t *)0)
         != JE_OK) {
@@ -606,7 +615,7 @@ static je_status vm_s3_destroy(uint32_t idx)
         je_arch_irq_restore(flags);
         return JE_ERR_INVALID;
     }
-    if (je_vm_destroy(&vm_s3, idx) != JE_OK) {
+    if (je_vm_destroy_owned(&vm_s3, idx, id) != JE_OK) {
         je_arch_irq_restore(flags);
         return JE_ERR_INVALID;
     }
@@ -1226,6 +1235,28 @@ static bool m4f_corroborate(je_proc_id supervisor,
 {
 #if JE_TEST_MODE == 13
     return m4g_corroborate(supervisor, report);
+#elif JE_TEST_MODE == 14
+    (void)report;
+    const je_proc_rec *sup = &process_pool.rec[supervisor.index];
+    bool ok = sup->state == JE_PROC_DYING
+           && sup->reason == JE_DEATH_EXIT
+           && sup->code == JE_SVC_DONE_EXIT_G
+           && m4f_spawn_count[JE_IMAGE_UART_DRIVER] == 14u
+           && m4f_terminal_count[JE_IMAGE_UART_DRIVER] == 14u
+           && !je_kernel_device()->active
+           && je_arch_tss_com2_io() == 0xffu
+           && je_kernel_device()->binding_gen >= 28u
+           && !je_kernel_device()->irq3_duplicate_tick
+           && !je_arch_page_user_accessible(
+               vm_s3.procs[sup->vm_index].root, je_arch_tss_address());
+    if (ok) {
+        je_arch_console_write("M4h: IRQ3 deliveries=");
+        je_arch_console_hex(je_kernel_device()->irq3_deliveries);
+        je_arch_console_write("; <=1/tick\r\n");
+        je_arch_console_write("M4h: TSS page U=0 in user CR3\r\n");
+        je_arch_console_write("M4h: ring-3 #GP isolation, revoke, and deny bitmap corroborated\r\n");
+    }
+    return ok;
 #else
     (void)report; /* report counters are diagnostics, never proof */
     if (m4f_unexpected_image
@@ -1304,12 +1335,16 @@ static _Noreturn void m4f_teardown(const m4f_baseline *baseline,
     if (success) {
 #if JE_TEST_MODE == 13
         je_arch_console_write("M4g-s1: broker scenario completed\r\n");
+#elif JE_TEST_MODE == 14
+        je_arch_console_write("M4h-s1: D9 device scenario completed\r\n");
 #else
         je_arch_console_write("M4f-s1: supervisor scenario completed\r\n");
 #endif
     } else {
 #if JE_TEST_MODE == 13
         je_arch_console_write("M4g: supervisor lost (last_phase=");
+#elif JE_TEST_MODE == 14
+        je_arch_console_write("M4h: supervisor lost (last_phase=");
 #else
         je_arch_console_write("M4f: supervisor lost (last_phase=");
 #endif
@@ -1336,6 +1371,8 @@ static _Noreturn void m4f_teardown(const m4f_baseline *baseline,
         || process_pool.used_count != 0u)
         fail("JeiOS fatal: M4g endpoint quiescence\r\n");
     je_arch_console_write("M4g: zero-leak identity baseline verified\r\n");
+#elif JE_TEST_MODE == 14
+    je_arch_console_write("M4h: zero-leak identity baseline verified\r\n");
 #else
     je_arch_console_write("M4f: zero-leak identity baseline verified\r\n");
 #endif
@@ -1670,6 +1707,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
     je_sched_init();
     je_proc_pool_init(&process_pool);
     je_sched_set_proc_pool(&process_pool);
+    je_device_init(je_kernel_device(), &process_pool);
     je_endpoint_kern_set_proc_pool(&process_pool);
     if (je_builtin_images_init() != JE_OK)
         fail("JeiOS fatal: built-in image table\r\n");

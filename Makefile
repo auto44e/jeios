@@ -16,12 +16,12 @@ CPPFLAGS += -DJE_DEV_COPY_INJECT
 endif
 CFLAGS := -std=c11 -O2 -g $(WARN) -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -m64 -march=x86-64 -mno-red-zone -mgeneral-regs-only
 CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c kernel/core/boot.c kernel/core/alloc.c
-SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/handle.c kernel/core/endpoint.c kernel/core/endpoint_kern.c kernel/core/proc.c kernel/core/image.c kernel/core/spawn.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
+SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/handle.c kernel/core/endpoint.c kernel/core/endpoint_kern.c kernel/core/device.c kernel/core/proc.c kernel/core/image.c kernel/core/spawn.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
 USER_WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
 USER_CFLAGS := -std=c11 -O2 $(USER_WARN) -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -m64 -march=x86-64 -mcmodel=small -mno-red-zone -mgeneral-regs-only -fno-tree-loop-distribute-patterns -DJE_TEST_MODE=$(TEST_MODE) -Iuser/include -Iinclude
 USER_LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 -z noexecstack -Wl,--build-id=none
 USER_COMMON_OBJECTS := $(BUILD)/user/crt0.o $(BUILD)/user/lib/mem.o
-USER_SERVICE_NAMES := supervisor restart survivor spoofer crashloop broker_service broker_client
+USER_SERVICE_NAMES := supervisor restart survivor spoofer crashloop broker_service broker_client uart_driver
 USER_SERVICE_OBJECTS := $(patsubst %,$(BUILD)/user/services/%.o,$(USER_SERVICE_NAMES))
 USER_IMAGES := $(patsubst %,$(BUILD)/user/%.elf,$(USER_SERVICE_NAMES))
 USER_GENERATED_IMAGES := $(patsubst %,$(BUILD)/gen/image_%.c,$(USER_SERVICE_NAMES))
@@ -186,11 +186,11 @@ $(BUILD)/test_image: tests/test_image.c $(USER_GENERATED) kernel/core/vm.c kerne
 # ADR 0010 D12: hosted coverage uses the production scheduler and PROCESS pool.
 # Private scheduler state is exposed only by the test TU; section GC discards
 # unrelated architecture-dependent scheduler entry points.
-$(BUILD)/test_sched_killall: tests/test_sched_killall.c kernel/core/proc.c $(wildcard include/jeios/*.h)
+$(BUILD)/test_sched_killall: tests/test_sched_killall.c kernel/core/proc.c kernel/core/device.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -ffunction-sections -fdata-sections \
 	  -fsanitize=address,undefined -fno-sanitize-recover=all \
-	  tests/test_sched_killall.c kernel/core/proc.c -Wl,--gc-sections -o $@
+	  -DJE_SCHED_HOSTED_TEST tests/test_sched_killall.c kernel/core/proc.c -Wl,--gc-sections -o $@
 
 
 # MP1 (ADR 0002): ARM64 (QEMU virt-8.2) build + smoke, kept fully separate from

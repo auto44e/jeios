@@ -433,18 +433,23 @@ int main(void)
 
     test_proc_kill_decode();
 
-    /* Ops reserved by ADR 0010 for later PRs stay UNSUPPORTED (17-19 DEV_*, and 20
-     * beyond), clean or dirty args alike. HISTORY: 13 and 14 were in this list
-     * until PR-C; 16 PROC_KILL was in it until PR-D (ADR 0010 D8), and its
-     * UNSUPPORTED expectation is intentionally retired (see test_proc_kill_decode). */
+    /* D9 recognizes 17-19 with strict handle-width/reserved-register decoding;
+     * op 20 remains unsupported. */
     {
-        static const uint64_t later_ops[] = { 17u, 18u, 19u, 20u };
-        for (unsigned i = 0; i < sizeof later_ops / sizeof later_ops[0]; ++i) {
-            assert(dec(later_ops[i], 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
-            assert(dec(later_ops[i], 0x00010000,0x40002000,1,2,3,4,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
-            /* the arg shape that is a valid PROC_KILL must not be one for 17-19 */
-            assert(dec(later_ops[i], 0x00010000,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED && res==0);
-        }
+        assert(dec(JE_SYS_DEV_ASSIGN, 0x00010000,0x00010001,0,0,0,0,
+                   &st,&res)==JE_SYSCALL_DEV_ASSIGN && st==JE_ABI_OK);
+        assert(dec(JE_SYS_DEV_REVOKE, 0x00010000,0,0,0,0,0,
+                   &st,&res)==JE_SYSCALL_DEV_REVOKE && st==JE_ABI_OK);
+        assert(dec(JE_SYS_DEV_IRQ_ACK, 0x00010000,0,0,0,0,0,
+                   &st,&res)==JE_SYSCALL_DEV_IRQ_ACK && st==JE_ABI_OK);
+        assert(dec(JE_SYS_DEV_ASSIGN, 0x00010000,0x100000000,0,0,0,0,
+                   &st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+        assert(dec(JE_SYS_DEV_REVOKE, 0x00010000,1,0,0,0,0,
+                   &st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+        assert(dec(JE_SYS_DEV_IRQ_ACK, 0x00010000,0,1,0,0,0,
+                   &st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
+        assert(dec(20u, 0,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN
+               && st==JE_ABI_UNSUPPORTED && res==0);
     }
     /* op 15 must not alias across the 64-bit op field */
     assert(dec(UINT64_C(0x100000000) | JE_SYS_PROC_STATUS, 0x00010000,0x40002000,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_UNSUPPORTED);
@@ -452,7 +457,7 @@ int main(void)
     printf("syscall: PASS (abi_query, yield, exit, copy_probe, handle self/close/query/rights/dup, "
            "endpoint_create, try_send/try_recv decode, dup KILL known, proc_status decode, "
            "clock_ticks decode, proc_spawn decode, spawn ABI layout, dup SPAWN known, "
-           "proc_kill decode, reserved-arg, wide-handle, unknown-rights, full-width op, "
-           "unsupported 17-20)\n");
+           "proc_kill decode, device decode, reserved-arg, wide-handle, unknown-rights, "
+           "full-width op, unsupported op 20)\n");
     return 0;
 }

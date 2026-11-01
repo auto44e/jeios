@@ -6,6 +6,7 @@
  * ADR 0008 D6 uniprocessor / IF=0 precondition (no SMP claim).
  */
 #include <jeios/endpoint.h>
+#include <jeios/abi.h>
 
 
 /* Policy-bound pins (ADR 0009 D4): REF_MAX must admit every non-handle owning
@@ -580,7 +581,14 @@ je_ep_status je_endpoint_handle_dup(je_endpoint_pool *pool, je_handle_table *t,
 
 int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t)
 {
+    return je_endpoint_release_table_owned(pool, t, JE_PROC_ID_NONE);
+}
+
+int je_endpoint_release_table_owned(je_endpoint_pool *pool, je_handle_table *t,
+                                    je_proc_id owner)
+{
     if (!pool || !t) return -1;
+    (void)owner;
     int released = 0;
     /* Reading t->capacity is table METADATA (public struct field), not slot
      * internals; slot contents are reached only via the read-only iterator. */
@@ -617,6 +625,9 @@ int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t)
             s = JE_EP_OK;
         } else if (type == JE_EP_PROCESS_OBJ_TYPE) {
             return -1;
+        } else if (type == JE_ABI_OBJ_DEVICE) {
+            if (je_handle_close(t, h) != JE_HANDLE_OK) return -1;
+            s = JE_EP_OK;
         } else {
             continue;
         }
@@ -627,7 +638,8 @@ int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t)
     for (uint32_t i = 0; i < t->capacity; ++i) {
         je_handle h = 0u; uint32_t type = 0u;
         if (je_handle_live_at(t, i, &h, &type) &&
-            (type == JE_ENDPOINT_OBJ_TYPE || type == JE_EP_PROCESS_OBJ_TYPE))
+            (type == JE_ENDPOINT_OBJ_TYPE || type == JE_EP_PROCESS_OBJ_TYPE
+             || type == JE_ABI_OBJ_DEVICE))
             return -1;   /* a LIVE endpoint survived the walk -> fatal */
     }
     return released;

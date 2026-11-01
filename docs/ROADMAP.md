@@ -62,14 +62,16 @@ M3 is complete. Follow [NEXT_PHASE.md](NEXT_PHASE.md): finish MP1 DTB/remote
 boot CI (#52), then core M4 services/devices (#53), then bounded read-only M5a
 (#54). ARM MP2/MP3 follows its own qualification gates.
 
-**2026-11-01 status refresh:** PR-G implements the bounded D11 broker scenario
-and its TEST_MODE 13 kernel-state corroboration on the M4 worktree. This is
-evidence for one focused supervisor-policy scenario, not completion of the
-whole M4 gate: device graph, buffer grants, DMA containment, and production
-service-registry guarantees remain planned. The next bounded implementation
-task after PR-G is PR-H (TSS I/O bitmap / DEVICE / IRQ3), subject to owner
-review and the remaining verification gates. PR-G's bounded ledger is keyed by
-supervisor-owned PROCESS handles; the frozen PROC_STATUS ABI remains unchanged.
+**2026-11-01T20:24:32Z status refresh:** PR-H implements the first bounded D9 direct-port
+authority scenario: COM2 DEVICE assignment, deny-by-default TSS I/O bitmap,
+IRQ3 delivery/re-arm, revoke/death/teardown integration, and TEST_MODE 14
+runtime evidence. This is evidence for one focused device scenario, not
+completion of the whole M4 gate: device graph, buffer grants, DMA containment,
+IRQ7 runtime injection, and production service-registry guarantees remain
+planned. The next bounded task is owner review and the remaining IRQ7/test
+gates, followed by PR-I/MP2. PR-H's driver authority remains exact
+owner+VM+table+slot+generation keyed; the frozen PROC_STATUS ABI remains
+unchanged.
 
 ### Historical M3 implementation sequence
 

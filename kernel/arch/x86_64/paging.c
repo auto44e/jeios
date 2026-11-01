@@ -84,6 +84,23 @@ uint64_t je_kernel_pd_phys(void) { return (uintptr_t)pd; }
 
 uint64_t je_arch_kernel_root_phys(void) { return (uintptr_t)pml4; }
 
+bool je_arch_page_user_accessible(uint64_t root_phys, uintptr_t address)
+{
+    if (root_phys == 0u || address >= JE_PHYSICAL_LIMIT) return false;
+    uint64_t *l4 = (uint64_t *)(uintptr_t)root_phys;
+    uint64_t e4 = l4[(address >> 39) & 511u];
+    if ((e4 & 5u) != 5u) return false;
+    uint64_t *l3 = (uint64_t *)(uintptr_t)(e4 & ~UINT64_C(0xfff));
+    uint64_t e3 = l3[(address >> 30) & 511u];
+    if ((e3 & 5u) != 5u) return false;
+    uint64_t *l2 = (uint64_t *)(uintptr_t)(e3 & ~UINT64_C(0xfff));
+    uint64_t e2 = l2[(address >> 21) & 511u];
+    if ((e2 & 5u) != 5u) return false;
+    uint64_t *l1 = (uint64_t *)(uintptr_t)(e2 & ~UINT64_C(0xfff));
+    uint64_t e1 = l1[(address >> 12) & 511u];
+    return (e1 & 5u) == 5u;
+}
+
 static int alias_addr_ok(uint64_t a)
 {
     /* A user frame's identity alias: page-aligned, inside the allocator window

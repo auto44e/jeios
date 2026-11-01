@@ -96,7 +96,7 @@ static void spawn_undo(je_vm *vm, uint32_t index, bool registered,
         if (je_sched_drop_user(vm, index) != JE_OK)
             je_arch_halt();
         if (vm_ready) {
-            if (je_vm_destroy(vm, index) != JE_OK)
+            if (je_vm_destroy_owned(vm, index, id) != JE_OK)
                 je_arch_halt();
         }
         if (je_proc_on_dying(pool, id, JE_DEATH_KILLED, 0u) != JE_OK)

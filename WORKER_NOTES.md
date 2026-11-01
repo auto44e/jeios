@@ -436,3 +436,90 @@ Not enforced yet: no supervisor image exists; no report is read at boot; no
 slot-0 identity scan, kill-all/reap integration, baseline audit, refusal marker
 or supervisor-loss QEMU scenario exists. No remote CI or human qualification
 is claimed.
+## PR-H D9 implementation record — observed 2026-11-01T20:24:32Z
+
+Repository/branch: `jeios`, `wip/m4h-impl`; inspected commit
+`b4e51542d1795e84057b114df5890046a13668c0`. Changes are intentionally
+uncommitted.
+
+### Decisions and reasoning
+
+- Kept one kernel singleton DEVICE record because M4 seeds exactly one COM2
+  resource. The record stores owner identity, binding generation, exact
+  driver VM/table/slot/handle generation, pending/revoking state, re-arm
+  generation/tick, last-unmask tick, and diagnostic IRQ3 delivery state.
+- Wrapped the existing architectural TSS in one packed object rather than
+  relocating or reloading it: the architectural TSS remains 104 bytes,
+  `LTR` sees descriptor limit 200, and only the COM2 bitmap byte changes after
+  dispatch. Filling the bitmap and terminator before `LTR` makes the
+  zero-means-allow encoding deny-by-default.
+- Used `je_handle_can_alloc` as the sole fallible ASSIGN preflight. A failure
+  returns quota/no-slots before binding; an allocation failure after the
+  preflight is a kernel invariant violation, not a recoverable user result.
+- Centralized revoke so DEV_REVOKE, exact DEVICE close, mark-dying, and kill
+  share mask-before-clear, generation invalidation, bitmap denial, exact raw
+  close, and owner clearing. The VM teardown callback carries process identity
+  to distinguish the recorded live driver slot from unrelated DEVICE handles.
+- Kept IRQ3 work kernel-owned and minimal: mask, set pending, EOI, schedule
+  normally. ACK and timer re-arm are delayed and generation-tagged, which
+  bounds an unacknowledged driver to at most one delivered IRQ per tick and
+  prevents stale ACKs from reopening a new binding.
+- Added a second QEMU serial backend for mode 14 so COM2 is a real emulated
+  16550. The ring-3 image performs the allowed eight-port exercise, then
+  reports/refuses if UART reads are `0xFF`; mode 14 rejects degraded results
+  rather than treating missing hardware as a successful security proof.
+- Extended mode 14 with a hostile driver incarnation that enables the UART
+  source, never ACKs, never clears that source, and waits for a supervisor
+  revoke. The supervisor performs three timer sleeps while it remains alive,
+  then revokes and releases the driver. The admin-revoke incarnation also
+  issues a stale ACK after revoke; it is intentionally ignored and cannot
+  reopen the binding.
+
+### Exact verification evidence
+
+```text
+ASAN_OPTIONS=detect_leaks=0 make check
+PASS (hosted sanitizers, ABI decode, VM/endpoint/handle/process/image/ELF checks)
+
+ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=14
+PASS
+
+make smoke
+PASS (mode 0 M4f supervisor scenario and zero-leak identity baseline)
+
+make integration
+PASS (fault modes 1-11, D12 mode 12, D11 mode 13, D9 mode 14; D9 used 14
+fresh driver bindings including stale-ACK and hostile no-ACK cases)
+
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --expect-nx absent
+PASS
+
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M --expect-nx absent
+PASS
+
+python3 tools/smoke.py build/0/jeios.iso --memory 1536M --expect-nx present
+PASS
+
+make smoke-aarch64
+PASS (QEMU virt 8.2; existing linker RWX warning only)
+
+git diff --check
+PASS
+```
+
+The mode-14 integration output observed:
+
+```text
+M4h: IRQ3 deliveries=0x0000000000000002; <=1/tick
+M4h: TSS page U=0 in user CR3
+M4h: ring-3 #GP isolation, revoke, and deny bitmap corroborated
+M4h-s1: D9 device scenario completed
+M4h: zero-leak identity baseline verified
+```
+
+### Not observed / not claimed
+
+The real and spurious IRQ7 branches were not synthesized by this QEMU run.
+They remain implementation code plus a planned runtime fixture, not tested
+evidence. Remote CI, independent human qualification, all hardware, DMA,
+SMP, dynamic loading, and release qualification remain unclaimed.
