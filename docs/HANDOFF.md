@@ -1,5 +1,51 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-F (#53) — the supervisor + D12 supervisor-loss — observed 2026-11-01T05:41:51Z
+
+Branch `feat/m4f-supervisor`, based on main `1343225` (#66 merged; main CI green);
+integrated head `1008d40`. Opened as the PR-F pull request.
+
+- **Implemented:** ADR 0010 D7/D11/D12. A ring-3 supervisor (image 2) launches and
+  monitors four child services (restart-svc 3, survivor 4, spoofer 5, crash-loop
+  6); a kernel slot-0 monitor watches the supervisor by identity and, on loss or
+  clean completion, runs the shared kill-all / reap / identity-baseline / halt. See
+  IMPLEMENTATION "M4 PR-F". Built across three worker passes (Stage 1 kernel
+  mechanism, Stage 2 supervisor+monitor, Stage 2 fix) with cross-lineage review at
+  each; the frozen-path frame-zero security bug found mid-build landed separately
+  as #66 and PR-F is rebased on it.
+- **Tested (local):** `make check` (incl. test_sched_killall 66, vm stale-upper
+  rejection, test_image 88, test_mkimage 562), `make smoke` (default boot runs the
+  success scenario to `M4f-s1` + zero-leak identity baseline), `make integration`
+  (12 modes incl. mode 12 = D12 supervisor-loss refusal), NX ×4, ARM64 base — all
+  PASS. Two design reviews and three code reviews (both lineages); the Stage-2
+  review found and fixed real blockers (success attestation that trusted report
+  counters; a vacuous rollback test; an unbounded monitor). See
+  `docs/adr/debates/m4f-reviews.md`.
+- **Key invariants:** D12 loss is detected by identity (`je_proc_status != LIVE`),
+  never a `mark_dying` hook; the monitor is the sole reaper after seeding and never
+  calls `idle_step`; success is decided ENTIRELY from kernel state (exact per-image
+  population from a kernel child ledger, spoofer death record + SEND-only shape,
+  `je_spawn_failpoint_fired()==1`, supervisor `reason==EXIT && code==JE_SVC_DONE_EXIT`)
+  with the report as diagnostics only; the identity baseline is an ownership
+  predicate (page_state + process/VM identities), not a count compare.
+- **Planned:** PR-G (broker), PR-H (TSS I/O bitmap / DEVICE / IRQ3), PR-I (UART
+  driver demo), then MP2. **Blocked:** nothing.
+
+**Open hazards / not claimed:**
+1. Forged-counter, torn-report, and impostor-child adversarial injection fixtures
+   are NOT separate end-to-end tests; the kernel-state per-image corroboration
+   defends against them structurally, but they are not independently exercised.
+2. A slot-0 `pause` poll stalled READY user threads in the PR-D round-2 fixture;
+   root cause still undetermined (`sti; hlt` / tick-sleep waits work, and PR-F uses
+   only those).
+
+## Superseded worker handoffs (PR-F stages) — kept as history
+
+The Stage 1 / Stage 2 / Stage 2-fix worker handoff blocks below were written
+against the intermediate `wip/m4f-*` branches before integration; the block above
+is the current, integrated status. The worker notes are preserved in
+`docs/adr/debates/m4f-workers*` and `m4f-reviews.md`.
+
 ## M4 PR-F Stage 2 FIX — observed 2026-11-01T05:32:14+00:00
 
 Repository `auto44e/jeios`; branch `wip/m4f-fix`; inspected commit
