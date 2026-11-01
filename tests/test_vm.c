@@ -24,6 +24,7 @@ void je_vm_fake_init(je_vm_ops *ops, je_pages *pages);
 void je_vm_fake_fail_at(unsigned n);
 size_t je_vm_fake_fallible_count(void);
 const unsigned char *je_vm_fake_peek(je_vm_ref frame);
+void je_vm_fake_poke_upper(uint32_t process, int level, uint32_t index, uint64_t value);
 
 static je_pages pages;
 static je_vm_ops ops;
@@ -888,11 +889,50 @@ static void test_build_quota_rollback(void)
     }
 }
 
+/* A stale PRESENT entry in any upper-table slot other than the four the build
+ * sets (PML4[0], PDPT[0], PDPT[1], PD[0]) is a live mapping the per-leaf arena
+ * walk never inspects — exactly the hazard a recycled, un-zeroed table frame
+ * creates. Prove the strengthened je_vm_audit rejects each such stale entry and
+ * still accepts the clean build. */
+static void test_audit_rejects_stale_upper(void)
+{
+    const je_vm_image image = image_fixture();
+    uint32_t idx;
+
+    init_blob();
+    reset_vm(0u);
+    assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &idx) == JE_OK);
+    assert(je_vm_audit(&vm, idx) == JE_OK);
+
+    /* PML4[1]: a present (user, writable) entry pointing anywhere. */
+    je_vm_fake_poke_upper(idx, 4, 1u, UINT64_C(0x1000) | 0x1u | 0x2u | 0x4u);
+    assert(je_vm_audit(&vm, idx) == JE_ERR_INVALID);
+    je_vm_fake_poke_upper(idx, 4, 1u, 0u);
+    assert(je_vm_audit(&vm, idx) == JE_OK);              /* cleared -> accepted again */
+
+    /* PDPT[2]: [0] and [1] are legitimately present, [2..511] must not be. */
+    je_vm_fake_poke_upper(idx, 3, 2u, UINT64_C(0x2000) | 0x1u);
+    assert(je_vm_audit(&vm, idx) == JE_ERR_INVALID);
+    je_vm_fake_poke_upper(idx, 3, 2u, 0u);
+    assert(je_vm_audit(&vm, idx) == JE_OK);
+
+    /* PD[1]: only [0] may be present. */
+    je_vm_fake_poke_upper(idx, 2, 1u, UINT64_C(0x3000) | 0x1u | 0x4u);
+    assert(je_vm_audit(&vm, idx) == JE_ERR_INVALID);
+    je_vm_fake_poke_upper(idx, 2, 1u, 0u);
+    assert(je_vm_audit(&vm, idx) == JE_OK);
+
+    /* A non-present stale value (P=0) is harmless and must NOT trip the audit. */
+    je_vm_fake_poke_upper(idx, 4, 5u, UINT64_C(0xdead0000));  /* P bit clear */
+    assert(je_vm_audit(&vm, idx) == JE_OK);
+}
+
 int main(void)
 {
     test_image_validation();
     test_admission();
     test_build_audit_and_teardown();
+    test_audit_rejects_stale_upper();
     test_rollback();
     test_teardown_hook();
     test_all_processes_isolated();
@@ -900,5 +940,5 @@ int main(void)
     test_build_quota_admits();
     test_build_quota_independent();
     test_build_quota_rollback();
-    puts("vm: PASS (validation, admission at P, audit, permissions, zeroing, rollback, teardown, death-hook, P-way isolation, handle quota)");
+    puts("vm: PASS (validation, admission at P, audit + stale-upper rejection, permissions, zeroing, rollback, teardown, death-hook, P-way isolation, handle quota)");
 }
