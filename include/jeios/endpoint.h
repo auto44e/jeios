@@ -453,6 +453,8 @@ uint8_t         je_endpoint_inbound_count(const je_ep_channel *rec, uint8_t side
  * endpoint slot in `t` is guaranteed no longer LIVE. MUST run with IF=0 (the
  * caller — je_vm_destroy — holds the IRQ-disabled critical section, A3-1). */
 int je_endpoint_release_table(je_endpoint_pool *pool, je_handle_table *t);
+int je_endpoint_release_table_owned(je_endpoint_pool *pool, je_handle_table *t,
+                                    je_proc_id owner);
 
 /* ---- M3c D7/A6: blocking-recv waiter primitives (PURE; sched.c owns the thread
  * side, endpoint_kern.c bridges the wake into the scheduler). ---- */

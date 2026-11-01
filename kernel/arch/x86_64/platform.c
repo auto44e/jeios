@@ -77,3 +77,22 @@ void je_arch_timer_init(void)
 }
 void je_arch_timer_eoi(void) { out8(0x20,0x20); }
 
+void je_arch_irq3_mask(void)
+{
+    out8(0x21, (uint8_t)(in8(0x21) | 0x08u));
+}
+void je_arch_irq3_unmask(void)
+{
+    out8(0x21, (uint8_t)(in8(0x21) & (uint8_t)~0x08u));
+}
+bool je_arch_irq3_is_unmasked(void) { return (in8(0x21) & 0x08u) == 0u; }
+bool je_arch_irq7_is_unmasked(void) { return (in8(0x21) & 0x80u) == 0u; }
+uint8_t je_arch_master_isr(void)
+{
+    out8(0x20, 0x0bu);
+    uint8_t value = in8(0x20);
+    out8(0x20, 0x0au);
+    return value;
+}
+void je_arch_master_eoi(void) { out8(0x20, 0x20); }
+

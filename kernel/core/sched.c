@@ -8,6 +8,7 @@
 #include <jeios/endpoint.h>
 #include <jeios/endpoint_kern.h>   /* je_endpoint_kern_waiter_release_by_id */
 #include <jeios/proc.h>
+#include <jeios/device.h>
 #define STACK_PAGES 5u
 /* M3c A6-CLARIFY-1: the fixed length of the `int 0x80` syscall gate instruction
  * (`CD 80`), rewound on park so the woken thread re-executes it. Architecturally
@@ -244,6 +245,10 @@ static void mark_dying(unsigned slot, death_reason reason, uint64_t code,
      * (keyed on the thread slot = waiter_id). Safe no-op if the thread held none.
      * This is the one site that RELEASES; the reaper only asserts it is clear. */
     (void)je_endpoint_kern_waiter_release_by_id((uint32_t)slot);
+#ifndef JE_SCHED_HOSTED_TEST
+    if (threads[slot].proc_id.gen != 0u)
+        je_device_on_process_dying(je_kernel_device(), threads[slot].proc_id);
+#endif
     if (threads[slot].proc_id.gen != 0u
         && je_proc_on_dying(process_pool, threads[slot].proc_id,
                             (uint32_t)reason, code) != JE_OK)
@@ -281,9 +286,14 @@ static je_trap_frame *select_and_install_next(void)
                 continue; /* pick another candidate */
             }
             threads[next].frame->rflags = sane;
+            je_device_apply_dispatch(je_kernel_device(), threads[next].proc_id,
+                                     &threads[next].vm->procs[threads[next].vm_index].htable,
+                                     true);
             je_arch_tss_set_rsp0(threads[next].rsp0_top);
             je_arch_cr3_load(threads[next].root);
         } else {
+            je_device_apply_dispatch(je_kernel_device(), JE_PROC_ID_NONE,
+                                     (je_handle_table *)0, false);
             je_arch_tss_set_rsp0(0); /* poison: CPL0->CPL0 never consults RSP0 */
             je_arch_cr3_load(je_arch_kernel_root_phys());
         }
@@ -311,6 +321,7 @@ je_trap_frame *je_sched_interrupt(je_trap_frame *f,bool timer)
     if (timer) {
         if (je_timer_ticks==UINT64_MAX) abort_scheduler();
         ++je_timer_ticks;
+        je_device_timer(je_kernel_device(), je_timer_ticks);
     }
     for (unsigned i=1;i<JE_THREAD_MAX;++i)
         if (threads[i].state==SLEEPING && threads[i].wake<=je_timer_ticks) threads[i].state=READY;
@@ -584,7 +595,7 @@ int je_sched_reap_dead(void)
         je_proc_id proc_id = threads[i].proc_id;
         je_status s=je_sched_drop_user(vm, idx); /* restores the kstack guard, clears the slot */
         if (s!=JE_OK) return (int)s;
-        s=je_vm_destroy(vm, idx);                /* frees the held kstack run + page tables */
+        s=je_vm_destroy_owned(vm, idx, proc_id); /* frees the held kstack run + page tables */
         if (s!=JE_OK) abort_scheduler();
         if (proc_id.gen != 0u
             && je_proc_on_reaped(process_pool, proc_id) != JE_OK)
@@ -651,6 +662,20 @@ je_status je_sched_current_user(je_vm **vm, uint32_t *index)
     if (vm) *vm=threads[current].vm;
     if (index) *index=threads[current].vm_index;
     return JE_OK;
+}
+je_status je_sched_find_process(je_proc_id id, je_vm **vm, uint32_t *index)
+{
+    if (!process_pool || id.gen == 0u || !je_proc_valid(process_pool, id))
+        return JE_ERR_INVALID;
+    for (uint32_t i = 0u; i < JE_VM_MAX_PROCESSES; ++i) {
+        if (registered_vm[i] && registered_proc[i].index == id.index
+            && registered_proc[i].gen == id.gen) {
+            if (vm) *vm = registered_vm[i];
+            if (index) *index = i;
+            return JE_OK;
+        }
+    }
+    return JE_ERR_INVALID;
 }
 uint64_t je_sched_min_dispatches(void)
 {

@@ -645,6 +645,43 @@ rules.
 **Flex:** reopen at M8 or with an IOMMU profile. Physical PCs with undocumented port
 aliases are explicitly unqualified.
 
+> **D9 implementation note — teardown integration (2026-11-01, owner-approved).**
+> PR-H design review (both lineages) found that the revoke-on-close/death contract
+> cannot be built on the current teardown code without two changes to tested
+> (M1/M2/M3c) paths; the owner approved them:
+> 1. **Close-event snapshot.** The typed-close release callback receives only the
+>    `object` pointer, but the DEVICE revoke rule must compare `{owner PROCESS
+>    identity, handle slot index, handle generation}` against the recorded binding —
+>    and the slot's generation changes the moment the handle is closed. So the close
+>    path captures that snapshot BEFORE `je_handle_close`, and a new DEVICE close
+>    branch uses it; the rule is never inferred from the post-close slot.
+> 2. **DEVICE in the process-death release walk.** `je_endpoint_release_table`
+>    (the M3c death-path walk) today handles ENDPOINT and PROCESS and silently skips
+>    other types; `je_vm_destroy` then zeroes the process state. Left unchanged, a
+>    driver's death would erase its DEVICE handle WITHOUT running revoke, leaving the
+>    port binding, the TSS bitmap byte and the IRQ mask live — the authority would
+>    NOT be revocable on death, defeating the whole contract. The walk gains a DEVICE
+>    branch that fail-stops if a live DEVICE slot survives teardown, and the VM
+>    teardown callback (which receives only the table today) is extended to carry the
+>    process identity. Revoke is centralized so every teardown path — `DEV_REVOKE`,
+>    the driver closing its handle, `mark_dying` on death, and kill — runs the one
+>    IF=0 revoke sequence and none can bypass the D9 hook. `mark_dying` and
+>    `je_sched_reap_dead` stay otherwise byte-identical; the DEVICE revoke is the only
+>    added synchronous step, before reap.
+>
+> **D9 implementation note — the supervisor's DEVICE admin handle via startup n=2
+> (2026-11-01, owner-approved).** The kernel-seeded supervisor receives its DEVICE
+> ADMIN handle (ASSIGN right) as a SECOND startup handle: `n = 2`, `RDX = LAUNCHER`,
+> `RCX = DEVICE admin`, `R8 = R9 = 0`. Startup v1 already defines RDX/RCX/R8/R9 as the
+> grants in order and crt0 already permits RCX (it checks only that the
+> promised-zero GPRs are zero), so the register layout is unchanged as a prefix; the
+> only change is the documented special-supervisor contract moving from `n = 1` to
+> `n = 2` (the D2 handle budget already counts "1 DEVICE admin"). The admin handle
+> carries ASSIGN only (no INSPECT, no PIO/IRQ), so it can assign/revoke but never do
+> port I/O itself. Rejected alternative: a "get admin handle" syscall, which would
+> add ambient-authority ABI surface. The abi.h startup comment, the supervisor
+> image, the uframe startup-GPR test and the quota evidence are updated together.
+
 ### D10. Ring-3 C images
 
 A freestanding ring-3 C build path is added, along with a host tool.

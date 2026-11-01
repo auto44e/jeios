@@ -27,13 +27,16 @@ extern const je_vm_image je_img_broker_service_desc;
 extern const unsigned char je_img_broker_client_blob[];
 extern const unsigned long je_img_broker_client_len;
 extern const je_vm_image je_img_broker_client_desc;
+extern const unsigned char je_img_uart_driver_blob[];
+extern const unsigned long je_img_uart_driver_len;
+extern const je_vm_image je_img_uart_driver_desc;
 
 #ifndef JE_C_HELLO_BLOB_SHA256
 #define JE_C_HELLO_BLOB_SHA256 "unavailable"
 #endif
 const char je_c_hello_blob_sha256[] = JE_C_HELLO_BLOB_SHA256;
 
-#define JE_BUILTIN_IMAGE_COUNT 9u
+#define JE_BUILTIN_IMAGE_COUNT 10u
 
 static je_builtin_image builtin_images[JE_BUILTIN_IMAGE_COUNT] = {
     { .name = "spawn-child" },
@@ -44,7 +47,8 @@ static je_builtin_image builtin_images[JE_BUILTIN_IMAGE_COUNT] = {
     { .name = "spoofer" },
     { .name = "crashloop" },
     { .name = "broker-service" },
-    { .name = "broker-client" }
+    { .name = "broker-client" },
+    { .name = "uart-driver" }
 };
 static bool builtin_images_ready;
 
@@ -116,6 +120,12 @@ je_status je_builtin_images_init(void)
     image->desc.segments[1] = (je_vm_segment){
         0u, 0u, JE_PAGE_SIZE, JE_PAGE_SIZE, JE_VM_R | JE_VM_W, 0u
     };
+    if (je_vm_image_validate(&image->desc, image->blob_len) != JE_OK)
+        return JE_ERR_INVALID;
+    image = &builtin_images[JE_IMAGE_UART_DRIVER];
+    image->blob = je_img_uart_driver_blob;
+    image->blob_len = (size_t)je_img_uart_driver_len;
+    image->desc = je_img_uart_driver_desc;
     if (je_vm_image_validate(&image->desc, image->blob_len) != JE_OK)
         return JE_ERR_INVALID;
     image = &builtin_images[JE_IMAGE_C_HELLO];

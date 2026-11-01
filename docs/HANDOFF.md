@@ -1,5 +1,124 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-H (#53) — D9 device / TSS I/O bitmap / kernel-owned IRQ3 — observed 2026-11-01T21:18:49Z
+
+Branch `feat/m4h-device`, based on main `b82d426` (#68 merged; main CI green);
+integrated head `18349b8`. Opened as the PR-H pull request. Built as impl → security
+code review (mutant-verified blockers) → fix, each cross-reviewed. The most
+privilege-sensitive M4 PR: the first ring-3 hardware port I/O + real IRQ.
+
+State: **implemented / tested / planned / not blocked**.
+
+- **Implemented:** kernel-owned exact FAULT/EXIT/#GP mode-14 attestation;
+  observed revoke/self-close denial probes; same-binding two-delivery IRQ3
+  evidence; exact binding-generation and IRQ3-mask checks; teardown-before-walk
+  centralized revoke with full inactive-state validation; corrected IRQ7
+  real/spurious handling; genuine `0x2FF`→`0x300` crossing; and hosted D9
+  lifecycle/IRQ7 coverage (`test_device`, 76 checks).
+- **Tested:** `ASAN_OPTIONS=detect_leaks=0 make check`,
+  `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=14`, `make smoke`, the
+  explicit NX/no-NX/16 MiB/1536 MiB profiles, `make smoke-aarch64`, and
+  `make integration` passed. Final mode 14 printed
+  `IRQ3 deliveries=0x...0f; max-binding=0x...2; <=1/tick`, TSS U=0,
+  ring-3 #GP isolation, D9 completion, and zero-leak markers. Required
+  bitmap-deny and allowed-port A/B mutants both failed mode-14 completion and
+  were restored.
+- **Planned:** PR-I (UART driver demo / end-to-end D9 console), then MP2.
+  IRQ7 remains host-tested but not QEMU-injected (recorded gap).
+- **Blocked:** no local implementation blocker; remote CI and independent human
+  qualification are unobserved and not claimed.
+
+**Review record:** `docs/adr/debates/m4h-reviews.md` (security design + code review;
+the mutant-verified blockers), worker notes in `docs/adr/debates/m4h-workers.md`.
+
+Changed invariants: mode 14 requires 13 vector-13 FAULT deaths and one clean
+EXIT for the 14 driver incarnations; binding generation is exactly 28; at
+least one IRQ3 delivery and at least two deliveries in one binding are
+observed with no duplicate tick; revoke/death/teardown leaves the device
+inactive, ownerless, pending-free, re-arm-free, bitmap-denied and IRQ3 masked.
+The hosted test does not substitute for QEMU ring-3 #GP evidence or real PIC
+IRQ7 injection. No DMA, SMP, arbitrary hardware, remote CI, or hardened/release
+qualification is claimed.
+
+## Historical pre-fix PR-H record
+
+## M4 PR-H — D9 COM2 DEVICE / TSS I/O bitmap / IRQ3 — observed 2026-11-01T20:24:32Z
+
+Repository `jeios`; branch `wip/m4h-impl`; exact inspected commit
+`b4e51542d1795e84057b114df5890046a13668c0`; implementation remains uncommitted
+as requested.
+
+State: **implemented / tested / planned / not blocked**.
+
+- **Implemented:** packed 201-byte TSS wrapper with a 96-byte deny-by-default
+  I/O bitmap plus terminator and GDT limit 200; per-dispatch COM2 byte
+  authority; kernel-only PIC IRQ3/IRQ7 helpers; singleton kernel-seeded DEVICE
+  record; ASSIGN/REVOKE/IRQ_ACK ABI operations; delayed, generation-tagged IRQ3
+  re-arm; exact-slot revoke/close/death/teardown integration; owner-aware VM
+  teardown identity threading; supervisor startup n=2 with DEVICE admin; the
+  ring-3 UART image; and TEST_MODE 14.
+- **Observed D9 evidence:** QEMU mode 14 with a real second 16550 at COM2
+  reached `M4h: IRQ3 deliveries=0x...2; <=1/tick`, `M4h: TSS page U=0 in
+  user CR3`, `M4h: ring-3 #GP isolation, revoke, and deny bitmap
+  corroborated`, `M4h-s1: D9 device scenario completed`, and the zero-leak
+  identity baseline. The scenario exercised COM2 ports 0x2F8–0x2FF,
+  forbidden-port/width/crossing probes, self-close, admin revoke, driver death,
+  stale authority, delayed ACK re-arm, and scheduler progress with a masked
+  IRQ3.
+- **Tested locally:** `ASAN_OPTIONS=detect_leaks=0 make check`,
+  `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=14`, `make smoke`,
+  `make integration`, the default NX-present, legacy no-NX, 16 MiB no-NX,
+  and 1536 MiB NX-present smoke profiles, `make smoke-aarch64`, and
+  `git diff --check` all passed. ARM smoke reported the existing linker
+  RWX warning and otherwise passed its DTB/CRC/EL1 markers.
+- **Planned:** independent real/spurious IRQ7 runtime injection, additional
+  hosted DEVICE-core tests, and owner review/PR qualification. PR-H does not
+  complete all M4 hardware/device gates; PR-I/MP2 remain future work.
+- **Blocked:** no local implementation blocker. Remote CI and independent
+  human qualification are unobserved and are not claimed.
+
+**Changed invariants and unresolved hazards:** only the COM2 bitmap byte may
+  become zero, only for a live exact driver handle during user dispatch; the
+  kernel console COM1 and all other tested ports remain denied. IRQ3 is masked
+  on delivery and can be unmasked only by the next-tick generation-checked
+  re-arm path. Revoke clears authority before closing the copied exact slot.
+  Process death revokes synchronously before reap; teardown treats an active
+  recorded DEVICE slot as fatal and drains all other DEVICE references.
+  IRQ7 real/spurious dispatch code exists, but neither case was generated by
+  this QEMU run. No DMA, SMP, arbitrary hardware, dynamic loading, remote CI,
+  or release/hardened qualification is claimed.
+
+## PR-H verification record — exact commands and results
+
+At the observation above, these commands returned exit 0:
+
+```text
+ASAN_OPTIONS=detect_leaks=0 make check
+ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=14
+make smoke
+make integration
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --expect-nx absent
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M --expect-nx absent
+python3 tools/smoke.py build/0/jeios.iso --memory 1536M --expect-nx present
+make smoke-aarch64
+git diff --check
+```
+
+The mode-14 integration output included:
+
+```text
+M4h: IRQ3 deliveries=0x0000000000000002; <=1/tick
+M4h: TSS page U=0 in user CR3
+M4h: ring-3 #GP isolation, revoke, and deny bitmap corroborated
+M4h-s1: D9 device scenario completed
+M4h: zero-leak identity baseline verified
+```
+
+The next bounded task is owner review of this privilege-sensitive first
+ring-3 direct-port-I/O change, with pass criteria of preserving the observed
+denial evidence and either adding an IRQ7 injection fixture or recording that
+coverage as a separate accepted gate.
+
 ## M4 PR-G (#53) — D11 broker / TEST_MODE 13 — observed 2026-11-01T10:43:43Z
 
 Branch `feat/m4g-broker`, based on main `ade5ddc` (#67 merged; main CI green);

@@ -39,6 +39,7 @@ _Static_assert(JE_BROKER_MAX <= 6u, "ADR 0010 D11 broker bound");
 #define JE_IMAGE_CRASHLOOP   6u   /* crash-to-terminal child (PR-F) */
 #define JE_IMAGE_BROKER_SVC  7u   /* brokered service (PR-G) */
 #define JE_IMAGE_BROKER_CLI  8u   /* broker client (PR-G) */
+#define JE_IMAGE_UART_DRIVER 9u   /* D9 ring-3 COM2 driver */
 
 /*
  * v0 service messages (ADR 0010 D7/D11). NOT a stable ABI. All little-endian,
