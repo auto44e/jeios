@@ -72,6 +72,30 @@ je_ep_status je_endpoint_kern_mint_recv_cap(je_vm *vm, uint32_t index,
                                             const je_ep_capdesc *d, je_handle *out);
 bool je_endpoint_kern_capdesc_live(const je_ep_capdesc *d);
 void je_endpoint_kern_capdesc_release_handle(const je_ep_capdesc *d);
+
+/* PR-G kernel-state evidence: resolve a live endpoint object to its creator and
+ * peer without exposing the endpoint pool or adding an ABI operation. */
+bool je_endpoint_kern_inspect_end(const void *object, je_proc_id *creator,
+                                  const je_ep_end **peer,
+                                  je_ep_end_state *state);
+
+#if JE_TEST_MODE == 13
+/* Test-mode audit hooks. They are called only after recv commit, so a rolled-back
+ * mint or copy fault cannot become kernel evidence. These are not ring-3 APIs. */
+void je_m4g_record_cap_delivery(je_vm *vm, uint32_t index,
+                                const je_ep_capdesc *descriptor);
+void je_m4g_record_control_receive(je_vm *vm, uint32_t index,
+                                   const je_ep_recv_lease *lease,
+                                   const void *message, size_t length,
+                                   uint8_t cap_count);
+void je_m4g_record_endpoint_create(je_proc_id creator);
+#endif
+
+/* Kernel-only descriptor inspection for TEST_MODE 13 corroboration. */
+bool je_endpoint_kern_inspect_descriptor(const je_ep_capdesc *descriptor,
+                                         je_proc_id *creator,
+                                         const je_ep_end **peer,
+                                         je_ep_end_state *state);
 /* TEST FIXTURE ONLY (A5-4): seed a channel with one end in vm->procs[idxA]'s
  * table and the other in procs[idxB]'s — a cross-process channel that ring-3
  * cannot bootstrap itself yet. Both procs' VM MUST be hooked (asserted). Returns

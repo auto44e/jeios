@@ -1,5 +1,61 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-G (#53) — D11 broker / TEST_MODE 13 — observed 2026-11-01T10:43:43Z
+
+Branch `feat/m4g-broker`, based on main `ade5ddc` (#67 merged; main CI green);
+integrated head `51b252b`. Opened as the PR-G pull request. Built as impl → code
+review (blockers found) → fix → owner option-2 identity re-key, each cross-reviewed.
+
+State: **implemented / tested / planned / not blocked**.
+
+- **Implemented:** bounded ring-3 supervisor policy over existing M3c IPC,
+  exact 12-byte transaction-bound `SERVICE_BIND`/`BROKER_GRANT` records,
+  two-phase service-first/client-second delivery, generation-wrap refusal,
+  supervisor-PROCESS-handle-keyed ledger, both-DEAD collection, PENDING
+  retention after uncertain ACK delivery, strict control-message validation,
+  and TEST_MODE 13.
+- **Kernel evidence:** cap-delivery audit is recorded only after receive commit,
+  resolved from kernel PROCESS state rather than VM slot. Mode 13
+  corroborates exactly three client-side and three service-side deliveries,
+  A/B/A ordering, supervisor creator, exact `SEND|RECV` rights, live service
+  state at the service-side delivery, the observed third A request with no
+  third delivery, and supervisor endpoint-charge peak at or below 21. The
+  report remains diagnostics only.
+- **Teardown:** shared kill-all/double-reap remains the only teardown path; mode
+  13 additionally requires endpoint allocation 0, endpoint quiescence, and
+  process-pool use count 0 before the baseline marker.
+- **Tested locally:** `ASAN_OPTIONS=detect_leaks=0 make check`,
+  `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=13`, `make smoke`,
+  `make integration`, the 16 MiB/no-NX and 1536 MiB/NX smoke profiles,
+  `make aarch64 && make smoke-aarch64 ARM_REQUIRE=1`, and `git diff --check`
+  all passed. Integration mode 13 reached
+  `M4g: client-reported EXHAUSTED; kernel delivery count A=2 corroborated`,
+  `M4g-s1`, and the zero-leak baseline; `M4g: supervisor lost` was absent.
+- **Planned:** PR-H (TSS I/O bitmap / DEVICE / IRQ3), PR-I (UART driver demo),
+  then MP2. **Blocked:** no implementation blocker; remote CI and independent human
+  qualification are unobserved.
+
+**Review record:** `docs/adr/debates/m4g-reviews.md` (design + code review; the code
+review's blockers and the owner's option-2 identity decision), worker notes in
+`docs/adr/debates/m4g-workers.md`. **Known coverage gap (honest):** A's EXHAUSTED
+lands where a live duplicate also exists, so mode 13 proves the cap check-order but
+not a duplicate-free lifetime cap; a host unit test would close it.
+
+**Changed invariants and unresolved hazards:** brokered endpoints are never
+forwardable; supervisor source handles close only after receiver ACKs; malformed
+control traffic cannot fail the supervisor scenario; and uncertain service
+delivery remains pending until both keyed PROCESS handles report DEAD or an
+uninspectable handle is explicitly cleared. A PROCESS handle referenced by a
+ledger entry is never closed or reused while that entry exists; the old service
+handle is retained across restart for this reason. The fixed broker table and
+endpoint bounds are exercised (`JE_BROKER_MAX=6`, endpoint pool 24,
+supervisor ep-limit 21).
+M5 remains intentionally limited: A's `EXHAUSTED` request occurs while a live
+generation-2 entry exists, so this scenario proves check ordering but not the
+duplicate-free cap; a host unit test is the next bounded task. No production
+service registry, dynamic loading, ring-0 fault isolation, hardware-wide
+support, remote CI, or independent human qualification is claimed.
+
 ## M4 PR-F (#53) — the supervisor + D12 supervisor-loss — observed 2026-11-01T05:41:51Z
 
 Branch `feat/m4f-supervisor`, based on main `1343225` (#66 merged; main CI green);

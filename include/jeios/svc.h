@@ -37,6 +37,8 @@ _Static_assert(JE_BROKER_MAX <= 6u, "ADR 0010 D11 broker bound");
 #define JE_IMAGE_SURVIVOR    4u   /* surviving peer child (PR-F) */
 #define JE_IMAGE_SPOOFER     5u   /* confused-deputy probe child (PR-F) */
 #define JE_IMAGE_CRASHLOOP   6u   /* crash-to-terminal child (PR-F) */
+#define JE_IMAGE_BROKER_SVC  7u   /* brokered service (PR-G) */
+#define JE_IMAGE_BROKER_CLI  8u   /* broker client (PR-G) */
 
 /*
  * v0 service messages (ADR 0010 D7/D11). NOT a stable ABI. All little-endian,
@@ -64,6 +66,77 @@ typedef struct {
 } je_svc_config;
 #define JE_SVC_CONFIG_LEN 16u
 _Static_assert(sizeof(je_svc_config) == JE_SVC_CONFIG_LEN, "CONFIG size");
+
+/*
+ * v0 broker protocol (ADR 0010 D11 + the 2026-11-01 protocol note). All ring-3
+ * supervisor policy; the kernel gains no broker status or identity. A cap send
+ * COPIES a descriptor and the receiver mints on recv (ADR 0009 A5), so every
+ * cap-bearing grant is a TWO-PHASE transaction acknowledged before the supervisor
+ * closes its source end. Fixed-size, little-endian, op first so a receiver can
+ * demux before trusting the rest. Brokered ends carry exactly SEND|RECV (no
+ * TRANSFER/INSPECT); the supervisor receives requests with hcap=0, and the client
+ * and service receive cap-bearing grants with hcap=1.
+ */
+#define JE_SVC_OP_BROKER_REQUEST   0x51455242u /* "BREQ": client -> supervisor */
+#define JE_SVC_OP_BROKER_GRANT     0x544e5247u /* "GRNT": sup -> client, +1 cap */
+#define JE_SVC_OP_BROKER_RESTARTED 0x54535352u /* "RSST": sup -> client, +1 cap */
+#define JE_SVC_OP_BROKER_UNAVAIL   0x5641564eu /* "NVAV": sup -> client, no cap, no cap-charge */
+#define JE_SVC_OP_BROKER_EXHAUSTED 0x48535845u /* "EXSH": sup -> client, no cap, cap spent */
+#define JE_SVC_OP_BROKER_ALREADY   0x44524c41u /* "ALRD": dup for a live generation */
+#define JE_SVC_OP_SERVICE_BIND     0x444e4942u /* "BIND": sup -> service, +1 cap */
+#define JE_SVC_OP_BROKER_ACK       0x4b434142u /* "BACK": recipient -> sup, cap minted */
+
+/* BROKER_REQUEST (client -> supervisor), no caps (received hcap=0). */
+typedef struct {
+    uint32_t op;          /* JE_SVC_OP_BROKER_REQUEST */
+    uint32_t service_id;  /* bounds-checked against the brokerable-service table */
+} je_svc_broker_request;
+#define JE_SVC_BROKER_REQUEST_LEN 8u
+_Static_assert(sizeof(je_svc_broker_request) == JE_SVC_BROKER_REQUEST_LEN,
+               "BROKER_REQUEST size");
+
+/* GRANT / RESTARTED (supervisor -> client), each carrying exactly ONE cap (the
+ * client's SEND|RECV end). service_generation is a supervisor-minted monotonic
+ * u32; the client treats it as metadata only (it never authenticates the service).
+ * RESTARTED uses the same layout with the RESTARTED op. */
+typedef struct {
+    uint32_t op;                 /* GRANT or RESTARTED */
+    uint32_t service_generation; /* supervisor per-service gen, monotonic */
+    uint32_t transaction;        /* supervisor-minted two-phase transaction id */
+} je_svc_broker_grant;
+#define JE_SVC_BROKER_GRANT_LEN 12u
+_Static_assert(sizeof(je_svc_broker_grant) == JE_SVC_BROKER_GRANT_LEN,
+               "BROKER_GRANT size");
+
+/* SERVICE_BIND (supervisor -> service), carrying ONE cap (the service's SEND|RECV
+ * end) and the generation the service must associate with it. */
+typedef struct {
+    uint32_t op;                 /* JE_SVC_OP_SERVICE_BIND */
+    uint32_t service_generation; /* authoritative; the service trusts ONLY this */
+    uint32_t transaction;        /* supervisor-minted two-phase transaction id */
+} je_svc_service_bind;
+#define JE_SVC_SERVICE_BIND_LEN 12u
+_Static_assert(sizeof(je_svc_service_bind) == JE_SVC_SERVICE_BIND_LEN,
+               "SERVICE_BIND size");
+
+/* UNAVAILABLE / EXHAUSTED / ALREADY_GRANTED / ACK: op-only replies (no cap).
+ * UNAVAILABLE carries a diagnostic reason; it does NOT consume the client's
+ * lifetime cap. EXHAUSTED means the lifetime cap is spent. ACK is the recipient's
+ * confirmation that it minted the cap (two-phase transaction). */
+typedef struct {
+    uint32_t op;      /* one of the no-cap broker ops above */
+    uint32_t detail;  /* UNAVAILABLE: a reason; others: 0 */
+} je_svc_broker_reply;
+#define JE_SVC_BROKER_REPLY_LEN 8u
+_Static_assert(sizeof(je_svc_broker_reply) == JE_SVC_BROKER_REPLY_LEN,
+               "BROKER_REPLY size");
+
+/* UNAVAILABLE reasons (diagnostic only). */
+#define JE_SVC_UNAVAIL_NOT_READY  1u /* service starting/backoff/not yet READY */
+#define JE_SVC_UNAVAIL_TERMINAL   2u /* service failed-terminal: no instance */
+#define JE_SVC_UNAVAIL_BAD_SERVICE 3u /* service_id out of range / not brokerable */
+#define JE_SVC_UNAVAIL_UNAUTH     4u /* client not authorized for this service */
+
 
 /*
  * The supervisor report (ADR 0010 D12). There is no console syscall, so the
@@ -152,6 +225,28 @@ _Static_assert(sizeof(je_svc_report) == JE_SVC_REPORT_LEN, "report struct size")
 #define JE_SVC_LOSS_GO 0xD1200001u
 #define JE_SVC_SPOOF_MAGIC 0x53504652u
 #define JE_SVC_SPOOF_EXPECTED_MASK 0x0007u
+
+/* PR-G broker scenario policy (TEST_MODE 13). One brokered service (restart_limit
+ * 1) and two clients: one reconnects through a service restart and then exhausts
+ * its lifetime cap; the other obtains a single grant and keeps it. The per-(client,
+ * service) lifetime cap is restart_limit+1 = 2; the supervisor's live-channel
+ * ledger (the true bound, ADR 0010 D2 note) refuses beyond JE_BROKER_MAX. */
+#define JE_SVC_BROKER_SERVICE_ID   0u            /* the single brokerable service */
+#define JE_SVC_BROKER_SERVICE_COUNT 1u           /* brokerable-service table size */
+#define JE_SVC_BROKER_CLIENT_CAP   (JE_SVC_RESTART_LIMIT + 1u) /* per client life */
+#define JE_SVC_BROKER_ACK_DEADLINE 400u          /* ticks to await a mint ACK */
+#define JE_SVC_BROKER_CLIENT_WAIT_DEADLINE \
+    (2u * JE_SVC_BROKER_ACK_DEADLINE)             /* client-side grant wait */
+/* Flex (revisit): a future PROC_STATUS could additionally return the record
+ * identity (index,gen) in RDX as an additive, v0 extension, giving ring-3 a
+ * stable process-identity primitive instead of relying on handle-value
+ * stability. Deferred 2026-11-01 (owner): PR-G keys its broker ledger on the
+ * supervisor-owned PROCESS handle instead, so no ABI change is needed now.
+ * Revisit if another component needs process identity at ring 3. */
+#define JE_SVC_DONE_EXIT_G 0x6734446Au           /* mode-13 supervisor clean EXIT code */
+_Static_assert(JE_SVC_BROKER_CLIENT_CAP <= JE_BROKER_MAX,
+               "a single client cannot exceed the live broker-channel bound");
+
 _Static_assert(JE_SVC_EP_LIMIT >= (4u * 3u) + 2u + 1u,
                "supervisor endpoint budget covers channels and sleep pair");
 

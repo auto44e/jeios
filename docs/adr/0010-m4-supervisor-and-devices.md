@@ -132,6 +132,22 @@ B is defined by D11's broker cap: B = Σ over broker clients and services of
 that B ≤ `JE_BROKER_MAX` (6), and asserts it. Otherwise E grows by the same formula in a reviewed
 change.
 
+> **D2 enforcement clarification (2026-11-01, owner-approved; numeric bound unchanged).**
+> The Σ formula above is the SIZING budget; it is NOT the runtime enforcement. PR-G
+> cross-lineage design review established that a brokered channel is destroyed (and
+> the supervisor's `ep_charge` released) only when BOTH its ends reach zero refs —
+> and a *service* can pin a dead client's end exactly as a client can pin a dead
+> service's. So the per-(client,service) lifetime counter alone does not bound the
+> number of live broker channels. The true bound is enforced by a supervisor-owned
+> **ledger of live granted channels**: an entry is provably freeable only when both
+> the client and the service PROCESS identities are dead (the brokered ends carry no
+> `TRANSFER`, and queued cap copies are discarded when a RECV end closes, so those
+> two processes are the only possible holders). The broker refuses to create a new
+> channel (answering a v0 `BROKER_UNAVAILABLE`/`BROKER_EXHAUSTED`) once the live
+> ledger count reaches `JE_BROKER_MAX`. The numbers (B ≤ 6, E = 24) and the Σ
+> sizing are unchanged; this note only states where the bound is actually enforced.
+> The per-client lifetime cap remains as D11 policy on top of the ledger.
+
 PR-A also replaces the fixed handle quota (`JE_VM_HANDLE_CAP − 1`, set in
 `vm.c`) with a per-table quota field. The quota value is a build parameter in
 PR-A, and becomes a spawn parameter in PR-C.
@@ -262,6 +278,13 @@ outlive the VM slot and never to point at it.
 
 **Flex:** a blocking wait, or a wait-set, needs its own ADR once polling cost is
 measured (D6).
+
+> **D4 flex note (2026-11-01, owner direction).** A future `PROC_STATUS` could
+> additionally return the record identity `(index,gen)` in RDX as an additive,
+> v0 extension, giving ring-3 a stable process-identity primitive instead of
+> relying on handle-value stability. Deferred 2026-11-01 (owner): PR-G keys its
+> broker ledger on the supervisor-owned PROCESS handle instead, so no ABI change
+> is needed now. Revisit if another component needs process identity at ring 3.
 
 ### D5. Spawn, launch grants and rollback
 
@@ -712,6 +735,27 @@ across generations, which is exactly what ADR 0009 D-OWNER-1 forbids.
 
 **Flex:** add policy-service separation (INIT.md:12) and multi-edge dependency
 graphs at M5a.
+
+> **D11 v0 broker protocol note (2026-11-01, owner-approved; v0, not a stable ABI).**
+> Implementing this safely needs more v0 messages than the sketch above. A cap send
+> COPIES a descriptor (ADR 0009 A5); the receiver mints on `try_recv`, so the
+> supervisor must NOT close its source end until the receiver has minted — a
+> premature close hands the receiver handle 0. The broker is therefore a two-phase
+> transaction: mint the channel, send the SERVICE end (cap) and the generation via a
+> `SERVICE_BIND`, await the service's ACK, send the CLIENT end (cap) + body via
+> `BROKER_GRANT`, await the client's ACK, THEN close both source handles (bounded
+> pending state + ACK deadlines; on timeout close sources, abort, and charge the
+> lifetime cap only if the client actually received its end). Replies beyond
+> `BROKER_GRANT`/`BROKER_EXHAUSTED`/`SERVICE_RESTARTED`: `BROKER_UNAVAILABLE`
+> (service not ready / died before the supervisor noticed — does NOT consume the
+> lifetime cap, distinct from EXHAUSTED which means the cap is spent) and
+> `BROKER_ALREADY_GRANTED` (duplicate request for the same still-live generation —
+> no second channel, per "at most one channel per (client, generation)").
+> `service_generation` is a per-service supervisor u32 (monotonic, non-wrapping,
+> bumped on each transition to READY, NOT the kernel PROCESS gen); the service learns
+> it only from `SERVICE_BIND`, never from client bytes. Brokered ends carry exactly
+> `SEND|RECV` (no `TRANSFER`, no `INSPECT`); the client demuxes replies by channel.
+> This is all ring-3 supervisor policy; the kernel gains no new status or identity.
 
 ### D12. Supervisor loss: a deliberate refusal (D-OWNER-6)
 
