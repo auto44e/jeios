@@ -514,3 +514,17 @@ const unsigned char *je_vm_fake_peek(je_vm_ref frame)
     const fake_frame *f = frame_of(&g, frame, NULL);
     return f ? (const unsigned char *)f->page : NULL;
 }
+
+/* Test-only: force a raw entry into a process's upper paging table, to simulate a
+ * stale PTE left in a recycled table frame (the zero-on-free hazard). level is
+ * 4=PML4, 3=PDPT, 2=PD, 1=PT. Used to prove je_vm_audit rejects a stale present
+ * upper entry. */
+void je_vm_fake_poke_upper(uint32_t process, int level, uint32_t index, uint64_t value)
+{
+    fake_proc *p = proc_of(&g, process);
+    if (!p || !p->linked || level < 1 || level > 4 || index >= ENTRIES) {
+        fprintf(stderr, "vm_fake: poke_upper out of range\n");
+        abort();
+    }
+    table_of(p, level)[index] = value;
+}

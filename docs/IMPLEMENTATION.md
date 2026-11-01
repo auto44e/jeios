@@ -20,6 +20,23 @@ This file records current contracts and execution evidence as gates are built.
 DESIGN.md describes the broader target architecture. No entry below implies
 userspace isolation, SMP safety, driver containment or production readiness.
 
+## Security fix: zero physical frames on free (ADR 0006 note) — 2026-11-01
+
+Closes a cross-process / kernel disclosure: `je_pages_alloc`/`free` never zeroed
+frame contents, and the VM backend reused freed frames (including as page tables)
+with stale bytes — stale page-table bytes are live PTEs. Fix (owner-approved b+c):
+`vb_scrub_frames` zeroes every frame run on free in `vb_free_extent` and
+`vb_release_hold` (root cause, covers all roles); `vb_link_tables` also clears the
+four table frames before publishing (defense in depth); `je_vm_audit` now rejects
+any present upper-table entry outside the four the build sets. Hosted regression
+test: test_vm `test_audit_rejects_stale_upper` (injects stale entries; verified it
+fails without the audit strengthening). The `je_pages` allocator contract is
+unchanged (it cannot address frame bytes; the backend is the lowest layer that
+can). Verified: `make check` (vm suite incl. stale-upper rejection), `make smoke`,
+`make integration` (11 fault modes), NX profiles, and ARM64 base — all PASS
+locally. Detail and rationale in ADR 0006's security note. Single-agent + ADR;
+AI-assisted review pending on the PR.
+
 ## M1a: exception entry
 
 The IDT has 256 ring-0 interrupt gates. Assembly normalizes CPU error-code and

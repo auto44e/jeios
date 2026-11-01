@@ -439,6 +439,22 @@ je_status je_vm_audit(const je_vm *vm, uint32_t index)
     if (o->read_upper(o->context, index, 2, 0, &fl) != JE_OK) return JE_ERR_INVALID;
     if (!(fl & 1u) || !(fl & 4u)) return JE_ERR_INVALID;              /* P|U */
 
+    /* Every OTHER upper-table entry must be not-present. The build sets exactly
+     * four upper entries (PML4[0], PDPT[0], PDPT[1], PD[0]); all 2044 others, and
+     * every PT entry not backing an arena page, must read P=0. A stale present
+     * entry here — e.g. from a recycled table frame that was not zeroed on free —
+     * is a live mapping the per-leaf walk below would miss (it only inspects the
+     * arena range), so it is a disclosure hazard. This closes the gap the
+     * zero-on-free fix addresses and fails closed if that fix ever regresses. */
+    for (uint32_t i = 0; i < 512u; ++i) {
+        if (o->read_upper(o->context, index, 4, i, &fl) != JE_OK) return JE_ERR_INVALID;
+        if ((fl & 1u) && i != 0u) return JE_ERR_INVALID;             /* PML4: only [0] */
+        if (o->read_upper(o->context, index, 3, i, &fl) != JE_OK) return JE_ERR_INVALID;
+        if ((fl & 1u) && i != 0u && i != 1u) return JE_ERR_INVALID;  /* PDPT: only [0],[1] */
+        if (o->read_upper(o->context, index, 2, i, &fl) != JE_OK) return JE_ERR_INVALID;
+        if ((fl & 1u) && i != 0u) return JE_ERR_INVALID;             /* PD: only [0] */
+    }
+
     /* Walk every arena page: a present user leaf must (a) not be the guard page,
      * (b) carry a perm that is one of the three legal values, (c) map a physical
      * frame that belongs to one of THIS process's USER_* extents, and (d) match
