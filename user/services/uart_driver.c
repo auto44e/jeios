@@ -84,8 +84,68 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t endpoint,
         result = D9_DEGRADED;
     uint32_t mode = message.op - D9_READY;
     uint64_t pending = 0u;
-    if (mode != 13u)
-        (void)je_dev_irq_ack(device, &pending);
+    if (mode != 13u) {
+        uint32_t first = 0u;
+        for (uint32_t i = 0u; i < 2000u; ++i) {
+            if (je_dev_irq_ack(device, &pending) != JE_ABI_OK) {
+                result = D9_DEGRADED;
+                break;
+            }
+            if (pending == 1u) {
+                first = 1u;
+                break;
+            }
+            if (je_yield() != JE_ABI_OK) {
+                result = D9_DEGRADED;
+                break;
+            }
+        }
+        if (result == D9_PRESENT && first == 0u) result = D9_DEGRADED;
+        if (result == D9_PRESENT) {
+            (void)port_in(0x2fau);
+            (void)port_in(0x2f8u);
+        }
+    }
+    if (result == D9_PRESENT && mode == 0u) {
+        uint64_t before = 0u;
+        uint64_t now = 0u;
+        uint32_t next_tick = 0u;
+        if (je_clock_ticks(&before) != JE_ABI_OK)
+            result = D9_DEGRADED;
+        for (uint32_t i = 0u; result == D9_PRESENT && i < 2000u; ++i) {
+            if (je_clock_ticks(&now) != JE_ABI_OK) {
+                result = D9_DEGRADED;
+                break;
+            }
+            if (now > before) {
+                next_tick = 1u;
+                break;
+            }
+            if (je_yield() != JE_ABI_OK) {
+                result = D9_DEGRADED;
+                break;
+            }
+        }
+        if (result == D9_PRESENT && next_tick == 0u) result = D9_DEGRADED;
+        if (result == D9_PRESENT) port_out(0x2f8u, 0x5bu);
+
+        uint32_t second = 0u;
+        for (uint32_t i = 0u; result == D9_PRESENT && i < 2000u; ++i) {
+            if (je_dev_irq_ack(device, &pending) != JE_ABI_OK) {
+                result = D9_DEGRADED;
+                break;
+            }
+            if (pending == 1u) {
+                second = 1u;
+                break;
+            }
+            if (je_yield() != JE_ABI_OK) {
+                result = D9_DEGRADED;
+                break;
+            }
+        }
+        if (result == D9_PRESENT && second == 0u) result = D9_DEGRADED;
+    }
     d9_message report = { D9_RESULT, result };
     (void)je_try_send(endpoint, &report, sizeof report);
     if (result == D9_DEGRADED)
@@ -106,6 +166,8 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t endpoint,
          * ACK must not reopen IRQ3 or arm a new generation. */
         (void)je_dev_irq_ack(device, &pending);
     }
+    if (result == D9_PRESENT && (mode == 1u || mode == 2u))
+        (void)port_in(0x2f8u);
     /* The forbidden-port fault is the isolation proof. A fresh incarnation is
      * used by the supervisor for revoke/death checks after this one dies. */
     uint32_t mode_probe = mode;
@@ -132,12 +194,8 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t endpoint,
     } else if (mode_probe == 11u) {
         (void)port_in(0x3f8u);
     } else if (mode_probe == 12u) {
-        uint8_t bytes[2] = {0u, 0u};
-        uint64_t count = 2u;
-        __asm__ volatile("cld; rep insb"
-                         : "+D"(bytes), "+c"(count)
-                         : "d"((uint16_t)0x2ffu)
-                         : "memory");
+        (void)port_in(0x2ffu);
+        (void)port_in(0x300u);
     }
     if (mode != 13u)
         (void)je_dev_irq_ack(device, (uint64_t *)0);

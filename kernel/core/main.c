@@ -55,6 +55,7 @@ typedef struct {
     uint32_t image_id;
     uint32_t terminal_reason;
     uint64_t terminal_code;
+    uint64_t terminal_vector;
     uint32_t terminal_ep_charge;
     bool terminal_endpoint_shape;
 } m4f_child_identity;
@@ -65,6 +66,7 @@ static bool m4f_run_proc_slots[JE_PROC_REC_MAX];
 static uint32_t m4f_spawn_count[M4F_IMAGE_COUNT];
 static uint32_t m4f_terminal_count[M4F_IMAGE_COUNT];
 static uint32_t m4f_death_count[M4F_IMAGE_COUNT][JE_PROC_REASON_MAX + 1u];
+static uint32_t m4f_fault_vector_count[M4F_IMAGE_COUNT][32u];
 static uint32_t m4f_spoofer_shape_count;
 static uint64_t m4f_spoofer_code;
 static uint32_t m4f_spoofer_ep_charge;
@@ -305,6 +307,8 @@ static void m4f_ledger_reset(void)
         m4f_terminal_count[image] = 0u;
         for (uint32_t reason = 0u; reason <= JE_PROC_REASON_MAX; ++reason)
             m4f_death_count[image][reason] = 0u;
+        for (uint32_t vector = 0u; vector < 32u; ++vector)
+            m4f_fault_vector_count[image][vector] = 0u;
     }
     m4f_spoofer_shape_count = 0u;
     m4f_spoofer_code = 0u;
@@ -324,7 +328,7 @@ void je_proc_record_image(je_proc_id id, uint32_t image_id)
         || m4f_children[id.index].active)
         fail("JeiOS fatal: M4f child ledger identity\r\n");
     m4f_children[id.index] = (m4f_child_identity){true, false, id, image_id,
-                                                   0u, 0u, 0u, false};
+                                                   0u, 0u, 0u, 0u, false};
     m4f_run_proc_slots[id.index] = true;
     if (image_id >= M4F_IMAGE_COUNT || image_id < JE_IMAGE_SUPERVISOR)
         m4f_unexpected_image = true;
@@ -1016,6 +1020,15 @@ static void m4f_capture_terminal_children(void)
         child->terminal_seen = true;
         child->terminal_reason = rec->reason;
         child->terminal_code = rec->code;
+        child->terminal_vector = 0u;
+        if (rec->reason == JE_DEATH_FAULT) {
+            uint64_t vector = UINT64_MAX;
+            if (je_sched_death_record(&vm_s3, rec->vm_index, &vector,
+                                      (uint64_t *)0, (uint64_t *)0,
+                                      (uint64_t *)0, (uint64_t *)0) != JE_OK)
+                fail("JeiOS fatal: M4f death vector missing\r\n");
+            child->terminal_vector = vector;
+        }
         child->terminal_ep_charge = rec->ep_charge;
 #if JE_TEST_MODE == 13
         if (child->image_id == JE_IMAGE_BROKER_CLI) {
@@ -1028,6 +1041,10 @@ static void m4f_capture_terminal_children(void)
         } else {
             ++m4f_terminal_count[child->image_id];
             ++m4f_death_count[child->image_id][child->terminal_reason];
+            if (child->terminal_reason == JE_DEATH_FAULT
+                && child->terminal_vector < 32u)
+                ++m4f_fault_vector_count[child->image_id]
+                                [child->terminal_vector];
         }
         if (child->image_id == JE_IMAGE_SPOOFER) {
             child->terminal_endpoint_shape = m4f_spoofer_endpoint_shape(rec);
@@ -1243,15 +1260,25 @@ static bool m4f_corroborate(je_proc_id supervisor,
            && sup->code == JE_SVC_DONE_EXIT_G
            && m4f_spawn_count[JE_IMAGE_UART_DRIVER] == 14u
            && m4f_terminal_count[JE_IMAGE_UART_DRIVER] == 14u
+           && m4f_death_count[JE_IMAGE_UART_DRIVER][JE_DEATH_FAULT] == 13u
+           && m4f_death_count[JE_IMAGE_UART_DRIVER][JE_DEATH_EXIT] == 1u
+           && m4f_fault_vector_count[JE_IMAGE_UART_DRIVER][13u] == 13u
            && !je_kernel_device()->active
            && je_arch_tss_com2_io() == 0xffu
-           && je_kernel_device()->binding_gen >= 28u
+           && je_kernel_device()->binding_gen == 28u
+           && je_kernel_device()->irq3_deliveries >= 1u
+           && je_kernel_device()->irq3_max_binding_deliveries >= 2u
+           && je_kernel_device()->irq3_pending_observed
+           && je_kernel_device()->irq3_ack_observed
            && !je_kernel_device()->irq3_duplicate_tick
+           && !je_arch_irq3_is_unmasked()
            && !je_arch_page_user_accessible(
                vm_s3.procs[sup->vm_index].root, je_arch_tss_address());
     if (ok) {
         je_arch_console_write("M4h: IRQ3 deliveries=");
         je_arch_console_hex(je_kernel_device()->irq3_deliveries);
+        je_arch_console_write("; max-binding=");
+        je_arch_console_hex(je_kernel_device()->irq3_max_binding_deliveries);
         je_arch_console_write("; <=1/tick\r\n");
         je_arch_console_write("M4h: TSS page U=0 in user CR3\r\n");
         je_arch_console_write("M4h: ring-3 #GP isolation, revoke, and deny bitmap corroborated\r\n");

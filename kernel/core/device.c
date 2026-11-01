@@ -97,6 +97,7 @@ je_abi_status je_device_assign(je_device *d, je_proc_id caller,
     je_handle_decode(h, &slot, &gen);
     d->driver_slot = slot;
     d->driver_handle_gen = gen;
+    d->irq3_binding_deliveries = 0u;
     schedule_rearm(d, je_sched_ticks(), d->binding_gen);
     *out = h;
     return JE_ABI_OK;
@@ -146,7 +147,10 @@ je_abi_status je_device_irq_ack(je_device *d, je_proc_id caller,
         return JE_ABI_H_STALE;
     bool pending = d->pending;
     d->pending = false;
-    if (pending) schedule_rearm(d, je_sched_ticks(), d->binding_gen);
+    if (pending) {
+        d->irq3_ack_observed = true;
+        schedule_rearm(d, je_sched_ticks(), d->binding_gen);
+    }
     *out_pending = pending ? 1u : 0u;
     return JE_ABI_OK;
 }
@@ -166,7 +170,13 @@ void je_device_irq3(je_device *d)
             d->irq3_duplicate_tick = true;
         d->irq3_last_tick = now;
         ++d->irq3_deliveries;
-        if (d->active) d->pending = true;
+        if (d->active) {
+            d->pending = true;
+            d->irq3_pending_observed = true;
+            ++d->irq3_binding_deliveries;
+            if (d->irq3_binding_deliveries > d->irq3_max_binding_deliveries)
+                d->irq3_max_binding_deliveries = d->irq3_binding_deliveries;
+        }
     }
     je_arch_master_eoi();
 }
@@ -175,16 +185,13 @@ void je_device_irq7(je_device *d)
 {
     uint8_t isr = je_arch_master_isr();
     if (isr & 0x80u) {
-        if (je_arch_irq7_is_unmasked())
-            je_arch_master_eoi();
-        else
-            device_panic("JeiOS fatal: masked real IRQ7\r\n");
+        je_arch_master_eoi();
         return;
     }
-    if (d && d->active && je_arch_irq3_is_unmasked()) {
+    if (je_arch_irq3_is_unmasked())
         je_arch_irq3_mask();
+    if (d && d->active)
         schedule_rearm(d, je_sched_ticks(), d->binding_gen);
-    }
 }
 
 void je_device_timer(je_device *d, uint64_t now)
@@ -228,15 +235,21 @@ bool je_device_close_matches(const je_device *d, je_proc_id caller,
         && h == je_handle_encode(d->driver_slot, d->driver_handle_gen);
 }
 
+bool je_device_teardown_matches(const je_device *d, je_proc_id owner,
+                                const je_handle_table *table)
+{
+    if (!d || !d->active || !table) return false;
+    return (d->owner.index == owner.index && d->owner.gen == owner.gen)
+        || (d->driver_vm && d->driver_vm_index < JE_VM_MAX_PROCESSES
+            && table == &d->driver_vm->procs[d->driver_vm_index].htable);
+}
+
 void je_device_teardown_check(const je_device *d, je_proc_id id,
                               je_handle_table *table)
 {
-    if (!d || !table || !d->active || d->owner.index != id.index
-        || d->owner.gen != id.gen)
-        return;
-    je_handle h = je_handle_encode(d->driver_slot, d->driver_handle_gen);
-    uint32_t type = 0u;
-    if (je_handle_live_at(table, d->driver_slot, &h, &type)
-        && type == JE_ABI_OBJ_DEVICE)
-        device_panic("JeiOS fatal: active DEVICE survived teardown\r\n");
+    (void)id;
+    (void)table;
+    if (!d || d->active || d->owner.gen != 0u || d->pending
+        || d->rearm_pending || je_arch_irq3_is_unmasked())
+        device_panic("JeiOS fatal: DEVICE teardown state survived\r\n");
 }

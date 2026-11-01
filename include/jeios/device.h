@@ -22,7 +22,11 @@ typedef struct {
     uint32_t ack_gen;
     uint64_t irq3_deliveries;
     uint64_t irq3_last_tick;
+    uint32_t irq3_binding_deliveries;
+    uint32_t irq3_max_binding_deliveries;
     bool irq3_duplicate_tick;
+    bool irq3_pending_observed;
+    bool irq3_ack_observed;
     bool active;
     bool pending;
     bool revoking;
@@ -50,6 +54,8 @@ void je_device_apply_dispatch(je_device *device, je_proc_id id,
                               je_handle_table *table, bool user);
 bool je_device_close_matches(const je_device *device, je_proc_id caller,
                              je_vm *vm, uint32_t vm_index, je_handle handle);
+bool je_device_teardown_matches(const je_device *device, je_proc_id owner,
+                                const je_handle_table *table);
 void je_device_teardown_check(const je_device *device, je_proc_id id,
                               je_handle_table *table);
 

@@ -79,7 +79,7 @@ $(BUILD)/kernel/core/image.o: kernel/core/image.c $(USER_GENERATED) $(USER_GENER
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_device
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
@@ -94,6 +94,7 @@ test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm
 	./$(BUILD)/test_fdt
 	./$(BUILD)/test_image
 	./$(BUILD)/test_sched_killall
+	./$(BUILD)/test_device
 check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
 	$(PYTHON) tools/mkimage.py --name c_hello --elf $(USER_IMAGE) --verify
@@ -191,6 +192,15 @@ $(BUILD)/test_sched_killall: tests/test_sched_killall.c kernel/core/proc.c kerne
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -ffunction-sections -fdata-sections \
 	  -fsanitize=address,undefined -fno-sanitize-recover=all \
 	  -DJE_SCHED_HOSTED_TEST tests/test_sched_killall.c kernel/core/proc.c -Wl,--gc-sections -o $@
+
+# ADR 0010 D9: hosted DEVICE lifecycle and IRQ policy coverage. Architecture
+# operations are stubbed in the test; device.c and the real handle/process cores
+# remain under ASan+UBSan.
+$(BUILD)/test_device: tests/test_device.c kernel/core/device.c kernel/core/handle.c kernel/core/proc.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined \
+	  -fno-sanitize-recover=all tests/test_device.c kernel/core/device.c \
+	  kernel/core/handle.c kernel/core/proc.c -o $@
 
 
 # MP1 (ADR 0002): ARM64 (QEMU virt-8.2) build + smoke, kept fully separate from

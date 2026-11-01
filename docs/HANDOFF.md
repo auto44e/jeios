@@ -1,5 +1,42 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-H FIX pass — D9 proof hardening — observed 2026-11-01T21:00:37Z
+
+Repository `jeios`; branch `wip/m4h-impl`; exact inspected commit
+`878db70c3906a0eb1841165a68f49816f1757be8`; changes remain uncommitted.
+
+State: **implemented / tested / planned / not blocked**.
+
+- **Implemented:** kernel-owned exact FAULT/EXIT/#GP mode-14 attestation;
+  observed revoke/self-close denial probes; same-binding two-delivery IRQ3
+  evidence; exact binding-generation and IRQ3-mask checks; teardown-before-walk
+  centralized revoke with full inactive-state validation; corrected IRQ7
+  real/spurious handling; genuine `0x2FF`→`0x300` crossing; and hosted D9
+  lifecycle/IRQ7 coverage (`test_device`, 76 checks).
+- **Tested:** `ASAN_OPTIONS=detect_leaks=0 make check`,
+  `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=14`, `make smoke`, the
+  explicit NX/no-NX/16 MiB/1536 MiB profiles, `make smoke-aarch64`, and
+  `make integration` passed. Final mode 14 printed
+  `IRQ3 deliveries=0x...0f; max-binding=0x...2; <=1/tick`, TSS U=0,
+  ring-3 #GP isolation, D9 completion, and zero-leak markers. Required
+  bitmap-deny and allowed-port A/B mutants both failed mode-14 completion and
+  were restored.
+- **Planned:** lead integration and independent human review. IRQ7 remains
+  host-tested but not QEMU-injected.
+- **Blocked:** no local implementation blocker; remote CI and independent human
+  qualification are unobserved and not claimed.
+
+Changed invariants: mode 14 requires 13 vector-13 FAULT deaths and one clean
+EXIT for the 14 driver incarnations; binding generation is exactly 28; at
+least one IRQ3 delivery and at least two deliveries in one binding are
+observed with no duplicate tick; revoke/death/teardown leaves the device
+inactive, ownerless, pending-free, re-arm-free, bitmap-denied and IRQ3 masked.
+The hosted test does not substitute for QEMU ring-3 #GP evidence or real PIC
+IRQ7 injection. No DMA, SMP, arbitrary hardware, remote CI, or hardened/release
+qualification is claimed.
+
+## Historical pre-fix PR-H record
+
 ## M4 PR-H — D9 COM2 DEVICE / TSS I/O bitmap / IRQ3 — observed 2026-11-01T20:24:32Z
 
 Repository `jeios`; branch `wip/m4h-impl`; exact inspected commit

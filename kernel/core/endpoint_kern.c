@@ -47,12 +47,15 @@ static void kern_peer_close_wake(je_ep_channel *rec, uint8_t side);
 static void kep_teardown(void *ctx, je_handle_table *t, je_proc_id owner)
 {
     je_endpoint_pool *pool = (je_endpoint_pool *)ctx;
-    je_device_teardown_check(je_kernel_device(), owner, t);
+    je_device *device = je_kernel_device();
+    bool device_teardown = je_device_teardown_matches(device, owner, t);
+    je_device_on_process_dying(device, owner);
     if (je_endpoint_release_table_owned(pool, t, owner) < 0) {
         je_arch_console_write("JeiOS fatal: endpoint release walk failed "
                               "(pool corrupt)\r\n");
         je_arch_halt();
     }
+    if (device_teardown) je_device_teardown_check(device, owner, t);
     /* A6-PEERWAKE: the release walk may have transitioned surviving peer ends to
      * PEER_CLOSED. Wake any receiver blocked on such an end (empty inbound ->
      * PEER_CLOSED; a nonempty end was already WOKEN by its enqueue, drain-first).

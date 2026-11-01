@@ -40,9 +40,9 @@ IRQ3, records pending, sends EOI, and returns through the normal scheduler
 interrupt path. ACK clears pending and schedules a generation-tagged re-arm;
 timer processing performs at most one delayed unmask per tick subject to
 `max(ack_tick+1,last_unmask+1)`. IRQ7 vector 39 reads the master ISR after
-selecting ISR mode, restores IRR mode, EOIs only a real IRQ7, and handles a
-spurious IRQ7 by masking/re-arming IRQ3 when needed. A real IRQ7 observed while
-masked is fatal.
+selecting ISR mode, restores IRR mode, EOIs every real IRQ7, and handles a
+spurious IRQ7 by masking IRQ3 whenever it is unmasked and scheduling a re-arm
+only for an active binding.
 
 The DEVICE syscall contract is transactional: ASSIGN resolves the admin
 DEVICE and KILL-capability target, performs `je_handle_can_alloc` as the only
@@ -54,31 +54,36 @@ and clears ownership. IRQ_ACK is O(1) against the recorded VM/table/slot/gen
 identity. A stale late close therefore cannot revoke a newer binding.
 
 The owner-aware VM teardown callback carries process identity into the existing
-endpoint release walk. Mark-dying performs synchronous revoke before process
-death publication; teardown fails closed if the recorded active slot survived
-that point and drains other DEVICE references without changing endpoint/PROCESS
-behavior. The supervisor receives startup `n=2` with LAUNCHER and DEVICE admin
-handles. The ring-3 UART image resets/drains/enables COM2, proves all eight
-authorized ports, ACKs IRQ3, reports and refuses a missing UART, and uses
-fault-local #GP death for forbidden-port and width/crossing probes.
+endpoint release walk. It centralizes revoke before the walk and validates that
+an affected teardown leaves the device inactive, ownerless, pending-free,
+re-arm-free and IRQ3 masked; endpoint/PROCESS behavior is unchanged. The
+supervisor receives startup `n=2` with LAUNCHER and DEVICE admin handles. The
+ring-3 UART image resets/drains/enables COM2, proves all eight authorized
+ports, observes pending ACKs, retriggers loopback across a tick, performs
+post-revoke/self-close `inb(0x2F8)` denial probes, and uses fault-local #GP
+death for forbidden-port and genuine `0x2FF`→`0x300` crossing probes.
 
-**Evidence at observation `2026-11-01T20:24:32Z`, exact inspected commit
-`b4e51542d1795e84057b114df5890046a13668c0` on branch `wip/m4h-impl`
+**Fix-pass evidence at observation `2026-11-01T21:00:37Z`, exact inspected commit
+`878db70c3906a0eb1841165a68f49816f1757be8` on branch `wip/m4h-impl`
 (changes uncommitted):**
 
 - `ASAN_OPTIONS=detect_leaks=0 make check` — PASS; all hosted sanitizer,
   syscall ABI, VM teardown, endpoint, handle, process, ELF and image checks
-  passed.
+  passed, including `test_device: PASS (76 checks)`.
 - `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=14` — PASS.
 - `make smoke` — PASS; mode 0 retained the M4F supervisor and zero-leak
   markers.
 - `make integration` — PASS for fault modes 1–11, supervisor-loss mode 12,
-  broker mode 13, and device mode 14. Mode 14 printed the five markers
-  recorded in HANDOFF.md.
-- The three explicit x86 profiles — default NX-present, `qemu64,-nx`, and
-  `qemu64,-nx --memory 16M` plus `--memory 1536M --expect-nx present` — PASS.
-- `make smoke-aarch64` — PASS on QEMU virt 8.2 with the expected DTB length,
-  CRC32, RAM and EL1 markers; the existing linker RWX warning remained.
+  broker mode 13, and device mode 14. Mode 14 printed
+  `M4h: IRQ3 deliveries=0x...0f; max-binding=0x...2; <=1/tick` plus exact
+  isolation and zero-leak markers.
+- Temporary revoke-bitmap and allowed-port mutants both failed mode-14
+  completion; both were restored. `git diff --check` — PASS.
+- `tests/test_device.c` host coverage is limited to production device-core
+  logic with architecture stubs; QEMU remains the evidence for ring-3 #GPs.
+- The explicit NX-present, legacy no-NX, 16 MiB no-NX, and 1536 MiB
+  NX-present smoke profiles passed. `make smoke-aarch64` passed with the
+  existing ARM linker RWX warning.
 - `git diff --check` — PASS.
 
 The mode-14 run used fourteen fresh driver bindings. One normal driver

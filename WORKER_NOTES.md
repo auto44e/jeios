@@ -1,3 +1,81 @@
+# PR-H FIX pass — D9 security-proof hardening
+
+Observation time: `2026-11-01T21:00:37Z`. Repository `jeios`; branch
+`wip/m4h-impl`; exact inspected commit `878db70c3906a0eb1841165a68f49816f1757be8`.
+Changes remain uncommitted for lead integration.
+
+State: **implemented / tested / planned / not blocked**. Remote CI and
+independent human qualification were not observed. AI-assisted review is not
+human qualification.
+
+## Decisions and implementation record
+
+- Mode 14 now decides isolation from the kernel child ledger's exact death
+  reasons, not aggregate terminal counts: the UART image must have exactly
+  13 `DEATH_FAULT` and 1 `DEATH_EXIT`, and all 13 faults must carry vector 13
+  (#GP). The binding-generation check is exact (`== 28`), not lower-bounded.
+- Revoke proof is causal. The driver polls `DEV_IRQ_ACK` until it observes
+  `pending=1`, services IIR/RBR, and one incarnation waits across a timer tick,
+  retriggers loopback, and observes a second ACK within the same binding.
+  Admin-revoke and self-close incarnations perform a real `inb(0x2F8)` after
+  authority withdrawal; the kernel ledger requires the resulting #GP death.
+  The crossing probe now performs `inb(0x2FF)` followed by `inb(0x300)`.
+- The teardown callback snapshots whether the closing table is the active
+  driver's table or owner identity, invokes centralized revoke before the
+  existing release walk, and then checks inactive owner/pending/re-arm and
+  masked IRQ3 state. Endpoint/PROCESS release behavior remains unchanged.
+- IRQ7 now unconditionally EOIs a real ISR-bit-7 interrupt. A spurious IRQ7
+  masks IRQ3 whenever hardware reports it unmasked and schedules a re-arm only
+  for an active binding; it never sends EOI.
+- Added `tests/test_device.c` with 76 `CHECK` cases under ASan+UBSan. Host
+  coverage includes assignment refusal precedence, near-`UINT32_MAX`
+  generation retirement, stale ACK/re-arm rejection, real/spurious IRQ7
+  branches, inactive-spurious behavior, and `UINT64_MAX` tick saturation.
+  It does not replace QEMU evidence for ring-3 #GPs or real PIC injection.
+
+## Exact verification observed
+
+- `ASAN_OPTIONS=detect_leaks=0 make check` — PASS; `test_device: PASS (76 checks)`.
+- `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=14` — PASS; the same
+  hosted suites and ELF/image checks passed under the mode-14 build.
+- `make smoke` — PASS; default mode 0 retained the M4f scenario and zero-leak
+  marker.
+- `make integration` — PASS. Final mode 14 included:
+
+  ```text
+  M4h: IRQ3 deliveries=0x000000000000000f; max-binding=0x0000000000000002; <=1/tick
+  M4h: TSS page U=0 in user CR3
+  M4h: ring-3 #GP isolation, revoke, and deny bitmap corroborated
+  M4h-s1: D9 device scenario completed
+  M4h: zero-leak identity baseline verified
+  ```
+
+- Temporary mutant A: scoped deletion of `je_arch_tss_set_com2_io(false)` from
+  `je_device_revoke`, rebuilt with `make iso TEST_MODE=14`, failed to produce
+  `M4h-s1`; output instead recorded `M4h: supervisor lost` and zero-leak.
+  The revoke call was restored in the revoke function.
+- Temporary mutant B: changed mode-0 forbidden `inb(0x2F7)` to allowed
+  `inb(0x2F8)`, rebuilt with `make iso TEST_MODE=14`, likewise failed to
+  produce `M4h-s1`; output recorded `M4h: supervisor lost` and zero-leak.
+  The probe was restored to `0x2F7`.
+- `git diff --check` — PASS at the final review point.
+- `python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx
+  --expect-nx absent` — PASS.
+- `python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M
+  --expect-nx absent` — PASS.
+- `python3 tools/smoke.py build/0/jeios.iso --memory 1536M
+  --expect-nx present` — PASS.
+- `make smoke-aarch64` — PASS; the existing ARM linker RWX warning remained,
+  and QEMU aarch64 smoke reached its DTB/CRC/EL1 markers.
+
+## Remaining limits
+
+The hosted test covers IRQ7 branch logic with architecture fakes; no current
+QEMU fixture injects real or spurious IRQ7. No remote CI, independent human
+review, hardened/release qualification, DMA, SMP, arbitrary hardware, or
+all-driver support is claimed. The next bounded task is lead integration and
+cross-review of this privilege-sensitive fix pass.
+
 # PR-G FIX pass — worker notes
 
 Observation time: `2026-11-01T08:04:50Z`. Repository: `jeios`; branch:

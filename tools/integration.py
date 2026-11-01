@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """Build and execute independent fault-injection kernels (never contaminate normal build)."""
+import re
 import subprocess
 from pathlib import Path
 from emulator import boot
@@ -106,5 +107,12 @@ output = boot(Path("build/14/jeios.iso"),
                         b"M4h-s1: D9 device scenario completed"],
               timeout=30, serial2="null")
 assert "JeiOS fatal:" not in output, f"mode 14 D9 scenario failed:\n{output}"
+delivery = re.search(
+    r"M4h: IRQ3 deliveries=0x([0-9a-f]+); max-binding=0x([0-9a-f]+); <=1/tick",
+    output,
+)
+assert delivery, f"mode 14 did not emit parseable IRQ3 evidence:\n{output}"
+assert int(delivery.group(1), 16) >= 1, output
+assert int(delivery.group(2), 16) >= 2, output
 print(f"device mode 14 (D9): PASS\n{output}")
 
