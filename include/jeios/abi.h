@@ -176,8 +176,34 @@ typedef enum {
                               * idempotent, decided from the PROCESS record), INVALID
                               * (self, a LIVE record with no thread yet, the supervisor),
                               * H_BADINDEX/H_STALE, H_WRONGTYPE, H_DENIED. RDX = 0. */
-    /* 17-19 DEV_* are reserved by
-     * ADR 0010 for later M4 PRs. Until then they stay UNSUPPORTED. */
+    /* ADR 0010 D9 device ops (PR-H). No new status values; all reuse the handle
+     * statuses below. A driver-op (PIO/IRQ) check requires the caller's PROCESS
+     * identity to equal the binding owner, the handle slot+generation to equal the
+     * recorded driver slot, and a binding to be active, else H_STALE. */
+    , JE_SYS_DEV_ASSIGN = 17 /* dev_assign(admin_h=RDI, process_h=RSI): needs ASSIGN on
+                              * admin_h and KILL on process_h. RDI[63:32]/RSI[63:32] and
+                              * RDX..R9 must be 0. The target must be LIVE (else H_STALE),
+                              * not the supervisor and not the caller (else INVALID), and
+                              * the device unbound (else H_DENIED). Transactional: reserve
+                              * a slot in the child's table (H_QUOTA/H_NOSLOTS on fail),
+                              * commit the binding (owner, recorded slot, gen+1), commit
+                              * the reserved slot as a PIO|IRQ DEVICE handle, then unmask
+                              * IRQ3 at the next eligible tick. -> RDX = the minted DEVICE
+                              * handle value in the child's table (plain data to the
+                              * caller; grants nothing outside that table), 0 on failure.
+                              * Refused H_QUOTA once the binding generation is exhausted. */
+    , JE_SYS_DEV_REVOKE = 18 /* dev_revoke(admin_h=RDI): needs ASSIGN on admin_h. RSI..R9
+                              * and RDI[63:32] must be 0. Runs the one IF=0 revoke
+                              * sequence (mask IRQ3, bump binding gen, clear pending,
+                              * deny the bitmap byte, close the driver slot, clear the
+                              * owner). Idempotent: OK on an unbound device. RDX = 0. */
+    , JE_SYS_DEV_IRQ_ACK = 19 /* dev_irq_ack(h=RDI): needs IRQ on a bound DEVICE handle.
+                              * RSI..R9 and RDI[63:32] must be 0. Returns and clears the
+                              * record's `pending`; does NOT unmask. If pending was set,
+                              * schedules a gen-tagged re-arm; the timer sweep unmasks
+                              * only if the binding gen still matches. -> RDX = 1 if an
+                              * interrupt was pending (and a re-arm was scheduled), else 0.
+                              * Never more than one IRQ3 delivery per tick. */
     , JE_SYS_PROC_STATUS = 15 /* M4 proc_status(h=RDI, out=RSI): needs INSPECT on a
                               * PROCESS handle. Copies a 16-byte je_abi_proc_status
                               * {u32 state, u32 reason, u64 code} to user memory at RSI
@@ -200,6 +226,10 @@ typedef enum {
 #define JE_ABI_OBJ_ENDPOINT 2u
 #define JE_ABI_OBJ_PROCESS 3u   /* ADR 0010 D3 */
 #define JE_ABI_OBJ_LAUNCHER 4u  /* ADR 0010 D3: SPAWN only; no INSPECT; not DUP-able */
+/* ADR 0010 D9: device-ownership capability. Admin handle carries ASSIGN only; the
+ * driver's bound handle carries PIO|IRQ. No INSPECT, not DUP-able. The object is a
+ * kernel DEVICE record; handles stay in the table they were minted into. */
+#define JE_ABI_OBJ_DEVICE 5u
 /* M3c D6 (step 4): max message payload bytes a try_send accepts. ABI-visible
  * (ring 3 must know the cap); pinned equal to the table-side JE_EP_MSG_MAX in the
  * syscall glue. */
@@ -225,6 +255,9 @@ _Static_assert(JE_SYS_PROC_STATUS == 15, "abi op proc_status (ADR 0010)");
 _Static_assert(JE_SYS_CLOCK_TICKS == 13, "abi op clock_ticks (ADR 0010 D6)");
 _Static_assert(JE_SYS_PROC_SPAWN == 14, "abi op proc_spawn (ADR 0010 D5)");
 _Static_assert(JE_SYS_PROC_KILL == 16, "abi op proc_kill (ADR 0010 D8)");
+_Static_assert(JE_SYS_DEV_ASSIGN == 17, "abi op dev_assign (ADR 0010 D9)");
+_Static_assert(JE_SYS_DEV_REVOKE == 18, "abi op dev_revoke (ADR 0010 D9)");
+_Static_assert(JE_SYS_DEV_IRQ_ACK == 19, "abi op dev_irq_ack (ADR 0010 D9)");
 
 /* ADR 0010 D5: spawn grant entry. 8 bytes, little-endian, no padding. `handle` names
  * an ENDPOINT in the caller's table; the caller's handle must hold TRANSFER; `rights`
@@ -292,9 +325,20 @@ _Static_assert(sizeof(je_abi_proc_status) == 16u, "proc_status ABI size");
  * PR-B so DUP can carry it; the PROC_KILL op that consumes it arrives in PR-D. */
 #define JE_ABI_RIGHT_KILL     0x10u            /* process: may kill (ADR 0010 D8) */
 #define JE_ABI_RIGHT_SPAWN    0x20u            /* launcher: may spawn (ADR 0010 D5) */
+/* ADR 0010 D9 DEVICE rights (PR-H). PIO|IRQ on the driver's bound handle; ASSIGN
+ * on the supervisor's admin handle. Appending these makes 0x40/0x80/0x100 KNOWN
+ * bits, so the handle_dup "unknown bit -> INVALID" gate now returns DENIED for
+ * them on a handle that does not hold them (as happened when SEND=0x2 was added);
+ * test_syscall.c must assert the new DENIED result and re-prove the unknown-bit ->
+ * INVALID contract on a still-unknown bit (e.g. 0x200). */
+#define JE_ABI_RIGHT_PIO      0x40u            /* device: may do port I/O on its ports */
+#define JE_ABI_RIGHT_IRQ      0x80u            /* device: may dev_irq_ack */
+#define JE_ABI_RIGHT_ASSIGN   0x100u           /* device admin: may dev_assign/dev_revoke */
 #define JE_ABI_RIGHTS_KNOWN  (JE_ABI_RIGHT_INSPECT | JE_ABI_RIGHT_SEND \
                               | JE_ABI_RIGHT_RECV | JE_ABI_RIGHT_TRANSFER \
-                              | JE_ABI_RIGHT_KILL | JE_ABI_RIGHT_SPAWN)
+                              | JE_ABI_RIGHT_KILL | JE_ABI_RIGHT_SPAWN \
+                              | JE_ABI_RIGHT_PIO | JE_ABI_RIGHT_IRQ \
+                              | JE_ABI_RIGHT_ASSIGN)
 _Static_assert(JE_ABI_RIGHT_KILL == 0x10u, "abi right kill (ADR 0010)");
 _Static_assert(JE_ABI_RIGHT_SPAWN == 0x20u, "abi right spawn (ADR 0010)");
 _Static_assert(JE_ABI_RIGHT_INSPECT == 0x1u, "abi right inspect");

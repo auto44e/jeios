@@ -110,6 +110,22 @@ static inline uint64_t je_proc_status(uint64_t h, void *status)
 static inline uint64_t je_proc_kill(uint64_t h)
 { return je_sys6(JE_SYS_PROC_KILL, h, 0, 0, 0, 0, 0, (uint64_t *)0); }
 
+/* ADR 0010 D9 device wrappers (PR-H). See abi.h for exact semantics. */
+
+/* dev_assign(admin_h, process_h): needs ASSIGN on admin_h + KILL on process_h.
+ * *out (optional) = RDX: the minted DEVICE handle value in the child's table. */
+static inline uint64_t je_dev_assign(uint64_t admin_h, uint64_t process_h, uint64_t *out)
+{ return je_sys6(JE_SYS_DEV_ASSIGN, admin_h, process_h, 0, 0, 0, 0, out); }
+
+/* dev_revoke(admin_h): needs ASSIGN. Idempotent. */
+static inline uint64_t je_dev_revoke(uint64_t admin_h)
+{ return je_sys6(JE_SYS_DEV_REVOKE, admin_h, 0, 0, 0, 0, 0, (uint64_t *)0); }
+
+/* dev_irq_ack(h): needs IRQ on the bound DEVICE handle. *out (optional) = RDX:
+ * 1 if an interrupt was pending (re-arm scheduled), else 0. */
+static inline uint64_t je_dev_irq_ack(uint64_t h, uint64_t *out)
+{ return je_sys6(JE_SYS_DEV_IRQ_ACK, h, 0, 0, 0, 0, 0, out); }
+
 __attribute__((noreturn)) static inline void je_exit(uint64_t code)
 {
     (void)je_sys6(JE_SYS_EXIT, code, 0, 0, 0, 0, 0, (uint64_t *)0);

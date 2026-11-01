@@ -390,18 +390,21 @@ int main(void)
      * 0010 D5 (PR-C) appends SPAWN=0x20 to JE_ABI_RIGHTS_KNOWN, so 0x20 is now a
      * well-formed request: decode returns the DUP action and the known-but-unheld
      * (or LAUNCHER not-DUP-able) DENIED is the glue's decision. The unknown-bit
-     * INVALID contract moves to the next still-unknown bit, 0x40. NOTE: ADR 0010
-     * D3 reserves 0x40/0x80/0x100 for DEVICE; the PR that makes them known must
-     * move these lines again. */
+     * INVALID contract moves to the next still-unknown bit, 0x200. NOTE: ADR 0010
+     * D9 (PR-H) made 0x40/0x80/0x100 known DEVICE rights (PIO/IRQ/ASSIGN), so a
+     * dup request naming one is now a well-formed decode (DENIED in the glue on a
+     * SELF handle), not an INVALID decode; the still-unknown bit is now 0x200. */
     assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_SPAWN,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
     assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_INSPECT|JE_ABI_RIGHT_SPAWN,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP && st==JE_ABI_OK);
-    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0x40u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* still unknown */
-    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_KILL|0x40u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* known+unknown */
-    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_SPAWN|0x40u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* known+unknown */
+    /* 0x40/0x80/0x100 are now KNOWN (PIO/IRQ/ASSIGN): a well-formed decode. */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_PIO,0,0,0,0,&st,&res)==JE_SYSCALL_HANDLE_DUP);
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, 0x200u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* still unknown */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_KILL|0x200u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* known+unknown */
+    assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHT_SPAWN|0x200u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID); /* known+unknown */
     assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, JE_ABI_RIGHTS_KNOWN|0x80000000u,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
-    for (uint32_t bit = 0x40u; bit != 0u; bit <<= 1)   /* every bit above SPAWN */
+    for (uint32_t bit = 0x200u; bit != 0u; bit <<= 1)   /* every bit above ASSIGN */
         assert(dec(JE_SYS_HANDLE_DUP, 0x00010000, bit,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
-    assert(JE_ABI_RIGHTS_KNOWN == 0x3fu);   /* exactly INSPECT..SPAWN known in PR-C */
+    assert(JE_ABI_RIGHTS_KNOWN == 0x1ffu);   /* INSPECT..ASSIGN known after PR-H */
 
     /* proc_status (op 15, ADR 0010 D4): h=RDI (must fit 32 bits), out=RSI,
      * RDX..R9 reserved (0). A clean call decodes to exactly the named action
