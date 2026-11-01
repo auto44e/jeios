@@ -34,6 +34,52 @@ stale entries; verified it fails without the audit strengthening). The `je_pages
 allocator contract is unchanged. Landed as PR #66. Detail and rationale in ADR
 0006's security note and `docs/adr/debates/secfix-frame-zero-reviews.md`.
 
+## M4 PR-F Stage 2 FIX — 2026-11-01
+
+This follow-up closes the success-attestation gaps found by adversarial review.
+The slot-0 monitor now reaps children during its interrupt-disabled scan section
+before `sti; hlt`, while remaining the sole reaper. A bounded kernel-owned
+ledger records successful `(PROCESS identity, image id)` spawns without changing
+the frozen process record layout. Terminal reason, code, endpoint shape, and
+per-image counts are captured before reap; ledger entries are cleared after
+reap, while aggregate death evidence remains bounded and available for the
+final decision.
+
+Success is now corroborated entirely from kernel state. The report is
+diagnostic only. The monitor requires the exact image population and outcomes:
+one live image-3 restart service, one live image-4 survivor with dispatches,
+one image-5 EXIT spoofer with the exact complement code and one SEND-only,
+zero-charge endpoint, exactly three image-6 FAULT terminals, and an image-2
+EXIT with `JE_SVC_DONE_EXIT`. Unexpected images/reasons, missing identity
+records, and extra terminal/live children fail closed. The ARM rollback launch
+uses a post-allocation step-4 failpoint, checks VM headroom first, and requires
+the one expected `H_NOSLOTS` result with handle zero.
+
+The monitor and ARM wait have wrap-safe progress deadlines. The supervisor
+publishes complete report snapshots under one odd-to-even seqlock bracket,
+checks the exact self handle `0x00010001`, treats survivor closure as fatal,
+uses one exact stale-handle probe, and reports private-channel sleep failures
+distinctly. Mode 12 records the observed READY phase and FAULT reason in its
+loss marker and rejects the success marker.
+
+**Local evidence at inspected commit
+`6520f1515d06a83ba6fcf400e029a8a21e616b0a` on branch `wip/m4f-fix`
+(uncommitted worker tree):**
+
+- `ASAN_OPTIONS=detect_leaks=0 make check` — PASS.
+- `make smoke` — PASS; M4f success and zero-leak markers plus
+  `QEMU smoke: PASS`.
+- `make aarch64 && make smoke-aarch64 ARM_REQUIRE=1` — PASS;
+  `QEMU aarch64 smoke: PASS`.
+- `make integration` — PASS for modes 1–12. Mode 12 printed READY phase
+  `0x...1`, FAULT reason `0x...0`, the supervisor-loss marker, and zero-leak,
+  with no scenario-completed marker.
+- `git diff --check` — PASS after the final documentation edits.
+
+Forged-counter, torn-report, and impostor-child injections are not separate
+end-to-end fixtures in this pass; no coverage claim is made for them. Remote
+CI and independent human qualification remain unobserved.
+
 ## M4 PR-F Stage 2 — supervisor, child services, and D12 monitor — 2026-11-01
 
 This worker-stage change wires the Stage 1 kernel mechanisms into the NX

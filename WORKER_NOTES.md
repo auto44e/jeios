@@ -1,5 +1,86 @@
 # PR-F Stage 1 worker notes
 
+## PR-F Stage 2 FIX worker notes — observation 2026-11-01T05:32:14+00:00
+
+Repository `auto44e/jeios`; branch `wip/m4f-fix`; inspected commit
+`6520f1515d06a83ba6fcf400e029a8a21e616b0a`; no commit created. The tree is
+intentionally dirty for lead integration.
+
+### State
+
+State: **implemented / tested / planned / not blocked**. The success
+attestation now uses kernel-observed child identity, death records, endpoint
+shape, exact exit evidence, and live survivor/restart records; the report is
+diagnostic only. The monitor reaps during the run, has a wrap-safe watchdog,
+and performs a second supervisor identity scan before the reaper can erase the
+supervisor's terminal record. Mode 12 remains a refusal path. Remote CI and
+independent human qualification were not observed.
+
+### Decisions and implementation record
+
+- Added a bounded kernel-owned side ledger keyed by PROCESS identity. Spawn
+  records the image id only after the transaction succeeds; terminal evidence
+  is captured before monitor reaping, and ledger entries are cleared after
+  reap while aggregate per-image death history remains available for
+  corroboration. This avoids changing the frozen `je_proc_rec` layout.
+- Reaped children in the monitor's interrupt-disabled scan section, before
+  `sti; hlt`. This preserves the monitor as the sole reaper and leaves VM,
+  PROCESS, and endpoint capacity available for the ARM rollback launch.
+- Rewrote success corroboration to ignore report counters for the security
+  decision. It requires the exact image population and per-image outcomes:
+  one live restart-service, one live survivor with dispatches, one EXIT
+  spoofer with the exact complement code and one SEND-only endpoint with zero
+  charge, three image-6 FAULT terminals, the exact supervisor EXIT code, and
+  the exact step-4 spawn failpoint observation.
+- Kept the rollback launch after `je_proc_alloc`/`je_vm_build` and asserted
+  VM headroom before arming. The supervisor performs exactly one ARM spawn and
+  requires `H_NOSLOTS` with handle zero.
+- Added wrap-safe monitor and ARM deadlines. A deadline is a liveness
+  fail-stop; it is reset only by an observed phase or kernel-progress change.
+- Hardened ring-3 behavior: survivor peer closure is fatal, the spoofer stale
+  probe is exact and singular, the supervisor checks self handle
+  `0x00010001`, and report publication is a complete odd/body/barrier/phase/
+  barrier/even snapshot.
+- Added `JE_SVC_DONE_EXIT` and require it in the supervisor death record.
+  Mode 12 now yields once after publishing READY so the kernel must observe
+  READY before the deliberate fault; the marker prints both last phase and
+  reason.
+
+Alternatives rejected: a `mark_dying` hook or DYING-only scan would violate
+the frozen D12 identity-scan policy; report counters cannot serve as proof
+because they are ring-3 writable diagnostics; changing `je_proc_rec` would
+ripple into frozen process tests; leaving children unreaped would make the
+rollback capacity check vacuous.
+
+Negative coverage deliberately remains explicit: this pass does not add
+separate forged-counter, torn-report, or impostor-child injection fixtures.
+The implementation makes counters non-authoritative and performs seqlock and
+image-ledger checks, but those adversarial injections are **not** claimed as
+end-to-end tested.
+
+### Exact verification observed
+
+- `ASAN_OPTIONS=detect_leaks=0 make check` — PASS. Hosted suites and
+  validators completed, including `test_sched_killall: PASS (66 checks)`,
+  `test_image: PASS (88 checks)`, and `test_mkimage: PASS (562 checks)`.
+- `make smoke` — PASS. The rebuilt NX image printed
+  `M4f-s1: supervisor scenario completed`,
+  `M4f: zero-leak identity baseline verified`, and `QEMU smoke: PASS`.
+- `make aarch64 && make smoke-aarch64 ARM_REQUIRE=1` — PASS.
+  `QEMU aarch64 smoke: PASS`; the existing RWX linker warning remained.
+- `make integration` — PASS. Modes 1–11 passed; mode 12 printed
+  `M4f: supervisor phase=0x0000000000000001`, then
+  `M4f: supervisor lost (last_phase=0x0000000000000001; reason=0x0000000000000000); no recovery path in this profile`,
+  `M4f: zero-leak identity baseline verified`, and no scenario-completed
+  marker.
+
+### Next bounded task
+
+Lead integration and review should inspect the complete dirty diff, rerun the
+same local gates after integration, and obtain independent human review before
+any hardened or release qualification claim. No PR, issue, or remote state was
+changed by this worker.
+
 ## PR-F Stage 2 worker notes — observation 2026-11-01T03:06:15Z
 
 Repository `auto44e/jeios`; branch `wip/m4f-impl`; inspected commit

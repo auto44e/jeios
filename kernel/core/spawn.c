@@ -17,6 +17,7 @@ extern je_status je_process_handle_mint(je_vm *vm, uint32_t index,
                                         je_handle_status *out_alloc_status);
 extern je_proc_pool *je_sched_proc_pool(void);
 extern _Noreturn void syscall_invariant(const char *message);
+extern void je_proc_record_image(je_proc_id id, uint32_t image_id);
 
 typedef struct {
     uint32_t step;
@@ -255,5 +256,6 @@ je_abi_status je_proc_spawn(je_vm *vm, uint32_t caller_idx, je_handle launcher,
         return spawn_finish(internal_status_to_abi(status));
     }
     *out = process_handle;
+    je_proc_record_image(id, image_id);
     return spawn_finish(JE_ABI_OK);
 }

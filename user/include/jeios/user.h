@@ -61,6 +61,9 @@ static inline uint64_t je_try_recv(uint64_t h, void *buf, uint64_t cap, uint64_t
 static inline uint64_t je_handle_rights(uint64_t h, uint64_t *rights)
 { return je_sys6(JE_SYS_HANDLE_RIGHTS, h, 0, 0, 0, 0, 0, rights); }
 
+static inline uint64_t je_handle_self(uint64_t *out)
+{ return je_sys6(JE_SYS_HANDLE_SELF, 0, 0, 0, 0, 0, 0, out); }
+
 /* PR-F ring-3 wrappers (the supervisor and its children). Thin: each forwards the
  * abi.h register contract and returns the je_abi_status; `out` (when non-NULL)
  * receives RDX. See include/jeios/abi.h for each op's exact semantics. */

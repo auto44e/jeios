@@ -37,7 +37,6 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t h0, uint64_t h1,
         || h1 != 0u || h2 != 0u || h3 != 0u)
         return (int64_t)spoof_exit(0u);
     if (je_handle_rights(JE_GUESSED_SUPERVISOR_HANDLE, &value)
-        == JE_ABI_H_BADINDEX || je_handle_rights(JE_GUESSED_SUPERVISOR_HANDLE, &value)
         == JE_ABI_H_STALE)
         mask |= JE_SVC_SPOOF_BIT_GUESS;
     if (je_handle_dup(h0, JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_TRANSFER, &derived)

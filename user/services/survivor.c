@@ -22,8 +22,7 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t h0, uint64_t h1,
     for (;;) {
         heartbeat.seq = ++sequence;
         uint64_t status = je_try_send(h0, &heartbeat, sizeof heartbeat);
-        if (status != JE_ABI_OK && status != JE_ABI_H_QUEUE_FULL
-            && status != JE_ABI_H_PEER_CLOSED)
+        if (status != JE_ABI_OK && status != JE_ABI_H_QUEUE_FULL)
             return 43;
         (void)je_yield();
     }

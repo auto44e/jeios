@@ -65,8 +65,12 @@ result = subprocess.run(["make", "iso", "TEST_MODE=12"], stdout=subprocess.PIPE,
 assert result.returncode == 0, result.stdout
 output = boot(Path("build/12/jeios.iso"),
               terminal=b"M4f: zero-leak identity baseline verified",
-              expected=[b"M4f: supervisor lost (reason=",
+              expected=[b"M4f: supervisor phase=0x0000000000000001",
+                        b"M4f: supervisor lost (last_phase=",
+                        b"reason=0x0000000000000000",
                         b"M4f: zero-leak identity baseline verified"])
 assert "JeiOS fatal:" not in output, f"mode 12 died during clean D12 teardown:\n{output}"
+assert "M4f-s1: supervisor scenario completed" not in output, \
+    "mode 12 unexpectedly completed the success scenario"
 print(f"supervisor-loss mode 12 (D12 refusal): PASS\n{output}")
 
