@@ -180,10 +180,18 @@ typedef enum {
      * statuses below. A driver-op (PIO/IRQ) check requires the caller's PROCESS
      * identity to equal the binding owner, the handle slot+generation to equal the
      * recorded driver slot, and a binding to be active, else H_STALE. */
-    , JE_SYS_DEV_ASSIGN = 17 /* dev_assign(admin_h=RDI, process_h=RSI): needs ASSIGN on
-                              * admin_h and KILL on process_h. RDI[63:32]/RSI[63:32] and
-                              * RDX..R9 must be 0. The target must be LIVE (else H_STALE),
-                              * not the supervisor and not the caller (else INVALID), and
+    , JE_SYS_DEV_ASSIGN = 17 /* dev_assign(admin_h=RDI, process_h=RSI, flags=RDX):
+                              * needs ASSIGN on admin_h and KILL on process_h.
+                              * RDI[63:32]/RSI[63:32] and R10/R8/R9 must be 0. RDX is
+                              * the isolation-requirement flags word: bit 0 =
+                              * JE_ABI_DEV_REQUIRE_DMA_CONTAINED, other bits reserved
+                              * (0). With the flag set the kernel makes NO binding/
+                              * mask/bitmap/ownership change and returns UNSUPPORTED
+                              * (RDX = JE_ABI_DEV_PROFILE_LEGACY_PIO) — the
+                              * hardened-request refusal (D9, PR-I). With RDX == 0 it
+                              * is the normal assign: the target must be LIVE (else
+                              * H_STALE), not the supervisor and not the caller (else
+                              * INVALID), and
                               * the device unbound (else H_DENIED). Transactional: reserve
                               * a slot in the child's table (H_QUOTA/H_NOSLOTS on fail),
                               * commit the binding (owner, recorded slot, gen+1), commit
@@ -230,6 +238,12 @@ typedef enum {
  * driver's bound handle carries PIO|IRQ. No INSPECT, not DUP-able. The object is a
  * kernel DEVICE record; handles stay in the table they were minted into. */
 #define JE_ABI_OBJ_DEVICE 5u
+
+/* ADR 0010 D9 (PR-I): DEV_ASSIGN isolation-requirement flags (RDX) and the profile
+ * id returned when a hardened request is refused. M4 has only the legacy no-DMA PIO
+ * profile, so any hardened requirement is refused UNSUPPORTED. */
+#define JE_ABI_DEV_REQUIRE_DMA_CONTAINED 0x1u
+#define JE_ABI_DEV_PROFILE_LEGACY_PIO    0x1u   /* "legacy no-DMA PIO" */
 /* M3c D6 (step 4): max message payload bytes a try_send accepts. ABI-visible
  * (ring 3 must know the cap); pinned equal to the table-side JE_EP_MSG_MAX in the
  * syscall glue. */
