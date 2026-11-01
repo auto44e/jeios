@@ -16,6 +16,7 @@
 #include <jeios/proc.h>
 #include <jeios/image.h>
 #include <jeios/spawn.h>
+#include <jeios/svc.h>
 
 extern void je_sched_set_proc_pool(je_proc_pool *pool);
 extern je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id);
@@ -38,6 +39,78 @@ static atomic_uint completed;
 static atomic_uint capacity_completed;
 static je_proc_pool process_pool;
 static je_proc_id vm_s3_proc_ids[JE_VM_MAX_PROCESSES];
+/*
+ * M4f identity evidence is kernel-owned and scoped to one seeded supervisor
+ * run. The active entries are cleared when the reaper destroys their VM slot;
+ * terminal facts are retained in fixed per-image counters so corroboration can
+ * still distinguish a reaped predecessor from its replacement.
+ */
+#define M4F_IMAGE_COUNT 7u
+typedef struct {
+    bool active;
+    bool terminal_seen;
+    je_proc_id id;
+    uint32_t image_id;
+    uint32_t terminal_reason;
+    uint64_t terminal_code;
+    uint32_t terminal_ep_charge;
+    bool terminal_endpoint_shape;
+} m4f_child_identity;
+static bool m4f_ledger_enabled;
+static bool m4f_unexpected_image;
+static m4f_child_identity m4f_children[JE_PROC_REC_MAX];
+static bool m4f_run_proc_slots[JE_PROC_REC_MAX];
+static uint32_t m4f_spawn_count[M4F_IMAGE_COUNT];
+static uint32_t m4f_terminal_count[M4F_IMAGE_COUNT];
+static uint32_t m4f_death_count[M4F_IMAGE_COUNT][JE_PROC_REASON_MAX + 1u];
+static uint32_t m4f_spoofer_shape_count;
+static uint64_t m4f_spoofer_code;
+static uint32_t m4f_spoofer_ep_charge;
+static uint32_t m4f_progress_serial;
+static uint32_t vm_s3_live_count(void);
+
+static bool m4f_id_equal(je_proc_id left, je_proc_id right)
+{
+    return left.index == right.index && left.gen == right.gen;
+}
+
+static void m4f_ledger_reset(void)
+{
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        m4f_children[i] = (m4f_child_identity){0};
+        m4f_run_proc_slots[i] = false;
+    }
+    for (uint32_t image = 0u; image < M4F_IMAGE_COUNT; ++image) {
+        m4f_spawn_count[image] = 0u;
+        m4f_terminal_count[image] = 0u;
+        for (uint32_t reason = 0u; reason <= JE_PROC_REASON_MAX; ++reason)
+            m4f_death_count[image][reason] = 0u;
+    }
+    m4f_spoofer_shape_count = 0u;
+    m4f_spoofer_code = 0u;
+    m4f_spoofer_ep_charge = UINT32_MAX;
+    m4f_unexpected_image = false;
+    m4f_progress_serial = 0u;
+    m4f_ledger_enabled = true;
+}
+
+/* Called only after a spawn is committed, so a failed journal never enters the
+ * run ledger. It is intentionally inert before the M4f seed point. */
+void je_proc_record_image(je_proc_id id, uint32_t image_id)
+{
+    if (!m4f_ledger_enabled) return;
+    if (id.gen == 0u || id.index >= JE_PROC_REC_MAX
+        || m4f_children[id.index].active)
+        fail("JeiOS fatal: M4f child ledger identity\r\n");
+    m4f_children[id.index] = (m4f_child_identity){true, false, id, image_id,
+                                                   0u, 0u, 0u, false};
+    m4f_run_proc_slots[id.index] = true;
+    if (image_id >= M4F_IMAGE_COUNT || image_id < JE_IMAGE_SUPERVISOR)
+        m4f_unexpected_image = true;
+    else
+        ++m4f_spawn_count[image_id];
+    ++m4f_progress_serial;
+}
 _Static_assert((1u + JE_M2_WORKERS) * 2u == 16u,
                "M2 preemption floor remains the T=8 floor");
 static void worker(void *argument)
@@ -236,6 +309,69 @@ static uint32_t vm_s3_build_quota(user_prog prog, uint32_t ep_limit)
     return vm_s3_build_quota_kind(prog, ep_limit, false);
 }
 
+/* PR-F kernel-seeded image path. PROC_SPAWN cannot create the first supervisor
+ * because no user LAUNCHER exists yet, so this is the same journal order with
+ * the supervisor flag set on the PROCESS identity. */
+static uint32_t vm_s3_build_builtin(uint32_t image_id, uint32_t ep_limit,
+                                    bool supervisor, je_proc_id *out_id)
+{
+    const je_builtin_image *image = je_builtin_image_get(image_id);
+    if (!image || !out_id) fail("JeiOS fatal: M4f image lookup\r\n");
+    vm_s3_init_once();
+    je_proc_id id = JE_PROC_ID_NONE;
+    uint64_t flags = je_arch_irq_save();
+    if (je_proc_alloc(&process_pool, ep_limit, supervisor, &id) != JE_OK) {
+        je_arch_irq_restore(flags);
+        fail("JeiOS fatal: M4f process allocation\r\n");
+    }
+    uint32_t index = JE_VM_MAX_PROCESSES;
+    je_status status = je_vm_build_quota(
+        &vm_s3, &image->desc, image->blob, image->blob_len,
+        je_arch_has_nx(), JE_VM_HANDLE_QUOTA_MAX, &index);
+    if (status != JE_OK) {
+        (void)je_proc_abandon(&process_pool, id);
+        je_arch_irq_restore(flags);
+        fail("JeiOS fatal: M4f supervisor VM build\r\n");
+    }
+    if (je_sched_register_process(&vm_s3, index, id) != JE_OK) {
+        (void)je_vm_destroy(&vm_s3, index);
+        (void)je_proc_abandon(&process_pool, id);
+        je_arch_irq_restore(flags);
+        fail("JeiOS fatal: M4f supervisor registration\r\n");
+    }
+    vm_s3_proc_ids[index] = id;
+    je_proc_record_image(id, image_id);
+    *out_id = id;
+    je_arch_irq_restore(flags);
+    return index;
+}
+
+static uint32_t m4f_seed_supervisor(je_proc_id *out_id)
+{
+    m4f_ledger_reset();
+    uint32_t index = vm_s3_build_builtin(
+        JE_IMAGE_SUPERVISOR, JE_SVC_EP_LIMIT, true, out_id);
+    je_handle launcher = 0u;
+    uint64_t flags = je_arch_irq_save();
+    je_handle_status alloc = je_handle_alloc(
+        &vm_s3.procs[index].htable, (void *)0, JE_ABI_OBJ_LAUNCHER,
+        JE_ABI_RIGHT_SPAWN, &launcher);
+    if (alloc != JE_HANDLE_OK) {
+        je_arch_irq_restore(flags);
+        fail("JeiOS fatal: M4f launcher allocation\r\n");
+    }
+    je_user_startup startup = {
+        JE_ABI_STARTUP_V1, 1u, launcher, 0u, 0u, 0u
+    };
+    if (je_thread_create_user_start(&vm_s3, index, &startup, (uint32_t *)0)
+        != JE_OK) {
+        je_arch_irq_restore(flags);
+        fail("JeiOS fatal: M4f supervisor thread\r\n");
+    }
+    je_arch_irq_restore(flags);
+    return index;
+}
+
 static je_status vm_s3_destroy(uint32_t idx)
 {
     if (idx >= JE_VM_MAX_PROCESSES) return JE_ERR_INVALID;
@@ -293,6 +429,105 @@ static uint64_t vm_s3_scratch(uint32_t idx, uint64_t off)
     je_arch_irq_restore(flags);
     return v;
 }
+
+static bool svc_phase_known(uint32_t phase)
+{
+    return phase <= JE_SVC_PHASE_FAILED;
+}
+
+static bool svc_fail_code_known(uint32_t fail_code)
+{
+    return fail_code <= JE_SVC_FAIL_CRASHLOOP;
+}
+
+/*
+ * The slot-0 monitor consumes this reader. The report is untrusted user memory,
+ * so the PTE probe completes before CR3 changes and no field is used as an
+ * address or bound. The rollback word has a separate fixed-address writer
+ * below; it uses the same PTE/RW/NX precondition.
+ */
+static bool svc_report_read(uint32_t vm_index, je_svc_report *out)
+{
+    _Static_assert(sizeof(je_svc_report) == JE_SVC_REPORT_LEN,
+                   "service report size");
+    _Static_assert((JE_SVC_REPORT_VADDR & (UINT64_C(8) - 1u)) == 0u,
+                   "service report alignment");
+    _Static_assert((JE_SVC_REPORT_VADDR & (JE_PAGE_SIZE - 1u))
+                   + sizeof(je_svc_report) <= JE_PAGE_SIZE,
+                   "service report must not straddle a page");
+
+    if (!out || vm_index >= JE_VM_MAX_PROCESSES || !vm_s3.ops
+        || JE_SVC_REPORT_VADDR < JE_VM_ARENA_BASE
+        || JE_SVC_REPORT_VADDR - JE_VM_ARENA_BASE >= JE_VM_ARENA_SIZE)
+        return false;
+
+    uint64_t off = JE_SVC_REPORT_VADDR - JE_VM_ARENA_BASE;
+    uint64_t page_off = off & (JE_PAGE_SIZE - 1u);
+    if (page_off > JE_PAGE_SIZE - sizeof(je_svc_report))
+        return false;
+
+    /* The PTE probe AND the raw read must happen in the same IF=0 section so no
+     * future unmap/mprotect syscall (none exists today) can invalidate the
+     * mapping between the check and the dereference, and so a non-slot-0 caller
+     * cannot race the supervisor. We assert IF=0 rather than relying on the
+     * absence of those syscalls. (Claude Stage-1 review #2.) */
+    uint64_t flags = je_arch_irq_save();
+    if ((flags & (UINT64_C(1) << 9)) != 0u)
+        fail("JeiOS fatal: svc_report_read IF set\r\n"); /* IF must be 0 */
+
+    uint64_t physical = 0u;
+    je_vm_perm perm = (je_vm_perm)0;
+    int present = 0;
+    if (vm_s3.ops->read_user_pte(vm_s3.ops->context, vm_index,
+                                 off & ~(uint64_t)(JE_PAGE_SIZE - 1u),
+                                 &physical, &perm, &present) != JE_OK
+        || !present || perm != JE_VM_PERM_RW_NX) {
+        je_arch_irq_restore(flags);
+        return false;
+    }
+    (void)physical;
+
+    uint64_t kroot = je_arch_kernel_root_phys();
+    je_arch_cr3_load(vm_s3.procs[vm_index].root);
+
+    volatile const uint32_t *src =
+        (volatile const uint32_t *)(uintptr_t)(JE_VM_ARENA_BASE + off);
+    je_svc_report snapshot = {0};
+    uint32_t seq_first = src[2];
+    snapshot.magic = src[0];
+    snapshot.version = src[1];
+    snapshot.seq = seq_first;
+    snapshot.phase = src[3];
+    snapshot.fail_code = src[4];
+    snapshot.restarts = src[5];
+    snapshot.heartbeats = src[6];
+    snapshot.spoofer_bits = src[7];
+    snapshot.crash_attempts = src[8];
+    snapshot.reserved = src[9];
+    uint32_t seq_second = src[2];
+
+    je_arch_cr3_load(kroot);
+    je_arch_irq_restore(flags);
+
+    if (seq_first != seq_second || (seq_first & 1u) != 0u)
+        return false;
+    if (snapshot.magic != JE_SVC_REPORT_MAGIC
+        || snapshot.version != JE_SVC_REPORT_V0
+        || !svc_phase_known(snapshot.phase)
+        || !svc_fail_code_known(snapshot.fail_code)
+        || snapshot.reserved != 0u)
+        return false;
+    /* Phase and fail_code must agree: FAILED requires a nonzero fail_code, and
+     * any non-FAILED phase (including DONE, which the success path keys on)
+     * requires fail_code == NONE. Reject a self-contradictory report here rather
+     * than leaving the Stage-2 caller to interpret it. (Claude Stage-1 review #3.) */
+    if ((snapshot.phase == JE_SVC_PHASE_FAILED)
+            != (snapshot.fail_code != JE_SVC_FAIL_NONE))
+        return false;
+    *out = snapshot;
+    return true;
+}
+
 /* Write a 64-bit word into proc idx's arena at offset off (CPL0, its CR3).
  * (Currently unused — kept for a future ring-3 fixture that hands a seeded
  * handle to a stub.) First used by the M3c-s7 bootstrap fixture to inject each
@@ -306,6 +541,404 @@ static void vm_s3_scratch_write(uint32_t idx, uint64_t off, uint64_t val)
     *p=val;
     je_arch_cr3_load(kroot);
     je_arch_irq_restore(flags);
+}
+
+static bool svc_report_word_write(uint32_t vm_index, uint64_t address,
+                                  uint32_t value)
+{
+    if (vm_index >= JE_VM_MAX_PROCESSES || !vm_s3.ops
+        || address < JE_VM_ARENA_BASE
+        || address - JE_VM_ARENA_BASE >= JE_VM_ARENA_SIZE
+        || (address & 3u) != 0u)
+        return false;
+    uint64_t off = address - JE_VM_ARENA_BASE;
+    uint64_t flags = je_arch_irq_save();
+    uint64_t physical = 0u;
+    je_vm_perm perm = (je_vm_perm)0;
+    int present = 0;
+    if (vm_s3.ops->read_user_pte(vm_s3.ops->context, vm_index,
+                                 off & ~(uint64_t)(JE_PAGE_SIZE - 1u),
+                                 &physical, &perm, &present) != JE_OK
+        || !present || perm != JE_VM_PERM_RW_NX) {
+        je_arch_irq_restore(flags);
+        return false;
+    }
+    (void)physical;
+    uint64_t kroot = je_arch_kernel_root_phys();
+    je_arch_cr3_load(vm_s3.procs[vm_index].root);
+    *(volatile uint32_t *)(uintptr_t)address = value;
+    je_arch_cr3_load(kroot);
+    je_arch_irq_restore(flags);
+    return true;
+}
+
+typedef struct {
+    uint32_t state;
+    uint32_t gen;
+    bool retired;
+    uint32_t reason;
+    uint64_t code;
+    bool run_linked;
+    uint32_t thread_slot;
+    uint32_t vm_index;
+    bool supervisor;
+    uint32_t handle_refs;
+    uint32_t ep_charge;
+    uint32_t ep_limit;
+} m4f_proc_identity;
+
+typedef struct {
+    uint32_t state;
+    uint64_t root;
+} m4f_vm_identity;
+
+typedef struct {
+    size_t free_pages;
+    uint16_t page_state[JE_PAGE_COUNT];
+    uint32_t endpoints;
+    uint32_t process_used_count;
+    unsigned user_threads;
+    m4f_proc_identity processes[JE_PROC_REC_MAX];
+    m4f_vm_identity vms[JE_VM_MAX_PROCESSES];
+} m4f_baseline;
+
+static void m4f_take_baseline(m4f_baseline *out)
+{
+    if (!out) fail("JeiOS fatal: M4f baseline output\r\n");
+    out->free_pages = je_kernel_pages.free_count;
+    for (uint32_t i = 0u; i < JE_PAGE_COUNT; ++i)
+        out->page_state[i] = je_kernel_pages.state[i];
+    out->endpoints = je_endpoint_kernel_allocated();
+    out->process_used_count = process_pool.used_count;
+    out->user_threads = je_sched_user_thread_count();
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        const je_proc_rec *rec = &process_pool.rec[i];
+        out->processes[i] = (m4f_proc_identity){
+            rec->state, rec->gen, rec->retired, rec->reason, rec->code,
+            rec->run_linked, rec->thread_slot, rec->vm_index, rec->supervisor,
+            rec->handle_refs, rec->ep_charge, rec->ep_limit
+        };
+    }
+    for (uint32_t i = 0u; i < JE_VM_MAX_PROCESSES; ++i)
+        out->vms[i] = (m4f_vm_identity){ vm_s3.procs[i].state,
+                                         vm_s3.procs[i].root };
+}
+
+static bool m4f_baseline_matches(const m4f_baseline *baseline)
+{
+    if (!baseline || je_kernel_pages.free_count != baseline->free_pages
+        || je_endpoint_kernel_allocated() != baseline->endpoints
+        || process_pool.used_count != baseline->process_used_count
+        || !je_endpoint_kern_quiescent()
+        || je_sched_user_thread_count() != baseline->user_threads)
+        return false;
+    for (uint32_t i = 0u; i < JE_PAGE_COUNT; ++i)
+        if (je_kernel_pages.state[i] != baseline->page_state[i])
+            return false;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        const je_proc_rec *rec = &process_pool.rec[i];
+        const m4f_proc_identity *old = &baseline->processes[i];
+        if (old->state != JE_PROC_FREE) {
+            if (rec->state != old->state || rec->gen != old->gen
+                || rec->retired != old->retired
+                || rec->reason != old->reason || rec->code != old->code
+                || rec->run_linked != old->run_linked
+                || rec->thread_slot != old->thread_slot
+                || rec->vm_index != old->vm_index
+                || rec->supervisor != old->supervisor
+                || rec->handle_refs != old->handle_refs
+                || rec->ep_charge != old->ep_charge
+                || rec->ep_limit != old->ep_limit)
+                return false;
+        } else if (rec->state != JE_PROC_FREE || rec->gen < old->gen
+                   || rec->retired != old->retired
+                   || (rec->gen != old->gen && !m4f_run_proc_slots[i])
+                   || rec->handle_refs != 0u || rec->ep_charge != 0u
+                   || rec->run_linked || rec->supervisor)
+            return false;
+    }
+    for (uint32_t i = 0u; i < JE_VM_MAX_PROCESSES; ++i) {
+        const m4f_vm_identity *old = &baseline->vms[i];
+        if (old->state != JE_VM_FREE
+            && (vm_s3.procs[i].state != old->state
+                || vm_s3.procs[i].root != old->root))
+            return false;
+        if (old->state == JE_VM_FREE && vm_s3.procs[i].state != JE_VM_FREE)
+            return false;
+    }
+    return true;
+}
+
+static bool m4f_spoofer_endpoint_shape(const je_proc_rec *rec)
+{
+    if (!rec || !rec->run_linked || rec->vm_index >= JE_VM_MAX_PROCESSES)
+        return false;
+    const je_handle_table *table = &vm_s3.procs[rec->vm_index].htable;
+    uint32_t live = 0u;
+    uint32_t endpoint = 0u;
+    for (uint32_t h = 0u; h < table->capacity; ++h) {
+        je_handle handle = 0u;
+        uint32_t type = 0u;
+        if (!je_handle_live_at(table, h, &handle, &type)) continue;
+        ++live;
+        uint32_t rights = 0u;
+        void *object = (void *)0;
+        if (type != JE_ABI_OBJ_ENDPOINT
+            || je_handle_resolve_any(table, handle, &type, &rights,
+                                     &object) != JE_HANDLE_OK
+            || rights != JE_ABI_RIGHT_SEND || object == (void *)0)
+            return false;
+        ++endpoint;
+    }
+    return live == 1u && endpoint == 1u;
+}
+
+/* Snapshot terminal facts before the monitor reaper destroys the VM slot. */
+static void m4f_capture_terminal_children(void)
+{
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        m4f_child_identity *child = &m4f_children[i];
+        if (!child->active || child->terminal_seen) continue;
+        const je_proc_rec *rec = &process_pool.rec[i];
+        if (!m4f_id_equal(child->id, (je_proc_id){i, rec->gen}))
+            fail("JeiOS fatal: M4f child ledger generation\r\n");
+        if (rec->state != JE_PROC_DYING || rec->supervisor) continue;
+        child->terminal_seen = true;
+        child->terminal_reason = rec->reason;
+        child->terminal_code = rec->code;
+        child->terminal_ep_charge = rec->ep_charge;
+        if (child->image_id >= M4F_IMAGE_COUNT
+            || child->terminal_reason > JE_PROC_REASON_MAX) {
+            m4f_unexpected_image = true;
+        } else {
+            ++m4f_terminal_count[child->image_id];
+            ++m4f_death_count[child->image_id][child->terminal_reason];
+        }
+        if (child->image_id == JE_IMAGE_SPOOFER) {
+            child->terminal_endpoint_shape = m4f_spoofer_endpoint_shape(rec);
+            if (child->terminal_endpoint_shape) ++m4f_spoofer_shape_count;
+            m4f_spoofer_code = child->terminal_code;
+            m4f_spoofer_ep_charge = child->terminal_ep_charge;
+        }
+        ++m4f_progress_serial;
+    }
+}
+
+static void m4f_clear_reaped_children(void)
+{
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        m4f_child_identity *child = &m4f_children[i];
+        if (!child->active || child->image_id == JE_IMAGE_SUPERVISOR)
+            continue;
+        const je_proc_rec *rec = &process_pool.rec[i];
+        if (!m4f_id_equal(child->id, (je_proc_id){i, rec->gen}))
+            continue;
+        if (rec->state != JE_PROC_LIVE && rec->state != JE_PROC_DYING) {
+            child->active = false;
+            ++m4f_progress_serial;
+        }
+    }
+}
+
+static void m4f_clear_free_vm_ids(void)
+{
+    for (uint32_t i = 0u; i < JE_VM_MAX_PROCESSES; ++i)
+        if (vm_s3.procs[i].state == JE_VM_FREE)
+            vm_s3_proc_ids[i] = JE_PROC_ID_NONE;
+}
+
+static bool m4f_corroborate(je_proc_id supervisor,
+                            const je_svc_report *report)
+{
+    (void)report; /* report counters are diagnostics, never proof */
+    if (m4f_unexpected_image
+        || m4f_spawn_count[JE_IMAGE_SPAWN_CHILD] != 0u
+        || m4f_spawn_count[JE_IMAGE_C_HELLO] != 0u
+        || m4f_spawn_count[JE_IMAGE_SUPERVISOR] != 1u
+        || m4f_spawn_count[JE_IMAGE_RESTART_SVC]
+            != JE_SVC_RESTART_LIMIT + 1u
+        || m4f_spawn_count[JE_IMAGE_SURVIVOR] != 1u
+        || m4f_spawn_count[JE_IMAGE_SPOOFER] != 1u
+        || m4f_spawn_count[JE_IMAGE_CRASHLOOP]
+            != JE_SVC_CRASHLOOP_RESTART_LIMIT + 1u
+        || m4f_terminal_count[JE_IMAGE_RESTART_SVC] != 1u
+        || m4f_terminal_count[JE_IMAGE_SPOOFER] != 1u
+        || m4f_terminal_count[JE_IMAGE_CRASHLOOP]
+            != JE_SVC_CRASHLOOP_RESTART_LIMIT + 1u
+        || m4f_death_count[JE_IMAGE_RESTART_SVC][JE_DEATH_FAULT]
+            != JE_SVC_RESTART_LIMIT
+        || m4f_death_count[JE_IMAGE_SPOOFER][JE_DEATH_EXIT] != 1u
+        || m4f_death_count[JE_IMAGE_CRASHLOOP][JE_DEATH_FAULT]
+            != JE_SVC_CRASHLOOP_RESTART_LIMIT + 1u
+        || m4f_spoofer_shape_count != 1u
+        || m4f_spoofer_ep_charge != 0u
+        || m4f_spoofer_code
+            != (((uint64_t)JE_SVC_SPOOF_MAGIC << 32)
+                | ((uint64_t)((~JE_SVC_SPOOF_EXPECTED_MASK)
+                              & UINT32_C(0xffff)) << 16)
+                | JE_SVC_SPOOF_EXPECTED_MASK)
+        || je_spawn_failpoint_fired() != 1u)
+        return false;
+
+    uint32_t live_restart = 0u;
+    uint32_t live_survivor = 0u;
+    bool survivor_dispatched = false;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        const m4f_child_identity *child = &m4f_children[i];
+        if (!child->active || child->image_id == JE_IMAGE_SUPERVISOR)
+            continue;
+        const je_proc_rec *rec = &process_pool.rec[i];
+        if (!m4f_id_equal(child->id, (je_proc_id){i, rec->gen}))
+            return false;
+        if (rec->state == JE_PROC_LIVE) {
+            if (!rec->run_linked || rec->vm_index >= JE_VM_MAX_PROCESSES)
+                return false;
+            if (child->image_id == JE_IMAGE_RESTART_SVC) ++live_restart;
+            else if (child->image_id == JE_IMAGE_SURVIVOR) {
+                ++live_survivor;
+                survivor_dispatched =
+                    je_sched_dispatches_of(&vm_s3, rec->vm_index) > 0u;
+            } else {
+                return false;
+            }
+        } else if (rec->state == JE_PROC_DYING) {
+            return false;
+        }
+    }
+    const je_proc_rec *sup = &process_pool.rec[supervisor.index];
+    if (!m4f_id_equal(supervisor, (je_proc_id){supervisor.index, sup->gen})
+        || sup->state != JE_PROC_DYING || sup->reason != JE_DEATH_EXIT
+        || sup->code != JE_SVC_DONE_EXIT)
+        return false;
+    return live_restart == 1u && live_survivor == 1u && survivor_dispatched;
+}
+
+static _Noreturn void m4f_teardown(const m4f_baseline *baseline,
+                                   je_proc_id supervisor, bool success,
+                                   uint32_t reason, uint32_t last_phase)
+{
+    if (success)
+        je_arch_console_write("M4f-s1: supervisor scenario completed\r\n");
+    else {
+        je_arch_console_write("M4f: supervisor lost (last_phase=");
+        je_arch_console_hex(last_phase);
+        je_arch_console_write("; reason=");
+        je_arch_console_hex(reason);
+        je_arch_console_write("); no recovery path in this profile\r\n");
+    }
+    uint32_t killed = 0u;
+    if (je_sched_kill_all_user(JE_PROC_ID_NONE, &killed) != JE_OK)
+        fail("JeiOS fatal: M4f kill-all teardown\r\n");
+    (void)supervisor;
+    int first_reap = je_sched_reap_dead();
+    if (first_reap < 0 || je_sched_reap_dead() != 0
+        || je_sched_has_dying())
+        fail("JeiOS fatal: M4f identity baseline teardown\r\n");
+    m4f_clear_free_vm_ids();
+    if (!m4f_baseline_matches(baseline))
+        fail("JeiOS fatal: M4f identity baseline teardown\r\n");
+    je_arch_console_write("M4f: zero-leak identity baseline verified\r\n");
+    je_arch_halt();
+}
+
+static _Noreturn void m4f_monitor_deadline(uint32_t phase)
+{
+    je_arch_console_write("JeiOS fatal: M4f monitor deadline phase=");
+    je_arch_console_hex(phase);
+    fail("\r\n");
+}
+
+static void m4f_reap_monitor_children(void)
+{
+    m4f_capture_terminal_children();
+    if (je_sched_reap_dead() < 0)
+        fail("JeiOS fatal: M4f monitor reap\r\n");
+    m4f_clear_reaped_children();
+    m4f_clear_free_vm_ids();
+}
+
+static _Noreturn void m4f_monitor(const m4f_baseline *baseline,
+                                  je_proc_id supervisor, uint32_t supervisor_vm)
+{
+    uint32_t last_phase = UINT32_MAX;
+    uint32_t observed_progress = m4f_progress_serial;
+    uint64_t deadline_start = je_sched_ticks();
+    bool rollback_armed = false;
+    for (;;) {
+        uint64_t flags = je_arch_irq_save();
+        uint32_t state = JE_PROC_FREE;
+        uint32_t reason = JE_DEATH_FAULT;
+        uint64_t code = 0u;
+        je_status status = je_proc_status(
+            &process_pool, supervisor, &state, &reason, &code);
+        je_svc_report report = {0};
+        bool readable = status == JE_OK
+            && svc_report_read(supervisor_vm, &report);
+        if (status == JE_OK && state == JE_PROC_LIVE) {
+            bool phase_progress = readable && report.phase != last_phase;
+            if (readable && report.phase != last_phase) {
+                last_phase = report.phase;
+                je_arch_console_write("M4f: supervisor phase=");
+                je_arch_console_hex(report.phase);
+                je_arch_console_write("\r\n");
+            }
+            if (readable && report.phase == JE_SVC_PHASE_ARM
+                && !rollback_armed) {
+                if (vm_s3_live_count() >= JE_VM_MAX_PROCESSES)
+                    fail("JeiOS fatal: M4f rollback no VM headroom\r\n");
+                je_spawn_failpoint_set(4u, 0u);
+                if (!svc_report_word_write(supervisor_vm,
+                                           JE_SVC_ROLLBACK_GO_VADDR,
+                                           JE_SVC_ROLLBACK_GO))
+                    fail("JeiOS fatal: M4f rollback arm write\r\n");
+                rollback_armed = true;
+            }
+            uint32_t verify_state = JE_PROC_FREE;
+            uint32_t verify_reason = JE_DEATH_FAULT;
+            uint64_t verify_code = 0u;
+            if (je_proc_status(&process_pool, supervisor, &verify_state,
+                               &verify_reason, &verify_code) != JE_OK
+                || verify_state != JE_PROC_LIVE) {
+                /*
+                 * The supervisor may die after the first scan but before the
+                 * child reaper. Do not let that reaper destroy the supervisor
+                 * record before D12 has made its decision.
+                 */
+                m4f_capture_terminal_children();
+                je_svc_report terminal_report = report;
+                bool terminal_readable =
+                    svc_report_read(supervisor_vm, &terminal_report);
+                if (terminal_readable
+                    && terminal_report.phase != last_phase) {
+                    last_phase = terminal_report.phase;
+                    je_arch_console_write("M4f: supervisor phase=");
+                    je_arch_console_hex(last_phase);
+                    je_arch_console_write("\r\n");
+                }
+                bool terminal_success =
+                    terminal_readable
+                    && terminal_report.phase == JE_SVC_PHASE_DONE
+                    && m4f_corroborate(supervisor, &terminal_report);
+                m4f_teardown(baseline, supervisor, terminal_success,
+                             verify_reason, last_phase);
+            }
+            m4f_reap_monitor_children();
+            if (phase_progress || m4f_progress_serial != observed_progress) {
+                observed_progress = m4f_progress_serial;
+                deadline_start = je_sched_ticks();
+            } else if (je_sched_ticks() - deadline_start
+                       >= JE_SVC_MONITOR_DEADLINE) {
+                m4f_monitor_deadline(last_phase);
+            }
+            je_arch_irq_restore(flags);
+            __asm__ volatile("sti; hlt" ::: "memory");
+            continue;
+        }
+        m4f_capture_terminal_children();
+        bool success = readable && report.phase == JE_SVC_PHASE_DONE
+            && m4f_corroborate(supervisor, &report);
+        m4f_teardown(baseline, supervisor, success, reason, last_phase);
+    }
 }
 
 /* M4d coordinator wait: permit one interrupt, but do not reap. The coordinator
@@ -2422,6 +3055,27 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
         /* M3c leaves no VM process intentionally live: B was torn down before
          * the cross-table, timeout, and bootstrap proofs. */
         vm_s3_assert_all_free("JeiOS fatal: M3c vm process leak\r\n");
+        /* --- M4f: seed the real supervisor only after every earlier fixture
+         * has returned the pools to its identity baseline. From this point
+         * forward slot 0 is owned exclusively by m4f_monitor; it does not call
+         * je_kernel_idle_step, because that would reap before the identity scan. */
+        {
+            static m4f_baseline baseline;
+            uint64_t baseline_flags = je_arch_irq_save();
+            m4f_take_baseline(&baseline);
+            je_arch_irq_restore(baseline_flags);
+            if (baseline.endpoints != 0u || baseline.user_threads != 0u
+                || process_pool.used_count != 0u || vm_s3_live_count() != 0u)
+                fail("JeiOS fatal: M4f nonempty pre-seed baseline\r\n");
+            je_proc_id supervisor_id = JE_PROC_ID_NONE;
+            uint32_t supervisor_vm = m4f_seed_supervisor(&supervisor_id);
+#if JE_TEST_MODE == 12
+            if (!svc_report_word_write(supervisor_vm, JE_SVC_ROLLBACK_GO_VADDR,
+                                       JE_SVC_LOSS_GO))
+                fail("JeiOS fatal: M4f loss configuration write\r\n");
+#endif
+            m4f_monitor(&baseline, supervisor_id, supervisor_vm);
+        }
     }
 
     je_arch_console_write("JeiOS: initialization complete; halted\r\n");

@@ -81,6 +81,9 @@ je_ep_status je_endpoint_kern_seed(je_vm *vm, uint32_t idxA, uint32_t idxB,
 
 /* Pool occupancy (live channel records). Kernel-internal / self-test only. */
 uint32_t je_endpoint_kernel_allocated(void);
+/* D12 teardown predicate: every channel record, end ref, queue and waiter is
+ * quiescent. This is stronger than pool occupancy and is kernel-internal. */
+bool je_endpoint_kern_quiescent(void);
 
 /* ---- M3c D7/A6 blocking-recv bridge ---- */
 /* Release owner (A6-CLARIFY-2), called by sched.c mark_dying with the dying slot. */

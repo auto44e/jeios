@@ -47,6 +47,24 @@ je_status je_thread_create_user_start(je_vm *vm, uint32_t index,
  *      sees CANCELLED.
  * The victim is reaped later by the idle step. mark_dying itself is unchanged. */
 je_status je_sched_kill(je_proc_id victim);
+/*
+ * ADR 0010 D12 (PR-F): mark every LIVE, run-linked USER thread DYING(KILLED) for
+ * the supervisor-loss teardown. Slot-0 only: asserts the current thread is slot 0
+ * (THREAD_KERNEL). It is NOT built on je_sched_kill (which requires a CURRENT user
+ * proc and would return INVALID from slot 0). Semantics, frozen:
+ *   - loop i = 1..JE_THREAD_MAX; skip slot 0 and any THREAD_KERNEL slot;
+ *   - skip the supervisor, identified by `spare` (its je_proc_id), not by state;
+ *   - a LIVE, linked, valid-identity user thread -> mark_dying(KILLED), counted;
+ *   - an already-DYING user thread is skipped but must have a valid matching
+ *     identity (it will be reaped in the same pass);
+ *   - any user thread that is RUNNING, SLEEPING or ZOMBIE, or has an unregistered
+ *     identity (gen == 0), is a fail-stop invariant violation (return != OK).
+ * *killed (optional) receives the LIVE->DYING transition count. The caller reaps
+ * once afterward and must then observe no DYING user thread remaining. WOKEN
+ * waiters are scheduler-READY with a reserved head; mark_dying releases the
+ * reservation idempotently, so they need no special case here.
+ */
+je_status je_sched_kill_all_user(je_proc_id spare, uint32_t *killed);
 /* M3a #4 step 3: remove a user thread (by owning vm process) from scheduling
  * before je_vm_destroy frees its kernel stack. Interrupts disabled; not the
  * running thread. */

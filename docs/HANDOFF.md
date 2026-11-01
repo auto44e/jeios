@@ -1,5 +1,169 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-F (#53) — the supervisor + D12 supervisor-loss — observed 2026-11-01T05:41:51Z
+
+Branch `feat/m4f-supervisor`, based on main `1343225` (#66 merged; main CI green);
+integrated head `1008d40`. Opened as the PR-F pull request.
+
+- **Implemented:** ADR 0010 D7/D11/D12. A ring-3 supervisor (image 2) launches and
+  monitors four child services (restart-svc 3, survivor 4, spoofer 5, crash-loop
+  6); a kernel slot-0 monitor watches the supervisor by identity and, on loss or
+  clean completion, runs the shared kill-all / reap / identity-baseline / halt. See
+  IMPLEMENTATION "M4 PR-F". Built across three worker passes (Stage 1 kernel
+  mechanism, Stage 2 supervisor+monitor, Stage 2 fix) with cross-lineage review at
+  each; the frozen-path frame-zero security bug found mid-build landed separately
+  as #66 and PR-F is rebased on it.
+- **Tested (local):** `make check` (incl. test_sched_killall 66, vm stale-upper
+  rejection, test_image 88, test_mkimage 562), `make smoke` (default boot runs the
+  success scenario to `M4f-s1` + zero-leak identity baseline), `make integration`
+  (12 modes incl. mode 12 = D12 supervisor-loss refusal), NX ×4, ARM64 base — all
+  PASS. Two design reviews and three code reviews (both lineages); the Stage-2
+  review found and fixed real blockers (success attestation that trusted report
+  counters; a vacuous rollback test; an unbounded monitor). See
+  `docs/adr/debates/m4f-reviews.md`.
+- **Key invariants:** D12 loss is detected by identity (`je_proc_status != LIVE`),
+  never a `mark_dying` hook; the monitor is the sole reaper after seeding and never
+  calls `idle_step`; success is decided ENTIRELY from kernel state (exact per-image
+  population from a kernel child ledger, spoofer death record + SEND-only shape,
+  `je_spawn_failpoint_fired()==1`, supervisor `reason==EXIT && code==JE_SVC_DONE_EXIT`)
+  with the report as diagnostics only; the identity baseline is an ownership
+  predicate (page_state + process/VM identities), not a count compare.
+- **Planned:** PR-G (broker), PR-H (TSS I/O bitmap / DEVICE / IRQ3), PR-I (UART
+  driver demo), then MP2. **Blocked:** nothing.
+
+**Open hazards / not claimed:**
+1. Forged-counter, torn-report, and impostor-child adversarial injection fixtures
+   are NOT separate end-to-end tests; the kernel-state per-image corroboration
+   defends against them structurally, but they are not independently exercised.
+2. A slot-0 `pause` poll stalled READY user threads in the PR-D round-2 fixture;
+   root cause still undetermined (`sti; hlt` / tick-sleep waits work, and PR-F uses
+   only those).
+
+## Superseded worker handoffs (PR-F stages) — kept as history
+
+The Stage 1 / Stage 2 / Stage 2-fix worker handoff blocks below were written
+against the intermediate `wip/m4f-*` branches before integration; the block above
+is the current, integrated status. The worker notes are preserved in
+`docs/adr/debates/m4f-workers*` and `m4f-reviews.md`.
+
+## M4 PR-F Stage 2 FIX — observed 2026-11-01T05:32:14+00:00
+
+Repository `auto44e/jeios`; branch `wip/m4f-fix`; inspected commit
+`6520f1515d06a83ba6fcf400e029a8a21e616b0a`; changes remain uncommitted for
+lead integration.
+
+- **Implemented:** monitor-time reaping in the IF=0 scan section, a bounded
+  kernel-owned image ledger, pre-reap terminal evidence capture, exact
+  kernel-only success corroboration, exact `JE_SVC_DONE_EXIT` supervisor
+  termination, and explicit image-specific population/death checks.
+- **Implemented:** real post-allocation rollback failpoint (step 4), VM
+  headroom assertion before ARM, exact one-shot `H_NOSLOTS`/handle-zero
+  observation, wrap-safe monitor and ARM watchdogs, and a second supervisor
+  identity scan before terminal reaping.
+- **Implemented:** survivor liveness enforcement, exact single spoofer stale
+  probe, exact supervisor self-handle check, complete report seqlock
+  publication, non-success sleep-channel diagnostics, mode-12 READY evidence,
+  and explicit second reap plus full baseline comparison.
+- **Tested:** `ASAN_OPTIONS=detect_leaks=0 make check` passed; `make smoke`
+  passed with `M4f-s1`, zero-leak, and `QEMU smoke: PASS`; required ARM
+  (`make aarch64 && make smoke-aarch64 ARM_REQUIRE=1`) passed; `make
+  integration` passed modes 1–12. Mode 12 printed READY phase `1`, FAULT
+  reason `0`, the D12 loss marker, zero-leak, and no scenario-completed
+  marker.
+- **Planned:** lead integration, repeat the local gates on the integrated
+  tree, and independent human review. **Blocked:** none known.
+
+Changed invariants and unresolved hazards: report counters are diagnostics and
+never authorize success; child identity and terminal outcomes come from
+kernel state. The ledger records only successful spawns and clears entries
+after reap while preserving bounded aggregate history. The adversarial
+forged-counter, torn-report, and impostor-child cases are not separate
+end-to-end fixtures in this pass and are not claimed as tested. Remote CI and
+human qualification are unobserved; this is AI-assisted work only.
+
+## M4 PR-F Stage 2 — supervisor, child services, and D12 monitor — observed 2026-11-01T03:06:15Z
+
+Repository `auto44e/jeios`, branch `wip/m4f-impl`, inspected commit
+`5ffd26c854a3603de838452c79e81d7996dbd7ff`; this worker left the requested
+changes uncommitted for lead integration.
+
+- **Implemented:** ring-3 images 2–6, the fixed `.je_report` RW placement,
+  startup-v1 service launch, readiness/config/heartbeat protocols, bounded
+  restart and crash-loop scenarios, spoofer evidence, rollback failpoint
+  handshake, and the default NX success path.
+- **Implemented:** the slot-0 monitor uses the saved supervisor identity
+  (`je_proc_status`), reads the report only after the PTE RW/NX probe, never
+  calls `je_kernel_idle_step` after seeding, and treats every non-LIVE status
+  as supervisor loss unless a stable DONE report and kernel corroboration prove
+  success.
+- **Implemented:** D12 teardown calls kill-all with no spare, explicitly reaps,
+  checks no DYING users remain, checks endpoint quiescence, and compares the
+  full allocator page-state snapshot plus process/VM identities against the
+  pre-seed baseline.
+- **Implemented:** `TEST_MODE=12` writes the mode word into the supervisor RW
+  report page after seeding; the supervisor faults after restart-service and
+  survivor readiness. The mode-12 harness expects the refusal and zero-leak
+  markers and rejects `JeiOS fatal:`.
+- **Tested:** `make smoke` passed locally at this observation. A direct
+  `make iso TEST_MODE=12` plus QEMU boot passed locally with
+  `M4f: supervisor lost (reason=0x...); no recovery path in this profile` and
+  `M4f: zero-leak identity baseline verified`.
+- **Tested:** `ASAN_OPTIONS=detect_leaks=0 make check`, `make integration`, the
+  default and 16 MiB no-NX profiles, and the 1536 MiB NX profile all passed
+  locally. Integration covered modes 1–12, including mode 12.
+- **Planned:** rerun the full suite after lead integration or any code changes;
+  inspect the complete diff and preserve the exact local-vs-remote evidence.
+- **Blocked:** no known blocker. Remote CI and independent human qualification
+  are not observed by this worker.
+
+**Changed invariants and hazards:** `vb_link_tables` now clears reused
+paging-table frames before publishing entries; allocator ownership reuse alone
+does not guarantee byte-zeroed tables. The supervisor report is untrusted
+diagnostic evidence; kernel proof uses death records and live endpoint-handle
+rights. The baseline does not claim hardware-wide support, SMP safety, or
+fault isolation for ring-0 modules. The monitor intentionally leaves child
+DYING records unreaped until the supervisor decision so the corroboration scan
+can inspect their first death records.
+
+## M4 PR-F Stage 1 — D12 kernel mechanism — observed 2026-10-31T23:05:35+00:00
+
+Repository `auto44e/jeios`, branch `wip/m4f-impl`, inspected commit
+`b3ae3b7b136346290bda91baadc4909ad203b3fb`; this worker left the requested
+changes uncommitted for lead integration.
+
+- **Implemented:** the real slot-0 `je_sched_kill_all_user` mechanism. It
+  validates every user-thread identity/run-link and process state in a first
+  pass, then marks all non-spared LIVE READY/BLOCKED_IPC users through the
+  unchanged `mark_dying` path. DYING records are validated and skipped;
+  RUNNING/SLEEPING/ZOMBIE, generation-zero, and mismatched links return
+  `JE_ERR_INVALID` without mutation. READY wait-pending reservations use the
+  existing idempotent release owner.
+- **Implemented:** Stage-2-only `svc_report_read` scaffolding in `main.c`.
+  It probes the fixed report page as present RW/NX before CR3 switching,
+  reads seq/body/seq, restores the kernel CR3 before return, and validates
+  fixed-format fields. It is unused until the supervisor monitor is added.
+- **Implemented:** the pure supervisor-image `report_vaddr_in_rw_segment`
+  predicate and commented image-table hook. Existing images are not checked
+  against the supervisor-only placement contract.
+- **Implemented:** hosted `test_sched_killall` coverage and Makefile wiring.
+- **Tested (local):** `ASAN_OPTIONS=detect_leaks=0 make check` passed, including
+  `test_sched_killall: PASS (66 checks)`, ELF/image checks and the existing
+  hosted suites. `make smoke` rebuilt `build/0/jeios.iso` and passed QEMU
+  smoke through `M4e-s1` and the existing M3/M4 fixtures.
+- **Not tested:** the new report reader and image predicate are not exercised
+  by the current boot because the supervisor image/monitor is Stage 2. No
+  remote CI or independent human qualification is claimed.
+- **Planned:** Stage 2 supervisor image, monitor identity scan, report success
+  decision, kill-all/reap/baseline refusal path, and TEST_MODE 12.
+- **Blocked:** nothing for this bounded Stage 1 task.
+
+**Changed invariants and hazards:** kill-all is transactional on validation
+failure and only slot 0 may invoke it with IF clear; it does not add a
+`mark_dying` hook or alter `mark_dying`/`je_sched_reap_dead`. The report reader
+still relies on its documented single-CPU, present-mapping/no-fault-recovery
+precondition after the explicit PTE probe. The current QEMU smoke does not
+prove supervisor-loss behavior.
+
 ## M4 PR-E (#53) — ring-3 C image path + `mkimage.py` — observed 2026-10-31T20:59:44Z
 
 Branch `feat/m4e-cimage`, based on main `1413ed8` (#64 merged; main CI green);

@@ -742,6 +742,86 @@ an automatic reboot is the "silent infinite reboot loop" INIT.md forbids.
 **Flex:** add a rescue image and watchdog when the platform has a watchdog, at M5a
 or later.
 
+#### D12 note — detection mechanism revised to a slot-0 scan (2026-10-31, owner-approved)
+
+Step 1 above says `mark_dying` sets a kernel `supervisor_lost` flag. During PR-F
+design this was found to be **unsafe to implement as written**, so the owner
+approved (2026-10-31) revising the *detection mechanism* while leaving the D12
+*policy* (refuse, kill-all, reap, verify baselines, halt) unchanged.
+
+**Decision.** The slot-0 monitor loop detects supervisor loss by **scanning the
+supervisor's PROCESS record by identity before it reaps**: the monitor holds the
+supervisor's `je_proc_id` as a plain value (no handle ref) and treats any
+`je_proc_status(sup_id)` result other than LIVE as loss (DYING, DEAD, or
+reaped-to-FREE — `record_for` rejects a FREE slot or a bumped generation). This is
+a strict superset of scanning for DYING and is necessary because
+`je_kernel_idle_step` itself reaps: a DYING-only scan can miss a supervisor that
+was reaped between two scans. The monitor therefore does **not** call `idle_step`;
+it uses its own wait — `cli; identity-scan; je_sched_reap_dead(); sti; hlt` — with
+the scan and the reap in a single IF=0 section, and the monitor is the **sole**
+reaper entry after seeding. `mark_dying` and `reap_dead` stay byte-identical to
+the tested M2/kill paths.
+
+A supervisor that EXITs normally also leaves its record non-LIVE, so the monitor
+disambiguates success from loss by the report's `phase`: `phase == DONE` prints a
+success marker and runs the same kill-all/reap/baseline/halt sequence; anything
+else is a loss. The **loss** decision never depends on the report being readable
+(a missing magic prints "no report" and still halts); only the success path reads
+`phase == DONE`.
+
+**Why.** `mark_dying` (via `je_proc_on_dying`) is *also* on the normal
+kernel-forced teardown path: `vm_s3_destroy` and `spawn_undo` reach it for fixture
+teardown and failed-spawn rollback. A `supervisor_lost` flag set inside
+`mark_dying` would fire spuriously whenever a supervisor-flagged record is torn
+down for a benign reason, turning ordinary teardown and D-rollback into a false
+"supervisor lost" halt. The scan keys on the record actually being DYING in the
+registry at monitor time, which only happens when the supervisor truly died and
+has not yet been reaped — not during a synchronous forced teardown that reaps in
+the same slot-0 step.
+
+**If otherwise (rejected: the `mark_dying` hook).** Keeping the flag in
+`mark_dying` would require a guard distinguishing supervisor-loss from the forced
+teardown callers (an added argument or caller-context check threaded through a
+tested path), which is more invasive to already-qualified code and widens the
+blast radius of a mistake into the kill/teardown machinery. Predicted cost:
+re-qualifying `mark_dying`'s callers and the M4d supervisor-guard fixture, for a
+detection that the scan already provides without touching them.
+
+**Ordering constraint.** No other slot-0 reap may run between the supervisor's
+death and the monitor scan. This holds because slot 0 is the *only* context that
+reaps after seeding, the monitor loop is the sole reaper entry, and it scans
+before each `reap_dead`. The monitor asserts the saved supervisor identity is
+still the expected `(index, generation)` each pass. (Identity-based detection also
+makes this robust: even if the record were reaped first, `je_proc_status(sup_id)`
+returning non-LIVE is still observed as loss.)
+
+**Future flex (toward the original D12 wording / "option 2").** If a later design
+needs **synchronous** detection at the instant of death — e.g. a watchdog or a
+rescue image (D12 Flex above) that must act before the next slot-0 step, or a
+multi-core slot-0 where "only slot 0 reaps" no longer holds — revisit this and
+move detection into the death path with a proper forced-teardown-vs-loss
+discriminator. At that point the `mark_dying`-hook alternative becomes the right
+choice and this scan is insufficient. Revisit trigger: any of (a) a watchdog/
+rescue path added, (b) reaping moved off a single slot-0 context, (c) a
+requirement to observe loss before the next monitor iteration.
+
+**Success-vs-loss signalling, and a planned second mechanism (owner, 2026-10-31).**
+Because a clean supervisor EXIT also leaves its record non-LIVE, the success path
+reads `phase == JE_SVC_PHASE_DONE` from the report to tell "finished cleanly" from
+"lost". The report therefore sits on the *success* decision (never on the loss
+decision, which stays fail-closed: a missing/garbage report always halts as loss).
+The owner accepted this as the PR-F mechanism and additionally directed that a
+**second, independent success signal be added down the line**: corroborate
+`phase == DONE` with the supervisor's **death record** — `reason == EXIT` and an
+agreed nonzero EXIT code — so success requires BOTH the report phase AND the
+kernel-observed exit, matching the "evidence, not attestation" rule already
+applied to the spoofer (D3 of the PR-F design notes). The report alone is
+untrusted; pairing it with the kernel-side exit code removes the last place a
+buggy/garbage report could, by itself, turn a loss into a reported success.
+Tracked as a follow-up; the `je_svc_report` layout and the EXIT path already carry
+everything needed, so it is additive (no contract change). Revisit trigger: adding
+it, or any change that makes the report the sole success signal.
+
 ### D13. Coding profile and evidence
 
 All M4 kernel code is in the **Critical** profile (CODING_STANDARD:20). So is the

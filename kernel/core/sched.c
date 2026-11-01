@@ -735,3 +735,89 @@ je_status je_sched_kill(je_proc_id victim)
     je_arch_irq_restore(flags);
     return JE_OK;
 }
+
+/*
+ * ADR 0010 D12 (PR-F): mark every live user process for supervisor-loss
+ * teardown. The validation pass is deliberately separate from the mutation
+ * pass: an inconsistent slot must leave every otherwise-valid slot untouched.
+ * The existing mark_dying() remains the sole waiter/reservation release owner.
+ */
+je_status je_sched_kill_all_user(je_proc_id spare, uint32_t *killed)
+{
+    uint64_t flags = je_arch_irq_save();
+    if ((flags & (UINT64_C(1) << 9)) != 0u) abort_scheduler(); /* IF must be 0 */
+    if (current != 0u) abort_scheduler(); /* slot-0 (bootstrap/monitor) only */
+    bool kill[JE_THREAD_MAX] = { false };
+    uint32_t live_to_dying = 0u;
+
+    /*
+     * First classify every user slot without changing scheduler or PROCESS
+     * state. Kernel slots are intentionally ignored: this operation owns only
+     * ring-3 teardown, and slot 0 is the bootstrap/monitor context.
+     */
+    for (unsigned i = 1u; i < JE_THREAD_MAX; ++i) {
+        thread *t = &threads[i];
+        if (t->kind == THREAD_KERNEL || t->state == EMPTY) continue;
+
+        if (t->kind != THREAD_USER || t->proc_id.gen == 0u)
+            goto invariant;
+
+        uint32_t linked_slot = 0u;
+        uint32_t linked_vm_index = 0u;
+        if (!process_pool
+            || je_proc_run_link(process_pool, t->proc_id, &linked_slot,
+                                &linked_vm_index) != JE_OK
+            || linked_slot != i || linked_vm_index != t->vm_index)
+            goto invariant;
+
+        uint32_t proc_state = JE_PROC_FREE;
+        uint32_t proc_reason = 0u;
+        uint64_t proc_code = 0u;
+        if (je_proc_status(process_pool, t->proc_id, &proc_state,
+                           &proc_reason, &proc_code) != JE_OK)
+            goto invariant;
+
+        if (t->state == DYING) {
+            if (proc_state != JE_PROC_DYING) goto invariant;
+            continue;
+        }
+
+        /*
+         * RUNNING, SLEEPING, and ZOMBIE are impossible from slot 0 while IF
+         * is clear and are fail-stop invariant violations. READY (including a
+         * WOKEN waiter reservation) and BLOCKED_IPC are live kill targets.
+         */
+        if (t->state != READY && t->state != BLOCKED_IPC)
+            goto invariant;
+        if (proc_state != JE_PROC_LIVE || t->frame == (je_trap_frame *)0)
+            goto invariant;
+
+        /* Identity, not a supervisor flag or scheduler state, spares sup. */
+        if (t->proc_id.index == spare.index && t->proc_id.gen == spare.gen)
+            continue;
+        kill[i] = true;
+        if (live_to_dying == UINT32_MAX) goto invariant;
+        ++live_to_dying;
+    }
+
+    /*
+     * All identities and states are now known to be coherent, so this second
+     * pass cannot encounter a validation failure. Snapshot the user return
+     * metadata before mark_dying clears the frame, just as je_sched_kill does.
+     */
+    for (unsigned i = 1u; i < JE_THREAD_MAX; ++i) {
+        if (kill[i]) {
+            uint64_t rip = threads[i].frame->rip;
+            uint64_t cs = threads[i].frame->cs;
+            mark_dying(i, DEATH_KILLED, 0u, 0u, 0u, rip, cs, 0u);
+        }
+    }
+    if (killed) *killed = live_to_dying;
+    je_arch_irq_restore(flags);
+    return JE_OK;
+
+invariant:
+    if (killed) *killed = 0u;
+    je_arch_irq_restore(flags);
+    return JE_ERR_INVALID;
+}

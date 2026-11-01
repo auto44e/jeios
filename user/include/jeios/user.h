@@ -45,6 +45,14 @@ static inline uint64_t je_clock_ticks(uint64_t *ticks)
 static inline uint64_t je_try_send(uint64_t h, const void *buf, uint64_t len)
 { return je_sys6(JE_SYS_TRY_SEND, h, (uint64_t)(uintptr_t)buf, len, 0, 0, 0, (uint64_t *)0); }
 
+/* Capability-carrying send. Each entry is {low32 handle, high32 rights}. */
+static inline uint64_t je_try_send_caps(uint64_t h, const void *buf, uint64_t len,
+                                        const uint64_t *caps, uint64_t cap_count)
+{
+    return je_sys6(JE_SYS_TRY_SEND, h, (uint64_t)(uintptr_t)buf, len,
+                   cap_count, (uint64_t)(uintptr_t)caps, 0, (uint64_t *)0);
+}
+
 /* timeout 0 = poll. *out (optional) = RDX: bytes[31:0] | caps[63:32]. */
 static inline uint64_t je_try_recv(uint64_t h, void *buf, uint64_t cap, uint64_t timeout,
                                    uint64_t *out)
@@ -52,6 +60,45 @@ static inline uint64_t je_try_recv(uint64_t h, void *buf, uint64_t cap, uint64_t
 
 static inline uint64_t je_handle_rights(uint64_t h, uint64_t *rights)
 { return je_sys6(JE_SYS_HANDLE_RIGHTS, h, 0, 0, 0, 0, 0, rights); }
+
+static inline uint64_t je_handle_self(uint64_t *out)
+{ return je_sys6(JE_SYS_HANDLE_SELF, 0, 0, 0, 0, 0, 0, out); }
+
+/* PR-F ring-3 wrappers (the supervisor and its children). Thin: each forwards the
+ * abi.h register contract and returns the je_abi_status; `out` (when non-NULL)
+ * receives RDX. See include/jeios/abi.h for each op's exact semantics. */
+
+static inline uint64_t je_yield(void)
+{ return je_sys6(JE_SYS_YIELD, 0, 0, 0, 0, 0, 0, (uint64_t *)0); }
+
+static inline uint64_t je_handle_close(uint64_t h)
+{ return je_sys6(JE_SYS_HANDLE_CLOSE, h, 0, 0, 0, 0, 0, (uint64_t *)0); }
+
+/* handle_dup(h, new_rights) -> *out = new handle (RDX). */
+static inline uint64_t je_handle_dup(uint64_t h, uint64_t new_rights, uint64_t *out)
+{ return je_sys6(JE_SYS_HANDLE_DUP, h, new_rights, 0, 0, 0, 0, out); }
+
+/* endpoint_create(): mints BOTH ends into the caller's table; *out (RDX) packs
+ * RDX[31:0]=h0, RDX[63:32]=h1 (undefined on failure). All args must be 0. */
+static inline uint64_t je_endpoint_create(uint64_t *packed_ends)
+{ return je_sys6(JE_SYS_ENDPOINT_CREATE, 0, 0, 0, 0, 0, 0, packed_ends); }
+
+/* proc_spawn(launcher, image_id, grants, grant_count, quotas): see JE_ABI_SPAWN_*.
+ * *out (RDX) = new PROCESS handle (INSPECT|KILL), 0 on failure. Transactional. */
+static inline uint64_t je_proc_spawn(uint64_t launcher, uint64_t image_id,
+                                     const void *grants, uint64_t grant_count,
+                                     uint64_t quotas, uint64_t *out)
+{ return je_sys6(JE_SYS_PROC_SPAWN, launcher, image_id,
+                 (uint64_t)(uintptr_t)grants, grant_count, quotas, 0, out); }
+
+/* proc_status(h, out): copies a 16-byte je_abi_proc_status to *status. */
+static inline uint64_t je_proc_status(uint64_t h, void *status)
+{ return je_sys6(JE_SYS_PROC_STATUS, h, (uint64_t)(uintptr_t)status,
+                 0, 0, 0, 0, (uint64_t *)0); }
+
+/* proc_kill(h): synchronous; needs KILL on a PROCESS handle. */
+static inline uint64_t je_proc_kill(uint64_t h)
+{ return je_sys6(JE_SYS_PROC_KILL, h, 0, 0, 0, 0, 0, (uint64_t *)0); }
 
 __attribute__((noreturn)) static inline void je_exit(uint64_t code)
 {

@@ -30,6 +30,21 @@ typedef struct {
 extern const unsigned char je_img_c_hello_blob[];
 extern const unsigned long je_img_c_hello_len;
 extern const je_vm_image   je_img_c_hello_desc;
+extern const unsigned char je_img_supervisor_blob[];
+extern const unsigned long je_img_supervisor_len;
+extern const je_vm_image   je_img_supervisor_desc;
+extern const unsigned char je_img_restart_blob[];
+extern const unsigned long je_img_restart_len;
+extern const je_vm_image   je_img_restart_desc;
+extern const unsigned char je_img_survivor_blob[];
+extern const unsigned long je_img_survivor_len;
+extern const je_vm_image   je_img_survivor_desc;
+extern const unsigned char je_img_spoofer_blob[];
+extern const unsigned long je_img_spoofer_len;
+extern const je_vm_image   je_img_spoofer_desc;
+extern const unsigned char je_img_crashloop_blob[];
+extern const unsigned long je_img_crashloop_len;
+extern const je_vm_image   je_img_crashloop_desc;
 
 je_status je_builtin_images_init(void);
 /* NULL for an unknown id, or before init. */
