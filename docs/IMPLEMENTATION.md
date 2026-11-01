@@ -20,6 +20,76 @@ This file records current contracts and execution evidence as gates are built.
 DESIGN.md describes the broader target architecture. No entry below implies
 userspace isolation, SMP safety, driver containment or production readiness.
 
+## M4 PR-G — D11 broker / TEST_MODE 13 — 2026-11-01
+
+The broker is entirely ring-3 supervisor policy over the existing M3c
+capability-transfer ABI. The kernel adds no broker status and stores no service
+identity. The supervisor launches image 7 (`broker_service`) and two image-8
+(`broker_client`) instances only in mode 13; mode 0 and mode 12 retain their
+existing scenarios.
+
+The transfer is deliberately two phase. The supervisor creates one channel,
+sends the service end first with `SERVICE_BIND{generation,transaction}`, waits
+for the service's matching `BROKER_ACK`, sends the client end with
+`GRANT`/`RESTARTED{generation,transaction}`, waits for the client's matching
+ACK, and only then closes both supervisor source handles. Any send/ACK failure
+closes both sources and does not increment the client's delivered lifetime
+count; if the service may already have minted its end, the ledger remains
+PENDING for both-DEAD collection. The service and client receive exactly
+`SEND|RECV` rights, without `TRANSFER` or `INSPECT`; the client attempts a cap
+send over the brokered endpoint and requires `DENIED`, then proves one echo
+round trip.
+
+The fixed ledger is keyed by the supervisor-owned client and service PROCESS
+handle values, service id and service generation. The supervisor keeps every
+PROCESS handle referenced by a live or pending entry open through teardown (or
+until its entries are collected), so a handle value cannot be reused for a
+different child instance while it is a ledger key. Entries are freed only after
+both PROCESS handles report exactly DEAD (or an uninspectable handle is
+explicitly cleared). The live-entry bound is `JE_BROKER_MAX`; each client has
+`JE_SVC_BROKER_CLIENT_CAP` delivered channels.
+The mode-13 scenario intentionally exercises A's first grant, service fault,
+generation-2 restart, second grant, and third request `EXHAUSTED`; B receives
+one grant and retains its endpoint. A and B send an explicit exercise-complete
+control record before the supervisor triggers the service fault, so the
+restart cannot interrupt B's first echo proof.
+
+Kernel corroboration does not trust the report or client claims. The receive
+audit records descriptors only after `je_endpoint_kern_recv_commit` succeeds,
+and resolves receivers from kernel PROCESS state. It requires exactly three
+client-side and three service-side deliveries, A/B/A ordering, supervisor
+creator, exact `SEND|RECV` rights, live service state for the service-side
+proof, the observed third A request with no third delivery, supervisor/service/
+client image populations `1/2/2`, one image-7 FAULT, two image-8 EXIT records,
+A delivery count 2, B delivery count 1, A's service peer, and supervisor
+`JE_SVC_DONE_EXIT_G`. Teardown additionally checks endpoint allocation zero,
+endpoint quiescence, and process-pool use count zero.
+
+**Local evidence at observation `2026-11-01T10:33:58Z`, exact inspected commit
+`f704111f1ba17b6a0e75da19621993ab588b466b` on branch `wip/m4g-impl` (changes
+uncommitted):**
+
+- `ASAN_OPTIONS=detect_leaks=0 make check` and
+  `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=13` — PASS; the hosted
+  `test_syscall` proc-status decode remained green with RDX zero.
+- `make smoke` — PASS; mode 0 retained the M4f
+  success and zero-leak markers.
+- `make integration` — PASS for modes 1–13, including the mode-13 broker
+  success, exact exhaustion/corroboration marker, and zero-leak markers; the
+  mode-13 `M4g: supervisor lost` string was absent.
+- The documented 16 MiB/no-NX and 1536 MiB/NX `tools/smoke.py` profiles —
+  PASS.
+- `make aarch64 && make smoke-aarch64 ARM_REQUIRE=1` — PASS; the existing
+  ARM linker RWX warning remained.
+- `git diff --check` — PASS.
+
+M5 gap: A's `EXHAUSTED` request occurs while a live generation-2 entry exists,
+so this scenario proves lifetime-check ordering but not the duplicate-free cap;
+a host unit test is the next bounded task. Not implemented or claimed: a
+general broker registry, arbitrary service identities, dynamic loading,
+hardware-wide support, remote CI, or independent human qualification. The
+broker is a focused TEST_MODE 13 scenario.
+
 ## Security fix: zero physical frames on free (ADR 0006 note) — 2026-11-01
 
 Closes a cross-process / kernel disclosure: `je_pages_alloc`/`free` never zeroed

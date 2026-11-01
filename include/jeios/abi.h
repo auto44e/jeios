@@ -182,8 +182,9 @@ typedef enum {
                               * PROCESS handle. Copies a 16-byte je_abi_proc_status
                               * {u32 state, u32 reason, u64 code} to user memory at RSI
                               * through the checked copy-out path. A fault gives
-                              * INVALID and nothing is written. RDX..R9 reserved (0);
-                              * RDI[63:32] must be 0. Non-blocking and idempotent
+                              * INVALID and nothing is written. RDX is 0 on success;
+                              * RDX..R9 reserved (0); RDI[63:32] must be 0.
+                              * Non-blocking and idempotent
                               * (ADR 0010 D4). */
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYS_COPY_FIXUP_INJECT = 4  /* dev-only: raw-copy an unmapped page to test the fixup */

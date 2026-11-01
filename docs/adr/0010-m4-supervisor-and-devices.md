@@ -279,6 +279,13 @@ outlive the VM slot and never to point at it.
 **Flex:** a blocking wait, or a wait-set, needs its own ADR once polling cost is
 measured (D6).
 
+> **D4 flex note (2026-11-01, owner direction).** A future `PROC_STATUS` could
+> additionally return the record identity `(index,gen)` in RDX as an additive,
+> v0 extension, giving ring-3 a stable process-identity primitive instead of
+> relying on handle-value stability. Deferred 2026-11-01 (owner): PR-G keys its
+> broker ledger on the supervisor-owned PROCESS handle instead, so no ABI change
+> is needed now. Revisit if another component needs process identity at ring 3.
+
 ### D5. Spawn, launch grants and rollback
 
 The call is `PROC_SPAWN(launcher, image_id, grants_ptr, grant_count ≤ 4, quotas)`

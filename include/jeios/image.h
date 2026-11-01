@@ -45,6 +45,12 @@ extern const je_vm_image   je_img_spoofer_desc;
 extern const unsigned char je_img_crashloop_blob[];
 extern const unsigned long je_img_crashloop_len;
 extern const je_vm_image   je_img_crashloop_desc;
+extern const unsigned char je_img_broker_service_blob[];
+extern const unsigned long je_img_broker_service_len;
+extern const je_vm_image   je_img_broker_service_desc;
+extern const unsigned char je_img_broker_client_blob[];
+extern const unsigned long je_img_broker_client_len;
+extern const je_vm_image   je_img_broker_client_desc;
 
 je_status je_builtin_images_init(void);
 /* NULL for an unknown id, or before init. */

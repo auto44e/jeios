@@ -485,6 +485,12 @@ static void je_syscall_finish_blocked_recv(je_trap_frame *f, je_ep_channel *rec,
     /* Infallible commit (dequeue + release inflight), then free the waiter. */
     je_ep_status cm = je_endpoint_kern_recv_commit(&lease);
     if (cm != JE_EP_OK) { je_arch_console_write("JeiOS fatal: blocked recv commit mismatch\r\n"); je_arch_halt(); }
+#if JE_TEST_MODE == 13
+    for (uint8_t c = 0u; c < mcaps; ++c)
+        if (was_live[c] && minted[c])
+            je_m4g_record_cap_delivery(vm, index, &caps[c]);
+    je_m4g_record_control_receive(vm, index, &lease, staging, mlen, mcaps);
+#endif
     je_endpoint_kern_wait_release(rec, side, slot);
     f->rax=(uint64_t)JE_ABI_OK;
     f->rdx=(uint64_t)mlen | ((uint64_t)mcaps << 32);
@@ -522,7 +528,7 @@ static je_trap_frame *dispatch_proc_status(je_trap_frame *f)
         syscall_invariant("JeiOS fatal: PROC_STATUS snapshot invariant\r\n");
     }
     f->rax=(uint64_t)je_copy_to_user(f->rsi, &snapshot, sizeof snapshot);
-    f->rdx=0;
+    f->rdx = 0u;
     return je_sched_return_to_user(f);
 }
 
@@ -969,6 +975,12 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
             je_arch_console_write("JeiOS fatal: recv commit mismatch\r\n");
             je_arch_halt();
         }
+#if JE_TEST_MODE == 13
+        for (uint8_t c = 0u; c < mcaps; ++c)
+            if (was_live[c] && minted[c])
+                je_m4g_record_cap_delivery(vm, index, &caps[c]);
+        je_m4g_record_control_receive(vm, index, &lease, staging, mlen, mcaps);
+#endif
         f->rax = (uint64_t)JE_ABI_OK;
         f->rdx = (uint64_t)mlen | ((uint64_t)mcaps << 32);
         return je_sched_return_to_user(f);

@@ -102,8 +102,9 @@ _Static_assert(sizeof(je_svc_broker_request) == JE_SVC_BROKER_REQUEST_LEN,
 typedef struct {
     uint32_t op;                 /* GRANT or RESTARTED */
     uint32_t service_generation; /* supervisor per-service gen, monotonic */
+    uint32_t transaction;        /* supervisor-minted two-phase transaction id */
 } je_svc_broker_grant;
-#define JE_SVC_BROKER_GRANT_LEN 8u
+#define JE_SVC_BROKER_GRANT_LEN 12u
 _Static_assert(sizeof(je_svc_broker_grant) == JE_SVC_BROKER_GRANT_LEN,
                "BROKER_GRANT size");
 
@@ -112,8 +113,9 @@ _Static_assert(sizeof(je_svc_broker_grant) == JE_SVC_BROKER_GRANT_LEN,
 typedef struct {
     uint32_t op;                 /* JE_SVC_OP_SERVICE_BIND */
     uint32_t service_generation; /* authoritative; the service trusts ONLY this */
+    uint32_t transaction;        /* supervisor-minted two-phase transaction id */
 } je_svc_service_bind;
-#define JE_SVC_SERVICE_BIND_LEN 8u
+#define JE_SVC_SERVICE_BIND_LEN 12u
 _Static_assert(sizeof(je_svc_service_bind) == JE_SVC_SERVICE_BIND_LEN,
                "SERVICE_BIND size");
 
@@ -233,6 +235,14 @@ _Static_assert(sizeof(je_svc_report) == JE_SVC_REPORT_LEN, "report struct size")
 #define JE_SVC_BROKER_SERVICE_COUNT 1u           /* brokerable-service table size */
 #define JE_SVC_BROKER_CLIENT_CAP   (JE_SVC_RESTART_LIMIT + 1u) /* per client life */
 #define JE_SVC_BROKER_ACK_DEADLINE 400u          /* ticks to await a mint ACK */
+#define JE_SVC_BROKER_CLIENT_WAIT_DEADLINE \
+    (2u * JE_SVC_BROKER_ACK_DEADLINE)             /* client-side grant wait */
+/* Flex (revisit): a future PROC_STATUS could additionally return the record
+ * identity (index,gen) in RDX as an additive, v0 extension, giving ring-3 a
+ * stable process-identity primitive instead of relying on handle-value
+ * stability. Deferred 2026-11-01 (owner): PR-G keys its broker ledger on the
+ * supervisor-owned PROCESS handle instead, so no ABI change is needed now.
+ * Revisit if another component needs process identity at ring 3. */
 #define JE_SVC_DONE_EXIT_G 0x6734446Au           /* mode-13 supervisor clean EXIT code */
 _Static_assert(JE_SVC_BROKER_CLIENT_CAP <= JE_BROKER_MAX,
                "a single client cannot exceed the live broker-channel bound");
