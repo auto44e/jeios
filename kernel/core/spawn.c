@@ -193,6 +193,16 @@ je_abi_status je_proc_spawn(je_vm *vm, uint32_t caller_idx, je_handle launcher,
         return spawn_finish(internal_status_to_abi(status));
     }
     vm_ready = true;
+    /* Audit the freshly built child before it is schedulable: je_vm_audit now
+     * rejects any stale present page-table entry (the zero-on-free regression
+     * guard). On the ring-3 spawn path this is the ONLY audit, so a recycled
+     * frame that slipped a stale mapping fails closed here through spawn_undo
+     * rather than producing a child with an unexpected live mapping. */
+    status = je_vm_audit(vm, child_index);
+    if (status != JE_OK) {
+        spawn_undo(vm, child_index, registered, vm_ready, thread_created, pool, id);
+        return spawn_finish(internal_status_to_abi(status));
+    }
     status = je_sched_register_process(vm, child_index, id);
     if (status != JE_OK) {
         spawn_undo(vm, child_index, registered, vm_ready, thread_created, pool, id);

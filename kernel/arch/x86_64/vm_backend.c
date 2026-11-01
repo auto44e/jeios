@@ -218,20 +218,38 @@ static void vb_restore_alias(void *ctx, je_vm_ref frame)
 }
 
 /*
- * Zero every byte of a physical frame run before it returns to the allocator.
- * je_pages_free only updates the free-list bookkeeping (kernel/core/alloc.c); it
- * does NOT clear frame contents, and je_pages_alloc hands the lowest free run
- * straight back. Because a freed frame can be reused by a later process in ANY
- * role (page table, user data, kernel stack), leftover bytes become a
- * cross-process / kernel disclosure or, if reused as a page table, live stale
- * PTEs. Zeroing here, at the single point every VM-owned frame is released, closes
- * that whole class at the root. (Security fix; see ADR note and the PR.)
+ * Zero every byte of a physical frame run before it returns to the allocator,
+ * for frames the VM backend owns (extents and kstack holds). je_pages_free only
+ * updates the free-list bookkeeping (kernel/core/alloc.c); it does NOT clear
+ * frame contents, and je_pages_alloc hands the lowest free run straight back. A
+ * freed VM frame can be reused by a later process as a PAGE TABLE, where leftover
+ * bytes are live stale PTEs (a user process could leave present/user/writable
+ * entries pointing at identity-mapped memory) — the disclosure this closes. It is
+ * also reused as user data, and user pages are already zeroed on build, so this
+ * additionally guarantees they start clean regardless of build order.
+ *
+ * SCOPE: this scrubs the frames freed through THIS backend (vb_free_extent,
+ * vb_release_hold). Kernel-heap pages (je_heap_*) and kernel thread stacks are
+ * freed directly via je_pages_free elsewhere and are NOT scrubbed here; the heap
+ * zeroes on alloc, and a kernel-stack frame later reused as a page table is
+ * caught present-stale-PTE-wise by vb_link_tables' own clear and the audit. The
+ * claim is therefore "no VM-owned frame, and no page-table frame, carries stale
+ * bytes into reuse" — not a blanket all-allocator-frames claim.
  *
  * Called from CPL0 with the kernel root active, so the identity map at phys_ptr()
- * is valid and writable for all physical frames below the identity limit.
+ * is valid and writable for all physical frames below the identity limit. The
+ * range is bounds-checked first: je_pages_free validates ownership only AFTER it
+ * would return, so we must not blindly zero a corrupted/out-of-range extent.
  */
-static void vb_scrub_frames(uint64_t physical, size_t pages)
+static void vb_scrub_frames(void *ctx, uint64_t physical, size_t pages)
 {
+    uint64_t bytes = (uint64_t)pages * JE_PAGE_SIZE;
+    if (pages == 0u
+        || physical < UINT64_C(0x100000)          /* never the low 1 MiB */
+        || physical >= JE_PHYSICAL_LIMIT          /* within identity-mapped RAM */
+        || bytes > JE_PHYSICAL_LIMIT - physical
+        || (physical & (JE_PAGE_SIZE - 1u)) != 0u)
+        vb_panic(ctx, "scrub range");             /* corrupted free request */
     for (size_t frame = 0u; frame < pages; ++frame) {
         volatile uint64_t *words =
             (volatile uint64_t *)phys_ptr(physical + frame * JE_PAGE_SIZE);
@@ -245,7 +263,7 @@ static void vb_free_extent(void *ctx, uint32_t process, uint32_t extent)
     vb_state *s = ctx;
     vb_extent *e = ext_of(s, process, extent);
     if (!e) { vb_panic(ctx, "free_extent id"); return; }
-    vb_scrub_frames(e->phys, e->pages);   /* zero on free: no stale bytes survive reuse */
+    vb_scrub_frames(ctx, e->phys, e->pages);   /* zero on free: no stale bytes survive reuse */
     if (je_pages_free(s->pages, e->phys, e->pages) != JE_OK) vb_panic(ctx, "free_extent pages");
     e->used = 0;
 }
@@ -253,7 +271,7 @@ static void vb_free_extent(void *ctx, uint32_t process, uint32_t extent)
 static void vb_release_hold(void *ctx, uint64_t physical, size_t pages)
 {
     vb_state *s = ctx;
-    vb_scrub_frames(physical, pages);     /* zero on free: kstack holds carry kernel data */
+    vb_scrub_frames(ctx, physical, pages);     /* zero on free: kstack holds carry kernel data */
     if (je_pages_free(s->pages, physical, pages) != JE_OK) vb_panic(ctx, "release_hold");
 }
 

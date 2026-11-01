@@ -89,7 +89,22 @@ surfaced it as a child-build failure.
   PRESENT upper-table entry outside the four the build sets (PML4[0], PDPT[0],
   PDPT[1], PD[0]). A hosted test (test_vm `test_audit_rejects_stale_upper`) injects
   stale entries and proves the audit rejects them; verified it FAILS without the
-  strengthening.
+  strengthening. `je_vm_audit` is now also called on the **ring-3 PROC_SPAWN path**
+  (spawn.c, right after the child build, failing closed through `spawn_undo`), so
+  the guard runs against the REAL backend on every child spawn — not only in boot
+  self-tests. That exercises real frame reuse (the default boot spawns c_hello;
+  PR-F spawns many children), so a scrub/clear regression fails closed in practice.
+
+**Scope of the claim (reviewed, narrowed).** This scrubs frames freed through the
+VM backend (`vb_free_extent`, `vb_release_hold`). Kernel-heap pages (`je_heap_*`)
+and kernel thread stacks are freed directly via `je_pages_free` elsewhere and are
+NOT scrubbed here: the heap already zeroes on alloc, and a kernel-stack frame later
+reused as a page table is still caught present-stale-PTE-wise by the
+`vb_link_tables` clear and the audit. The accurate claim is therefore "no VM-owned
+frame, and no page-table frame, carries stale bytes into reuse" — not a blanket
+all-allocator-frames claim. `vb_scrub_frames` bounds-checks the range (≥ 1 MiB,
+within identity-mapped RAM, page-aligned) before zeroing, because `je_pages_free`
+validates ownership only after it would return.
 
 **Why not zero inside je_pages_free.** `je_pages` is a pure, hostable bookkeeping
 module with no way to address frame BYTES (it has no phys→virtual map). The backend
