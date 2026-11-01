@@ -1,9 +1,11 @@
 # Agent handoff: M1/M2 kernel foundation
 
-## M4 PR-H FIX pass — D9 proof hardening — observed 2026-11-01T21:00:37Z
+## M4 PR-H (#53) — D9 device / TSS I/O bitmap / kernel-owned IRQ3 — observed 2026-11-01T21:18:49Z
 
-Repository `jeios`; branch `wip/m4h-impl`; exact inspected commit
-`878db70c3906a0eb1841165a68f49816f1757be8`; changes remain uncommitted.
+Branch `feat/m4h-device`, based on main `b82d426` (#68 merged; main CI green);
+integrated head `18349b8`. Opened as the PR-H pull request. Built as impl → security
+code review (mutant-verified blockers) → fix, each cross-reviewed. The most
+privilege-sensitive M4 PR: the first ring-3 hardware port I/O + real IRQ.
 
 State: **implemented / tested / planned / not blocked**.
 
@@ -21,10 +23,13 @@ State: **implemented / tested / planned / not blocked**.
   ring-3 #GP isolation, D9 completion, and zero-leak markers. Required
   bitmap-deny and allowed-port A/B mutants both failed mode-14 completion and
   were restored.
-- **Planned:** lead integration and independent human review. IRQ7 remains
-  host-tested but not QEMU-injected.
+- **Planned:** PR-I (UART driver demo / end-to-end D9 console), then MP2.
+  IRQ7 remains host-tested but not QEMU-injected (recorded gap).
 - **Blocked:** no local implementation blocker; remote CI and independent human
   qualification are unobserved and not claimed.
+
+**Review record:** `docs/adr/debates/m4h-reviews.md` (security design + code review;
+the mutant-verified blockers), worker notes in `docs/adr/debates/m4h-workers.md`.
 
 Changed invariants: mode 14 requires 13 vector-13 FAULT deaths and one clean
 EXIT for the 14 driver incarnations; binding generation is exactly 28; at
