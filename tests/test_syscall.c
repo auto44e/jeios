@@ -438,6 +438,11 @@ int main(void)
     {
         assert(dec(JE_SYS_DEV_ASSIGN, 0x00010000,0x00010001,0,0,0,0,
                    &st,&res)==JE_SYSCALL_DEV_ASSIGN && st==JE_ABI_OK);
+        assert(dec(JE_SYS_DEV_ASSIGN, 0x00010000,0x00010001,
+                   JE_ABI_DEV_REQUIRE_DMA_CONTAINED,0,0,0,
+                   &st,&res)==JE_SYSCALL_DEV_ASSIGN && st==JE_ABI_OK);
+        assert(dec(JE_SYS_DEV_ASSIGN, 0x00010000,0x00010001,2,0,0,0,
+                   &st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID);
         assert(dec(JE_SYS_DEV_REVOKE, 0x00010000,0,0,0,0,0,
                    &st,&res)==JE_SYSCALL_DEV_REVOKE && st==JE_ABI_OK);
         assert(dec(JE_SYS_DEV_IRQ_ACK, 0x00010000,0,0,0,0,0,

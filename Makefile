@@ -21,7 +21,7 @@ USER_WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
 USER_CFLAGS := -std=c11 -O2 $(USER_WARN) -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -m64 -march=x86-64 -mcmodel=small -mno-red-zone -mgeneral-regs-only -fno-tree-loop-distribute-patterns -DJE_TEST_MODE=$(TEST_MODE) -Iuser/include -Iinclude
 USER_LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 -z noexecstack -Wl,--build-id=none
 USER_COMMON_OBJECTS := $(BUILD)/user/crt0.o $(BUILD)/user/lib/mem.o
-USER_SERVICE_NAMES := supervisor restart survivor spoofer crashloop broker_service broker_client uart_driver
+USER_SERVICE_NAMES := supervisor restart survivor spoofer crashloop broker_service broker_client uart_driver uart_service uart_client
 USER_SERVICE_OBJECTS := $(patsubst %,$(BUILD)/user/services/%.o,$(USER_SERVICE_NAMES))
 USER_IMAGES := $(patsubst %,$(BUILD)/user/%.elf,$(USER_SERVICE_NAMES))
 USER_GENERATED_IMAGES := $(patsubst %,$(BUILD)/gen/image_%.c,$(USER_SERVICE_NAMES))

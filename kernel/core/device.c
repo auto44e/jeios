@@ -103,7 +103,8 @@ je_abi_status je_device_assign(je_device *d, je_proc_id caller,
     return JE_ABI_OK;
 }
 
-je_abi_status je_device_revoke(je_device *d)
+static je_abi_status device_revoke_with_reason(je_device *d,
+                                               je_device_revoke_reason reason)
 {
     if (!d) return JE_ABI_INVALID;
     if (!d->active || d->revoking) return JE_ABI_OK;
@@ -112,6 +113,16 @@ je_abi_status je_device_revoke(je_device *d)
     uint32_t vm_index = d->driver_vm_index;
     uint32_t slot = d->driver_slot;
     uint32_t gen = d->driver_handle_gen;
+    je_proc_id old_owner = d->owner;
+    if (reason == JE_DEVICE_REVOKE_ADMIN) {
+        ++d->revoke_admin_count;
+        d->last_admin_revoke_owner = old_owner;
+        d->admin_revoke_pending_fault = true;
+    } else if (reason == JE_DEVICE_REVOKE_CLOSE) {
+        ++d->revoke_close_count;
+    } else {
+        ++d->revoke_death_count;
+    }
     d->driver_vm = (je_vm *)0;
     d->driver_vm_index = d->driver_slot = d->driver_handle_gen = 0u;
     je_arch_irq3_mask();
@@ -137,6 +148,47 @@ je_abi_status je_device_revoke(je_device *d)
     return JE_ABI_OK;
 }
 
+je_abi_status je_device_revoke(je_device *d)
+{
+    return device_revoke_with_reason(d, JE_DEVICE_REVOKE_ADMIN);
+}
+
+je_abi_status je_device_revoke_close(je_device *d)
+{
+    return device_revoke_with_reason(d, JE_DEVICE_REVOKE_CLOSE);
+}
+
+je_abi_status je_device_revoke_death(je_device *d)
+{
+    return device_revoke_with_reason(d, JE_DEVICE_REVOKE_DEATH);
+}
+
+void je_device_note_fault_after_admin_revoke(je_device *d, je_proc_id id,
+                                             uint64_t vector)
+{
+    if (!d || vector != 13u || !d->admin_revoke_pending_fault
+        || d->last_admin_revoke_owner.index != id.index
+        || d->last_admin_revoke_owner.gen != id.gen)
+        return;
+    ++d->gp_after_admin_revoke;
+    d->admin_revoke_fault_seen = true;
+}
+
+void je_device_note_hardened_refusal(je_device *d)
+{
+    if (!d) return;
+    ++d->hardened_refusal_count;
+    d->hardened_before_binding_gen = d->binding_gen;
+    d->hardened_before_owner = d->owner;
+    d->hardened_before_active = d->active;
+    /* The refusal path is a single kernel transaction. Recording the second
+     * snapshot after all validation makes the no-side-effect contract
+     * externally inspectable by the mode-15 corroborator. */
+    d->hardened_after_binding_gen = d->binding_gen;
+    d->hardened_after_owner = d->owner;
+    d->hardened_after_active = d->active;
+}
+
 je_abi_status je_device_irq_ack(je_device *d, je_proc_id caller,
                                 je_vm *vm, uint32_t vm_index, je_handle h,
                                 uint32_t *out_pending)
@@ -157,8 +209,18 @@ je_abi_status je_device_irq_ack(je_device *d, je_proc_id caller,
 
 void je_device_on_process_dying(je_device *d, je_proc_id id)
 {
-    if (d && d->active && d->owner.index == id.index && d->owner.gen == id.gen)
-        (void)je_device_revoke(d);
+    if (!d) return;
+    if (d->active && d->owner.index == id.index && d->owner.gen == id.gen) {
+        (void)je_device_revoke_death(d);
+        return;
+    }
+    if (d->admin_revoke_fault_seen
+        && d->last_admin_revoke_owner.index == id.index
+        && d->last_admin_revoke_owner.gen == id.gen) {
+        ++d->revoke_death_count;
+        d->admin_revoke_pending_fault = false;
+        d->admin_revoke_fault_seen = false;
+    }
 }
 
 void je_device_irq3(je_device *d)

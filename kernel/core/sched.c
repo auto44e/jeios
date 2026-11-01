@@ -247,7 +247,12 @@ static void mark_dying(unsigned slot, death_reason reason, uint64_t code,
     (void)je_endpoint_kern_waiter_release_by_id((uint32_t)slot);
 #ifndef JE_SCHED_HOSTED_TEST
     if (threads[slot].proc_id.gen != 0u)
+    {
+        if (reason == DEATH_FAULT)
+            je_device_note_fault_after_admin_revoke(
+                je_kernel_device(), threads[slot].proc_id, vec);
         je_device_on_process_dying(je_kernel_device(), threads[slot].proc_id);
+    }
 #endif
     if (threads[slot].proc_id.gen != 0u
         && je_proc_on_dying(process_pool, threads[slot].proc_id,
