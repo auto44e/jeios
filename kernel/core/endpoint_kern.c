@@ -302,6 +302,26 @@ uint32_t je_endpoint_kernel_allocated(void)
     return g_kep_inited ? je_endpoint_pool_allocated(&g_kep) : 0u;
 }
 
+bool je_endpoint_kern_quiescent(void)
+{
+    if (!g_kep_inited) return true;
+    for (uint32_t i = 0u; i < JE_EP_POOL_CAP; ++i) {
+        const je_ep_channel *rec = &g_kep.rec[i];
+        if (rec->allocated) return false;
+        for (uint8_t side = 0u; side < 2u; ++side) {
+            const je_ep_end *end = &rec->end[side];
+            if (end->handle_refs != 0u || end->inflight_refs != 0u
+                || end->state != JE_EP_END_FREE || end->waiter.present
+                || end->waiter.head_reserved || end->inbound.count != 0u)
+                return false;
+            for (uint8_t q = 0u; q < JE_EP_QUEUE_DEPTH; ++q)
+                if (end->inbound.cap_count[q] != 0u)
+                    return false;
+        }
+    }
+    return true;
+}
+
 /* ---- M3c D7/A6 blocking-recv bridge (ties the pure waiter to the scheduler) ---- */
 
 /* A6-CLARIFY-2: the single release owner, called by sched.c mark_dying with the

@@ -1,5 +1,86 @@
 # PR-F Stage 1 worker notes
 
+## PR-F Stage 2 worker notes — observation 2026-11-01T03:06:15Z
+
+Repository `auto44e/jeios`; branch `wip/m4f-impl`; inspected commit
+`5ffd26c854a3603de838452c79e81d7996dbd7ff`; no commit created.
+
+### Decisions and debugging record
+
+- Used the frozen D12 identity scan. The supervisor id is retained as a plain
+  `{index, generation}` value; the monitor calls `je_proc_status` before any
+  reap and treats every non-LIVE state as loss unless a stable DONE report plus
+  kernel corroboration proves the normal path.
+- Selected a kernel-written `JE_SVC_LOSS_GO` word at the fixed report-page
+  address for mode 12. This keeps crt0’s unused GPRs zero and makes the
+  deliberate fault a data-plane test rather than an ABI change.
+- The first boot exposed a real recycled-page-table defect: the backend
+  assumed `je_pages_alloc` zeroed reused frames, and a stale PT entry made the
+  first child build return `JE_ERR_INVALID`. `vb_link_tables` now clears all
+  four table pages with bounded loops before publishing the new topology.
+- The first supervisor run stalled after publishing ARM because the go word
+  symbol was at `0x4001003c`, while the frozen contract is `0x40010040`.
+  Increasing the linker padding from 20 to 24 bytes fixed the placement.
+- The first success teardown was rejected because the report stored the
+  spoofer’s complement-encoded low 32 bits instead of its low mask, and the
+  kernel compared the full low 32 bits. The report now stores the low 16-bit
+  mask; the kernel checks the same field and separately validates the
+  complement.
+- The corroboration fault scan initially made the FAULT count unreachable
+  behind an EXIT-only guard. It now counts DYING/FAULT records before
+  validating the EXIT spoofer record.
+- The baseline is an ownership predicate, not a count comparison: it snapshots
+  every allocator page-state word, endpoint quiescence, all PROCESS record
+  identity fields, and all VM state/root identities. Free baseline process
+  slots require FREE after teardown with nondecreasing generation and no
+  residual link/ref/charge/supervisor state.
+
+### Exact verification observed
+
+`make smoke` — PASS. The rebuilt NX image printed:
+
+```text
+M4f-s1: supervisor scenario completed
+M4f: zero-leak identity baseline verified
+QEMU smoke: PASS
+```
+
+`make iso TEST_MODE=12` followed by direct QEMU boot — PASS. The terminal output
+included:
+
+```text
+M4f: supervisor lost (reason=0x0000000000000000); no recovery path in this profile
+M4f: zero-leak identity baseline verified
+```
+
+`ASAN_OPTIONS=detect_leaks=0 make check` — PASS. Hosted/sanitizer tests,
+ELF/image validation, `test_sched_killall: PASS (66 checks)`, and
+`test_mkimage: PASS (562 checks)` completed successfully.
+
+`make integration` — PASS. Modes 1–9, fault-local mode 10, exception-fixup
+mode 11, and supervisor-loss mode 12 completed successfully.
+
+CI-equivalent smoke profiles — PASS:
+
+```text
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --expect-nx absent
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M --expect-nx absent
+python3 tools/smoke.py build/0/jeios.iso --memory 1536M --expect-nx present
+```
+
+Each printed `QEMU smoke: PASS`; the no-NX profiles retained the legacy
+terminal and the NX profile printed the M4f success and zero-leak markers.
+
+`git diff --check` — PASS after the final code and documentation edits.
+
+### State and next task
+
+State: **implemented / tested / planned / not blocked**. Implemented files
+include the service images, Makefile/image registration, supervisor monitor,
+baseline predicate, page-table reuse fix, smoke/integration harnesses, and
+documentation updates. Remote CI and independent human qualification remain
+unobserved; no hardened or release qualification claim is made.
+
 Observation time: `2026-10-31T23:05:35+00:00`  
 Repository: `auto44e/jeios`  
 Branch: `wip/m4f-impl`  

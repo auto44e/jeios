@@ -34,6 +34,57 @@ stale entries; verified it fails without the audit strengthening). The `je_pages
 allocator contract is unchanged. Landed as PR #66. Detail and rationale in ADR
 0006's security note and `docs/adr/debates/secfix-frame-zero-reviews.md`.
 
+## M4 PR-F Stage 2 — supervisor, child services, and D12 monitor — 2026-11-01
+
+This worker-stage change wires the Stage 1 kernel mechanisms into the NX
+profile. The default NX boot runs the bounded success scenario; `TEST_MODE=12`
+selects the deliberate supervisor-loss variant. The non-NX profile remains on
+the existing final idle path.
+
+- **Ring-3 images:** `JE_IMAGE_SUPERVISOR` (2), restart-service (3), survivor
+  (4), spoofer (5), and crash-loop (6) are compiled with the existing
+  freestanding C image recipe, validated by `mkimage.py`, and registered in
+  the built-in image table. The supervisor report and rollback word are kept
+  at `0x40010000` and `0x40010040` in a dedicated RW/NX segment; the kernel
+  validates the placement for image 2.
+- **Protocol and behavior:** all messages are fixed-size v0 records. Readiness
+  requires the exact first READY message and no caps. The supervisor uses
+  blocking one-tick private-channel waits, not pause polling; any unexpected
+  private-channel result fails closed. Restart-service faults once then
+  recovers at incarnation 1. Survivor heartbeats continue during that window.
+  The spoofer records exact BADINDEX/STALE, denied rights escalation, and
+  denied cap-transfer attempts in its complement-encoded exit code. Crash-loop
+  attempts are deterministic (`2 + 1` launches) and terminal.
+- **Kernel proof:** before teardown, the monitor corroborates the stable DONE
+  report against the spoofer EXIT death record and exact SEND-only child table,
+  survivor dispatches, one restart, heartbeat progress, and four FAULT death
+  records. This evidence is independent of report counters for the security
+  decision; counters remain diagnostic evidence.
+- **D12 monitor:** after seeding, slot 0 is the sole reaper. It scans the saved
+  plain supervisor identity before any reap, reads report memory only after
+  `read_user_pte` validates the fixed RW/NX page, and refuses recovery for any
+  non-LIVE supervisor without a proven DONE report. Teardown kills all user
+  threads with no spare, reaps once, checks no DYING users remain, and compares
+  allocator page ownership, endpoint quiescence, PROCESS identities, and VM
+  identities against the pre-seed snapshot.
+
+**Local evidence at inspected commit `5ffd26c854a3603de838452c79e81d7996dbd7ff`
+on branch `wip/m4f-impl` (uncommitted worker tree):**
+
+- `make smoke` — PASS; rebuilt `build/0/jeios.iso`, reached
+  `M4f-s1: supervisor scenario completed`, and printed the zero-leak marker.
+- `make iso TEST_MODE=12` plus direct QEMU boot — PASS; reached the D12 loss
+  marker and the zero-leak marker with no `JeiOS fatal:` output.
+- `ASAN_OPTIONS=detect_leaks=0 make check` — PASS; hosted/sanitizer tests,
+  ELF/image validators, 66 kill-all checks, and 562 mkimage checks completed.
+- `make integration` — PASS; modes 1–9, 10, 11, and 12 completed.
+- CI-equivalent smoke profiles — PASS for default NX, 16 MiB no-NX, and
+  1536 MiB NX.
+- `git diff --check` — PASS after the final code and documentation edits.
+
+**Not observed:** remote CI or independent human qualification. No hardened or
+release qualification claim is made.
+
 ## M4 PR-F Stage 1 — D12 kernel mechanism — 2026-10-31
 
 This worker-stage change implements only the kernel mechanism that a later

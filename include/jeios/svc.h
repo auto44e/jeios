@@ -138,4 +138,19 @@ _Static_assert(sizeof(je_svc_report) == JE_SVC_REPORT_LEN, "report struct size")
  * supervisor against JE_EP_CHILD_QUOTA_MAX-independent need; see PR-F IMPL. */
 #define JE_SVC_EP_LIMIT 21u
 
+/* PR-F bounded scenario policy. These values are deliberately small enough to
+ * fit the static VM/thread/process pools while still exercising one recovery
+ * and one terminal crash-loop path. */
+#define JE_SVC_RESTART_LIMIT 1u
+#define JE_SVC_RESTART_CRASH_BEFORE 1u
+#define JE_SVC_CRASHLOOP_RESTART_LIMIT 2u
+#define JE_SVC_READY_DEADLINE 400u
+#define JE_SVC_SCENARIO_DEADLINE 2000u
+#define JE_SVC_BACKOFF_TICKS 1u
+#define JE_SVC_LOSS_GO 0xD1200001u
+#define JE_SVC_SPOOF_MAGIC 0x53504652u
+#define JE_SVC_SPOOF_EXPECTED_MASK 0x0007u
+_Static_assert(JE_SVC_EP_LIMIT >= (4u * 3u) + 2u + 1u,
+               "supervisor endpoint budget covers channels and sleep pair");
+
 #endif /* JEIOS_SVC_H */

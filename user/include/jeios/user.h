@@ -45,6 +45,14 @@ static inline uint64_t je_clock_ticks(uint64_t *ticks)
 static inline uint64_t je_try_send(uint64_t h, const void *buf, uint64_t len)
 { return je_sys6(JE_SYS_TRY_SEND, h, (uint64_t)(uintptr_t)buf, len, 0, 0, 0, (uint64_t *)0); }
 
+/* Capability-carrying send. Each entry is {low32 handle, high32 rights}. */
+static inline uint64_t je_try_send_caps(uint64_t h, const void *buf, uint64_t len,
+                                        const uint64_t *caps, uint64_t cap_count)
+{
+    return je_sys6(JE_SYS_TRY_SEND, h, (uint64_t)(uintptr_t)buf, len,
+                   cap_count, (uint64_t)(uintptr_t)caps, 0, (uint64_t *)0);
+}
+
 /* timeout 0 = poll. *out (optional) = RDX: bytes[31:0] | caps[63:32]. */
 static inline uint64_t je_try_recv(uint64_t h, void *buf, uint64_t cap, uint64_t timeout,
                                    uint64_t *out)

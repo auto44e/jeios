@@ -47,15 +47,26 @@ print(f"fault mode 10 (fault-local D7 #UD): PASS\n{output}")
 # Mode 11 is the DEV-ONLY exception-fixup recovery proof (compiled with
 # -DJE_DEV_COPY_INJECT, which the default kernel never gets). A user task
 # raw-copies a deliberately unmapped page; the fixup must RECOVER the copy-site
-# #PF and the kernel must reach the normal halt — a "JeiOS fatal:" would be a
-# FAILURE. This is NOT a fatal fault-injection, so its terminal is the normal
-# completion line.
+# #PF and the kernel must survive into the NX supervisor success path.
 result = subprocess.run(["make", "iso", "TEST_MODE=11"], stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT, text=True)
 assert result.returncode == 0, result.stdout
 output = boot(Path("build/11/jeios.iso"),
-              terminal=b"JeiOS: initialization complete; halted",
+              terminal=b"M4f: zero-leak identity baseline verified",
               expected=[b"M3a-s5b: exception-fixup recovered load+store copy-site #PF (dev inject); kernel alive"])
 assert "JeiOS fatal:" not in output, f"mode 11 kernel died instead of recovering the copy fault:\n{output}"
 print(f"fault mode 11 (exception-fixup recovery): PASS\n{output}")
+
+# Mode 12 is the frozen D12 supervisor-loss profile.  The supervisor deliberately
+# faults after child readiness; slot 0 must refuse recovery, kill/reap the
+# remaining user population, and prove the identity baseline before halting.
+result = subprocess.run(["make", "iso", "TEST_MODE=12"], stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True)
+assert result.returncode == 0, result.stdout
+output = boot(Path("build/12/jeios.iso"),
+              terminal=b"M4f: zero-leak identity baseline verified",
+              expected=[b"M4f: supervisor lost (reason=",
+                        b"M4f: zero-leak identity baseline verified"])
+assert "JeiOS fatal:" not in output, f"mode 12 died during clean D12 teardown:\n{output}"
+print(f"supervisor-loss mode 12 (D12 refusal): PASS\n{output}")
 

@@ -24,6 +24,15 @@ SECTIONS
     {
         *(.data .data.*)
     } :data
+    /* ADR 0010 D12: the supervisor report is a dedicated RW section at the
+     * fixed user virtual address. The linker keeps it below the guard; the
+     * kernel re-validates that the containing LOAD is RW and NX. */
+    .je_report 0x40010000 : ALIGN(0x8)
+    {
+        KEEP(*(.je_report.report))
+        KEEP(*(.je_report.padding))
+        KEEP(*(.je_report.go))
+    } :data
     .bss ALIGN(0x1000) (NOLOAD) :
     {
         *(.bss .bss.*)

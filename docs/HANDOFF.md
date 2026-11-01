@@ -1,5 +1,49 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-F Stage 2 — supervisor, child services, and D12 monitor — observed 2026-11-01T03:06:15Z
+
+Repository `auto44e/jeios`, branch `wip/m4f-impl`, inspected commit
+`5ffd26c854a3603de838452c79e81d7996dbd7ff`; this worker left the requested
+changes uncommitted for lead integration.
+
+- **Implemented:** ring-3 images 2–6, the fixed `.je_report` RW placement,
+  startup-v1 service launch, readiness/config/heartbeat protocols, bounded
+  restart and crash-loop scenarios, spoofer evidence, rollback failpoint
+  handshake, and the default NX success path.
+- **Implemented:** the slot-0 monitor uses the saved supervisor identity
+  (`je_proc_status`), reads the report only after the PTE RW/NX probe, never
+  calls `je_kernel_idle_step` after seeding, and treats every non-LIVE status
+  as supervisor loss unless a stable DONE report and kernel corroboration prove
+  success.
+- **Implemented:** D12 teardown calls kill-all with no spare, explicitly reaps,
+  checks no DYING users remain, checks endpoint quiescence, and compares the
+  full allocator page-state snapshot plus process/VM identities against the
+  pre-seed baseline.
+- **Implemented:** `TEST_MODE=12` writes the mode word into the supervisor RW
+  report page after seeding; the supervisor faults after restart-service and
+  survivor readiness. The mode-12 harness expects the refusal and zero-leak
+  markers and rejects `JeiOS fatal:`.
+- **Tested:** `make smoke` passed locally at this observation. A direct
+  `make iso TEST_MODE=12` plus QEMU boot passed locally with
+  `M4f: supervisor lost (reason=0x...); no recovery path in this profile` and
+  `M4f: zero-leak identity baseline verified`.
+- **Tested:** `ASAN_OPTIONS=detect_leaks=0 make check`, `make integration`, the
+  default and 16 MiB no-NX profiles, and the 1536 MiB NX profile all passed
+  locally. Integration covered modes 1–12, including mode 12.
+- **Planned:** rerun the full suite after lead integration or any code changes;
+  inspect the complete diff and preserve the exact local-vs-remote evidence.
+- **Blocked:** no known blocker. Remote CI and independent human qualification
+  are not observed by this worker.
+
+**Changed invariants and hazards:** `vb_link_tables` now clears reused
+paging-table frames before publishing entries; allocator ownership reuse alone
+does not guarantee byte-zeroed tables. The supervisor report is untrusted
+diagnostic evidence; kernel proof uses death records and live endpoint-handle
+rights. The baseline does not claim hardware-wide support, SMP safety, or
+fault isolation for ring-0 modules. The monitor intentionally leaves child
+DYING records unreaped until the supervisor decision so the corroboration scan
+can inspect their first death records.
+
 ## M4 PR-F Stage 1 — D12 kernel mechanism — observed 2026-10-31T23:05:35+00:00
 
 Repository `auto44e/jeios`, branch `wip/m4f-impl`, inspected commit
