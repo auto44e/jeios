@@ -6,10 +6,13 @@ import subprocess
 import time
 
 
-def boot(image, *, cpu="qemu64", memory="128M", terminal=b"initialization complete; halted", expected=(), timeout=15):
+def boot(image, *, cpu="qemu64", memory="128M", terminal=b"initialization complete; halted",
+         expected=(), timeout=15, serial2=None):
     cmd = ["qemu-system-x86_64", "-machine", "pc", "-cpu", cpu, "-m", memory,
            "-cdrom", str(image), "-display", "none", "-serial", "stdio", "-monitor", "none",
            "-no-reboot", "-no-shutdown", "-nic", "none"]
+    if serial2 is not None:
+        cmd.extend(["-serial", serial2])
     output = bytearray()
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as proc:
         try:

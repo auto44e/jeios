@@ -24,6 +24,7 @@
 #include <jeios/proc.h>
 #include <jeios/arch.h>
 #include <jeios/spawn.h>
+#include <jeios/device.h>
 extern je_ep_status je_endpoint_kern_dup(je_vm *vm, uint32_t index, je_handle src,
                                          uint32_t rights, je_handle *out);
 extern bool je_endpoint_kern_is_wired(const je_vm *vm);
@@ -152,6 +153,21 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
         if (rsi|rdx|r10|r8|r9) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_PROC_KILL;
+    case JE_SYS_DEV_ASSIGN:
+        if ((rdi >> 32) || (rsi >> 32) || rdx || r10 || r8 || r9) {
+            *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN;
+        }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_DEV_ASSIGN;
+    case JE_SYS_DEV_REVOKE:
+        if ((rdi >> 32) || rsi || rdx || r10 || r8 || r9) {
+            *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN;
+        }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_DEV_REVOKE;
+    case JE_SYS_DEV_IRQ_ACK:
+        if ((rdi >> 32) || rsi || rdx || r10 || r8 || r9) {
+            *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN;
+        }
+        *out_status=JE_ABI_OK; return JE_SYSCALL_DEV_IRQ_ACK;
 #ifdef JE_DEV_COPY_INJECT
     case JE_SYS_COPY_FIXUP_INJECT:
         /* dev-only: uaddr=RDI (an unmapped arena page); glue raw-copies to prove
@@ -213,7 +229,7 @@ static bool process_id_from_object(je_proc_pool *pool, void *object,
 static je_status dispatch_retain_process(void *object);
 static void dispatch_release_process(void *object);
 
-static const je_type_dispatch type_dispatch[JE_ABI_OBJ_LAUNCHER + 1u] = {
+static const je_type_dispatch type_dispatch[JE_ABI_OBJ_DEVICE + 1u] = {
     [JE_ABI_OBJ_SELF] = {
         JE_ABI_RIGHT_INSPECT, JE_DUP_POLICY_SELF, JE_ABI_OBJ_SELF,
         (je_status (*)(void *))0, (void (*)(void *))0
@@ -231,12 +247,17 @@ static const je_type_dispatch type_dispatch[JE_ABI_OBJ_LAUNCHER + 1u] = {
     [JE_ABI_OBJ_LAUNCHER] = {
         JE_ABI_RIGHT_SPAWN, JE_DUP_POLICY_DENIED, JE_ABI_OBJ_LAUNCHER,
         (je_status (*)(void *))0, (void (*)(void *))0
+    },
+    [JE_ABI_OBJ_DEVICE] = {
+        JE_ABI_RIGHT_PIO | JE_ABI_RIGHT_IRQ | JE_ABI_RIGHT_ASSIGN,
+        JE_DUP_POLICY_DENIED, JE_ABI_OBJ_DEVICE,
+        (je_status (*)(void *))0, (void (*)(void *))0
     }
 };
 
 static const je_type_dispatch *dispatch_for_type(uint32_t type)
 {
-    if (type == 0u || type > JE_ABI_OBJ_LAUNCHER
+    if (type == 0u || type > JE_ABI_OBJ_DEVICE
         || type_dispatch[type].known_rights == 0u)
         return (const je_type_dispatch *)0;
     return &type_dispatch[type];
@@ -563,6 +584,116 @@ static je_trap_frame *dispatch_proc_kill(je_trap_frame *f)
     return je_sched_return_to_user(f);
 }
 
+static je_abi_status resolve_device_admin(je_handle_table *t, je_handle h)
+{
+    uint32_t type = 0u, rights = 0u;
+    void *object = (void *)0;
+    je_handle_status s = je_handle_resolve_any(t, h, &type, &rights, &object);
+    if (s != JE_HANDLE_OK) return handle_status_to_abi(s);
+    if (type != JE_ABI_OBJ_DEVICE || !je_device_is_object(je_kernel_device(), object))
+        return JE_ABI_H_WRONGTYPE;
+    if ((rights & JE_ABI_RIGHT_ASSIGN) == 0u) return JE_ABI_H_DENIED;
+    return JE_ABI_OK;
+}
+
+static je_trap_frame *dispatch_device_assign(je_trap_frame *f)
+{
+    je_vm *caller_vm = (je_vm *)0;
+    uint32_t caller_index = 0u;
+    je_proc_id caller = JE_PROC_ID_NONE;
+    if (!current_vm_index(&caller_vm, &caller_index)
+        || je_sched_current_proc_id(&caller) != JE_OK) {
+        f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0u;
+        return je_sched_return_to_user(f);
+    }
+    je_abi_status admin = resolve_device_admin(
+        &caller_vm->procs[caller_index].htable, (je_handle)f->rdi);
+    if (admin != JE_ABI_OK) {
+        f->rax=(uint64_t)admin; f->rdx=0u;
+        return je_sched_return_to_user(f);
+    }
+    uint32_t type = 0u, rights = 0u;
+    void *object = (void *)0;
+    je_handle_status rs = je_handle_resolve_any(
+        &caller_vm->procs[caller_index].htable, (je_handle)f->rsi,
+        &type, &rights, &object);
+    if (rs != JE_HANDLE_OK) {
+        f->rax=(uint64_t)handle_status_to_abi(rs); f->rdx=0u;
+        return je_sched_return_to_user(f);
+    }
+    if (type != JE_ABI_OBJ_PROCESS) {
+        f->rax=(uint64_t)JE_ABI_H_WRONGTYPE; f->rdx=0u;
+        return je_sched_return_to_user(f);
+    }
+    if ((rights & JE_ABI_RIGHT_KILL) == 0u) {
+        f->rax=(uint64_t)JE_ABI_H_DENIED; f->rdx=0u;
+        return je_sched_return_to_user(f);
+    }
+    je_proc_id target = JE_PROC_ID_NONE;
+    if (!process_id_from_object(process_pool(), object, &target)) {
+        syscall_invariant("JeiOS fatal: DEV_ASSIGN process invariant\r\n");
+    }
+    je_vm *target_vm = (je_vm *)0;
+    uint32_t target_index = 0u;
+    if (je_sched_find_process(target, &target_vm, &target_index) != JE_OK) {
+        f->rax=(uint64_t)JE_ABI_H_STALE; f->rdx=0u;
+        return je_sched_return_to_user(f);
+    }
+    je_handle out = 0u;
+    je_abi_status status = je_device_assign(
+        je_kernel_device(), caller, target, target_vm, target_index, &out);
+    f->rax=(uint64_t)status; f->rdx=(uint64_t)out;
+    return je_sched_return_to_user(f);
+}
+
+static je_trap_frame *dispatch_device_revoke(je_trap_frame *f)
+{
+    je_vm *vm = (je_vm *)0;
+    uint32_t index = 0u;
+    if (!current_vm_index(&vm, &index)) {
+        f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0u;
+        return je_sched_return_to_user(f);
+    }
+    je_abi_status status = resolve_device_admin(
+        &vm->procs[index].htable, (je_handle)f->rdi);
+    if (status == JE_ABI_OK) status = je_device_revoke(je_kernel_device());
+    f->rax=(uint64_t)status; f->rdx=0u;
+    return je_sched_return_to_user(f);
+}
+
+static je_trap_frame *dispatch_device_ack(je_trap_frame *f)
+{
+    je_vm *vm = (je_vm *)0;
+    uint32_t index = 0u, pending = 0u;
+    je_proc_id caller = JE_PROC_ID_NONE;
+    if (!current_vm_index(&vm, &index)
+        || je_sched_current_proc_id(&caller) != JE_OK) {
+        f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0u;
+        return je_sched_return_to_user(f);
+    }
+    uint32_t type = 0u, rights = 0u;
+    void *object = (void *)0;
+    je_handle_status rs = je_handle_resolve_any(
+        &vm->procs[index].htable, (je_handle)f->rdi,
+        &type, &rights, &object);
+    if (rs != JE_HANDLE_OK) {
+        f->rax=(uint64_t)handle_status_to_abi(rs); f->rdx=0u;
+        return je_sched_return_to_user(f);
+    }
+    if (type != JE_ABI_OBJ_DEVICE) {
+        f->rax=(uint64_t)JE_ABI_H_WRONGTYPE; f->rdx=0u;
+        return je_sched_return_to_user(f);
+    }
+    if ((rights & JE_ABI_RIGHT_IRQ) == 0u) {
+        f->rax=(uint64_t)JE_ABI_H_DENIED; f->rdx=0u;
+        return je_sched_return_to_user(f);
+    }
+    je_abi_status status = je_device_irq_ack(
+        je_kernel_device(), caller, vm, index, (je_handle)f->rdi, &pending);
+    f->rax=(uint64_t)status; f->rdx=(uint64_t)pending;
+    return je_sched_return_to_user(f);
+}
+
 /* Kernel glue. Returns the frame to iretq to (the caller for RETURN/invalid, a
  * live successor for YIELD/EXIT). Must only be called for a user-origin int 0x80
  * frame (je_trap_dispatch enforces cs&3==3; the scheduler helpers re-check the
@@ -595,6 +726,12 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         return dispatch_proc_status(f);
     if (action == JE_SYSCALL_PROC_KILL)
         return dispatch_proc_kill(f);
+    if (action == JE_SYSCALL_DEV_ASSIGN)
+        return dispatch_device_assign(f);
+    if (action == JE_SYSCALL_DEV_REVOKE)
+        return dispatch_device_revoke(f);
+    if (action == JE_SYSCALL_DEV_IRQ_ACK)
+        return dispatch_device_ack(f);
 
     switch (action) {
     case JE_SYSCALL_YIELD:
@@ -655,6 +792,15 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
                 syscall_invariant("JeiOS fatal: PROCESS close mismatch\r\n");
             dispatch_release_process(object);
             f->rax=(uint64_t)JE_ABI_OK; f->rdx=0;
+        } else if (type == JE_ABI_OBJ_DEVICE) {
+            je_proc_id caller = JE_PROC_ID_NONE;
+            if (je_sched_current_proc_id(&caller) != JE_OK)
+                syscall_invariant("JeiOS fatal: DEVICE close caller invariant\r\n");
+            bool revoke = je_device_close_matches(
+                je_kernel_device(), caller, vm, index, h);
+            je_handle_status s = je_handle_close(t, h);
+            if (s == JE_HANDLE_OK && revoke) (void)je_device_revoke(je_kernel_device());
+            f->rax = (uint64_t)handle_status_to_abi(s); f->rdx = 0u;
         } else if (type == JE_ABI_OBJ_SELF || type == JE_ABI_OBJ_LAUNCHER) {
             je_handle_status s = je_handle_close(t, h);
             f->rax = (uint64_t)handle_status_to_abi(s); f->rdx = 0;

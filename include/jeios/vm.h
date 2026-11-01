@@ -28,6 +28,7 @@
  */
 #include <stddef.h>
 #include <jeios/alloc.h>
+#include <jeios/proc.h>
 #include <jeios/status.h>
 #include <jeios/handle.h>    /* M3b: per-process handle table storage */
 
@@ -259,14 +260,16 @@ typedef struct {
      * pair, installed by kernel VM wiring and left NULL by the vm unit test (which
      * keeps vm.c endpoint- and arch-agnostic). je_vm_destroy, if `teardown` is
      * set, runs teardown(teardown_ctx, &proc.htable) — the endpoint release walk —
-     * immediately before unwind(); and if `irq_save` is set, wraps the whole
+     * immediately before unwind(); the callback receives the process identity
+     * used to validate process-owned DEVICE handles. If `irq_save` is set,
+     * wraps the whole
      * hook+unwind+zero sequence in irq_save()/irq_restore() so a timer cannot
      * preempt between the walk and the table-zeroing (the direct main.c destroy
      * callers may run with IF=1). All four are a single write at wiring time and
      * immutable thereafter. NULL => current behaviour (no walk, no extra IRQ
      * save), which is exactly what the unit test and the build-failure unwind
      * want. */
-    void     (*teardown)(void *ctx, je_handle_table *t);
+    void     (*teardown)(void *ctx, je_handle_table *t, je_proc_id owner);
     void      *teardown_ctx;
     uint64_t (*irq_save)(void);    /* disable IRQs, return prior flags */
     void     (*irq_restore)(uint64_t flags);
@@ -307,6 +310,7 @@ je_status je_vm_build_quota(je_vm *vm, const je_vm_image *image, const void *blo
  * run. Returns JE_ERR_INVALID only for a bad index/non-READY slot; backend undo
  * failures panic. */
 je_status je_vm_destroy(je_vm *vm, uint32_t index);
+je_status je_vm_destroy_owned(je_vm *vm, uint32_t index, je_proc_id owner);
 
 /* Audit oracle (see this header's design notes and ADR 0007). JE_OK iff every
  * frozen invariant holds for process `index`, including cross-process root/

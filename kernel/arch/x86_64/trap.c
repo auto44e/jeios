@@ -6,6 +6,7 @@
 #include <jeios/sched.h>
 #include <jeios/syscall.h>
 #include <jeios/usercopy.h>
+#include <jeios/device.h>
 /* Intel SDM Vol.3A: 64-bit interrupt handling, IST and TSS; Vol.2: LIDT/LTR.
  * Source references and ABI rationale are in docs/IMPLEMENTATION.md. */
 struct __attribute__((packed)) gate {
@@ -20,11 +21,19 @@ struct __attribute__((packed)) tss64 {
 };
 _Static_assert(sizeof(struct gate) == 16, "IDT entry layout");
 _Static_assert(sizeof(struct tss64) == 104, "TSS layout");
+struct __attribute__((packed)) tss_with_bitmap {
+    struct tss64 tss;
+    uint8_t iobm[0x60];
+    uint8_t term;
+};
+_Static_assert(offsetof(struct tss_with_bitmap, iobm) == 104, "TSS bitmap offset");
+_Static_assert(sizeof(struct tss_with_bitmap) == 201, "TSS bitmap layout");
+_Static_assert(offsetof(struct tss_with_bitmap, term) == 200, "TSS terminator");
 _Static_assert(sizeof(je_trap_frame) == 176, "trap frame size");
 _Static_assert(offsetof(je_trap_frame, vector) == 120, "assembly frame offset");
 static struct gate idt[256] __attribute__((aligned(16)));
 static uint64_t gdt[7] __attribute__((aligned(16)));
-static struct tss64 tss;
+static struct tss_with_bitmap tss;
 /* First page becomes unmapped guard in M1b; next four pages hold the stack. */
 unsigned char je_df_stack[5 * 4096] __attribute__((aligned(4096)));
 unsigned char je_nmi_stack[5 * 4096] __attribute__((aligned(4096)));
@@ -40,11 +49,15 @@ void je_arch_traps_init(void)
      *   gdt[6] user code  (selector 0x33 = index 6, RPL 3): present, DPL3, L, exec/read. */
     gdt[5] = UINT64_C(0x00cff2000000ffff);
     gdt[6] = UINT64_C(0x00affa000000ffff);
-    tss.ist[0] = (uintptr_t)je_df_stack + sizeof(je_df_stack);
-    tss.ist[1] = (uintptr_t)je_nmi_stack + sizeof(je_nmi_stack);
-    tss.iomap = (uint16_t)sizeof(tss); /* No I/O bitmap within the TSS limit. */
+    tss.tss.ist[0] = (uintptr_t)je_df_stack + sizeof(je_df_stack);
+    tss.tss.ist[1] = (uintptr_t)je_nmi_stack + sizeof(je_nmi_stack);
+    tss.tss.iomap = (uint16_t)offsetof(struct tss_with_bitmap, iobm);
+    for (size_t i = 0; i < sizeof(tss.iobm); ++i) tss.iobm[i] = 0xffu;
+    tss.term = 0xffu;
     uint64_t base = (uintptr_t)&tss;
-    gdt[3] = UINT64_C(103) | ((base & 0xffffff) << 16) |
+    _Static_assert(offsetof(struct tss_with_bitmap, iobm) + sizeof(tss.iobm) == 200,
+                   "TSS descriptor limit");
+    gdt[3] = UINT64_C(200) | ((base & 0xffffff) << 16) |
              (UINT64_C(0x89) << 40) | (((base >> 24) & 0xff) << 56);
     gdt[4] = base >> 32;
     struct table_pointer gp = {(uint16_t)(sizeof(gdt)-1), (uintptr_t)gdt};
@@ -70,8 +83,11 @@ static volatile unsigned panicking;
  * trap. The scheduler sets it to the next user thread's per-process kernel stack
  * top before returning that thread's frame; a kernel thread sets 0 (never
  * consulted for CPL0->CPL0, fail-closed if ever wrongly used). */
-void je_arch_tss_set_rsp0(uint64_t rsp0) { tss.rsp[0] = rsp0; }
-uint64_t je_arch_tss_get_rsp0(void) { return tss.rsp[0]; }
+void je_arch_tss_set_rsp0(uint64_t rsp0) { tss.tss.rsp[0] = rsp0; }
+uint64_t je_arch_tss_get_rsp0(void) { return tss.tss.rsp[0]; }
+void je_arch_tss_set_com2_io(bool allow) { tss.iobm[0x5f] = allow ? 0x00u : 0xffu; }
+uint8_t je_arch_tss_com2_io(void) { return tss.iobm[0x5f]; }
+uintptr_t je_arch_tss_address(void) { return (uintptr_t)&tss; }
 
 /* M3a #4 step 3 (ADR 0007 D7): architectural denial of x87/MMX/SSE/AVX and
  * extended state, so hostile ring-3 FP/SIMD traps (#NM/#UD) instead of executing
@@ -123,6 +139,14 @@ je_trap_frame *je_trap_dispatch(je_trap_frame *f)
 {
     if (f->vector==32) {
         je_arch_timer_eoi(); return je_sched_interrupt(f,true);
+    }
+    if (f->vector == 35) {
+        je_device_irq3(je_kernel_device());
+        return je_sched_interrupt(f, false);
+    }
+    if (f->vector == 39) {
+        je_device_irq7(je_kernel_device());
+        return je_sched_interrupt(f, false);
     }
     if (f->vector==0x81) return je_sched_interrupt(f,false);
     uint64_t cr2 = 0;

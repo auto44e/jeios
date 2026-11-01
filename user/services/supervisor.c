@@ -96,6 +96,111 @@ static uint32_t spawn_one(uint64_t launcher, uint32_t image, uint64_t source,
     return 1u;
 }
 
+#if JE_TEST_MODE == 14
+static uint64_t sleep_tick(uint64_t self_recv);
+static uint32_t wait_ready(uint64_t endpoint, uint64_t process,
+                           uint64_t self_recv, uint64_t deadline);
+static uint32_t wait_dead(uint64_t process, uint64_t self_recv,
+                          uint64_t deadline);
+static int64_t failed(report_state *report_values, uint32_t code);
+typedef struct {
+    uint32_t op;
+    uint32_t value;
+} d9_message;
+#define D9_DEGRADED 1u
+#define D9_PRESENT 2u
+
+static uint32_t d9_wait_result(uint64_t endpoint, uint64_t process,
+                               uint64_t self_recv)
+{
+    d9_message result = {0};
+    uint64_t meta = 0u;
+    uint64_t start = 0u, now = 0u;
+    if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
+    for (;;) {
+        uint64_t status = je_try_recv(endpoint, &result, sizeof result, 0u, &meta);
+        if (status == JE_ABI_OK) {
+            if ((meta & UINT64_C(0xffffffff)) != sizeof result
+                || (meta >> 32) != 0u || result.op != UINT32_C(0x54534552))
+                return 0u;
+            return result.value;
+        }
+        if (status != JE_ABI_H_EMPTY) return 0u;
+        (void)process;
+        if (je_clock_ticks(&now) != JE_ABI_OK
+            || now - start >= JE_SVC_READY_DEADLINE)
+            return 0u;
+        if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
+    }
+}
+
+static uint32_t d9_run_one(uint64_t launcher, uint64_t admin,
+                           uint64_t self_recv, uint32_t mode)
+{
+    uint64_t process = 0u, endpoint = 0u, device = 0u;
+    if (!spawn_one(launcher, JE_IMAGE_UART_DRIVER, 0u,
+                   JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV,
+                   &process, &endpoint)
+        || wait_ready(endpoint, process, self_recv, JE_SVC_READY_DEADLINE) != 1u)
+        return 101u;
+    if (je_dev_assign(admin, process, &device) != JE_ABI_OK || device == 0u)
+        return 102u;
+    d9_message grant = {
+        UINT32_C(0x44525952) + mode,
+        (uint32_t)device
+    };
+    if (je_try_send(endpoint, &grant, sizeof grant) != JE_ABI_OK)
+        return 103u;
+    uint32_t result = d9_wait_result(endpoint, process, self_recv);
+    if (result == 0u) return 104u;
+    if (result == D9_DEGRADED) {
+        /* A missing COM2 is an explicit degraded profile, never a successful
+         * isolation run. The driver has already refused the probe and exited. */
+        if (wait_dead(process, self_recv, JE_SVC_READY_DEADLINE) != 1u)
+            return 108u;
+        (void)je_handle_close(endpoint);
+        (void)je_handle_close(process);
+        return result;
+    }
+    if (mode == 1u) {
+        if (je_dev_revoke(admin) != JE_ABI_OK) return 105u;
+        d9_message go = { UINT32_C(0x54534552), 0u };
+        if (je_try_send(endpoint, &go, sizeof go) != JE_ABI_OK
+            || wait_dead(process, self_recv, JE_SVC_READY_DEADLINE) != 1u)
+            return 106u;
+    } else if (mode == 13u) {
+        /* The hostile driver never ACKs and leaves the UART source enabled.
+         * These timer sleeps are the survivor-progress proof: IRQ3 is masked
+         * after its first delivery, but the supervisor continues to run. */
+        for (uint32_t tick = 0u; tick < 3u; ++tick)
+            if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT)
+                return 109u;
+        if (je_dev_revoke(admin) != JE_ABI_OK) return 110u;
+        d9_message go = { UINT32_C(0x54534552), 0u };
+        if (je_try_send(endpoint, &go, sizeof go) != JE_ABI_OK
+            || wait_dead(process, self_recv, JE_SVC_READY_DEADLINE) != 1u)
+            return 111u;
+    } else if (wait_dead(process, self_recv, JE_SVC_READY_DEADLINE) != 1u) {
+        return 107u;
+    }
+    (void)je_handle_close(endpoint);
+    (void)je_handle_close(process);
+    return result;
+}
+
+static int64_t device_mode14(uint64_t launcher, uint64_t admin,
+                             uint64_t self_recv, report_state *values)
+{
+    for (uint32_t mode = 0u; mode <= 13u; ++mode) {
+        uint32_t result = d9_run_one(launcher, admin, self_recv, mode);
+        if (result != D9_PRESENT)
+            return failed(values, UINT32_C(0x1400) + mode * 0x100u + result);
+    }
+    publish(JE_SVC_PHASE_DONE, JE_SVC_FAIL_NONE, values);
+    return (int64_t)JE_SVC_DONE_EXIT_G;
+}
+#endif
+
 #define WAIT_FAILED         0u
 #define WAIT_OK             1u
 #define WAIT_SLEEP_CHANNEL  2u
@@ -693,21 +798,23 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t h0, uint64_t h1,
 
     (void)report_padding;
     (void)supervisor_rodata;
-    if (version != JE_ABI_STARTUP_V1 || n != 1u
-        || h1 != 0u || h2 != 0u || h3 != 0u)
+    if (version != JE_ABI_STARTUP_V1 || n != 2u
+        || h1 == 0u || h2 != 0u || h3 != 0u)
         return failed(&report_values, JE_SVC_FAIL_READINESS);
     report.seq = 0u;
     publish(JE_SVC_PHASE_BOOT, JE_SVC_FAIL_NONE, &report_values);
     /* The seeded launcher occupies slot 0. Mint SELF before any endpoint so
-     * this scenario checks the exact slot-1/gen-1 handle it relies on. */
+     * this scenario checks the exact slot-2/gen-1 handle it relies on. */
     if (je_handle_self(&supervisor_self) != JE_ABI_OK
-        || supervisor_self != UINT64_C(0x00010001))
+        || supervisor_self != UINT64_C(0x00010002))
         return failed(&report_values, JE_SVC_FAIL_READINESS);
     if (je_endpoint_create(&self_packed) != JE_ABI_OK)
         return failed(&report_values, JE_SVC_FAIL_SLEEP_CHANNEL);
     self_recv = (uint32_t)self_packed;
 #if JE_TEST_MODE == 13
     return broker_mode13(h0, self_recv, &report_values);
+#elif JE_TEST_MODE == 14
+    return device_mode14(h0, h1, self_recv, &report_values);
 #endif
     if (!spawn_one(h0, JE_IMAGE_RESTART_SVC, 0u,
                    JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV,

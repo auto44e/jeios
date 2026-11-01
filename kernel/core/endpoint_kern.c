@@ -10,6 +10,7 @@
 #include <jeios/sched.h>   /* je_sched_wake_ipc for the blocking-recv bridge */
 #include <jeios/arch.h>
 #include <jeios/abi.h>
+#include <jeios/device.h>
 
 _Static_assert(JE_EP_PROCESS_OBJ_TYPE == JE_ABI_OBJ_PROCESS,
                "PROCESS object type must match the ABI");
@@ -43,14 +44,18 @@ static void kern_peer_close_wake(je_ep_channel *rec, uint8_t side);
  * return is an invariant violation (pool corruption) and MUST stop the kernel
  * before the table is zeroed — continuing would zero away the leak evidence and
  * ship a lie. */
-static void kep_teardown(void *ctx, je_handle_table *t)
+static void kep_teardown(void *ctx, je_handle_table *t, je_proc_id owner)
 {
     je_endpoint_pool *pool = (je_endpoint_pool *)ctx;
-    if (je_endpoint_release_table(pool, t) < 0) {
+    je_device *device = je_kernel_device();
+    bool device_teardown = je_device_teardown_matches(device, owner, t);
+    je_device_on_process_dying(device, owner);
+    if (je_endpoint_release_table_owned(pool, t, owner) < 0) {
         je_arch_console_write("JeiOS fatal: endpoint release walk failed "
                               "(pool corrupt)\r\n");
         je_arch_halt();
     }
+    if (device_teardown) je_device_teardown_check(device, owner, t);
     /* A6-PEERWAKE: the release walk may have transitioned surviving peer ends to
      * PEER_CLOSED. Wake any receiver blocked on such an end (empty inbound ->
      * PEER_CLOSED; a nonempty end was already WOKEN by its enqueue, drain-first).

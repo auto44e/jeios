@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #ifndef JEIOS_ARCH_H
 #define JEIOS_ARCH_H
+#include <stdbool.h>
 #include <stdint.h>
 #include <jeios/status.h>
 je_status je_arch_console_init(void);
@@ -11,6 +12,12 @@ uint64_t je_arch_irq_save(void);
 void je_arch_irq_restore(uint64_t flags);
 void je_arch_timer_init(void);
 void je_arch_timer_eoi(void);
+void je_arch_irq3_mask(void);
+void je_arch_irq3_unmask(void);
+bool je_arch_irq3_is_unmasked(void);
+bool je_arch_irq7_is_unmasked(void);
+uint8_t je_arch_master_isr(void);
+void je_arch_master_eoi(void);
 /* Bootstrap detection only; not a scheduler capability record. */
 int je_arch_has_nx(void);
 /* M3a #4 step 3: ring-transition support. tss_set_rsp0 sets the kernel stack the
@@ -22,5 +29,8 @@ uint64_t je_arch_tss_get_rsp0(void);
 void je_arch_cpu_policy_init(void);
 uint64_t je_arch_cpu_policy_cr0(void);
 uint64_t je_arch_cpu_policy_cr4(void);
+void je_arch_tss_set_com2_io(bool allow);
+uint8_t je_arch_tss_com2_io(void);
+uintptr_t je_arch_tss_address(void);
 #endif
 

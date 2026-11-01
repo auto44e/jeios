@@ -274,8 +274,7 @@ _Static_assert(sizeof(je_abi_spawn_grant) == 8u, "spawn grant ABI size");
 /* Startup register ABI v1 (ADR 0010 D5). At a spawned process's first dispatch:
  * RDI = JE_ABI_STARTUP_V1, RSI = n grants, RDX/RCX/R8/R9 = the minted handles in grant
  * order (zero beyond n), RSP = image stack top, every other GPR zero. The kernel-seeded
- * supervisor gets the same layout with n = 1 and RDX = its LAUNCHER handle (PR-C lead
- * decision; the ADR left this unspecified). */
+ * supervisor uses n = 2 with RDX = LAUNCHER and RCX = DEVICE admin. */
 #define JE_ABI_STARTUP_V1 1u
 
 /* ADR 0010 D4: PROC_STATUS output. state: 1 LIVE, 2 DYING, 3 DEAD (0 FREE is never

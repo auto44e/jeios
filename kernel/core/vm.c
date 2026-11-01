@@ -400,6 +400,11 @@ je_status je_vm_build(je_vm *vm, const je_vm_image *image, const void *blob,
 
 je_status je_vm_destroy(je_vm *vm, uint32_t index)
 {
+    return je_vm_destroy_owned(vm, index, JE_PROC_ID_NONE);
+}
+
+je_status je_vm_destroy_owned(je_vm *vm, uint32_t index, je_proc_id owner)
+{
     if (!vm || !vm->ops || index >= JE_VM_MAX_PROCESSES) return JE_ERR_INVALID;
     if (vm->procs[index].state != JE_VM_READY) return JE_ERR_INVALID;
     /* A3-1: the release walk + unwind + the *p={0} zeroing in unwind() must be
@@ -412,7 +417,7 @@ je_status je_vm_destroy(je_vm *vm, uint32_t index)
      * release walk) runs after the checks above and immediately before unwind. */
     uint64_t irq = 0u;
     if (vm->irq_save) irq = vm->irq_save();
-    if (vm->teardown) vm->teardown(vm->teardown_ctx, &vm->procs[index].htable);
+    if (vm->teardown) vm->teardown(vm->teardown_ctx, &vm->procs[index].htable, owner);
     unwind(vm, index);
     if (vm->irq_restore) vm->irq_restore(irq);
     return JE_OK;

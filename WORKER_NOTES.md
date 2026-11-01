@@ -1,3 +1,81 @@
+# PR-H FIX pass — D9 security-proof hardening
+
+Observation time: `2026-11-01T21:00:37Z`. Repository `jeios`; branch
+`wip/m4h-impl`; exact inspected commit `878db70c3906a0eb1841165a68f49816f1757be8`.
+Changes remain uncommitted for lead integration.
+
+State: **implemented / tested / planned / not blocked**. Remote CI and
+independent human qualification were not observed. AI-assisted review is not
+human qualification.
+
+## Decisions and implementation record
+
+- Mode 14 now decides isolation from the kernel child ledger's exact death
+  reasons, not aggregate terminal counts: the UART image must have exactly
+  13 `DEATH_FAULT` and 1 `DEATH_EXIT`, and all 13 faults must carry vector 13
+  (#GP). The binding-generation check is exact (`== 28`), not lower-bounded.
+- Revoke proof is causal. The driver polls `DEV_IRQ_ACK` until it observes
+  `pending=1`, services IIR/RBR, and one incarnation waits across a timer tick,
+  retriggers loopback, and observes a second ACK within the same binding.
+  Admin-revoke and self-close incarnations perform a real `inb(0x2F8)` after
+  authority withdrawal; the kernel ledger requires the resulting #GP death.
+  The crossing probe now performs `inb(0x2FF)` followed by `inb(0x300)`.
+- The teardown callback snapshots whether the closing table is the active
+  driver's table or owner identity, invokes centralized revoke before the
+  existing release walk, and then checks inactive owner/pending/re-arm and
+  masked IRQ3 state. Endpoint/PROCESS release behavior remains unchanged.
+- IRQ7 now unconditionally EOIs a real ISR-bit-7 interrupt. A spurious IRQ7
+  masks IRQ3 whenever hardware reports it unmasked and schedules a re-arm only
+  for an active binding; it never sends EOI.
+- Added `tests/test_device.c` with 76 `CHECK` cases under ASan+UBSan. Host
+  coverage includes assignment refusal precedence, near-`UINT32_MAX`
+  generation retirement, stale ACK/re-arm rejection, real/spurious IRQ7
+  branches, inactive-spurious behavior, and `UINT64_MAX` tick saturation.
+  It does not replace QEMU evidence for ring-3 #GPs or real PIC injection.
+
+## Exact verification observed
+
+- `ASAN_OPTIONS=detect_leaks=0 make check` — PASS; `test_device: PASS (76 checks)`.
+- `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=14` — PASS; the same
+  hosted suites and ELF/image checks passed under the mode-14 build.
+- `make smoke` — PASS; default mode 0 retained the M4f scenario and zero-leak
+  marker.
+- `make integration` — PASS. Final mode 14 included:
+
+  ```text
+  M4h: IRQ3 deliveries=0x000000000000000f; max-binding=0x0000000000000002; <=1/tick
+  M4h: TSS page U=0 in user CR3
+  M4h: ring-3 #GP isolation, revoke, and deny bitmap corroborated
+  M4h-s1: D9 device scenario completed
+  M4h: zero-leak identity baseline verified
+  ```
+
+- Temporary mutant A: scoped deletion of `je_arch_tss_set_com2_io(false)` from
+  `je_device_revoke`, rebuilt with `make iso TEST_MODE=14`, failed to produce
+  `M4h-s1`; output instead recorded `M4h: supervisor lost` and zero-leak.
+  The revoke call was restored in the revoke function.
+- Temporary mutant B: changed mode-0 forbidden `inb(0x2F7)` to allowed
+  `inb(0x2F8)`, rebuilt with `make iso TEST_MODE=14`, likewise failed to
+  produce `M4h-s1`; output recorded `M4h: supervisor lost` and zero-leak.
+  The probe was restored to `0x2F7`.
+- `git diff --check` — PASS at the final review point.
+- `python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx
+  --expect-nx absent` — PASS.
+- `python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M
+  --expect-nx absent` — PASS.
+- `python3 tools/smoke.py build/0/jeios.iso --memory 1536M
+  --expect-nx present` — PASS.
+- `make smoke-aarch64` — PASS; the existing ARM linker RWX warning remained,
+  and QEMU aarch64 smoke reached its DTB/CRC/EL1 markers.
+
+## Remaining limits
+
+The hosted test covers IRQ7 branch logic with architecture fakes; no current
+QEMU fixture injects real or spurious IRQ7. No remote CI, independent human
+review, hardened/release qualification, DMA, SMP, arbitrary hardware, or
+all-driver support is claimed. The next bounded task is lead integration and
+cross-review of this privilege-sensitive fix pass.
+
 # PR-G FIX pass — worker notes
 
 Observation time: `2026-11-01T08:04:50Z`. Repository: `jeios`; branch:
@@ -436,3 +514,90 @@ Not enforced yet: no supervisor image exists; no report is read at boot; no
 slot-0 identity scan, kill-all/reap integration, baseline audit, refusal marker
 or supervisor-loss QEMU scenario exists. No remote CI or human qualification
 is claimed.
+## PR-H D9 implementation record — observed 2026-11-01T20:24:32Z
+
+Repository/branch: `jeios`, `wip/m4h-impl`; inspected commit
+`b4e51542d1795e84057b114df5890046a13668c0`. Changes are intentionally
+uncommitted.
+
+### Decisions and reasoning
+
+- Kept one kernel singleton DEVICE record because M4 seeds exactly one COM2
+  resource. The record stores owner identity, binding generation, exact
+  driver VM/table/slot/handle generation, pending/revoking state, re-arm
+  generation/tick, last-unmask tick, and diagnostic IRQ3 delivery state.
+- Wrapped the existing architectural TSS in one packed object rather than
+  relocating or reloading it: the architectural TSS remains 104 bytes,
+  `LTR` sees descriptor limit 200, and only the COM2 bitmap byte changes after
+  dispatch. Filling the bitmap and terminator before `LTR` makes the
+  zero-means-allow encoding deny-by-default.
+- Used `je_handle_can_alloc` as the sole fallible ASSIGN preflight. A failure
+  returns quota/no-slots before binding; an allocation failure after the
+  preflight is a kernel invariant violation, not a recoverable user result.
+- Centralized revoke so DEV_REVOKE, exact DEVICE close, mark-dying, and kill
+  share mask-before-clear, generation invalidation, bitmap denial, exact raw
+  close, and owner clearing. The VM teardown callback carries process identity
+  to distinguish the recorded live driver slot from unrelated DEVICE handles.
+- Kept IRQ3 work kernel-owned and minimal: mask, set pending, EOI, schedule
+  normally. ACK and timer re-arm are delayed and generation-tagged, which
+  bounds an unacknowledged driver to at most one delivered IRQ per tick and
+  prevents stale ACKs from reopening a new binding.
+- Added a second QEMU serial backend for mode 14 so COM2 is a real emulated
+  16550. The ring-3 image performs the allowed eight-port exercise, then
+  reports/refuses if UART reads are `0xFF`; mode 14 rejects degraded results
+  rather than treating missing hardware as a successful security proof.
+- Extended mode 14 with a hostile driver incarnation that enables the UART
+  source, never ACKs, never clears that source, and waits for a supervisor
+  revoke. The supervisor performs three timer sleeps while it remains alive,
+  then revokes and releases the driver. The admin-revoke incarnation also
+  issues a stale ACK after revoke; it is intentionally ignored and cannot
+  reopen the binding.
+
+### Exact verification evidence
+
+```text
+ASAN_OPTIONS=detect_leaks=0 make check
+PASS (hosted sanitizers, ABI decode, VM/endpoint/handle/process/image/ELF checks)
+
+ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=14
+PASS
+
+make smoke
+PASS (mode 0 M4f supervisor scenario and zero-leak identity baseline)
+
+make integration
+PASS (fault modes 1-11, D12 mode 12, D11 mode 13, D9 mode 14; D9 used 14
+fresh driver bindings including stale-ACK and hostile no-ACK cases)
+
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --expect-nx absent
+PASS
+
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M --expect-nx absent
+PASS
+
+python3 tools/smoke.py build/0/jeios.iso --memory 1536M --expect-nx present
+PASS
+
+make smoke-aarch64
+PASS (QEMU virt 8.2; existing linker RWX warning only)
+
+git diff --check
+PASS
+```
+
+The mode-14 integration output observed:
+
+```text
+M4h: IRQ3 deliveries=0x0000000000000002; <=1/tick
+M4h: TSS page U=0 in user CR3
+M4h: ring-3 #GP isolation, revoke, and deny bitmap corroborated
+M4h-s1: D9 device scenario completed
+M4h: zero-leak identity baseline verified
+```
+
+### Not observed / not claimed
+
+The real and spurious IRQ7 branches were not synthesized by this QEMU run.
+They remain implementation code plus a planned runtime fixture, not tested
+evidence. Remote CI, independent human qualification, all hardware, DMA,
+SMP, dynamic loading, and release qualification remain unclaimed.
