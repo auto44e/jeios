@@ -1,11 +1,10 @@
 # Agent handoff: M1/M2 kernel foundation
 
-## M4 PR-G — D11 broker / TEST_MODE 13 — current status
+## M4 PR-G (#53) — D11 broker / TEST_MODE 13 — observed 2026-11-01T10:43:43Z
 
-Observation: `2026-11-01T10:33:58Z`; repository `jeios`; branch
-`wip/m4g-impl`; exact inspected commit
-`f704111f1ba17b6a0e75da19621993ab588b466b`. Changes remain intentionally
-uncommitted for lead integration.
+Branch `feat/m4g-broker`, based on main `ade5ddc` (#67 merged; main CI green);
+integrated head `51b252b`. Opened as the PR-G pull request. Built as impl → code
+review (blockers found) → fix → owner option-2 identity re-key, each cross-reviewed.
 
 State: **implemented / tested / planned / not blocked**.
 
@@ -32,9 +31,15 @@ State: **implemented / tested / planned / not blocked**.
   all passed. Integration mode 13 reached
   `M4g: client-reported EXHAUSTED; kernel delivery count A=2 corroborated`,
   `M4g-s1`, and the zero-leak baseline; `M4g: supervisor lost` was absent.
-- **Planned:** lead cross-review/mutant review and owner integration. **Blocked:**
-  no implementation blocker; remote CI and independent human qualification are
-  unobserved.
+- **Planned:** PR-H (TSS I/O bitmap / DEVICE / IRQ3), PR-I (UART driver demo),
+  then MP2. **Blocked:** no implementation blocker; remote CI and independent human
+  qualification are unobserved.
+
+**Review record:** `docs/adr/debates/m4g-reviews.md` (design + code review; the code
+review's blockers and the owner's option-2 identity decision), worker notes in
+`docs/adr/debates/m4g-workers.md`. **Known coverage gap (honest):** A's EXHAUSTED
+lands where a live duplicate also exists, so mode 13 proves the cap check-order but
+not a duplicate-free lifetime cap; a host unit test would close it.
 
 **Changed invariants and unresolved hazards:** brokered endpoints are never
 forwardable; supervisor source handles close only after receiver ACKs; malformed
