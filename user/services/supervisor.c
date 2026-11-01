@@ -16,16 +16,28 @@ static void compiler_barrier(void)
     __asm__ volatile("" ::: "memory");
 }
 
-static void publish(uint32_t phase, uint32_t fail_code)
+typedef struct {
+    uint32_t restarts;
+    uint32_t heartbeats;
+    uint32_t spoofer_bits;
+    uint32_t crash_attempts;
+} report_state;
+
+static void publish(uint32_t phase, uint32_t fail_code,
+                    const report_state *state)
 {
+    if (!state) return;
     uint32_t seq = report.seq;
     if ((seq & 1u) != 0u) ++seq;
     report.seq = seq + 1u;
+    report.magic = JE_SVC_REPORT_MAGIC;
+    report.version = JE_SVC_REPORT_V0;
     report.fail_code = fail_code;
-    report.restarts = report.restarts;
-    report.heartbeats = report.heartbeats;
-    report.spoofer_bits = report.spoofer_bits;
-    report.crash_attempts = report.crash_attempts;
+    report.restarts = state->restarts;
+    report.heartbeats = state->heartbeats;
+    report.spoofer_bits = state->spoofer_bits;
+    report.crash_attempts = state->crash_attempts;
+    report.reserved = 0u;
     compiler_barrier();
     report.phase = phase;
     compiler_barrier();
@@ -35,7 +47,8 @@ static void publish(uint32_t phase, uint32_t fail_code)
 static uint64_t sleep_tick(uint64_t self_recv)
 {
     uint64_t marker = 0u;
-    uint64_t status = je_try_recv(self_recv, &marker, sizeof marker, 1u, &marker);
+    uint64_t meta = 0u;
+    uint64_t status = je_try_recv(self_recv, &marker, sizeof marker, 1u, &meta);
     return status;
 }
 
@@ -82,22 +95,28 @@ static uint32_t spawn_one(uint64_t launcher, uint32_t image, uint64_t source,
     return 1u;
 }
 
+#define WAIT_FAILED         0u
+#define WAIT_OK             1u
+#define WAIT_SLEEP_CHANNEL  2u
+#define WAIT_SURVIVOR       3u
+
 static uint32_t wait_ready(uint64_t endpoint, uint64_t process,
                            uint64_t self_recv, uint64_t deadline)
 {
     uint64_t start = 0u;
     uint64_t now = 0u;
-    if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
+    if (je_clock_ticks(&start) != JE_ABI_OK) return WAIT_FAILED;
     for (;;) {
         uint32_t ready = ready_message(endpoint);
-        if (ready != 0u) return ready == 1u;
+        if (ready != 0u) return ready == 1u ? WAIT_OK : WAIT_FAILED;
         je_abi_proc_status state = {0};
         if (status_of(process, &state) != JE_ABI_OK
             || state.state != JE_ABI_PROC_LIVE)
-            return 0u;
+            return WAIT_FAILED;
         if (je_clock_ticks(&now) != JE_ABI_OK || now - start >= deadline)
-            return 0u;
-        if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
+            return WAIT_FAILED;
+        if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT)
+            return WAIT_SLEEP_CHANNEL;
     }
 }
 
@@ -111,46 +130,56 @@ static uint32_t wait_dead(uint64_t process, uint64_t self_recv, uint64_t deadlin
 {
     uint64_t start = 0u;
     uint64_t now = 0u;
-    if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
+    if (je_clock_ticks(&start) != JE_ABI_OK) return WAIT_FAILED;
     for (;;) {
         je_abi_proc_status state = {0};
-        if (process_dead(process, &state)) return 1u;
+        if (process_dead(process, &state)) return WAIT_OK;
         if (je_clock_ticks(&now) != JE_ABI_OK || now - start >= deadline)
-            return 0u;
-        if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
+            return WAIT_FAILED;
+        if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT)
+            return WAIT_SLEEP_CHANNEL;
     }
 }
 
-static uint32_t wait_restart_window(uint64_t restart_process, uint64_t survivor_endpoint,
-                                    uint64_t self_recv)
+static uint32_t wait_restart_window(uint64_t restart_process, uint64_t survivor_process,
+                                    uint64_t survivor_endpoint, uint64_t self_recv,
+                                    report_state *report_values)
 {
     uint64_t start = 0u;
     uint64_t now = 0u;
-    if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
+    if (!report_values || je_clock_ticks(&start) != JE_ABI_OK)
+        return WAIT_FAILED;
     for (;;) {
         je_abi_proc_status state = {0};
+        je_abi_proc_status survivor_state = {0};
         je_svc_heartbeat heartbeat = {0};
         uint64_t meta = 0u;
+        if (status_of(survivor_process, &survivor_state) != JE_ABI_OK
+            || survivor_state.state != JE_ABI_PROC_LIVE)
+            return WAIT_SURVIVOR;
         uint64_t status = je_try_recv(survivor_endpoint, &heartbeat,
                                       sizeof heartbeat, 0u, &meta);
         if (status == JE_ABI_OK
             && (meta & UINT64_C(0xffffffff)) == JE_SVC_HEARTBEAT_LEN
             && (meta >> 32) == 0u
             && heartbeat.op == JE_SVC_OP_HEARTBEAT)
-            ++report.heartbeats;
-        else if (status != JE_ABI_H_EMPTY && status != JE_ABI_H_PEER_CLOSED)
-            return 0u;
-        if (process_dead(restart_process, &state)) return 1u;
+            ++report_values->heartbeats;
+        else if (status == JE_ABI_H_PEER_CLOSED)
+            return WAIT_SURVIVOR;
+        else if (status != JE_ABI_H_EMPTY)
+            return WAIT_FAILED;
+        if (process_dead(restart_process, &state)) return WAIT_OK;
         if (je_clock_ticks(&now) != JE_ABI_OK
             || now - start >= JE_SVC_SCENARIO_DEADLINE)
-            return 0u;
-        if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
+            return WAIT_FAILED;
+        if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT)
+            return WAIT_SLEEP_CHANNEL;
     }
 }
 
-static int64_t failed(uint32_t code)
+static int64_t failed(report_state *report_values, uint32_t code)
 {
-    publish(JE_SVC_PHASE_FAILED, code);
+    publish(JE_SVC_PHASE_FAILED, code, report_values);
     return (int64_t)code;
 }
 
@@ -162,77 +191,110 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t h0, uint64_t h1,
     uint64_t restart_proc = 0u, survivor_proc = 0u;
     uint64_t restart_ep = 0u, survivor_ep = 0u;
     uint64_t spoofer_proc = 0u, spoofer_ep = 0u;
+    uint64_t supervisor_self = 0u;
     uint64_t config;
     uint32_t incarnation = 0u;
     je_svc_config restart_config = {0};
+    report_state report_values = {0};
     uint64_t status;
 
     (void)report_padding;
     (void)supervisor_rodata;
     if (version != JE_ABI_STARTUP_V1 || n != 1u
         || h1 != 0u || h2 != 0u || h3 != 0u)
-        return failed(JE_SVC_FAIL_READINESS);
-    report.magic = JE_SVC_REPORT_MAGIC;
-    report.version = JE_SVC_REPORT_V0;
+        return failed(&report_values, JE_SVC_FAIL_READINESS);
     report.seq = 0u;
-    report.reserved = 0u;
-    report.restarts = 0u;
-    report.heartbeats = 0u;
-    report.spoofer_bits = 0u;
-    report.crash_attempts = 0u;
-    publish(JE_SVC_PHASE_BOOT, JE_SVC_FAIL_NONE);
+    publish(JE_SVC_PHASE_BOOT, JE_SVC_FAIL_NONE, &report_values);
+    /* The seeded launcher occupies slot 0. Mint SELF before any endpoint so
+     * this scenario checks the exact slot-1/gen-1 handle it relies on. */
+    if (je_handle_self(&supervisor_self) != JE_ABI_OK
+        || supervisor_self != UINT64_C(0x00010001))
+        return failed(&report_values, JE_SVC_FAIL_READINESS);
     if (je_endpoint_create(&self_packed) != JE_ABI_OK)
-        return failed(JE_SVC_FAIL_SLEEP_CHANNEL);
+        return failed(&report_values, JE_SVC_FAIL_SLEEP_CHANNEL);
     self_recv = (uint32_t)self_packed;
     if (!spawn_one(h0, JE_IMAGE_RESTART_SVC, 0u,
                    JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV,
                    &restart_proc, &restart_ep))
-        return failed(JE_SVC_FAIL_RESTART);
+        return failed(&report_values, JE_SVC_FAIL_RESTART);
     if (!spawn_one(h0, JE_IMAGE_SURVIVOR, 0u, JE_ABI_RIGHT_SEND,
                    &survivor_proc, &survivor_ep))
-        return failed(JE_SVC_FAIL_SURVIVOR);
+        return failed(&report_values, JE_SVC_FAIL_SURVIVOR);
 
     restart_config.op = JE_SVC_OP_CONFIG;
     restart_config.incarnation = incarnation;
     restart_config.crash_before = JE_SVC_RESTART_CRASH_BEFORE;
     restart_config.reserved = 0u;
     if (je_try_send(restart_ep, &restart_config, sizeof restart_config) != JE_ABI_OK)
-        return failed(JE_SVC_FAIL_RESTART);
-    if (!wait_ready(survivor_ep, survivor_proc, self_recv, JE_SVC_READY_DEADLINE))
-        return failed(JE_SVC_FAIL_SURVIVOR);
-    if (!wait_restart_window(restart_proc, survivor_ep, self_recv))
-        return failed(JE_SVC_FAIL_RESTART);
+        return failed(&report_values, JE_SVC_FAIL_RESTART);
+    {
+        uint32_t wait = wait_ready(survivor_ep, survivor_proc, self_recv,
+                                   JE_SVC_READY_DEADLINE);
+        if (wait != WAIT_OK)
+            return failed(&report_values, wait == WAIT_SLEEP_CHANNEL
+                          ? JE_SVC_FAIL_SLEEP_CHANNEL
+                          : JE_SVC_FAIL_SURVIVOR);
+    }
+    {
+        uint32_t wait = wait_restart_window(restart_proc, survivor_proc,
+                                            survivor_ep, self_recv,
+                                            &report_values);
+        if (wait != WAIT_OK)
+            return failed(&report_values, wait == WAIT_SLEEP_CHANNEL
+                          ? JE_SVC_FAIL_SLEEP_CHANNEL
+                          : JE_SVC_FAIL_SURVIVOR);
+    }
     (void)je_proc_kill(restart_proc);
     (void)je_handle_close(restart_proc);
     (void)je_handle_close(restart_ep);
     ++incarnation;
-    ++report.restarts;
+    ++report_values.restarts;
     if (!spawn_one(h0, JE_IMAGE_RESTART_SVC, 0u,
                    JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV,
                    &restart_proc, &restart_ep))
-        return failed(JE_SVC_FAIL_RESTART);
+        return failed(&report_values, JE_SVC_FAIL_RESTART);
     restart_config.incarnation = incarnation;
-    if (je_try_send(restart_ep, &restart_config, sizeof restart_config) != JE_ABI_OK
-        || !wait_ready(restart_ep, restart_proc, self_recv, JE_SVC_READY_DEADLINE))
-        return failed(JE_SVC_FAIL_RESTART);
-    publish(JE_SVC_PHASE_READY, JE_SVC_FAIL_NONE);
+    if (je_try_send(restart_ep, &restart_config, sizeof restart_config) != JE_ABI_OK)
+        return failed(&report_values, JE_SVC_FAIL_RESTART);
+    {
+        uint32_t wait = wait_ready(restart_ep, restart_proc, self_recv,
+                                   JE_SVC_READY_DEADLINE);
+        if (wait != WAIT_OK)
+            return failed(&report_values, wait == WAIT_SLEEP_CHANNEL
+                          ? JE_SVC_FAIL_SLEEP_CHANNEL
+                          : JE_SVC_FAIL_RESTART);
+    }
+    publish(JE_SVC_PHASE_READY, JE_SVC_FAIL_NONE, &report_values);
 #if JE_TEST_MODE == 12
-    if (rollback_go == JE_SVC_LOSS_GO) __asm__ volatile("ud2");
+    if (rollback_go == JE_SVC_LOSS_GO) {
+        /* Give slot 0 one scheduler observation of READY before the deliberate
+         * fault; the loss harness must prove that readiness was reached. */
+        if (je_yield() != JE_ABI_OK)
+            return failed(&report_values, JE_SVC_FAIL_READINESS);
+        __asm__ volatile("ud2");
+    }
 #endif
-    publish(JE_SVC_PHASE_RUNNING, JE_SVC_FAIL_NONE);
+    publish(JE_SVC_PHASE_RUNNING, JE_SVC_FAIL_NONE, &report_values);
 
     if (!spawn_one(h0, JE_IMAGE_SPOOFER, 0u, JE_ABI_RIGHT_SEND,
                    &spoofer_proc, &spoofer_ep))
-        return failed(JE_SVC_FAIL_READINESS);
-    if (!wait_dead(spoofer_proc, self_recv, JE_SVC_READY_DEADLINE))
-        return failed(JE_SVC_FAIL_READINESS);
+        return failed(&report_values, JE_SVC_FAIL_READINESS);
+    {
+        uint32_t wait = wait_dead(spoofer_proc, self_recv, JE_SVC_READY_DEADLINE);
+        if (wait != WAIT_OK)
+            return failed(&report_values, wait == WAIT_SLEEP_CHANNEL
+                          ? JE_SVC_FAIL_SLEEP_CHANNEL
+                          : JE_SVC_FAIL_READINESS);
+    }
     {
         je_abi_proc_status spoofer_status = {0};
         if (je_proc_status(spoofer_proc, &spoofer_status) != JE_ABI_OK
-            || spoofer_status.state != JE_ABI_PROC_DYING
+            || (spoofer_status.state != JE_ABI_PROC_DYING
+                && spoofer_status.state != JE_ABI_PROC_DEAD)
             || spoofer_status.reason != JE_ABI_DEATH_EXIT)
-            return failed(JE_SVC_FAIL_READINESS);
-        report.spoofer_bits = (uint32_t)spoofer_status.code & UINT32_C(0xffff);
+            return failed(&report_values, JE_SVC_FAIL_READINESS);
+        report_values.spoofer_bits =
+            (uint32_t)spoofer_status.code & UINT32_C(0xffff);
     }
     (void)je_proc_kill(spoofer_proc);
     (void)je_handle_close(spoofer_ep);
@@ -240,37 +302,47 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t h0, uint64_t h1,
 
     for (uint32_t attempt = 0u; attempt <= JE_SVC_CRASHLOOP_RESTART_LIMIT; ++attempt) {
         uint64_t crash_proc = 0u, crash_ep = 0u;
-        ++report.crash_attempts;
+        ++report_values.crash_attempts;
         if (!spawn_one(h0, JE_IMAGE_CRASHLOOP, 0u, JE_ABI_RIGHT_SEND,
                        &crash_proc, &crash_ep))
-            return failed(JE_SVC_FAIL_CRASHLOOP);
-        if (!wait_dead(crash_proc, self_recv, JE_SVC_READY_DEADLINE))
-            return failed(JE_SVC_FAIL_CRASHLOOP);
+            return failed(&report_values, JE_SVC_FAIL_CRASHLOOP);
+        {
+            uint32_t wait = wait_dead(crash_proc, self_recv,
+                                      JE_SVC_READY_DEADLINE);
+            if (wait != WAIT_OK)
+                return failed(&report_values, wait == WAIT_SLEEP_CHANNEL
+                              ? JE_SVC_FAIL_SLEEP_CHANNEL
+                              : JE_SVC_FAIL_CRASHLOOP);
+        }
         (void)je_proc_kill(crash_proc);
         (void)je_handle_close(crash_ep);
         (void)je_handle_close(crash_proc);
     }
-    if (report.crash_attempts != JE_SVC_CRASHLOOP_RESTART_LIMIT + 1u)
-        return failed(JE_SVC_FAIL_CRASHLOOP);
+    if (report_values.crash_attempts != JE_SVC_CRASHLOOP_RESTART_LIMIT + 1u)
+        return failed(&report_values, JE_SVC_FAIL_CRASHLOOP);
 
-    publish(JE_SVC_PHASE_ARM, JE_SVC_FAIL_NONE);
+    publish(JE_SVC_PHASE_ARM, JE_SVC_FAIL_NONE, &report_values);
+    uint64_t arm_start = 0u;
+    if (je_clock_ticks(&arm_start) != JE_ABI_OK)
+        return failed(&report_values, JE_SVC_FAIL_ROLLBACK);
     for (;;) {
         if (rollback_go == JE_SVC_ROLLBACK_GO) break;
+        uint64_t now = 0u;
+        if (je_clock_ticks(&now) != JE_ABI_OK
+            || now - arm_start >= JE_SVC_SCENARIO_DEADLINE)
+            return failed(&report_values, JE_SVC_FAIL_ROLLBACK);
         if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT)
-            return failed(JE_SVC_FAIL_SLEEP_CHANNEL);
+            return failed(&report_values, JE_SVC_FAIL_SLEEP_CHANNEL);
     }
     config = 0u;
     status = je_proc_spawn(h0, JE_IMAGE_C_HELLO, (const void *)0, 0u,
                            JE_ABI_SPAWN_QUOTAS(15u, 0u), &config);
     if (status != JE_ABI_H_NOSLOTS || config != 0u)
-        return failed(JE_SVC_FAIL_ROLLBACK);
-    (void)je_handle_close(restart_proc);
-    (void)je_handle_close(restart_ep);
-    (void)je_handle_close(survivor_proc);
-    (void)je_handle_close(survivor_ep);
+        return failed(&report_values, JE_SVC_FAIL_ROLLBACK);
     (void)je_handle_close(self_recv);
     (void)je_handle_close((uint32_t)(self_packed >> 32));
+    (void)je_handle_close(supervisor_self);
     (void)je_handle_close(h0);
-    publish(JE_SVC_PHASE_DONE, JE_SVC_FAIL_NONE);
-    return 0;
+    publish(JE_SVC_PHASE_DONE, JE_SVC_FAIL_NONE, &report_values);
+    return (int64_t)JE_SVC_DONE_EXIT;
 }

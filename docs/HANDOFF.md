@@ -1,5 +1,40 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-F Stage 2 FIX — observed 2026-11-01T05:32:14+00:00
+
+Repository `auto44e/jeios`; branch `wip/m4f-fix`; inspected commit
+`6520f1515d06a83ba6fcf400e029a8a21e616b0a`; changes remain uncommitted for
+lead integration.
+
+- **Implemented:** monitor-time reaping in the IF=0 scan section, a bounded
+  kernel-owned image ledger, pre-reap terminal evidence capture, exact
+  kernel-only success corroboration, exact `JE_SVC_DONE_EXIT` supervisor
+  termination, and explicit image-specific population/death checks.
+- **Implemented:** real post-allocation rollback failpoint (step 4), VM
+  headroom assertion before ARM, exact one-shot `H_NOSLOTS`/handle-zero
+  observation, wrap-safe monitor and ARM watchdogs, and a second supervisor
+  identity scan before terminal reaping.
+- **Implemented:** survivor liveness enforcement, exact single spoofer stale
+  probe, exact supervisor self-handle check, complete report seqlock
+  publication, non-success sleep-channel diagnostics, mode-12 READY evidence,
+  and explicit second reap plus full baseline comparison.
+- **Tested:** `ASAN_OPTIONS=detect_leaks=0 make check` passed; `make smoke`
+  passed with `M4f-s1`, zero-leak, and `QEMU smoke: PASS`; required ARM
+  (`make aarch64 && make smoke-aarch64 ARM_REQUIRE=1`) passed; `make
+  integration` passed modes 1–12. Mode 12 printed READY phase `1`, FAULT
+  reason `0`, the D12 loss marker, zero-leak, and no scenario-completed
+  marker.
+- **Planned:** lead integration, repeat the local gates on the integrated
+  tree, and independent human review. **Blocked:** none known.
+
+Changed invariants and unresolved hazards: report counters are diagnostics and
+never authorize success; child identity and terminal outcomes come from
+kernel state. The ledger records only successful spawns and clears entries
+after reap while preserving bounded aggregate history. The adversarial
+forged-counter, torn-report, and impostor-child cases are not separate
+end-to-end fixtures in this pass and are not claimed as tested. Remote CI and
+human qualification are unobserved; this is AI-assisted work only.
+
 ## M4 PR-F Stage 2 — supervisor, child services, and D12 monitor — observed 2026-11-01T03:06:15Z
 
 Repository `auto44e/jeios`, branch `wip/m4f-impl`, inspected commit

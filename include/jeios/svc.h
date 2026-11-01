@@ -122,6 +122,7 @@ _Static_assert(sizeof(je_svc_report) == JE_SVC_REPORT_LEN, "report struct size")
 #define JE_SVC_FAIL_SLEEP_CHANNEL 4u  /* non-TIMED_OUT on the private sleep end */
 #define JE_SVC_FAIL_ROLLBACK      5u  /* failed-launch rollback did not hold */
 #define JE_SVC_FAIL_CRASHLOOP     6u  /* crash-loop attempt count was wrong */
+#define JE_SVC_DONE_EXIT          0x4d3446u /* nonzero clean supervisor exit */
 
 /*
  * Failed-launch rollback handshake (ADR 0010 D5 evidence, driven by the kernel).
@@ -146,6 +147,7 @@ _Static_assert(sizeof(je_svc_report) == JE_SVC_REPORT_LEN, "report struct size")
 #define JE_SVC_CRASHLOOP_RESTART_LIMIT 2u
 #define JE_SVC_READY_DEADLINE 400u
 #define JE_SVC_SCENARIO_DEADLINE 2000u
+#define JE_SVC_MONITOR_DEADLINE  12000u
 #define JE_SVC_BACKOFF_TICKS 1u
 #define JE_SVC_LOSS_GO 0xD1200001u
 #define JE_SVC_SPOOF_MAGIC 0x53504652u
