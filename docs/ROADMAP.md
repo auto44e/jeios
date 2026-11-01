@@ -62,6 +62,14 @@ M3 is complete. Follow [NEXT_PHASE.md](NEXT_PHASE.md): finish MP1 DTB/remote
 boot CI (#52), then core M4 services/devices (#53), then bounded read-only M5a
 (#54). ARM MP2/MP3 follows its own qualification gates.
 
+**2026-11-01 status refresh:** PR-G implements the bounded D11 broker scenario
+and its TEST_MODE 13 kernel-state corroboration on the M4 worktree. This is
+evidence for one focused supervisor-policy scenario, not completion of the
+whole M4 gate: device graph, buffer grants, DMA containment, and production
+service-registry guarantees remain planned. The next bounded implementation
+task after PR-G is PR-H (TSS I/O bitmap / DEVICE / IRQ3), subject to owner
+review and the remaining verification gates.
+
 ### Historical M3 implementation sequence
 
 The sequence below records earlier implementation staging; the completion summary

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <jeios/user.h>
 #include <jeios/svc.h>
+#include <jeios/broker_test.h>
 
 static const char supervisor_rodata[] __attribute__((used, section(".rodata")))
     = "JeiOS supervisor";
@@ -177,6 +178,388 @@ static uint32_t wait_restart_window(uint64_t restart_process, uint64_t survivor_
     }
 }
 
+static int64_t failed(report_state *report_values, uint32_t code);
+
+#if JE_TEST_MODE == 13
+typedef struct {
+    uint64_t process;
+    uint64_t control;
+    uint32_t role;
+    uint32_t delivered;
+    uint32_t exercised;
+} broker_client_state;
+
+typedef struct {
+    uint64_t process;
+    uint64_t control;
+    uint32_t generation;
+    uint32_t restarts;
+} broker_service_state;
+
+typedef struct {
+    uint64_t client_process;
+    uint64_t service_process;
+    uint32_t service_id;
+    uint32_t service_generation;
+    uint32_t state;
+} broker_ledger_entry;
+
+#define BROKER_LEDGER_FREE    0u
+#define BROKER_LEDGER_PENDING 1u
+#define BROKER_LEDGER_LIVE    2u
+
+static uint32_t broker_reply(uint64_t control, uint32_t op, uint32_t detail)
+{
+    je_svc_broker_reply reply = { op, detail };
+    return je_try_send(control, &reply, sizeof reply) == JE_ABI_OK;
+}
+
+static uint32_t broker_wait_ack(uint64_t control, uint64_t self_recv)
+{
+    uint64_t start = 0u;
+    uint64_t now = 0u;
+    if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
+    for (;;) {
+        je_svc_broker_reply reply = {0};
+        uint64_t meta = 0u;
+        uint64_t status = je_try_recv_caps(control, &reply, sizeof reply,
+                                           (uint32_t *)0, 0u, 0u, &meta);
+        if (status == JE_ABI_OK)
+            return (meta & UINT64_C(0xffffffff)) == JE_SVC_BROKER_REPLY_LEN
+                && (meta >> 32) == 0u
+                && reply.op == JE_SVC_OP_BROKER_ACK;
+        if (status == JE_ABI_H_PEER_CLOSED) return 0u;
+        if (status != JE_ABI_H_EMPTY
+            || je_clock_ticks(&now) != JE_ABI_OK
+            || now - start >= JE_SVC_BROKER_ACK_DEADLINE)
+            return 0u;
+        if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
+    }
+}
+
+static uint32_t broker_ledger_find(const broker_ledger_entry *ledger,
+                                   uint64_t client_process,
+                                   uint32_t service_id,
+                                   uint32_t generation)
+{
+    for (uint32_t i = 0u; i < JE_BROKER_MAX; ++i)
+        if (ledger[i].state != BROKER_LEDGER_FREE
+            && ledger[i].client_process == client_process
+            && ledger[i].service_id == service_id
+            && ledger[i].service_generation == generation)
+            return i;
+    return JE_BROKER_MAX;
+}
+
+static void broker_ledger_collect(broker_ledger_entry *ledger)
+{
+    for (uint32_t i = 0u; i < JE_BROKER_MAX; ++i) {
+        if (ledger[i].state == BROKER_LEDGER_FREE) continue;
+        je_abi_proc_status client = {0};
+        je_abi_proc_status service = {0};
+        if (je_proc_status(ledger[i].client_process, &client) != JE_ABI_OK
+            || je_proc_status(ledger[i].service_process, &service) != JE_ABI_OK)
+            continue;
+        if (client.state != JE_ABI_PROC_LIVE
+            && service.state != JE_ABI_PROC_LIVE)
+            ledger[i] = (broker_ledger_entry){0};
+    }
+}
+
+static uint32_t broker_ledger_live(const broker_ledger_entry *ledger)
+{
+    uint32_t count = 0u;
+    for (uint32_t i = 0u; i < JE_BROKER_MAX; ++i)
+        if (ledger[i].state != BROKER_LEDGER_FREE) ++count;
+    return count;
+}
+
+static uint32_t broker_ledger_reserve(broker_ledger_entry *ledger,
+                                      uint64_t client_process,
+                                      uint64_t service_process,
+                                      uint32_t service_id,
+                                      uint32_t generation)
+{
+    for (uint32_t i = 0u; i < JE_BROKER_MAX; ++i) {
+        if (ledger[i].state == BROKER_LEDGER_FREE) {
+            ledger[i] = (broker_ledger_entry){
+                client_process, service_process, service_id, generation,
+                BROKER_LEDGER_PENDING
+            };
+            return i;
+        }
+    }
+    return JE_BROKER_MAX;
+}
+
+static uint32_t broker_send_channel(broker_service_state *service,
+                                    broker_client_state *client,
+                                    uint64_t self_recv,
+                                    broker_ledger_entry *ledger,
+                                    uint32_t service_id,
+                                    uint32_t response_op)
+{
+    uint32_t ledger_slot = broker_ledger_reserve(
+        ledger, client->process, service->process, service_id,
+        service->generation);
+    if (ledger_slot >= JE_BROKER_MAX) {
+        return 0u;
+    }
+
+    uint64_t packed = 0u;
+    if (je_endpoint_create(&packed) != JE_ABI_OK) {
+        ledger[ledger_slot] = (broker_ledger_entry){0};
+        return 0u;
+    }
+    uint64_t service_end = (uint32_t)packed;
+    uint64_t client_end = packed >> 32;
+    uint64_t service_cap = service_end
+        | ((uint64_t)(JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV) << 32);
+    je_svc_service_bind bind = {
+        JE_SVC_OP_SERVICE_BIND, service->generation
+    };
+    if (je_try_send_caps(service->control, &bind, sizeof bind,
+                         &service_cap, 1u) != JE_ABI_OK) {
+        (void)je_handle_close(service_end);
+        (void)je_handle_close(client_end);
+        ledger[ledger_slot] = (broker_ledger_entry){0};
+        return 0u;
+    }
+    if (!broker_wait_ack(service->control, self_recv)) {
+        (void)je_handle_close(service_end);
+        (void)je_handle_close(client_end);
+        ledger[ledger_slot] = (broker_ledger_entry){0};
+        return 0u;
+    }
+
+    uint64_t client_cap = client_end
+        | ((uint64_t)(JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV) << 32);
+    je_svc_broker_grant grant = { response_op, service->generation };
+    if (je_try_send_caps(client->control, &grant, sizeof grant,
+                         &client_cap, 1u) != JE_ABI_OK) {
+        (void)je_handle_close(service_end);
+        (void)je_handle_close(client_end);
+        return 0u;
+    }
+    if (!broker_wait_ack(client->control, self_recv)) {
+        (void)je_handle_close(service_end);
+        (void)je_handle_close(client_end);
+        return 0u;
+    }
+
+    (void)je_handle_close(service_end);
+    (void)je_handle_close(client_end);
+    ledger[ledger_slot].state = BROKER_LEDGER_LIVE;
+    ++client->delivered;
+    return 1u;
+}
+
+static uint32_t broker_restart_service(broker_service_state *service,
+                                        uint64_t launcher, uint64_t self_recv)
+{
+    je_abi_proc_status status = {0};
+    if (je_proc_status(service->process, &status) != JE_ABI_OK
+        || status.state == JE_ABI_PROC_LIVE
+        || service->restarts >= JE_SVC_RESTART_LIMIT)
+        return 0u;
+    (void)je_proc_kill(service->process);
+    (void)je_handle_close(service->control);
+    uint64_t process = 0u;
+    uint64_t control = 0u;
+    if (!spawn_one(launcher, JE_IMAGE_BROKER_SVC, 0u,
+                   JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV,
+                   &process, &control))
+        return 0u;
+    if (wait_ready(control, process, self_recv, JE_SVC_READY_DEADLINE)
+        != WAIT_OK)
+        return 0u;
+    service->process = process;
+    service->control = control;
+    service->generation++;
+    service->restarts++;
+    return 1u;
+}
+
+static uint32_t broker_handle_request(broker_service_state *service,
+                                      broker_client_state *client,
+                                      uint64_t launcher, uint64_t self_recv,
+                                      broker_ledger_entry *ledger,
+                                      const je_svc_broker_request *request,
+                                      uint32_t *a_exhausted)
+{
+    if (request->service_id >= JE_SVC_BROKER_SERVICE_COUNT)
+        return broker_reply(client->control, JE_SVC_OP_BROKER_UNAVAIL,
+                            JE_SVC_UNAVAIL_BAD_SERVICE);
+    je_abi_proc_status service_status = {0};
+    if (je_proc_status(service->process, &service_status) != JE_ABI_OK)
+        return broker_reply(client->control, JE_SVC_OP_BROKER_UNAVAIL,
+                            JE_SVC_UNAVAIL_NOT_READY);
+    if (service_status.state != JE_ABI_PROC_LIVE) {
+        if (!broker_restart_service(service, launcher, self_recv))
+            return broker_reply(client->control, JE_SVC_OP_BROKER_UNAVAIL,
+                                service->restarts >= JE_SVC_RESTART_LIMIT
+                                    ? JE_SVC_UNAVAIL_TERMINAL
+                                    : JE_SVC_UNAVAIL_NOT_READY);
+    }
+    if (client->delivered >= JE_SVC_BROKER_CLIENT_CAP) {
+        if (client->role == JE_BROKER_TEST_ROLE_A) *a_exhausted = 1u;
+        return broker_reply(client->control, JE_SVC_OP_BROKER_EXHAUSTED, 0u);
+    }
+    uint32_t existing = broker_ledger_find(
+        ledger, client->process, request->service_id, service->generation);
+    if (existing < JE_BROKER_MAX
+        && ledger[existing].state == BROKER_LEDGER_LIVE)
+        return broker_reply(client->control, JE_SVC_OP_BROKER_ALREADY, 0u);
+    broker_ledger_collect(ledger);
+    if (broker_ledger_live(ledger) >= JE_BROKER_MAX)
+        return broker_reply(client->control, JE_SVC_OP_BROKER_UNAVAIL,
+                            JE_SVC_UNAVAIL_NOT_READY);
+    uint32_t response = service->generation == 1u
+        ? JE_SVC_OP_BROKER_GRANT : JE_SVC_OP_BROKER_RESTARTED;
+    if (!broker_send_channel(service, client, self_recv, ledger,
+                             request->service_id, response))
+        return broker_reply(client->control, JE_SVC_OP_BROKER_UNAVAIL,
+                            JE_SVC_UNAVAIL_NOT_READY);
+    return 1u;
+}
+
+static uint32_t broker_poll_client(broker_service_state *service,
+                                   broker_client_state *client,
+                                   uint64_t launcher, uint64_t self_recv,
+                                   broker_ledger_entry *ledger,
+                                   uint32_t *a_exhausted)
+{
+    uint8_t bytes[JE_SVC_CONFIG_LEN] = {0u};
+    uint64_t meta = 0u;
+    uint64_t status = je_try_recv_caps(client->control, bytes, sizeof bytes,
+                                       (uint32_t *)0, 0u, 0u, &meta);
+    if (status == JE_ABI_H_EMPTY) return 1u;
+    if (status == JE_ABI_H_PEER_CLOSED) return 2u;
+    if (status != JE_ABI_OK) return 3u;
+    if ((meta >> 32) != 0u) return 4u;
+    if ((meta & UINT64_C(0xffffffff)) == sizeof(je_svc_config)) {
+        je_svc_config progress = {0};
+        memcpy(&progress, bytes, sizeof progress);
+        if (progress.op == JE_SVC_OP_CONFIG
+            && progress.incarnation == JE_BROKER_TEST_EXERCISED) {
+            client->exercised = 1u;
+            return 4u;
+        }
+        return 5u;
+    }
+    if ((meta & UINT64_C(0xffffffff)) != JE_SVC_BROKER_REQUEST_LEN)
+        return 5u;
+    je_svc_broker_request request = {0};
+    memcpy(&request, bytes, sizeof request);
+    if (request.op != JE_SVC_OP_BROKER_REQUEST) return 6u;
+    return broker_handle_request(service, client, launcher, self_recv,
+                                 ledger, &request, a_exhausted);
+}
+
+static int64_t broker_mode13(uint64_t launcher, uint64_t self_recv,
+                             report_state *report_values)
+{
+    broker_service_state service = {0};
+    broker_client_state clients[2] = {0};
+    broker_ledger_entry ledger[JE_BROKER_MAX] = {{0}};
+    uint32_t a_exhausted = 0u;
+    uint32_t finish_sent = 0u;
+    uint64_t start = 0u;
+    uint64_t now = 0u;
+
+    if (!spawn_one(launcher, JE_IMAGE_BROKER_SVC, 0u,
+                   JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV,
+                   &service.process, &service.control)
+        || wait_ready(service.control, service.process, self_recv,
+                      JE_SVC_READY_DEADLINE) != WAIT_OK)
+        return failed(report_values, JE_SVC_FAIL_RESTART);
+    service.generation = 1u;
+
+    for (uint32_t i = 0u; i < 2u; ++i) {
+        if (!spawn_one(launcher, JE_IMAGE_BROKER_CLI, 0u,
+                       JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV,
+                       &clients[i].process, &clients[i].control)
+            || wait_ready(clients[i].control, clients[i].process, self_recv,
+                          JE_SVC_READY_DEADLINE) != WAIT_OK)
+            return failed(report_values, JE_SVC_FAIL_READINESS);
+        clients[i].role = i;
+        je_svc_config role = {
+            JE_SVC_OP_CONFIG, i, 0u, 0u
+        };
+        if (je_try_send(clients[i].control, &role, sizeof role) != JE_ABI_OK)
+            return failed(report_values, JE_SVC_FAIL_READINESS);
+    }
+    publish(JE_SVC_PHASE_READY, JE_SVC_FAIL_NONE, report_values);
+    if (je_yield() != JE_ABI_OK)
+        return failed(report_values, JE_SVC_FAIL_READINESS);
+    publish(JE_SVC_PHASE_RUNNING, JE_SVC_FAIL_NONE, report_values);
+    if (je_clock_ticks(&start) != JE_ABI_OK)
+        return failed(report_values, JE_SVC_FAIL_READINESS);
+
+    for (;;) {
+        broker_ledger_collect(ledger);
+        je_abi_proc_status service_status = {0};
+        if (je_proc_status(service.process, &service_status) != JE_ABI_OK)
+            return failed(report_values, JE_SVC_FAIL_RESTART);
+        if (service_status.state != JE_ABI_PROC_LIVE) {
+            if (!a_exhausted || service.restarts >= JE_SVC_RESTART_LIMIT
+                || !broker_restart_service(&service, launcher, self_recv))
+                return failed(report_values, JE_SVC_FAIL_RESTART);
+            ++report_values->restarts;
+        }
+        for (uint32_t i = 0u; i < 2u; ++i) {
+            uint32_t result = broker_poll_client(
+                &service, &clients[i], launcher, self_recv, ledger,
+                &a_exhausted);
+            if (result == 0u || result == 3u || result == 5u
+                || result == 6u) {
+                report_values->crash_attempts = 0x100u + result;
+                return failed(report_values, JE_SVC_FAIL_READINESS);
+            }
+        }
+        if (!a_exhausted && clients[0].exercised && clients[1].exercised) {
+            je_svc_config trigger = {
+                JE_SVC_OP_CONFIG, 0u, JE_SVC_RESTART_CRASH_BEFORE, 0u
+            };
+            if (je_try_send(service.control, &trigger, sizeof trigger)
+                != JE_ABI_OK)
+                return failed(report_values, JE_SVC_FAIL_RESTART);
+            a_exhausted = 2u; /* trigger sent; restart is now expected */
+        }
+        if (a_exhausted == 1u && !finish_sent) {
+            je_svc_config finish = {
+                JE_SVC_OP_CONFIG, JE_BROKER_TEST_FINISH, 0u, 0u
+            };
+            if (je_try_send(clients[1].control, &finish, sizeof finish)
+                != JE_ABI_OK)
+                return failed(report_values, JE_SVC_FAIL_READINESS);
+            finish_sent = 1u;
+        }
+        je_abi_proc_status client_a = {0};
+        je_abi_proc_status client_b = {0};
+        if (je_proc_status(clients[0].process, &client_a) != JE_ABI_OK
+            || je_proc_status(clients[1].process, &client_b) != JE_ABI_OK)
+            return failed(report_values, JE_SVC_FAIL_READINESS);
+        if (a_exhausted == 2u) {
+            /* The third request sets a_exhausted to 1 after restart. */
+            if (clients[0].delivered == JE_SVC_BROKER_CLIENT_CAP)
+                a_exhausted = 1u;
+        }
+        if (finish_sent && client_a.state != JE_ABI_PROC_LIVE
+            && client_b.state != JE_ABI_PROC_LIVE)
+            break;
+        if (je_clock_ticks(&now) != JE_ABI_OK
+            || now - start >= JE_SVC_SCENARIO_DEADLINE)
+            return failed(report_values, JE_SVC_FAIL_RESTART);
+        if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT)
+            return failed(report_values, JE_SVC_FAIL_SLEEP_CHANNEL);
+    }
+    publish(JE_SVC_PHASE_DONE, JE_SVC_FAIL_NONE, report_values);
+    return (int64_t)JE_SVC_DONE_EXIT_G;
+}
+
+#endif
+
 static int64_t failed(report_state *report_values, uint32_t code)
 {
     publish(JE_SVC_PHASE_FAILED, code, report_values);
@@ -213,6 +596,9 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t h0, uint64_t h1,
     if (je_endpoint_create(&self_packed) != JE_ABI_OK)
         return failed(&report_values, JE_SVC_FAIL_SLEEP_CHANNEL);
     self_recv = (uint32_t)self_packed;
+#if JE_TEST_MODE == 13
+    return broker_mode13(h0, self_recv, &report_values);
+#endif
     if (!spawn_one(h0, JE_IMAGE_RESTART_SVC, 0u,
                    JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV,
                    &restart_proc, &restart_ep))

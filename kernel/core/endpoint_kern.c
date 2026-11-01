@@ -267,6 +267,7 @@ je_ep_status je_endpoint_kern_mint_recv_cap(je_vm *vm, uint32_t index,
         }
     }
     *out = nh;
+    je_m4g_record_cap_delivery(vm, index, d);
     return JE_EP_OK;
 }
 
@@ -278,6 +279,26 @@ bool je_endpoint_kern_capdesc_live(const je_ep_capdesc *d)
 void je_endpoint_kern_capdesc_release_handle(const je_ep_capdesc *d)
 {
     je_endpoint_capdesc_release_handle(&g_kep, d);
+}
+
+bool je_endpoint_kern_inspect_end(const void *object, je_proc_id *creator,
+                                  const je_ep_end **peer,
+                                  je_ep_end_state *state)
+{
+    if (!object || !creator || !peer || !state || !g_kep_inited)
+        return false;
+    for (uint32_t i = 0u; i < JE_EP_POOL_CAP; ++i) {
+        const je_ep_channel *record = &g_kep.rec[i];
+        if (!record->allocated) continue;
+        for (uint8_t side = 0u; side < 2u; ++side) {
+            if ((const void *)&record->end[side] != object) continue;
+            *creator = record->creator;
+            *peer = &record->end[side ^ 1u];
+            *state = record->end[side].state;
+            return true;
+        }
+    }
+    return false;
 }
 
 je_ep_status je_endpoint_kern_seed(je_vm *vm, uint32_t idxA, uint32_t idxB,

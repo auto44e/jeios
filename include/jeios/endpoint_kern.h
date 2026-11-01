@@ -72,6 +72,17 @@ je_ep_status je_endpoint_kern_mint_recv_cap(je_vm *vm, uint32_t index,
                                             const je_ep_capdesc *d, je_handle *out);
 bool je_endpoint_kern_capdesc_live(const je_ep_capdesc *d);
 void je_endpoint_kern_capdesc_release_handle(const je_ep_capdesc *d);
+
+/* PR-G kernel-state evidence: resolve a live endpoint object to its creator and
+ * peer without exposing the endpoint pool or adding an ABI operation. */
+bool je_endpoint_kern_inspect_end(const void *object, je_proc_id *creator,
+                                  const je_ep_end **peer,
+                                  je_ep_end_state *state);
+
+/* Test-mode audit hook invoked after a receive cap is minted. The hook is a
+ * no-op outside TEST_MODE 13 and is not a ring-3 interface. */
+void je_m4g_record_cap_delivery(je_vm *vm, uint32_t index,
+                                const je_ep_capdesc *descriptor);
 /* TEST FIXTURE ONLY (A5-4): seed a channel with one end in vm->procs[idxA]'s
  * table and the other in procs[idxB]'s — a cross-process channel that ring-3
  * cannot bootstrap itself yet. Both procs' VM MUST be hooked (asserted). Returns

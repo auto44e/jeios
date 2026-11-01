@@ -1,5 +1,45 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-G — D11 broker / TEST_MODE 13 — current status
+
+Observation: `2026-11-01T07:28:13Z`; repository branch `wip/m4g-impl`;
+inspected base commit `fb740ad5d772b1d534974619b0ed6a9010eb105f`; PR-G changes
+are intentionally uncommitted in this worker tree.
+
+- **Implemented:** two freestanding C images (broker service 7 and broker client
+  8), supervisor-owned D11 policy over existing M3c capability IPC, bounded
+  two-phase service-first/client-second ACK transfer with rollback, generation-2
+  service restart, per-client delivered lifetime cap, fixed live ledger keyed by
+  PROCESS identity plus service generation, and TEST_MODE 13.
+- **Kernel evidence:** the existing M4f image ledger records images 7/8. Mode 13
+  records every broker-client cap mint, snapshots client handle tables before
+  reaping, and corroborates exact `SEND|RECV` rights with no `TRANSFER`, the
+  supervisor creator, A's service peer, A's two deliveries/B's one delivery,
+  service population 2 with one FAULT, client population 2 with EXIT, and
+  `JE_SVC_DONE_EXIT_G`. The report remains diagnostics only.
+- **Teardown:** shared kill-all/double-reap remains the only teardown path; mode
+  13 additionally requires endpoint allocation 0, endpoint quiescence, and
+  process-pool use count 0 before the baseline marker.
+- **Tested:** `ASAN_OPTIONS=detect_leaks=0 make check` for TEST_MODE 13 and
+  the default profile, default smoke, complete integration (including mode
+  13), both documented memory/NX profiles, ARM64 build/smoke with
+  `ARM_REQUIRE=1`, and `git diff --check` all passed locally. The clean mode-13
+  run reached `M4g-s1`, the kernel `EXHAUSTED` corroboration marker, and the
+  zero-leak baseline.
+- **Planned:** lead cross-review/mutant review and owner integration. **Blocked:**
+  no implementation blocker; remote CI and independent human qualification are
+  unobserved.
+
+**Changed invariants and unresolved hazards:** brokered endpoints are never
+forwardable; supervisor source handles close only after both receiver ACKs.
+Client lifetime exhaustion is independent of the per-generation duplicate rule.
+Failed client delivery leaves a pending ledger entry until both PROCESS identities
+are dead, matching the D-DEV both-dead reclamation rule. The fixed broker table
+and endpoint pool bounds are exercised (`JE_BROKER_MAX=6`, endpoint pool 24,
+supervisor ep-limit 21; mode 13 peaks at seven supervisor-created channels),
+but no production service registry, dynamic loading, or ring-0 fault isolation
+is claimed. AI-assisted review is not independent human qualification.
+
 ## M4 PR-F (#53) — the supervisor + D12 supervisor-loss — observed 2026-11-01T05:41:51Z
 
 Branch `feat/m4f-supervisor`, based on main `1343225` (#66 merged; main CI green);

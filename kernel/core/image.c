@@ -21,13 +21,19 @@ extern const je_vm_image je_img_spoofer_desc;
 extern const unsigned char je_img_crashloop_blob[];
 extern const unsigned long je_img_crashloop_len;
 extern const je_vm_image je_img_crashloop_desc;
+extern const unsigned char je_img_broker_service_blob[];
+extern const unsigned long je_img_broker_service_len;
+extern const je_vm_image je_img_broker_service_desc;
+extern const unsigned char je_img_broker_client_blob[];
+extern const unsigned long je_img_broker_client_len;
+extern const je_vm_image je_img_broker_client_desc;
 
 #ifndef JE_C_HELLO_BLOB_SHA256
 #define JE_C_HELLO_BLOB_SHA256 "unavailable"
 #endif
 const char je_c_hello_blob_sha256[] = JE_C_HELLO_BLOB_SHA256;
 
-#define JE_BUILTIN_IMAGE_COUNT 7u
+#define JE_BUILTIN_IMAGE_COUNT 9u
 
 static je_builtin_image builtin_images[JE_BUILTIN_IMAGE_COUNT] = {
     { .name = "spawn-child" },
@@ -36,7 +42,9 @@ static je_builtin_image builtin_images[JE_BUILTIN_IMAGE_COUNT] = {
     { .name = "restart-svc" },
     { .name = "survivor" },
     { .name = "spoofer" },
-    { .name = "crashloop" }
+    { .name = "crashloop" },
+    { .name = "broker-service" },
+    { .name = "broker-client" }
 };
 static bool builtin_images_ready;
 
@@ -145,6 +153,18 @@ je_status je_builtin_images_init(void)
     image->blob = je_img_crashloop_blob;
     image->blob_len = (size_t)je_img_crashloop_len;
     image->desc = je_img_crashloop_desc;
+    if (je_vm_image_validate(&image->desc, image->blob_len) != JE_OK)
+        return JE_ERR_INVALID;
+    image = &builtin_images[JE_IMAGE_BROKER_SVC];
+    image->blob = je_img_broker_service_blob;
+    image->blob_len = (size_t)je_img_broker_service_len;
+    image->desc = je_img_broker_service_desc;
+    if (je_vm_image_validate(&image->desc, image->blob_len) != JE_OK)
+        return JE_ERR_INVALID;
+    image = &builtin_images[JE_IMAGE_BROKER_CLI];
+    image->blob = je_img_broker_client_blob;
+    image->blob_len = (size_t)je_img_broker_client_len;
+    image->desc = je_img_broker_client_desc;
     if (je_vm_image_validate(&image->desc, image->blob_len) != JE_OK)
         return JE_ERR_INVALID;
     builtin_images_ready = true;

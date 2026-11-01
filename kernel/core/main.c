@@ -17,6 +17,7 @@
 #include <jeios/image.h>
 #include <jeios/spawn.h>
 #include <jeios/svc.h>
+#include <jeios/broker_test.h>
 
 extern void je_sched_set_proc_pool(je_proc_pool *pool);
 extern je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id);
@@ -45,7 +46,7 @@ static je_proc_id vm_s3_proc_ids[JE_VM_MAX_PROCESSES];
  * terminal facts are retained in fixed per-image counters so corroboration can
  * still distinguish a reaped predecessor from its replacement.
  */
-#define M4F_IMAGE_COUNT 7u
+#define M4F_IMAGE_COUNT 9u
 typedef struct {
     bool active;
     bool terminal_seen;
@@ -68,6 +69,101 @@ static uint64_t m4f_spoofer_code;
 static uint32_t m4f_spoofer_ep_charge;
 static uint32_t m4f_progress_serial;
 static uint32_t vm_s3_live_count(void);
+
+typedef struct {
+    bool active;
+    je_proc_id receiver;
+    uint32_t endpoint_generation;
+    uint16_t endpoint_index;
+    uint8_t endpoint_side;
+} m4g_delivery;
+static m4g_delivery m4g_deliveries[JE_BROKER_MAX];
+static uint32_t m4g_delivery_used;
+static uint32_t m4g_delivery_count[JE_PROC_REC_MAX];
+static je_proc_id m4g_delivery_identity[JE_PROC_REC_MAX];
+static bool m4g_delivery_bad;
+#if JE_TEST_MODE == 13
+typedef struct {
+    bool captured;
+    je_proc_id client;
+    uint32_t brokered_count;
+    uint32_t service_peer_count;
+} m4g_client_audit;
+static m4g_client_audit m4g_client_audits[JE_PROC_REC_MAX];
+#endif
+static bool m4f_id_equal(je_proc_id left, je_proc_id right);
+#if JE_TEST_MODE == 13
+static bool m4g_table_holds_object(uint32_t vm_index, const void *object);
+#endif
+
+static void m4g_delivery_reset(void)
+{
+    for (uint32_t i = 0u; i < JE_BROKER_MAX; ++i)
+        m4g_deliveries[i] = (m4g_delivery){0};
+    m4g_delivery_used = 0u;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        m4g_delivery_count[i] = 0u;
+        m4g_delivery_identity[i] = JE_PROC_ID_NONE;
+#if JE_TEST_MODE == 13
+        m4g_client_audits[i] = (m4g_client_audit){0};
+#endif
+    }
+    m4g_delivery_bad = false;
+}
+
+/*
+ * Called after the endpoint layer has minted a received cap. Spawn grants are
+ * deliberately ignored because je_proc_record_image() is published only after
+ * the spawn transaction commits. In mode 13, the only later SEND|RECV cap
+ * deliveries into a broker client are the supervisor's broker grants.
+ */
+void je_m4g_record_cap_delivery(je_vm *vm, uint32_t index,
+                                const je_ep_capdesc *descriptor)
+{
+#if JE_TEST_MODE == 13
+    if (!vm || !descriptor || index >= JE_VM_MAX_PROCESSES
+        || !m4f_ledger_enabled || descriptor->rights
+            != (JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV))
+        return;
+    (void)vm;
+    je_proc_id receiver = JE_PROC_ID_NONE;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        const je_proc_rec *record = &process_pool.rec[i];
+        if ((record->state == JE_PROC_LIVE || record->state == JE_PROC_DYING)
+            && record->run_linked && record->vm_index == index) {
+            receiver = (je_proc_id){i, record->gen};
+            break;
+        }
+    }
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        m4f_child_identity *child = &m4f_children[i];
+        if (!child->active || child->image_id != JE_IMAGE_BROKER_CLI
+            || !m4f_id_equal(child->id, receiver))
+            continue;
+        if (m4g_delivery_count[index] == 0u)
+            m4g_delivery_identity[index] = child->id;
+        if (!m4f_id_equal(m4g_delivery_identity[index], child->id)
+            || m4g_delivery_count[index] >= JE_BROKER_MAX) {
+            m4g_delivery_bad = true;
+            return;
+        }
+        uint32_t slot = m4g_delivery_used;
+        m4g_delivery_count[index]++;
+        if (slot < JE_BROKER_MAX) {
+            m4g_deliveries[slot] = (m4g_delivery){
+                true, child->id, descriptor->generation,
+                descriptor->rec_index, descriptor->side
+            };
+            m4g_delivery_used++;
+        }
+        return;
+    }
+#else
+    (void)vm;
+    (void)index;
+    (void)descriptor;
+#endif
+}
 
 static bool m4f_id_equal(je_proc_id left, je_proc_id right)
 {
@@ -92,6 +188,7 @@ static void m4f_ledger_reset(void)
     m4f_unexpected_image = false;
     m4f_progress_serial = 0u;
     m4f_ledger_enabled = true;
+    m4g_delivery_reset();
 }
 
 /* Called only after a spawn is committed, so a failed journal never enters the
@@ -693,6 +790,87 @@ static bool m4f_spoofer_endpoint_shape(const je_proc_rec *rec)
     return live == 1u && endpoint == 1u;
 }
 
+#if JE_TEST_MODE == 13
+static uint32_t m4g_live_service_vm(void)
+{
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        const m4f_child_identity *child = &m4f_children[i];
+        const je_proc_rec *record = &process_pool.rec[i];
+        if (child->active && child->image_id == JE_IMAGE_BROKER_SVC
+            && !child->terminal_seen && record->state == JE_PROC_LIVE
+            && record->run_linked)
+            return record->vm_index;
+    }
+    return JE_VM_MAX_PROCESSES;
+}
+
+static void m4g_capture_client_handles(const m4f_child_identity *client,
+                                        const je_proc_rec *record)
+{
+    if (!client || !record || client->id.index >= JE_PROC_REC_MAX
+        || !record->run_linked || record->vm_index >= JE_VM_MAX_PROCESSES)
+        return;
+    je_proc_id supervisor = JE_PROC_ID_NONE;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i)
+        if (m4f_children[i].active
+            && m4f_children[i].image_id == JE_IMAGE_SUPERVISOR) {
+            supervisor = m4f_children[i].id;
+            break;
+        }
+    uint32_t service_vm = m4g_live_service_vm();
+    uint32_t supervisor_vm = JE_VM_MAX_PROCESSES;
+    if (supervisor.index < JE_PROC_REC_MAX
+        && process_pool.rec[supervisor.index].run_linked)
+        supervisor_vm = process_pool.rec[supervisor.index].vm_index;
+    const je_handle_table *table = &vm_s3.procs[record->vm_index].htable;
+    uint32_t brokered_count = 0u;
+    uint32_t service_peer_count = 0u;
+    for (uint32_t slot = 0u; slot < table->capacity; ++slot) {
+        je_handle handle = 0u;
+        uint32_t type = 0u;
+        uint32_t rights = 0u;
+        void *object = (void *)0;
+        if (!je_handle_live_at(table, slot, &handle, &type)
+            || type != JE_ABI_OBJ_ENDPOINT
+            || je_handle_resolve_any(table, handle, &type, &rights,
+                                     &object) != JE_HANDLE_OK
+            || rights != (JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV))
+            continue;
+        je_proc_id creator = JE_PROC_ID_NONE;
+        const je_ep_end *peer = (const je_ep_end *)0;
+        je_ep_end_state state = JE_EP_END_FREE;
+        if (!je_endpoint_kern_inspect_end(object, &creator, &peer, &state)
+            || !m4f_id_equal(creator, supervisor)
+            || state == JE_EP_END_CLOSED
+            || m4g_table_holds_object(supervisor_vm, peer))
+            continue;
+        ++brokered_count;
+        if (service_vm < JE_VM_MAX_PROCESSES
+            && m4g_table_holds_object(service_vm, peer))
+            ++service_peer_count;
+    }
+    m4g_client_audit *audit = &m4g_client_audits[client->id.index];
+    audit->captured = true;
+    audit->client = client->id;
+    if (brokered_count > audit->brokered_count)
+        audit->brokered_count = brokered_count;
+    if (service_peer_count > audit->service_peer_count)
+        audit->service_peer_count = service_peer_count;
+}
+
+static void m4g_capture_live_clients(void)
+{
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        const m4f_child_identity *child = &m4f_children[i];
+        const je_proc_rec *record = &process_pool.rec[i];
+        if (!child->active || child->image_id != JE_IMAGE_BROKER_CLI
+            || child->terminal_seen || record->state != JE_PROC_LIVE)
+            continue;
+        m4g_capture_client_handles(child, record);
+    }
+}
+#endif
+
 /* Snapshot terminal facts before the monitor reaper destroys the VM slot. */
 static void m4f_capture_terminal_children(void)
 {
@@ -707,6 +885,11 @@ static void m4f_capture_terminal_children(void)
         child->terminal_reason = rec->reason;
         child->terminal_code = rec->code;
         child->terminal_ep_charge = rec->ep_charge;
+#if JE_TEST_MODE == 13
+        if (child->image_id == JE_IMAGE_BROKER_CLI) {
+            m4g_capture_client_handles(child, rec);
+        }
+#endif
         if (child->image_id >= M4F_IMAGE_COUNT
             || child->terminal_reason > JE_PROC_REASON_MAX) {
             m4f_unexpected_image = true;
@@ -747,9 +930,132 @@ static void m4f_clear_free_vm_ids(void)
             vm_s3_proc_ids[i] = JE_PROC_ID_NONE;
 }
 
+#if JE_TEST_MODE == 13
+static bool m4g_table_holds_object(uint32_t vm_index, const void *object)
+{
+    if (!object || vm_index >= JE_VM_MAX_PROCESSES
+        || vm_s3.procs[vm_index].state == JE_VM_FREE)
+        return false;
+    const je_handle_table *table = &vm_s3.procs[vm_index].htable;
+    for (uint32_t slot = 0u; slot < table->capacity; ++slot) {
+        je_handle handle = 0u;
+        uint32_t type = 0u;
+        uint32_t rights = 0u;
+        void *candidate = (void *)0;
+        if (!je_handle_live_at(table, slot, &handle, &type)
+            || type != JE_ABI_OBJ_ENDPOINT
+            || je_handle_resolve_any(table, handle, &type, &rights,
+                                     &candidate) != JE_HANDLE_OK)
+            continue;
+        if (candidate == object) return true;
+    }
+    return false;
+}
+
+static uint32_t m4g_endpoint_count(const m4f_child_identity *client,
+                                   je_proc_id supervisor,
+                                   uint32_t supervisor_vm,
+                                   uint32_t service_vm,
+                                   bool require_service_peer)
+{
+    (void)supervisor;
+    (void)supervisor_vm;
+    (void)service_vm;
+    if (!client || !client->terminal_seen
+        || client->id.index >= JE_PROC_REC_MAX)
+        return 0u;
+    const m4g_client_audit *audit = &m4g_client_audits[client->id.index];
+    if (!audit->captured || !m4f_id_equal(audit->client, client->id))
+        return 0u;
+    return require_service_peer ? audit->service_peer_count
+                                : audit->brokered_count;
+}
+
+static const m4f_child_identity *m4g_find_client(uint32_t required_bits,
+                                                 uint32_t forbidden_bits)
+{
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        const m4f_child_identity *child = &m4f_children[i];
+        if (child->image_id != JE_IMAGE_BROKER_CLI || !child->terminal_seen)
+            continue;
+        uint32_t code = (uint32_t)child->terminal_code;
+        if ((code & required_bits) == required_bits
+            && (code & forbidden_bits) == 0u)
+            return child;
+    }
+    return (const m4f_child_identity *)0;
+}
+
+static bool m4g_corroborate(je_proc_id supervisor,
+                            const je_svc_report *report)
+{
+    (void)report;
+    if (m4f_unexpected_image
+        || m4f_spawn_count[JE_IMAGE_SPAWN_CHILD] != 0u
+        || m4f_spawn_count[JE_IMAGE_C_HELLO] != 0u
+        || m4f_spawn_count[JE_IMAGE_SUPERVISOR] != 1u
+        || m4f_spawn_count[JE_IMAGE_BROKER_SVC] != 2u
+        || m4f_spawn_count[JE_IMAGE_BROKER_CLI] != 2u
+        || m4f_spawn_count[JE_IMAGE_RESTART_SVC] != 0u
+        || m4f_spawn_count[JE_IMAGE_SURVIVOR] != 0u
+        || m4f_spawn_count[JE_IMAGE_SPOOFER] != 0u
+        || m4f_spawn_count[JE_IMAGE_CRASHLOOP] != 0u
+        || m4f_terminal_count[JE_IMAGE_BROKER_SVC] != 1u
+        || m4f_terminal_count[JE_IMAGE_BROKER_CLI] != 2u
+        || m4f_death_count[JE_IMAGE_BROKER_SVC][JE_DEATH_FAULT] != 1u
+        || m4f_death_count[JE_IMAGE_BROKER_CLI][JE_DEATH_EXIT] != 2u
+        || m4g_delivery_bad || m4g_delivery_used != 3u)
+        return false;
+    const m4f_child_identity *client_a = m4g_find_client(
+        JE_BROKER_TEST_BIT_READY | JE_BROKER_TEST_BIT_GRANTS
+            | JE_BROKER_TEST_BIT_ECHO | JE_BROKER_TEST_BIT_NO_TRANSFER
+            | JE_BROKER_TEST_BIT_PEER_CLOSED | JE_BROKER_TEST_BIT_RESTARTED
+            | JE_BROKER_TEST_BIT_EXHAUSTED,
+        JE_BROKER_TEST_BIT_ROLE_B);
+    const m4f_child_identity *client_b = m4g_find_client(
+        JE_BROKER_TEST_BIT_READY | JE_BROKER_TEST_BIT_GRANTS
+            | JE_BROKER_TEST_BIT_ECHO | JE_BROKER_TEST_BIT_NO_TRANSFER
+            | JE_BROKER_TEST_BIT_ROLE_B,
+        JE_BROKER_TEST_BIT_EXHAUSTED);
+    if (!client_a || !client_b || client_a == client_b
+        || m4g_delivery_count[client_a->id.index] != 2u
+        || m4g_delivery_count[client_b->id.index] != 1u
+        || !m4f_id_equal(m4g_delivery_identity[client_a->id.index],
+                          client_a->id)
+        || !m4f_id_equal(m4g_delivery_identity[client_b->id.index],
+                          client_b->id))
+        return false;
+    for (uint32_t i = 0u; i < m4g_delivery_used; ++i)
+        if (!m4g_deliveries[i].active
+            || m4g_deliveries[i].endpoint_index >= JE_EP_POOL_CAP
+            || m4g_deliveries[i].endpoint_side > 1u
+            || m4g_deliveries[i].endpoint_generation == 0u)
+            return false;
+
+    const je_proc_rec *sup = &process_pool.rec[supervisor.index];
+    if (!m4f_id_equal(supervisor, (je_proc_id){supervisor.index, sup->gen})
+        || sup->state != JE_PROC_DYING
+        || sup->reason != JE_DEATH_EXIT
+        || sup->code != JE_SVC_DONE_EXIT_G
+        || !sup->run_linked)
+        return false;
+    uint32_t supervisor_vm = sup->vm_index;
+    if (m4g_endpoint_count(client_a, supervisor, supervisor_vm,
+                           JE_VM_MAX_PROCESSES, true) != 1u
+        || m4g_endpoint_count(client_b, supervisor, supervisor_vm,
+                              JE_VM_MAX_PROCESSES, false) != 1u)
+        return false;
+    je_arch_console_write("M4g: EXHAUSTED observed and kernel-delivery count corroborated\r\n");
+    return true;
+}
+#endif
+
 static bool m4f_corroborate(je_proc_id supervisor,
                             const je_svc_report *report)
 {
+#if JE_TEST_MODE == 13
+    return m4g_corroborate(supervisor, report);
+#else
     (void)report; /* report counters are diagnostics, never proof */
     if (m4f_unexpected_image
         || m4f_spawn_count[JE_IMAGE_SPAWN_CHILD] != 0u
@@ -811,19 +1117,36 @@ static bool m4f_corroborate(je_proc_id supervisor,
         || sup->code != JE_SVC_DONE_EXIT)
         return false;
     return live_restart == 1u && live_survivor == 1u && survivor_dispatched;
+#endif
 }
 
 static _Noreturn void m4f_teardown(const m4f_baseline *baseline,
                                    je_proc_id supervisor, bool success,
                                    uint32_t reason, uint32_t last_phase)
 {
-    if (success)
+    uint64_t terminal_code = 0u;
+    if (supervisor.index < JE_PROC_REC_MAX
+        && m4f_id_equal(supervisor,
+                        (je_proc_id){supervisor.index,
+                                     process_pool.rec[supervisor.index].gen}))
+        terminal_code = process_pool.rec[supervisor.index].code;
+    if (success) {
+#if JE_TEST_MODE == 13
+        je_arch_console_write("M4g-s1: broker scenario completed\r\n");
+#else
         je_arch_console_write("M4f-s1: supervisor scenario completed\r\n");
-    else {
+#endif
+    } else {
+#if JE_TEST_MODE == 13
+        je_arch_console_write("M4g: supervisor lost (last_phase=");
+#else
         je_arch_console_write("M4f: supervisor lost (last_phase=");
+#endif
         je_arch_console_hex(last_phase);
         je_arch_console_write("; reason=");
         je_arch_console_hex(reason);
+        je_arch_console_write("; code=");
+        je_arch_console_hex(terminal_code);
         je_arch_console_write("); no recovery path in this profile\r\n");
     }
     uint32_t killed = 0u;
@@ -837,7 +1160,14 @@ static _Noreturn void m4f_teardown(const m4f_baseline *baseline,
     m4f_clear_free_vm_ids();
     if (!m4f_baseline_matches(baseline))
         fail("JeiOS fatal: M4f identity baseline teardown\r\n");
+#if JE_TEST_MODE == 13
+    if (je_endpoint_kernel_allocated() != 0u || !je_endpoint_kern_quiescent()
+        || process_pool.used_count != 0u)
+        fail("JeiOS fatal: M4g endpoint quiescence\r\n");
+    je_arch_console_write("M4g: zero-leak identity baseline verified\r\n");
+#else
     je_arch_console_write("M4f: zero-leak identity baseline verified\r\n");
+#endif
     je_arch_halt();
 }
 
@@ -851,6 +1181,9 @@ static _Noreturn void m4f_monitor_deadline(uint32_t phase)
 static void m4f_reap_monitor_children(void)
 {
     m4f_capture_terminal_children();
+#if JE_TEST_MODE == 13
+    m4g_capture_live_clients();
+#endif
     if (je_sched_reap_dead() < 0)
         fail("JeiOS fatal: M4f monitor reap\r\n");
     m4f_clear_reaped_children();
@@ -878,7 +1211,11 @@ static _Noreturn void m4f_monitor(const m4f_baseline *baseline,
             bool phase_progress = readable && report.phase != last_phase;
             if (readable && report.phase != last_phase) {
                 last_phase = report.phase;
+#if JE_TEST_MODE == 13
+                je_arch_console_write("M4g: supervisor phase=");
+#else
                 je_arch_console_write("M4f: supervisor phase=");
+#endif
                 je_arch_console_hex(report.phase);
                 je_arch_console_write("\r\n");
             }
@@ -911,7 +1248,11 @@ static _Noreturn void m4f_monitor(const m4f_baseline *baseline,
                 if (terminal_readable
                     && terminal_report.phase != last_phase) {
                     last_phase = terminal_report.phase;
+#if JE_TEST_MODE == 13
+                    je_arch_console_write("M4g: supervisor phase=");
+#else
                     je_arch_console_write("M4f: supervisor phase=");
+#endif
                     je_arch_console_hex(last_phase);
                     je_arch_console_write("\r\n");
                 }

@@ -74,3 +74,20 @@ assert "M4f-s1: supervisor scenario completed" not in output, \
     "mode 12 unexpectedly completed the success scenario"
 print(f"supervisor-loss mode 12 (D12 refusal): PASS\n{output}")
 
+# Mode 13 is the PR-G D11 broker scenario. The supervisor owns all policy and
+# the kernel monitor accepts success only from its image/process/cap state.
+result = subprocess.run(["make", "iso", "TEST_MODE=13"], stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True)
+assert result.returncode == 0, result.stdout
+output = boot(Path("build/13/jeios.iso"),
+              terminal=b"M4g: zero-leak identity baseline verified",
+              expected=[b"M4g: supervisor phase=0x0000000000000001",
+                        b"M4g: supervisor phase=0x0000000000000002",
+                        b"M4g-s1: broker scenario completed",
+                        b"M4g: zero-leak identity baseline verified",
+                        b"EXHAUSTED"])
+assert "JeiOS fatal:" not in output, f"mode 13 broker scenario failed:\n{output}"
+assert "M4f: supervisor lost" not in output, \
+    "mode 13 unexpectedly took the mode-12 supervisor-loss path"
+print(f"broker mode 13 (D11): PASS\n{output}")
+

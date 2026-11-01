@@ -1,3 +1,67 @@
+# PR-G worker notes
+
+Observation date: `2026-11-01T07:28:13Z`. Branch: `wip/m4g-impl`. Base
+inspected commit: `fb740ad5d772b1d534974619b0ed6a9010eb105f`. Changes are
+intentionally uncommitted for lead integration.
+
+## Decisions and reasoning
+
+- The broker remains ring-3 supervisor policy. No kernel ABI status or service
+  identity was added.
+- Capability delivery is service-first, client-second. Source handles close only
+  after the corresponding receiver ACK; any failed phase closes both sources,
+  leaves no delivered lifetime increment, and preserves the service-side minted
+  endpoint for normal both-dead ledger cleanup.
+- The ledger uses client PROCESS identity `(index,generation)`, service id and
+  service generation. It does not use a VM slot or handle value. A's third
+  request is checked against the delivered lifetime cap before the live
+  per-generation duplicate rule, so `EXHAUSTED` is observed independently of
+  the generation-2 live entry.
+- A and B report exercise completion over their control channels before the
+  supervisor faults service generation 1. This makes the echo proof causal:
+  the deliberate restart cannot interrupt B's first brokered round trip.
+- Kernel corroboration records cap mints at the existing receive/mint boundary
+  and snapshots client endpoint tables before reaping. Report fields and client
+  claims are diagnostics/evidence only, not success authority.
+- The fixed bounds remain explicit: `JE_BROKER_MAX=6`, endpoint pool capacity
+  `24`, and supervisor endpoint limit `21`. The observed mode-13 peak has three
+  broker channels plus three control channels and the private sleep pair
+  (`7` supervisor-created channels), below both limits; teardown observes
+  endpoint allocation and charge return to zero.
+
+## Verification record
+
+Commands run locally (exact commands; results are recorded only when observed):
+
+- `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=13` — PASS.
+- `ASAN_OPTIONS=detect_leaks=0 make check TEST_MODE=0` — PASS.
+- `ASAN_OPTIONS=detect_leaks=0 make smoke` — PASS. Mode 0 reached
+  `M4f-s1`, zero-leak baseline, and `QEMU smoke: PASS`.
+- `make integration` — PASS. Modes 1–12 retained their existing results;
+  mode 13 reached `M4g-s1`, `EXHAUSTED observed and kernel-delivery count
+  corroborated`, and zero-leak baseline with no fatal marker.
+- `python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M
+  --expect-nx absent` — PASS.
+- `python3 tools/smoke.py build/0/jeios.iso --memory 1536M --expect-nx
+  present` — PASS.
+- `make aarch64 && make smoke-aarch64 ARM_REQUIRE=1` — PASS. The existing
+  ARM linker RWX warning remained; `QEMU aarch64 smoke: PASS`.
+- `git diff --check` — PASS.
+
+Remote CI and independent human qualification are not observed.
+
+## Known dead ends
+
+- Deferring all mode-13 monitor reaping stalled progress in QEMU. The final
+  design keeps the shared reaper and captures client handle evidence before
+  reaping; this preserves normal scheduler progress and still makes the
+  proof kernel-owned.
+- Triggering service death immediately after both grant ACKs allowed B's echo
+  to race the deliberate fault. The explicit exercise-complete control record
+  closes that race without weakening the bounded scenario.
+
+## Historical records preserved from the pre-PR-G file
+
 # PR-F Stage 1 worker notes
 
 ## PR-F Stage 2 FIX worker notes — observation 2026-11-01T05:32:14+00:00
