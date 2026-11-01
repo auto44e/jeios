@@ -58,6 +58,16 @@ static inline uint64_t je_try_recv(uint64_t h, void *buf, uint64_t cap, uint64_t
                                    uint64_t *out)
 { return je_sys6(JE_SYS_TRY_RECV, h, (uint64_t)(uintptr_t)buf, cap, timeout, 0, 0, out); }
 
+/* Capability-carrying recv (PR-G broker). hbuf is a u32[] of hcap slots that
+ * receive the minted cap handles; R8=hbuf, R9=hcap. hbuf!=0 iff hcap!=0. A message
+ * carrying more caps than hcap returns SHORT_BUFFER (RDX = bytes | caps<<32) and
+ * stays queued. *out (optional) = RDX. */
+static inline uint64_t je_try_recv_caps(uint64_t h, void *buf, uint64_t cap,
+                                        uint32_t *hbuf, uint64_t hcap,
+                                        uint64_t timeout, uint64_t *out)
+{ return je_sys6(JE_SYS_TRY_RECV, h, (uint64_t)(uintptr_t)buf, cap, timeout,
+                 (uint64_t)(uintptr_t)hbuf, hcap, out); }
+
 static inline uint64_t je_handle_rights(uint64_t h, uint64_t *rights)
 { return je_sys6(JE_SYS_HANDLE_RIGHTS, h, 0, 0, 0, 0, 0, rights); }
 
