@@ -1,5 +1,7 @@
 # Built-in hardware security-key support
 
+[Included native software portfolio](NATIVE_PRODUCTS.md): latest-stable source policy, C coreutils/GNU+uutils tracking, SSH/TLS, compilers, Make, curl, FIDO, zlib and QEMU. Planned integration; no runtime support added.
+
 Status: owner requirement and design, 2026-10-13. No authenticator transport,
 credential broker or MFA login flow is implemented. This extends IDENTITY.md,
 DOMAINS.md and ENCRYPTION.md; it does not advance the current M3a kernel gate.

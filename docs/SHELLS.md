@@ -1,5 +1,7 @@
 # Native shell and selectable shell ecosystem
 
+[Included native software portfolio](NATIVE_PRODUCTS.md): latest-stable source policy, C coreutils/GNU+uutils tracking, SSH/TLS, compilers, Make, curl, FIDO, zlib and QEMU. Planned integration; no runtime support added.
+
 Owner decision: 2026-11-01 (America/New_York). Accepted roadmap requirements;
 no shell runtime is implemented by this documentation change. PowerShell is
 explicitly deferred for separate discussion.

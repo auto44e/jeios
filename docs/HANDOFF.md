@@ -1,5 +1,17 @@
 # Agent handoff: M1/M2 kernel foundation
 
+Owner clarification: existing C++ is allowed in included upstream products;
+retain native compatibility/integration patches. Core C11 and coreutils C-only
+remain distinct requirements. Tracker: #75.
+Validation: `make check` blocked by environment LeakSanitizer inspection;
+`ASAN_OPTIONS=detect_leaks=0 make check` passed (exit 0, leaks disabled).
+Changed Markdown links and `git diff --check` passed. Docs-only; no emulator
+rerun, source import or native product support claim. Single-agent contribution.
+
+## Native product portfolio — observed 2026-11-01T22:08:31-05:00
+
+Inspected core main `2c5bdb01c3726dbe551492f6d2ecd0e30b66308e`; shell PR #74 merged. Branch docs/native-products. Added NATIVE_PRODUCTS.md and roadmap/shell/FIDO entry links. Implemented: policy docs only. Planned: included native product portfolio; LibreSSL default with explicit OpenSSL consumers; C-only coreutils adaptation tracking GNU and uutils independently. No dependency import/runtime/ABI change. Other products require language inventories; a blanket compiler rewrite is not assumed. Next: reviewed dependency/provenance/qualification matrix. MP2 remains next execution gate. PowerShell deferred. Exact local validation recorded below before publication; no native package or new remote CI result claimed.
+
 Refresh validation: Core `make check` hit environment LeakSanitizer inspection failure; `ASAN_OPTIONS=detect_leaks=0 make check` passed. Leak detection disabled. Local Markdown links and `git diff --check` passed. No emulator rerun for this docs-only change; cited remote CI is for inspected main, not the new documentation head. Board summary/history refreshed; shell issues #71–#73 and mobile #12 added Todo; M4 #53 Done. Single-agent docs contribution, no independent human qualification. Branch `docs/native-shell-refresh`; no ABI, runtime, dependency import or mobile pin change.
 
 ## Current ecosystem status — observed 2026-11-01T21:30:30-05:00
