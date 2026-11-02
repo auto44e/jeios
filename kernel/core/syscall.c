@@ -28,6 +28,10 @@
 extern je_ep_status je_endpoint_kern_dup(je_vm *vm, uint32_t index, je_handle src,
                                          uint32_t rights, je_handle *out);
 extern bool je_endpoint_kern_is_wired(const je_vm *vm);
+#if JE_TEST_MODE == 15
+extern void je_m4g_record_cap_delivery(je_vm *vm, uint32_t index,
+                                       const je_ep_capdesc *descriptor);
+#endif
 #endif
 
 /* Pure decode: given the operation and its six argument registers, decide the
@@ -154,7 +158,9 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
         if (rdi >> 32) { *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN; }
         *out_status=JE_ABI_OK; return JE_SYSCALL_PROC_KILL;
     case JE_SYS_DEV_ASSIGN:
-        if ((rdi >> 32) || (rsi >> 32) || rdx || r10 || r8 || r9) {
+        if ((rdi >> 32) || (rsi >> 32)
+            || (rdx & ~(uint64_t)JE_ABI_DEV_REQUIRE_DMA_CONTAINED)
+            || r10 || r8 || r9) {
             *out_status=JE_ABI_INVALID; return JE_SYSCALL_RETURN;
         }
         *out_status=JE_ABI_OK; return JE_SYSCALL_DEV_ASSIGN;
@@ -512,6 +518,11 @@ static void je_syscall_finish_blocked_recv(je_trap_frame *f, je_ep_channel *rec,
             je_m4g_record_cap_delivery(vm, index, &caps[c]);
     je_m4g_record_control_receive(vm, index, &lease, staging, mlen, mcaps);
 #endif
+#if JE_TEST_MODE == 15
+    for (uint8_t c = 0u; c < mcaps; ++c)
+        if (was_live[c] && minted[c])
+            je_m4g_record_cap_delivery(vm, index, &caps[c]);
+#endif
     je_endpoint_kern_wait_release(rec, side, slot);
     f->rax=(uint64_t)JE_ABI_OK;
     f->rdx=(uint64_t)mlen | ((uint64_t)mcaps << 32);
@@ -632,6 +643,16 @@ static je_trap_frame *dispatch_device_assign(je_trap_frame *f)
     je_proc_id target = JE_PROC_ID_NONE;
     if (!process_id_from_object(process_pool(), object, &target)) {
         syscall_invariant("JeiOS fatal: DEV_ASSIGN process invariant\r\n");
+    }
+    if ((f->rdx & JE_ABI_DEV_REQUIRE_DMA_CONTAINED) != 0u) {
+        je_device *device = je_kernel_device();
+        bool first = device->hardened_refusal_count == 0u;
+        je_device_note_hardened_refusal(device);
+        if (first) je_arch_console_write("JeiOS: legacy no-DMA PIO\r\n");
+        f->rax = (uint64_t)JE_ABI_UNSUPPORTED;
+        f->rdx = JE_ABI_DEV_PROFILE_LEGACY_PIO;
+        je_device_note_hardened_refusal_after(device);
+        return je_sched_return_to_user(f);
     }
     je_vm *target_vm = (je_vm *)0;
     uint32_t target_index = 0u;
@@ -799,7 +820,8 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
             bool revoke = je_device_close_matches(
                 je_kernel_device(), caller, vm, index, h);
             je_handle_status s = je_handle_close(t, h);
-            if (s == JE_HANDLE_OK && revoke) (void)je_device_revoke(je_kernel_device());
+            if (s == JE_HANDLE_OK && revoke)
+                (void)je_device_revoke_close(je_kernel_device());
             f->rax = (uint64_t)handle_status_to_abi(s); f->rdx = 0u;
         } else if (type == JE_ABI_OBJ_SELF || type == JE_ABI_OBJ_LAUNCHER) {
             je_handle_status s = je_handle_close(t, h);
@@ -1126,6 +1148,11 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
             if (was_live[c] && minted[c])
                 je_m4g_record_cap_delivery(vm, index, &caps[c]);
         je_m4g_record_control_receive(vm, index, &lease, staging, mlen, mcaps);
+#endif
+#if JE_TEST_MODE == 15
+        for (uint8_t c = 0u; c < mcaps; ++c)
+            if (was_live[c] && minted[c])
+                je_m4g_record_cap_delivery(vm, index, &caps[c]);
 #endif
         f->rax = (uint64_t)JE_ABI_OK;
         f->rdx = (uint64_t)mlen | ((uint64_t)mcaps << 32);

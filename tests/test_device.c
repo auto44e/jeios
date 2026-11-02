@@ -44,6 +44,7 @@ bool je_arch_irq7_is_unmasked(void) { return g_irq7_unmasked; }
 uint8_t je_arch_master_isr(void) { return g_isr; }
 void je_arch_master_eoi(void) { ++g_eoi_count; }
 void je_arch_tss_set_com2_io(bool allow) { g_bitmap = allow ? 0u : 0xffu; }
+uint8_t je_arch_tss_com2_io(void) { return g_bitmap; }
 
 static je_proc_pool g_procs;
 static je_vm g_vm;

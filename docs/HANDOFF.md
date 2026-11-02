@@ -1,5 +1,128 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## M4 PR-I FIX pass — evidence hardening and cleanup — observed 2026-11-02T00:59:59+00:00
+
+Repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/wt-m4i-impl`;
+branch `wip/m4i-impl`; exact inspected commit
+`8109379b79a570772e2b1642bc23a0cb593f7877`. Changes remain uncommitted for
+lead integration. Remote CI and independent human qualification are not
+observed; AI-assisted review is not human qualification.
+
+State: **implemented / tested / planned / not blocked**.
+
+- **Implemented:** supervisor-owned healthy-incarnation PING/PONG before HANG
+  and after every restart; kernel HANG acknowledgement before the timeout PING;
+  non-closing HANG behavior with bounded timeout/kill; full before/after
+  hardened-refusal snapshots including COM2 bitmap and IRQ3 mask; identity-based
+  per-client cap attribution; exact exit-code checks; generation-validated
+  SERVICE_BIND; revoke-send ordering; separate admin-revoked-owner death
+  accounting; cleanup of endpoint/device/cap handles; actual partial-write
+  lengths; and the gen-3 `I3` recovered-TX proof.
+- **Tested:** `ASAN_OPTIONS=detect_leaks=0 make check`, `make smoke`,
+  `make integration`, explicit NX-present and NX-absent smoke profiles,
+  `make aarch64 && make smoke-aarch64 ARM_REQUIRE=1`, and `git diff --check`
+  all passed. Final mode 15 reached all kernel corroboration markers and
+  QEMU's independent COM2 file contained `b'I1I2I3'`; `D!` and `R!` were
+  absent. Required four A/B mutants all failed their corresponding proof and
+  were restored; exact outputs are in `WORKER_NOTES.md`.
+- **Planned:** lead integration, cross-review, and the independent human gate
+  required for any hardened/release qualification claim.
+- **Blocked:** no local implementation blocker.
+
+Changed invariants: mode 15 cannot complete until each healthy incarnation
+answers its generation-tagged PING, HANG has been kernel-applied and timed out
+under the bounded scenario budget, the normal client has exactly three
+identity-attributed brokered caps, the hardened client has zero, both client
+exit codes are exact, the admin-revoked owner fault is consumed against the
+matching identity, and final QEMU COM2 evidence is `I1I2I3` with `D!`/`R!`
+absent. The post-teardown final device check separately expects the final live
+owner death revoke, so the pre-teardown corroboration count is exact one and
+the teardown count is exact two.
+
+Unresolved hazards: the hardened refusal is an explicit legacy-PIO
+`UNSUPPORTED` profile, not DMA containment; support is limited to the tested
+QEMU COM2 fixture; IRQ3 and TSS authority remain architecture-specific; no
+remote CI or human qualification was observed; and no claim is made for SMP,
+arbitrary hardware, dynamic loading, all drivers, or a general application ABI.
+
+Exact commands/evidence:
+
+```text
+ASAN_OPTIONS=detect_leaks=0 make check — PASS
+make smoke — PASS
+make integration — PASS; mode 15 COM2=b'I1I2I3'
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M --expect-nx absent — PASS
+python3 tools/smoke.py build/0/jeios.iso --memory 1536M --expect-nx present — PASS
+make aarch64 && make smoke-aarch64 ARM_REQUIRE=1 — PASS
+git diff --check — PASS
+```
+
+Next bounded task: lead integration and owner/human review. Pass criteria are
+preservation of the mode-15 kernel-state and independent COM2 evidence above;
+do not claim hardened/release qualification until the human gate occurs.
+
+## M4 PR-I — D9 brokered UART service / final M4 gate — observed 2026-11-02T00:07:42+00:00
+
+Repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/wt-m4i-impl`;
+branch `wip/m4i-impl`; exact inspected commit
+`3b447d0aa7c194e55fa2beca1bdad41b64fd2f60`. Changes remain uncommitted for
+lead integration. This is local evidence only; remote CI and independent human
+qualification are not observed. AI-assisted review is not human qualification.
+
+State: **implemented / tested / planned / not blocked**.
+
+- **Implemented:** mode-15 completion checklist and bounded supervisor deadline;
+  the client grant wait now covers the supervisor's bounded kill/restart/attach
+  sequence; the HANG incarnation yields and closes broker channels so
+  `PEER_CLOSED` is observable without monopolizing the single CPU; hardened
+  `DEV_ASSIGN` is refused with `UNSUPPORTED` and the legacy-PIO profile; and
+  the UART scenario reaches DONE after timeout, same-live detach/reassign, and
+  admin-revoke/fault restart.
+- **Kernel/independent hardware evidence:** final mode 15 accepted the timeout
+  PING/PONG deadline, detach, vector-13 revoke restart, hardened refusal with
+  zero brokered caps, final revoked DEVICE state (`bitmap=0xff`, IRQ3 masked),
+  and zero-leak identity baseline. QEMU's independent COM2 file contained
+  exactly `b'I1I2'`; `D!` and `R!` were absent.
+- **Root cause of the stall:** the client issued its reconnect request while
+  the supervisor was still spending the 600-tick PING deadline plus
+  kill/restart/DEV_ASSIGN/ATTACH work. The client used the same 600-tick grant
+  wait, exited before the restart grant arrived, and the supervisor later saw
+  `PEER_CLOSED` while sending it. The HANG path also needed to yield and close
+  its broker channels so the client could observe the expected peer death.
+- **Planned:** lead integration, cross-review, and the independent human gate
+  required for any hardened/release qualification claim. No broader hardware,
+  DMA, SMP, arbitrary-driver, or application ABI support is claimed.
+- **Blocked:** no local implementation blocker.
+
+Changed invariants: mode 15 exits only after all five checklist facts are set
+(`timeout_done`, `detach_done`, `revoke_done`, `hardened_done`,
+`client_i2_done`), both clients are closed, service generation is 3, and the
+service is live. A missing fact fails with `JE_SVC_FAIL_UART_DEADLINE` rather
+than relying on the kernel monitor deadline. The QEMU COM2 backend, not the
+driver's self-report, is authoritative for `I1`/`I2` and forbidden post-
+detach/revoke writes.
+
+Exact local verification:
+
+```text
+ASAN_OPTIONS=detect_leaks=0 make check — PASS
+make smoke — PASS (mode 0 unchanged)
+make integration — PASS (modes 1–15; final mode 15 COM2=b'I1I2')
+python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M --expect-nx absent — PASS
+python3 tools/smoke.py build/0/jeios.iso --memory 1536M --expect-nx present — PASS
+make aarch64 && make smoke-aarch64 ARM_REQUIRE=1 — PASS
+git diff --check — PASS
+```
+
+The ARM build retained the existing linker RWX warning. Temporary A/B controls
+were restored: removing the hardened refusal produced fail code `0x7` and no
+`M4i-s1`; omitting `DEV_REVOKE` produced fail code `0x7` and QEMU COM2
+`b'I1I2R!'`, proving the final absence check is meaningful.
+
+Next bounded task: lead review of this uncommitted PR-I diff. Pass criteria are
+preservation of the above mode-15 kernel/COM2 evidence and completion of the
+owner's human qualification gate; no claim is made until that gate occurs.
+
 ## M4 PR-H (#53) — D9 device / TSS I/O bitmap / kernel-owned IRQ3 — observed 2026-11-01T21:18:49Z
 
 Branch `feat/m4h-device`, based on main `b82d426` (#68 merged; main CI green);

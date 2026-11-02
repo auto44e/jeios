@@ -265,6 +265,7 @@ _Static_assert(sizeof(je_svc_report) == JE_SVC_REPORT_LEN, "report struct size")
 #define JE_SVC_FAIL_SLEEP_CHANNEL 4u  /* non-TIMED_OUT on the private sleep end */
 #define JE_SVC_FAIL_ROLLBACK      5u  /* failed-launch rollback did not hold */
 #define JE_SVC_FAIL_CRASHLOOP     6u  /* crash-loop attempt count was wrong */
+#define JE_SVC_FAIL_UART_DEADLINE 7u  /* PR-I UART scenario deadline expired */
 #define JE_SVC_DONE_EXIT          0x4d3446u /* nonzero clean supervisor exit */
 
 /*

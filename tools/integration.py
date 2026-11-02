@@ -116,3 +116,39 @@ assert int(delivery.group(1), 16) >= 1, output
 assert int(delivery.group(2), 16) >= 2, output
 print(f"device mode 14 (D9): PASS\n{output}")
 
+# Mode 15 is the final D9 PR-I proof: the brokered UART service owns COM2,
+# timeout/detach/revoke are corroborated by kernel state, and the client writes
+# are checked against QEMU's independent COM2 backend.
+result = subprocess.run(["make", "iso", "TEST_MODE=15"], stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True)
+assert result.returncode == 0, result.stdout
+com2 = Path("build/15/com2.log")
+if com2.exists():
+    com2.unlink()
+output = boot(
+    Path("build/15/jeios.iso"),
+    terminal=b"M4i: zero-leak identity baseline verified",
+    expected=[
+        b"M4i: supervisor phase=0x0000000000000001",
+        b"M4i: supervisor phase=0x0000000000000002",
+        b"M4i: kernel HANG command applied",
+        b"M4i: UART PRESENT; timeout PING/PONG deadline corroborated",
+        b"M4i: detach CLOSE + same-live reassign corroborated",
+        b"M4i: admin revoke -> vector-13 fault and restart corroborated",
+        b"M4i: hardened UNSUPPORTED refusal and zero-cap client corroborated",
+        b"M4i-s1: UART service scenario completed",
+        b"M4i: final device revoked; bitmap=0xff; IRQ3 masked",
+    ],
+    timeout=180,
+    serial2="file:build/15/com2.log",
+)
+assert "JeiOS fatal:" not in output, f"mode 15 UART scenario failed:\n{output}"
+assert "M4i: supervisor lost" not in output, \
+    "mode 15 unexpectedly took the supervisor-loss path"
+com2_bytes = com2.read_bytes()
+assert b"I1" in com2_bytes and b"I2" in com2_bytes and b"I3" in com2_bytes, \
+    f"mode 15 COM2 log missed required writes: {com2_bytes!r}"
+assert b"R!" not in com2_bytes and b"D!" not in com2_bytes, \
+    f"mode 15 COM2 log contains unauthorized/detached writes: {com2_bytes!r}"
+print(f"UART mode 15 (D9 PR-I): PASS\n{output}\nCOM2={com2_bytes!r}")
+
