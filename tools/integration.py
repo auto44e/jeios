@@ -131,6 +131,7 @@ output = boot(
     expected=[
         b"M4i: supervisor phase=0x0000000000000001",
         b"M4i: supervisor phase=0x0000000000000002",
+        b"M4i: kernel HANG command applied",
         b"M4i: UART PRESENT; timeout PING/PONG deadline corroborated",
         b"M4i: detach CLOSE + same-live reassign corroborated",
         b"M4i: admin revoke -> vector-13 fault and restart corroborated",
@@ -145,7 +146,7 @@ assert "JeiOS fatal:" not in output, f"mode 15 UART scenario failed:\n{output}"
 assert "M4i: supervisor lost" not in output, \
     "mode 15 unexpectedly took the supervisor-loss path"
 com2_bytes = com2.read_bytes()
-assert b"I1" in com2_bytes and b"I2" in com2_bytes, \
+assert b"I1" in com2_bytes and b"I2" in com2_bytes and b"I3" in com2_bytes, \
     f"mode 15 COM2 log missed required writes: {com2_bytes!r}"
 assert b"R!" not in com2_bytes and b"D!" not in com2_bytes, \
     f"mode 15 COM2 log contains unauthorized/detached writes: {com2_bytes!r}"

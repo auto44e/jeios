@@ -37,11 +37,16 @@ typedef struct {
     je_proc_id hardened_after_owner;
     bool hardened_before_active;
     bool hardened_after_active;
-    bool hardened_refusal_reported;
+    uint8_t hardened_before_com2_io;
+    uint8_t hardened_after_com2_io;
+    bool hardened_before_irq3_unmasked;
+    bool hardened_after_irq3_unmasked;
     je_proc_id last_admin_revoke_owner;
+    je_proc_id admin_revoke_owner_death;
     bool admin_revoke_pending_fault;
     bool admin_revoke_fault_seen;
     uint32_t gp_after_admin_revoke;
+    uint32_t admin_revoke_owner_death_count;
     bool active;
     bool pending;
     bool revoking;
@@ -68,6 +73,7 @@ je_abi_status je_device_revoke_death(je_device *device);
 void je_device_note_fault_after_admin_revoke(je_device *device,
                                              je_proc_id id, uint64_t vector);
 void je_device_note_hardened_refusal(je_device *device);
+void je_device_note_hardened_refusal_after(je_device *device);
 je_abi_status je_device_irq_ack(je_device *device, je_proc_id caller,
                                 je_vm *caller_vm, uint32_t caller_vm_index,
                                 je_handle handle, uint32_t *out_pending);

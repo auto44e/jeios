@@ -50,12 +50,15 @@ static uint32_t recv_one(uint64_t endpoint, uint8_t *bytes, uint32_t capacity,
     return 1u;
 }
 
-static void close_minted(uint32_t *minted, uint32_t count)
+static uint32_t close_minted(uint32_t *minted, uint32_t count)
 {
+    if (!minted || count > 1u) return 0u;
+    if (count == 0u) return 1u;
     for (uint32_t i = 0u; i < count; ++i) {
         if (minted[i] != 0u) (void)je_handle_close(minted[i]);
         minted[i] = 0u;
     }
+    return 1u;
 }
 
 static uint32_t uart_probe(void)
@@ -79,9 +82,11 @@ static uint32_t uart_probe(void)
     return JE_SVC_UART_PRESENT;
 }
 
-static uint32_t uart_write(const uint8_t *bytes, uint32_t length)
+static uint32_t uart_write(const uint8_t *bytes, uint32_t length,
+                           uint32_t *written)
 {
-    if (!bytes || length > JE_SVC_UART_PAYLOAD_MAX)
+    if (written) *written = 0u;
+    if (!bytes || !written || length > JE_SVC_UART_PAYLOAD_MAX)
         return JE_SVC_UART_IO_INVALID;
     for (uint32_t i = 0u; i < length; ++i) {
         uint32_t ready = 0u;
@@ -93,6 +98,7 @@ static uint32_t uart_write(const uint8_t *bytes, uint32_t length)
         }
         if (ready == 0u) return JE_SVC_UART_IO_WOULDBLOCK;
         port_out(UART_BASE, bytes[i]);
+        *written = i + 1u;
     }
     return JE_SVC_UART_IO_OK;
 }
@@ -123,8 +129,7 @@ static uint32_t serve_request(uint64_t endpoint, uint32_t device,
     if (attached == 0u) {
         reply.status = JE_SVC_UART_IO_DETACHED;
     } else if (request.op == JE_SVC_OP_UART_WRITE) {
-        reply.status = uart_write(request.bytes, request.len);
-        if (reply.status == JE_SVC_UART_IO_OK) reply.len = request.len;
+        reply.status = uart_write(request.bytes, request.len, &reply.len);
     } else if (request.op == JE_SVC_OP_UART_READ) {
         reply.status = JE_SVC_UART_IO_EMPTY;
         while (reply.len < request.len
@@ -134,14 +139,17 @@ static uint32_t serve_request(uint64_t endpoint, uint32_t device,
         }
         if (reply.len != 0u) reply.status = JE_SVC_UART_IO_OK;
     }
-    if (je_try_send(endpoint, &reply, sizeof reply) != JE_ABI_OK)
+    if (je_try_send(endpoint, &reply, sizeof reply) != JE_ABI_OK) {
+        (void)je_handle_close(endpoint);
         return 2u;
+    }
     (void)device;
     return 0u;
 }
 
 static uint32_t handle_control(uint64_t control, uint32_t *device,
-                               uint32_t *attached, uint32_t *brokerable,
+                               uint32_t *device_present, uint32_t *attached,
+                               uint32_t *brokerable, uint32_t *generation,
                                uint32_t *channels, uint32_t *channel_count)
 {
     uint8_t bytes[JE_SVC_UART_REQUEST_LEN] = {0u};
@@ -153,6 +161,11 @@ static uint32_t handle_control(uint64_t control, uint32_t *device,
     if (result == 0u) return 1u;
     if (result == UINT32_MAX) return 0u;
     if (result == UINT32_MAX - 1u) {
+        (void)je_handle_close(control);
+        return 0u;
+    }
+    if (caps > 1u) {
+        (void)close_minted(minted, caps);
         (void)je_handle_close(control);
         return 0u;
     }
@@ -168,21 +181,29 @@ static uint32_t handle_control(uint64_t control, uint32_t *device,
         je_svc_service_bind bind = {0};
         if (length != JE_SVC_SERVICE_BIND_LEN || caps != 1u
             || minted[0] == 0u || *attached == 0u || *brokerable == 0u
-            || *channel_count >= UART_CHANNEL_MAX) {
-            close_minted(minted, caps);
+            || *generation == 0u || *channel_count >= UART_CHANNEL_MAX) {
+            (void)close_minted(minted, caps);
             (void)je_handle_close(control);
             return 0u;
         }
         memcpy(&bind, bytes, sizeof bind);
+        if (bind.service_generation != *generation) {
+            (void)close_minted(minted, caps);
+            (void)je_handle_close(control);
+            return 0u;
+        }
+        je_svc_broker_reply ack = { JE_SVC_OP_BROKER_ACK, bind.transaction };
+        if (je_try_send(control, &ack, sizeof ack) != JE_ABI_OK) {
+            (void)close_minted(minted, caps);
+            (void)je_handle_close(control);
+            return 0u;
+        }
         channels[*channel_count] = minted[0];
         ++*channel_count;
-        je_svc_broker_reply ack = { JE_SVC_OP_BROKER_ACK, bind.transaction };
-        if (je_try_send(control, &ack, sizeof ack) != JE_ABI_OK)
-            return 0u;
         return 1u;
     }
     if (caps != 0u) {
-        close_minted(minted, caps);
+        (void)close_minted(minted, caps);
         (void)je_handle_close(control);
         return 0u;
     }
@@ -194,9 +215,10 @@ static uint32_t handle_control(uint64_t control, uint32_t *device,
         }
         memcpy(&attach, bytes, sizeof attach);
         if (attach.device_handle == 0u) {
-            if (*attached != 0u) {
+            if (*device_present != 0u) {
                 (void)je_handle_close(*device);
                 *device = 0u;
+                *device_present = 0u;
                 *attached = 0u;
                 *brokerable = 0u;
                 je_svc_uart_control detached = {
@@ -208,24 +230,34 @@ static uint32_t handle_control(uint64_t control, uint32_t *device,
             }
             return 1u;
         }
-        if (*attached != 0u) {
+        if (*device_present != 0u) {
             (void)je_handle_close(*device);
             *device = 0u;
+            *device_present = 0u;
             *attached = 0u;
             *brokerable = 0u;
         }
         *device = attach.device_handle;
+        *device_present = 1u;
         uint32_t profile = uart_probe();
         je_svc_uart_control reply = {
             JE_SVC_OP_UART_ATTACH_OK, profile
         };
-        if (je_try_send(control, &reply, sizeof reply) != JE_ABI_OK)
+        if (je_try_send(control, &reply, sizeof reply) != JE_ABI_OK) {
+            (void)je_handle_close(*device);
+            *device = 0u;
+            *device_present = 0u;
             return 0u;
+        }
         if (profile == JE_SVC_UART_PRESENT) {
             *attached = 1u;
             *brokerable = 1u;
         } else {
+            (void)je_handle_close(*device);
             *device = 0u;
+            *device_present = 0u;
+            *attached = 0u;
+            *brokerable = 0u;
         }
         return 1u;
     }
@@ -236,6 +268,11 @@ static uint32_t handle_control(uint64_t control, uint32_t *device,
             return 0u;
         }
         memcpy(&ping, bytes, sizeof ping);
+        if (ping.arg == 0u) {
+            (void)je_handle_close(control);
+            return 0u;
+        }
+        if (*generation == 0u) *generation = ping.arg;
         if (je_try_send(control,
                         &(je_svc_uart_control){JE_SVC_OP_UART_PONG, ping.arg},
                         sizeof(je_svc_uart_control)) != JE_ABI_OK)
@@ -262,22 +299,14 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t control,
         return 92;
 
     uint32_t device = 0u;
+    uint32_t device_present = 0u;
     uint32_t attached = 0u;
     uint32_t brokerable = 0u;
+    uint32_t generation = 0u;
     uint32_t channels[UART_CHANNEL_MAX] = {0u};
     uint32_t channel_count = 0u;
-    uint32_t hang_channels_closed = 0u;
     for (;;) {
-        if (attached != 0u && uart_mode == JE_SVC_UART_MODE_HANG) {
-            if (hang_channels_closed == 0u) {
-                for (uint32_t i = 0u; i < channel_count; ++i) {
-                    if (channels[i] != 0u)
-                        (void)je_handle_close(channels[i]);
-                    channels[i] = 0u;
-                }
-                channel_count = 0u;
-                hang_channels_closed = 1u;
-            }
+        if (uart_mode == JE_SVC_UART_MODE_HANG) {
             uint8_t ignored[JE_SVC_UART_REQUEST_LEN] = {0u};
             uint64_t meta = 0u;
             uint64_t status = je_try_recv(control, ignored, sizeof ignored,
@@ -295,7 +324,8 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t control,
             if (je_yield() != JE_ABI_OK) return 95;
             continue;
         }
-        if (handle_control(control, &device, &attached, &brokerable,
+        if (handle_control(control, &device, &device_present, &attached,
+                           &brokerable, &generation,
                            channels, &channel_count) == 0u)
             return 94;
         for (uint32_t i = 0u; i < channel_count; ++i) {

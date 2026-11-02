@@ -177,16 +177,22 @@ void je_device_note_fault_after_admin_revoke(je_device *d, je_proc_id id,
 void je_device_note_hardened_refusal(je_device *d)
 {
     if (!d) return;
-    ++d->hardened_refusal_count;
     d->hardened_before_binding_gen = d->binding_gen;
     d->hardened_before_owner = d->owner;
     d->hardened_before_active = d->active;
-    /* The refusal path is a single kernel transaction. Recording the second
-     * snapshot after all validation makes the no-side-effect contract
-     * externally inspectable by the mode-15 corroborator. */
+    d->hardened_before_com2_io = je_arch_tss_com2_io();
+    d->hardened_before_irq3_unmasked = je_arch_irq3_is_unmasked();
+    ++d->hardened_refusal_count;
+}
+
+void je_device_note_hardened_refusal_after(je_device *d)
+{
+    if (!d) return;
     d->hardened_after_binding_gen = d->binding_gen;
     d->hardened_after_owner = d->owner;
     d->hardened_after_active = d->active;
+    d->hardened_after_com2_io = je_arch_tss_com2_io();
+    d->hardened_after_irq3_unmasked = je_arch_irq3_is_unmasked();
 }
 
 je_abi_status je_device_irq_ack(je_device *d, je_proc_id caller,
@@ -217,7 +223,8 @@ void je_device_on_process_dying(je_device *d, je_proc_id id)
     if (d->admin_revoke_fault_seen
         && d->last_admin_revoke_owner.index == id.index
         && d->last_admin_revoke_owner.gen == id.gen) {
-        ++d->revoke_death_count;
+        ++d->admin_revoke_owner_death_count;
+        d->admin_revoke_owner_death = id;
         d->admin_revoke_pending_fault = false;
         d->admin_revoke_fault_seen = false;
     }

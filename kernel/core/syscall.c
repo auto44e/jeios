@@ -31,9 +31,6 @@ extern bool je_endpoint_kern_is_wired(const je_vm *vm);
 #if JE_TEST_MODE == 15
 extern void je_m4g_record_cap_delivery(je_vm *vm, uint32_t index,
                                        const je_ep_capdesc *descriptor);
-extern void je_m4i_record_control_receive(je_vm *vm, uint32_t index,
-                                          const void *message, size_t length,
-                                          uint8_t cap_count);
 #endif
 #endif
 
@@ -525,7 +522,6 @@ static void je_syscall_finish_blocked_recv(je_trap_frame *f, je_ep_channel *rec,
     for (uint8_t c = 0u; c < mcaps; ++c)
         if (was_live[c] && minted[c])
             je_m4g_record_cap_delivery(vm, index, &caps[c]);
-    je_m4i_record_control_receive(vm, index, staging, mlen, mcaps);
 #endif
     je_endpoint_kern_wait_release(rec, side, slot);
     f->rax=(uint64_t)JE_ABI_OK;
@@ -655,6 +651,7 @@ static je_trap_frame *dispatch_device_assign(je_trap_frame *f)
         if (first) je_arch_console_write("JeiOS: legacy no-DMA PIO\r\n");
         f->rax = (uint64_t)JE_ABI_UNSUPPORTED;
         f->rdx = JE_ABI_DEV_PROFILE_LEGACY_PIO;
+        je_device_note_hardened_refusal_after(device);
         return je_sched_return_to_user(f);
     }
     je_vm *target_vm = (je_vm *)0;
@@ -1156,7 +1153,6 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         for (uint8_t c = 0u; c < mcaps; ++c)
             if (was_live[c] && minted[c])
                 je_m4g_record_cap_delivery(vm, index, &caps[c]);
-        je_m4i_record_control_receive(vm, index, staging, mlen, mcaps);
 #endif
         f->rax = (uint64_t)JE_ABI_OK;
         f->rdx = (uint64_t)mlen | ((uint64_t)mcaps << 32);

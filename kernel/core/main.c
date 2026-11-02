@@ -106,10 +106,11 @@ static m4g_client_audit m4g_client_audits[JE_PROC_REC_MAX];
 #endif
 #if JE_TEST_MODE == 15
 static uint32_t m4i_cap_delivery_count[JE_PROC_REC_MAX];
-static bool m4i_capful_seen[JE_PROC_REC_MAX];
-static uint32_t m4i_cap_delivery_total;
-static uint32_t m4i_capful_client_count;
-static uint32_t m4i_restarted_delivery_count;
+static uint32_t m4i_normal_client_cap_count;
+static uint32_t m4i_hardened_client_cap_count;
+static uint32_t m4i_normal_client_exit_count;
+static uint32_t m4i_hardened_client_exit_count;
+static bool m4i_bad_client_exit;
 static bool m4i_mode_command_applied;
 #endif
 static bool m4f_id_equal(je_proc_id left, je_proc_id right);
@@ -324,47 +325,6 @@ void je_m4g_record_cap_delivery(je_vm *vm, uint32_t index,
         ++m4i_cap_delivery_count[receiver.index];
 }
 
-void je_m4i_record_control_receive(je_vm *vm, uint32_t index,
-                                   const void *message, size_t length,
-                                   uint8_t cap_count)
-{
-    if (!vm || !message || index >= JE_VM_MAX_PROCESSES
-        || cap_count != 1u || length != JE_SVC_BROKER_GRANT_LEN)
-        return;
-    je_proc_id receiver = JE_PROC_ID_NONE;
-    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
-        const je_proc_rec *record = &process_pool.rec[i];
-        if ((record->state == JE_PROC_LIVE || record->state == JE_PROC_DYING)
-            && record->run_linked && record->vm_index == index) {
-            receiver = (je_proc_id){i, record->gen};
-            break;
-        }
-    }
-    if (receiver.gen == 0u || receiver.index >= JE_PROC_REC_MAX
-        || !m4f_children[receiver.index].active
-        || m4f_children[receiver.index].image_id != JE_IMAGE_UART_CLIENT
-        || !m4f_id_equal(m4f_children[receiver.index].id, receiver))
-        return;
-    je_svc_broker_grant grant = {0};
-    const uint8_t *bytes = (const uint8_t *)message;
-    uint8_t *grant_bytes = (uint8_t *)&grant;
-    for (uint32_t i = 0u; i < sizeof grant; ++i)
-        grant_bytes[i] = bytes[i];
-    if (grant.op == JE_SVC_OP_BROKER_GRANT
-        || grant.op == JE_SVC_OP_BROKER_RESTARTED) {
-        if (!m4i_capful_seen[receiver.index]) {
-            m4i_capful_seen[receiver.index] = true;
-            ++m4i_capful_client_count;
-        }
-    }
-    if (grant.op == JE_SVC_OP_BROKER_GRANT
-        || grant.op == JE_SVC_OP_BROKER_RESTARTED) {
-        ++m4i_cap_delivery_total;
-        ++m4i_cap_delivery_count[receiver.index];
-    }
-    if (grant.op == JE_SVC_OP_BROKER_RESTARTED)
-        ++m4i_restarted_delivery_count;
-}
 #endif
 
 static bool m4f_id_equal(je_proc_id left, je_proc_id right)
@@ -379,7 +339,6 @@ static void m4f_ledger_reset(void)
         m4f_run_proc_slots[i] = false;
 #if JE_TEST_MODE == 15
         m4i_cap_delivery_count[i] = 0u;
-        m4i_capful_seen[i] = false;
 #endif
     }
     for (uint32_t image = 0u; image < M4F_IMAGE_COUNT; ++image) {
@@ -398,9 +357,11 @@ static void m4f_ledger_reset(void)
     m4f_ledger_enabled = true;
     m4g_delivery_reset();
 #if JE_TEST_MODE == 15
-    m4i_cap_delivery_total = 0u;
-    m4i_capful_client_count = 0u;
-    m4i_restarted_delivery_count = 0u;
+    m4i_normal_client_cap_count = 0u;
+    m4i_hardened_client_cap_count = 0u;
+    m4i_normal_client_exit_count = 0u;
+    m4i_hardened_client_exit_count = 0u;
+    m4i_bad_client_exit = false;
     m4i_mode_command_applied = false;
 #endif
 }
@@ -940,7 +901,12 @@ static void m4i_apply_mode_command(uint32_t supervisor_vm)
                                       JE_SVC_UART_MODE_VADDR,
                                       JE_SVC_UART_MODE_HANG))
             continue;
+        if (!svc_report_word_write(supervisor_vm,
+                                   JE_SVC_UART_MODE_ACK_VADDR,
+                                   JE_SVC_UART_MODE_HANG))
+            fail("JeiOS fatal: M4i mode acknowledgement\r\n");
         m4i_mode_command_applied = true;
+        je_arch_console_write("M4i: kernel HANG command applied\r\n");
         return;
     }
 }
@@ -1187,6 +1153,20 @@ static void m4f_capture_terminal_children(void)
                 ++m4f_fault_vector_count[child->image_id]
                                 [child->terminal_vector];
         }
+#if JE_TEST_MODE == 15
+        if (child->image_id == JE_IMAGE_UART_CLIENT
+            && child->terminal_reason == JE_DEATH_EXIT) {
+            if (child->terminal_code == UINT64_C(0x5548)) {
+                ++m4i_hardened_client_exit_count;
+                m4i_hardened_client_cap_count = m4i_cap_delivery_count[i];
+            } else if (child->terminal_code == JE_SVC_UART_DONE_EXIT) {
+                ++m4i_normal_client_exit_count;
+                m4i_normal_client_cap_count = m4i_cap_delivery_count[i];
+            } else {
+                m4i_bad_client_exit = true;
+            }
+        }
+#endif
         if (child->image_id == JE_IMAGE_SPOOFER) {
             child->terminal_endpoint_shape = m4f_spoofer_endpoint_shape(rec);
             if (child->terminal_endpoint_shape) ++m4f_spoofer_shape_count;
@@ -1428,15 +1408,15 @@ static bool m4f_corroborate(je_proc_id supervisor,
 #elif JE_TEST_MODE == 15
     (void)report;
     const je_proc_rec *sup = &process_pool.rec[supervisor.index];
-    uint32_t uart_clients = m4f_spawn_count[JE_IMAGE_UART_CLIENT];
-    uint32_t uart_client_caps_zero = uart_clients - m4i_capful_client_count;
-    uint32_t uart_client_caps_three = m4i_cap_delivery_total == 3u
-        && m4i_capful_client_count == 1u;
     const je_device *device = je_kernel_device();
     bool equal_owner = device->hardened_before_owner.index
             == device->hardened_after_owner.index
         && device->hardened_before_owner.gen
             == device->hardened_after_owner.gen;
+    bool equal_hardened_io = device->hardened_before_com2_io
+            == device->hardened_after_com2_io
+        && device->hardened_before_irq3_unmasked
+            == device->hardened_after_irq3_unmasked;
     bool ok = sup->state == JE_PROC_DYING
         && sup->reason == JE_DEATH_EXIT
         && sup->code == JE_SVC_UART_DONE_EXIT
@@ -1448,20 +1428,29 @@ static bool m4f_corroborate(je_proc_id supervisor,
         && m4f_fault_vector_count[JE_IMAGE_UART_SVC][13u] == 1u
         && m4f_terminal_count[JE_IMAGE_UART_CLIENT] == 2u
         && m4f_death_count[JE_IMAGE_UART_CLIENT][JE_DEATH_EXIT] == 2u
+        && m4i_normal_client_exit_count == 1u
+        && m4i_hardened_client_exit_count == 1u
+        && !m4i_bad_client_exit
+        && m4i_normal_client_cap_count == 3u
+        && m4i_hardened_client_cap_count == 0u
         && device->binding_gen == 7u
         && device->revoke_admin_count == 1u
         && device->revoke_close_count == 1u
-        && device->revoke_death_count >= 2u
+        && device->revoke_death_count == 1u
+        && device->admin_revoke_owner_death_count == 1u
         && device->gp_after_admin_revoke == 1u
+        && device->admin_revoke_owner_death.index
+            == device->last_admin_revoke_owner.index
+        && device->admin_revoke_owner_death.gen
+            == device->last_admin_revoke_owner.gen
+        && !device->admin_revoke_pending_fault
+        && !device->admin_revoke_fault_seen
         && device->hardened_refusal_count == 1u
         && device->hardened_before_binding_gen
             == device->hardened_after_binding_gen
         && device->hardened_before_active == device->hardened_after_active
         && equal_owner
-        && uart_clients == 2u
-        && uart_client_caps_zero == 1u
-        && uart_client_caps_three == 1u
-        && m4i_restarted_delivery_count == 2u
+        && equal_hardened_io
         && m4i_mode_command_applied
         && device->active;
     if (ok) {
@@ -1597,7 +1586,7 @@ static _Noreturn void m4f_teardown(const m4f_baseline *baseline,
             || je_kernel_device()->binding_gen != 8u
             || je_arch_tss_com2_io() != 0xffu
             || je_arch_irq3_is_unmasked()
-            || je_kernel_device()->revoke_death_count < 2u))
+            || je_kernel_device()->revoke_death_count != 2u))
         fail("JeiOS fatal: M4i final device state\r\n");
     je_arch_console_write("M4i: final device revoked; bitmap=0xff; IRQ3 masked\r\n");
     je_arch_console_write("M4i: zero-leak identity baseline verified\r\n");

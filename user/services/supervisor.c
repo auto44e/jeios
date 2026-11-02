@@ -127,7 +127,7 @@ static uint32_t d9_wait_result(uint64_t endpoint, uint64_t process,
             return result.value;
         }
         if (status != JE_ABI_H_EMPTY) return 0u;
-        (void)process;
+    (void)process;
         if (je_clock_ticks(&now) != JE_ABI_OK
             || now - start >= JE_SVC_READY_DEADLINE)
             return 0u;
@@ -809,14 +809,13 @@ typedef struct {
 #define UART_LEDGER_FREE 0u
 #define UART_LEDGER_LIVE 1u
 
-#define UART_SCENARIO_DEADLINE (JE_SVC_UART_DEADLINE * 2u)
-
 typedef struct {
     uint32_t timeout_done;
     uint32_t detach_done;
     uint32_t revoke_done;
+    uint32_t hardened_refused;
     uint32_t hardened_done;
-    uint32_t client_i2_done;
+    uint32_t client_i3_done;
 } uart_demo_checklist;
 
 static uint32_t uart_transaction = 1u;
@@ -827,8 +826,19 @@ static uint32_t uart_send_config(uint64_t endpoint, uint32_t value)
     return je_try_send(endpoint, &message, sizeof message) == JE_ABI_OK;
 }
 
+static uint32_t uart_budget_live(uint64_t start, uint64_t now,
+                                 uint64_t scenario_deadline,
+                                 uint64_t local_deadline)
+{
+    if (now >= scenario_deadline) return 0u;
+    uint64_t remaining = scenario_deadline - now;
+    uint64_t budget = remaining < local_deadline ? remaining : local_deadline;
+    return now - start < budget;
+}
+
 static uint32_t uart_wait_control(uint64_t endpoint, uint32_t expected_op,
-                                  uint32_t expected_arg, uint64_t self_recv)
+                                  uint32_t expected_arg, uint64_t self_recv,
+                                  uint64_t scenario_deadline)
 {
     uint64_t start = 0u;
     if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
@@ -849,13 +859,15 @@ static uint32_t uart_wait_control(uint64_t endpoint, uint32_t expected_op,
             return 0u;
         uint64_t now = 0u;
         if (je_clock_ticks(&now) != JE_ABI_OK
-            || now - start >= JE_SVC_UART_DEADLINE)
+            || !uart_budget_live(start, now, scenario_deadline,
+                                 JE_SVC_UART_DEADLINE))
             return 0u;
         if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
     }
 }
 
-static uint32_t uart_wait_dead(uint64_t process, uint64_t self_recv)
+static uint32_t uart_wait_dead(uint64_t process, uint64_t self_recv,
+                               uint64_t scenario_deadline)
 {
     uint64_t start = 0u;
     if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
@@ -865,14 +877,16 @@ static uint32_t uart_wait_dead(uint64_t process, uint64_t self_recv)
         if (state.state == JE_ABI_PROC_DEAD) return 1u;
         uint64_t now = 0u;
         if (je_clock_ticks(&now) != JE_ABI_OK
-            || now - start >= JE_SVC_UART_DEADLINE)
+            || !uart_budget_live(start, now, scenario_deadline,
+                                 JE_SVC_UART_DEADLINE))
             return 0u;
         if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
     }
 }
 
 static uint32_t uart_wait_ack(uint64_t endpoint, uint32_t transaction,
-                              uint64_t self_recv)
+                              uint64_t self_recv,
+                              uint64_t scenario_deadline)
 {
     uint64_t start = 0u;
     if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
@@ -894,25 +908,35 @@ static uint32_t uart_wait_ack(uint64_t endpoint, uint32_t transaction,
             return 0u;
         uint64_t now = 0u;
         if (je_clock_ticks(&now) != JE_ABI_OK
-            || now - start >= JE_SVC_UART_DEADLINE)
+            || !uart_budget_live(start, now, scenario_deadline,
+                                 JE_SVC_UART_DEADLINE))
             return 0u;
         if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
     }
 }
 
 static uint32_t uart_spawn_ready(uint64_t launcher, uint64_t self_recv,
-                                 uint64_t *process, uint64_t *control)
+                                 uint64_t *process, uint64_t *control,
+                                 uint64_t scenario_deadline)
 {
     if (!spawn_one(launcher, JE_IMAGE_UART_SVC, 0u,
                    JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV,
                    process, control))
         return 0u;
-    return wait_ready(*control, *process, self_recv, JE_SVC_UART_DEADLINE)
+    uint64_t now = 0u;
+    if (je_clock_ticks(&now) != JE_ABI_OK || now >= scenario_deadline)
+        return 0u;
+    uint64_t remaining = scenario_deadline - now;
+    if (remaining > JE_SVC_UART_DEADLINE)
+        remaining = JE_SVC_UART_DEADLINE;
+    return wait_ready(*control, *process, self_recv,
+                      remaining)
         == WAIT_OK;
 }
 
 static uint32_t uart_attach(uint64_t admin, uint64_t process,
                             uint64_t control, uint64_t self_recv,
+                            uint32_t generation, uint64_t scenario_deadline,
                             uint64_t *device)
 {
     if (!device) return 0u;
@@ -923,7 +947,13 @@ static uint32_t uart_attach(uint64_t admin, uint64_t process,
     };
     if (je_try_send(control, &attach, sizeof attach) != JE_ABI_OK
         || !uart_wait_control(control, JE_SVC_OP_UART_ATTACH_OK,
-                              JE_SVC_UART_PRESENT, self_recv))
+                              JE_SVC_UART_PRESENT, self_recv,
+                              scenario_deadline))
+        return 0u;
+    je_svc_uart_control ping = { JE_SVC_OP_UART_PING, generation };
+    if (je_try_send(control, &ping, sizeof ping) != JE_ABI_OK
+        || !uart_wait_control(control, JE_SVC_OP_UART_PONG, generation,
+                              self_recv, scenario_deadline))
         return 0u;
     return 1u;
 }
@@ -995,6 +1025,7 @@ static uint32_t uart_broker_channel(uart_service_state *service,
                                     uart_client_state *client,
                                     uint64_t self_recv,
                                     uart_ledger_entry *ledger,
+                                    uint64_t scenario_deadline,
                                     uint32_t *out_op,
                                     uint32_t *out_channel)
 {
@@ -1017,7 +1048,8 @@ static uint32_t uart_broker_channel(uart_service_state *service,
     };
     if (je_try_send_caps(service->control, &bind, sizeof bind,
                          &service_cap, 1u) != JE_ABI_OK
-        || !uart_wait_ack(service->control, transaction, self_recv)) {
+        || !uart_wait_ack(service->control, transaction, self_recv,
+                          scenario_deadline)) {
         (void)je_handle_close(service_end);
         (void)je_handle_close(client_end);
         ledger[slot] = (uart_ledger_entry){0};
@@ -1035,7 +1067,8 @@ static uint32_t uart_broker_channel(uart_service_state *service,
         ledger[slot] = (uart_ledger_entry){0};
         return 0u;
     }
-    if (!uart_wait_ack(client->control, transaction, self_recv)) {
+    if (!uart_wait_ack(client->control, transaction, self_recv,
+                       scenario_deadline)) {
         (void)je_handle_close(service_end);
         (void)je_handle_close(client_end);
         ledger[slot] = (uart_ledger_entry){0};
@@ -1052,7 +1085,8 @@ static uint32_t uart_broker_channel(uart_service_state *service,
 static uint32_t uart_restart_service(uart_service_state *service,
                                      uint64_t launcher, uint64_t admin,
                                      uint64_t self_recv,
-                                     uart_ledger_entry *ledger)
+                                     uart_ledger_entry *ledger,
+                                     uint64_t scenario_deadline)
 {
     if (!service || service->restarts >= JE_SVC_UART_RESTART_LIMIT
         || service->old_count >= JE_SVC_UART_RESTART_LIMIT)
@@ -1062,21 +1096,25 @@ static uint32_t uart_restart_service(uart_service_state *service,
     if (state.state == JE_ABI_PROC_LIVE
         && je_proc_kill(service->process) != JE_ABI_OK)
         return 0u;
-    if (!uart_wait_dead(service->process, self_recv)) return 0u;
+    if (!uart_wait_dead(service->process, self_recv, scenario_deadline))
+        return 0u;
     uart_ledger_mark_dead(ledger, service->process);
     service->old_process[service->old_count++] = service->process;
     (void)je_handle_close(service->control);
     service->control = 0u;
     service->live = 0u;
+    uint32_t generation = service->generation + 1u;
     uint64_t process = 0u;
     uint64_t control = 0u;
     uint64_t device = 0u;
-    if (!uart_spawn_ready(launcher, self_recv, &process, &control)
-        || !uart_attach(admin, process, control, self_recv, &device))
+    if (!uart_spawn_ready(launcher, self_recv, &process, &control,
+                          scenario_deadline)
+        || !uart_attach(admin, process, control, self_recv, generation,
+                        scenario_deadline, &device))
         return 0u;
     service->process = process;
     service->control = control;
-    service->generation++;
+    service->generation = generation;
     service->restarts++;
     service->live = 1u;
     return 1u;
@@ -1086,25 +1124,36 @@ static uint32_t uart_handle_request(uart_service_state *service,
                                     uart_client_state *client,
                                     uint64_t launcher, uint64_t admin,
                                     uint64_t self_recv,
-                                    uart_ledger_entry *ledger)
+                                    uart_ledger_entry *ledger,
+                                    uint64_t scenario_deadline)
 {
+    if (client->delivered >= JE_SVC_UART_CLIENT_CAP) {
+        je_svc_broker_reply exhausted = {
+            JE_SVC_OP_BROKER_EXHAUSTED, 0u
+        };
+        return je_try_send(client->control, &exhausted, sizeof exhausted)
+            == JE_ABI_OK;
+    }
     je_abi_proc_status status = {0};
     if (service->live != 0u
         && (je_proc_status(service->process, &status) != JE_ABI_OK
             || status.state != JE_ABI_PROC_LIVE))
         service->live = 0u;
     if (service->live == 0u
-        && !uart_restart_service(service, launcher, admin, self_recv, ledger)) {
+        && !uart_restart_service(service, launcher, admin, self_recv, ledger,
+                                 scenario_deadline)) {
         return 0u;
     }
     uint32_t response = 0u;
     uint32_t channel = 0u;
     return uart_broker_channel(service, client, self_recv, ledger,
+                               scenario_deadline,
                                &response, &channel);
 }
 
 static uint32_t uart_wait_progress(uart_client_state *client,
-                                   uint32_t expected, uint64_t self_recv)
+                                   uint32_t expected, uint64_t self_recv,
+                                   uint64_t scenario_deadline)
 {
     uint64_t start = 0u;
     if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
@@ -1130,22 +1179,44 @@ static uint32_t uart_wait_progress(uart_client_state *client,
         if (status != JE_ABI_H_EMPTY) return 0u;
         uint64_t now = 0u;
         if (je_clock_ticks(&now) != JE_ABI_OK
-            || now - start >= JE_SVC_UART_DEADLINE)
+            || !uart_budget_live(start, now, scenario_deadline,
+                                 JE_SVC_UART_DEADLINE))
             return 0u;
         if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
     }
     return 1u;
 }
 
+static uint32_t uart_wait_mode_applied(uint64_t self_recv,
+                                       uint64_t scenario_deadline)
+{
+    (void)self_recv;
+    uint64_t start = 0u;
+    if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
+    for (;;) {
+        if (*(volatile uint32_t *)(uintptr_t)JE_SVC_UART_MODE_ACK_VADDR
+            == JE_SVC_UART_MODE_HANG)
+            return 1u;
+        uint64_t now = 0u;
+        if (je_clock_ticks(&now) != JE_ABI_OK
+            || !uart_budget_live(start, now, scenario_deadline,
+                                 JE_SVC_UART_DEADLINE))
+            return 0u;
+        if (je_yield() != JE_ABI_OK) return 0u;
+    }
+}
+
 static uint32_t uart_timeout_demo(uart_service_state *service,
                                   uint64_t self_recv,
-                                  uart_ledger_entry *ledger)
+                                  uart_ledger_entry *ledger,
+                                  uint64_t scenario_deadline)
 {
     uint64_t start = 0u;
     if (je_clock_ticks(&start) != JE_ABI_OK) return 0u;
     je_svc_uart_control ping = { JE_SVC_OP_UART_PING, 1u };
     if (je_try_send(service->control, &ping, sizeof ping) != JE_ABI_OK)
         return 0u;
+    uint32_t polls = 0u;
     for (;;) {
         je_svc_uart_control reply = {0};
         uint32_t minted[1] = {0u};
@@ -1153,21 +1224,18 @@ static uint32_t uart_timeout_demo(uart_service_state *service,
         uint64_t status = je_try_recv_caps(service->control, &reply,
                                            sizeof reply, minted, 1u, 0u,
                                            &meta);
-        if (status == JE_ABI_OK) {
-            if ((meta & UINT64_C(0xffffffff)) != JE_SVC_UART_CONTROL_LEN
-                || (meta >> 32) != 0u || reply.op != JE_SVC_OP_UART_PONG
-                || reply.arg != 1u)
-                return 0u;
-            return 0u;
-        }
         if (status != JE_ABI_H_EMPTY) return 0u;
         uint64_t now = 0u;
-        if (je_clock_ticks(&now) != JE_ABI_OK) return 0u;
-        if (now - start >= JE_SVC_UART_DEADLINE) break;
-        if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT) return 0u;
+        if (je_clock_ticks(&now) != JE_ABI_OK
+            || !uart_budget_live(start, now, scenario_deadline,
+                                 JE_SVC_UART_DEADLINE))
+            break;
+        ++polls;
+        if (polls >= JE_SVC_UART_DEADLINE)
+            break;
     }
     if (je_proc_kill(service->process) != JE_ABI_OK
-        || !uart_wait_dead(service->process, self_recv))
+        || !uart_wait_dead(service->process, self_recv, scenario_deadline))
         return 0u;
     uart_ledger_mark_dead(ledger, service->process);
     service->live = 0u;
@@ -1178,18 +1246,20 @@ static uint32_t uart_timeout_demo(uart_service_state *service,
 
 static uint32_t uart_detach_demo(uart_service_state *service,
                                  uart_client_state *client, uint64_t admin,
-                                 uint64_t self_recv)
+                                 uint64_t self_recv,
+                                 uint64_t scenario_deadline)
 {
     je_svc_uart_attach detach = { JE_SVC_OP_UART_ATTACH, 0u };
     if (je_try_send(service->control, &detach, sizeof detach) != JE_ABI_OK
         || !uart_wait_control(service->control, JE_SVC_OP_UART_DETACHED, 0u,
-                              self_recv)
+                              self_recv, scenario_deadline)
         || !uart_send_config(client->control, JE_UART_COMMAND_DETACH)
-        || !uart_wait_progress(client, JE_UART_PROGRESS_D_SENT, self_recv))
+        || !uart_wait_progress(client, JE_UART_PROGRESS_D_SENT, self_recv,
+                               scenario_deadline))
         return 0u;
     uint64_t device = 0u;
     if (!uart_attach(admin, service->process, service->control, self_recv,
-                     &device))
+                     service->generation, scenario_deadline, &device))
         return 0u;
     if (je_dev_revoke(admin) != JE_ABI_OK
         || !uart_send_config(client->control, JE_UART_COMMAND_REVOKED))
@@ -1226,6 +1296,8 @@ static uint32_t uart_poll_hardened(uart_service_state *service,
         if (role.incarnation != JE_UART_PROGRESS_DONE)
             return 0u;
         if (role.crash_before != 0u || role.reserved != 0u) return 0u;
+        if (!checklist || checklist->hardened_refused == 0u)
+            return 0u;
         client->progress = role.incarnation;
         if (checklist) checklist->hardened_done = 1u;
         return 1u;
@@ -1246,14 +1318,18 @@ static uint32_t uart_poll_hardened(uart_service_state *service,
     je_svc_broker_reply unavailable = {
         JE_SVC_OP_BROKER_UNAVAIL, JE_SVC_UNAVAIL_HARDENED
     };
-    return je_try_send(client->control, &unavailable, sizeof unavailable)
-        == JE_ABI_OK ? 1u : 0u;
+    if (je_try_send(client->control, &unavailable, sizeof unavailable)
+        != JE_ABI_OK)
+        return 0u;
+    if (checklist) checklist->hardened_refused = 1u;
+    return 1u;
 }
 
 static uint32_t uart_poll_normal(uart_service_state *service,
                                  uart_client_state *client, uint64_t launcher,
                                  uint64_t admin, uint64_t self_recv,
                                  uart_ledger_entry *ledger,
+                                 uint64_t scenario_deadline,
                                  uart_demo_checklist *checklist)
 {
     uint8_t bytes[JE_SVC_UART_REQUEST_LEN] = {0u};
@@ -1278,15 +1354,17 @@ static uint32_t uart_poll_normal(uart_service_state *service,
         if (client->progress == JE_UART_PROGRESS_I1
             && checklist && checklist->timeout_done == 0u) {
             rollback_go = JE_UART_COMMAND_HANG;
-            if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT)
+            if (!uart_wait_mode_applied(self_recv, scenario_deadline))
                 return 0u;
             uint32_t timeout_result =
-                uart_timeout_demo(service, self_recv, ledger);
+                uart_timeout_demo(service, self_recv, ledger,
+                                  scenario_deadline);
             if (timeout_result != 1u) return timeout_result;
             checklist->timeout_done = 1u;
         } else if (client->progress == JE_UART_PROGRESS_I2
                    && checklist && checklist->detach_done == 0u) {
-            if (!uart_detach_demo(service, client, admin, self_recv))
+            if (!uart_detach_demo(service, client, admin, self_recv,
+                                  scenario_deadline))
                 return 0u;
             checklist->detach_done = 1u;
         }
@@ -1300,7 +1378,7 @@ static uint32_t uart_poll_normal(uart_service_state *service,
         || request.service_id != JE_SVC_UART_SERVICE_ID)
         return 0u;
     return uart_handle_request(service, client, launcher, admin, self_recv,
-                               ledger);
+                               ledger, scenario_deadline);
 }
 
 static int64_t uart_mode15(uint64_t launcher, uint64_t admin,
@@ -1314,26 +1392,39 @@ static int64_t uart_mode15(uint64_t launcher, uint64_t admin,
     uint64_t scenario_start = 0u;
     if (je_clock_ticks(&scenario_start) != JE_ABI_OK)
         return failed(report_values, JE_SVC_FAIL_UART_DEADLINE);
+    uint64_t scenario_deadline =
+        scenario_start + JE_SVC_UART_SCENARIO_DEADLINE;
     if (!uart_spawn_ready(launcher, self_recv, &service.process,
-                          &service.control)
+                          &service.control, scenario_deadline)
         || !uart_attach(admin, service.process, service.control, self_recv,
-                        &service.device))
+                        1u, scenario_deadline, &service.device))
         return failed(report_values, JE_SVC_FAIL_RESTART);
     service.generation = 1u;
     service.live = 1u;
 
+    uint64_t now = 0u;
+    if (je_clock_ticks(&now) != JE_ABI_OK || now >= scenario_deadline)
+        return failed(report_values, JE_SVC_FAIL_UART_DEADLINE);
+    uint64_t remaining = scenario_deadline - now;
+    if (remaining > JE_SVC_UART_DEADLINE)
+        remaining = JE_SVC_UART_DEADLINE;
     if (!spawn_one(launcher, JE_IMAGE_UART_CLIENT, 0u,
                    JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV,
                    &normal.process, &normal.control)
         || wait_ready(normal.control, normal.process, self_recv,
-                      JE_SVC_UART_DEADLINE) != WAIT_OK
+                      remaining) != WAIT_OK
         || !uart_send_config(normal.control, JE_UART_CLIENT_NORMAL))
         return failed(report_values, JE_SVC_FAIL_READINESS);
+    if (je_clock_ticks(&now) != JE_ABI_OK || now >= scenario_deadline)
+        return failed(report_values, JE_SVC_FAIL_UART_DEADLINE);
+    remaining = scenario_deadline - now;
+    if (remaining > JE_SVC_UART_DEADLINE)
+        remaining = JE_SVC_UART_DEADLINE;
     if (!spawn_one(launcher, JE_IMAGE_UART_CLIENT, 0u,
                    JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV,
                    &hardened.process, &hardened.control)
         || wait_ready(hardened.control, hardened.process, self_recv,
-                      JE_SVC_UART_DEADLINE) != WAIT_OK
+                      remaining) != WAIT_OK
         || !uart_send_config(hardened.control, JE_UART_CLIENT_HARDENED))
         return failed(report_values, JE_SVC_FAIL_READINESS);
     hardened.configured = 1u;
@@ -1352,16 +1443,14 @@ static int64_t uart_mode15(uint64_t launcher, uint64_t admin,
         if (!normal.closed) {
             uint32_t normal_result =
                 uart_poll_normal(&service, &normal, launcher, admin,
-                                 self_recv, ledger, &checklist);
+                                 self_recv, ledger, scenario_deadline,
+                                 &checklist);
             if (normal_result != 1u)
                 return failed(report_values, JE_SVC_FAIL_READINESS);
         }
-        if (checklist.client_i2_done == 0u
-            && (normal.progress == JE_UART_PROGRESS_I2
-                || normal.progress == JE_UART_PROGRESS_D_SENT
-                || normal.progress == JE_UART_PROGRESS_R_SENT
-                || normal.progress == JE_UART_PROGRESS_DONE))
-            checklist.client_i2_done = 1u;
+        if (checklist.client_i3_done == 0u
+            && normal.progress == JE_UART_PROGRESS_DONE)
+            checklist.client_i3_done = 1u;
         if (checklist.revoke_done == 0u
             && normal.progress == JE_UART_PROGRESS_R_SENT
             && service.generation == 3u)
@@ -1383,13 +1472,12 @@ static int64_t uart_mode15(uint64_t launcher, uint64_t admin,
             && checklist.detach_done != 0u
             && checklist.revoke_done != 0u
             && checklist.hardened_done != 0u
-            && checklist.client_i2_done != 0u) {
+            && checklist.client_i3_done != 0u) {
             publish(JE_SVC_PHASE_DONE, JE_SVC_FAIL_NONE, report_values);
             return (int64_t)JE_SVC_UART_DONE_EXIT;
         }
-        uint64_t now = 0u;
         if (je_clock_ticks(&now) != JE_ABI_OK
-            || now - scenario_start >= UART_SCENARIO_DEADLINE)
+            || now >= scenario_deadline)
             return failed(report_values, JE_SVC_FAIL_UART_DEADLINE);
         if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT)
             return failed(report_values, JE_SVC_FAIL_SLEEP_CHANNEL);
