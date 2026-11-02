@@ -1,6 +1,6 @@
 # Built-in hardware security-key support
 
-[Included native software portfolio](NATIVE_PRODUCTS.md): latest-stable source policy, stable GNU C coreutils with selective uutils improvements, SSH/TLS, compilers, Make, curl, FIDO, zlib and QEMU. Planned integration; no runtime support added.
+[Included native software portfolio](NATIVE_PRODUCTS.md): latest-stable source policy, stable GNU C coreutils with selective uutils improvements, doas/optional sudo, vi, C/C++ and assembly tools, SSH/TLS, curl, FIDO, zlib and QEMU; shared hardening and feature-preservation gates. Planned integration; no runtime support added.
 
 Status: owner requirement and design, 2026-10-13. No authenticator transport,
 credential broker or MFA login flow is implemented. This extends IDENTITY.md,
