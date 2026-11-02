@@ -38,7 +38,7 @@ unassigned until a bounded integration task is accepted.
 
 | Product | Intended native role | Main prerequisites and acceptance |
 | --- | --- | --- |
-| GNU coreutils + tracked uutils coreutils | Native C command suite; GNU C implementation as initial base, uutils stable behavior/improvements tracked | M5/M6 descriptors/filesystem/process/runtime; per-command semantics, errors, locale/encoding and malicious-input tests; C adaptation policy below |
+| GNU coreutils + tracked uutils coreutils | Native C command suite; stable GNU C implementation preferred; uutils improvements selected only with evidence | M5/M6 descriptors/filesystem/process/runtime; per-command semantics, errors, locale/encoding and malicious-input tests; C adaptation policy below |
 | OpenSSH | Native client and optional administratively enabled server | Networking, identities, entropy, key storage, process/session/PTY support; host-key verification, auth denial, privilege separation and session cleanup; server off by default |
 | LibreSSL (default) | Default cryptographic/TLS provider where compatible and qualified | Entropy/time/trust stores, secure memory/key ownership, platform acceleration/context; protocol/certificate and failure tests |
 | OpenSSL | Included alternative for consumers requiring its APIs/features | Separate versioned dependency selection and qualification; never assume LibreSSL ABI/API equivalence or silently swap providers |
@@ -62,23 +62,27 @@ and test that dependency visibly. Do not claim validated crypto modules merely
 because a provider offers them elsewhere. Cryptographic primitives should not be
 rewritten simply for branding or default-provider uniformity.
 
-## Coreutils: C deliverable, two upstream reference tracks
+## Coreutils: stable GNU C baseline, selective uutils improvements
 
-The owner explicitly requests the source used to build our coreutils to remain C
-while following both original GNU coreutils and its Rust rewrite, uutils. Start
-with the GNU C source and its dependency/provenance review. Maintain separate
-latest-stable version/digest records for GNU and uutils. Identify whether each
-selected uutils behavior is standard-defined, GNU-compatible or an extension.
+GNU coreutils' latest stable C release is the preferred source and default native
+command provider. Keep the built coreutils source in C. Review uutils stable
+release changes only as a source of selectively adopted improvements; it is not
+a parallel shipped implementation or a full C rewrite target.
 
-uutils is Rust; turning it into maintained C is a reimplementation/translation
-project, not a compiler flag or an ordinary port. A C result must be labeled as a
-JeiOS adaptation referencing an upstream version, never an unmodified upstream
-uutils build. Do not assume translation preserves Rust safety properties.
-Review memory/ownership/overflow/error semantics, fuzz parsers, compare defined
-behavior and run failure/resource tests. Preserve licensing/provenance for derived
-code; tests and documentation also require provenance review. Automated conversion
-alone is not acceptance. Prefer one clear default command provider; alternative
-implementations need explicit names/selection and cannot unpredictably shadow PATH.
+Adopt a uutils change only when comparison with the current stable GNU baseline
+shows a genuine correctness, security, performance or portability improvement.
+Record the upstream release/change, reproducible before/after evidence, relevant
+workloads, compatibility impact and maintenance cost in the PR. Skip changes with
+no demonstrated benefit or whose benefit GNU already supplies. Distinguish
+standard-defined behavior, GNU compatibility and optional extensions.
+
+Here, cherry-picking means selecting an improvement and adapting or implementing
+it in C, not directly applying Rust source to the C build. Preserve provenance
+and applicable licensing for derived code, tests and documentation. Label the
+result as a JeiOS adaptation. Review memory, ownership, overflow and error
+semantics; use relevant regression, failure and performance tests. Translation
+does not preserve Rust safety guarantees automatically. Pin the GNU release and
+record exact uutils versions/changes for reviews and accepted adaptations.
 
 Owner clarification: existing C++ is allowed for included upstream products,
 including LLVM and GCC. Preserve their established implementation languages where
