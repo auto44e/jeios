@@ -1,5 +1,7 @@
 # Coding-agent starting guide
 
+[Included native software portfolio](NATIVE_PRODUCTS.md): latest-stable source policy, C coreutils/GNU+uutils tracking, SSH/TLS, compilers, Make, curl, FIDO, zlib and QEMU. Planned integration; no runtime support added.
+
 Owner-approved [two-phase native shell and selectable shell roadmap](SHELLS.md): recovery + original JeiOS sh, included native Bash/Zsh, and bring-your-own shell. PowerShell deferred. Planned, not runtime support.
 
 ## Current ecosystem status — observed 2026-11-01T21:30:30-05:00
