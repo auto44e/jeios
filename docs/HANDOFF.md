@@ -1,5 +1,21 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## 2026-11-01T22:22:44-05:00 — coreutils preference clarification
+
+Inspected main `da4179d437670f2ac015fa2cef57b07bcb55536b` after PR #76 merged.
+Planned policy: stable GNU C coreutils is the preferred baseline and default
+provider. Review uutils release changes only for genuine improvements supported
+by comparative evidence; selectively adapt those changes in C. No parallel Rust
+provider or full uutils C rewrite is planned. Updated NATIVE_PRODUCTS and portfolio
+links in README, ROADMAP, SHELLS, SECURITY_KEYS and AGENT_START; tracker #75 updated.
+No runtime behavior or security invariants changed. Next: #75 source/dependency
+inventory with exact pins and per-change acceptance evidence.
+
+Validation: `make check` exited 2 because LeakSanitizer cannot inspect this
+environment; `ASAN_OPTIONS=detect_leaks=0 make check` passed (exit 0; leak checking
+disabled). `git diff --check` passed. No boot change; smoke not rerun. Native
+product imports and execution remain planned, not qualified.
+
 Owner clarification: existing C++ is allowed in included upstream products;
 retain native compatibility/integration patches. Core C11 and coreutils C-only
 remain distinct requirements. Tracker: #75.
