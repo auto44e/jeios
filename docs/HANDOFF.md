@@ -1,12 +1,11 @@
 # Agent handoff: M1/M2 kernel foundation
 
-## M4 PR-I FIX pass — evidence hardening and cleanup — observed 2026-11-02T00:59:59+00:00
+## M4 PR-I (#53) — brokered UART service + D9 timeout/detach/revoke/UNSUPPORTED — observed 2026-11-02T01:12:33Z
 
-Repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/wt-m4i-impl`;
-branch `wip/m4i-impl`; exact inspected commit
-`8109379b79a570772e2b1642bc23a0cb593f7877`. Changes remain uncommitted for
-lead integration. Remote CI and independent human qualification are not
-observed; AI-assisted review is not human qualification.
+Branch `feat/m4i-uart`, based on main `af17af5` (#69 merged; main CI green);
+integrated head `81e31c7`. Opened as the PR-I pull request — the FINAL M4 PR. Built
+as impl → continuation (fixed a phase-RUNNING stall) → code review → evidence fix,
+each cross-reviewed; the lead mutant-verified the proofs.
 
 State: **implemented / tested / planned / not blocked**.
 
@@ -25,9 +24,13 @@ State: **implemented / tested / planned / not blocked**.
   QEMU's independent COM2 file contained `b'I1I2I3'`; `D!` and `R!` were
   absent. Required four A/B mutants all failed their corresponding proof and
   were restored; exact outputs are in `WORKER_NOTES.md`.
-- **Planned:** lead integration, cross-review, and the independent human gate
-  required for any hardened/release qualification claim.
-- **Blocked:** no local implementation blocker.
+- **Planned:** **M4 is complete** (PR-A..PR-I + the frame-zero security fix all
+  merged or open). Next: **MP2** (mobile milestone #2). **Blocked:** no local
+  implementation blocker; remote CI and the independent human gate (required for
+  any hardened/release qualification claim) are unobserved and not claimed.
+
+**Review record:** `docs/adr/debates/m4i-reviews.md` (design + code review; the
+evidence-gap fixes), worker notes in `docs/adr/debates/m4i-workers.md`.
 
 Changed invariants: mode 15 cannot complete until each healthy incarnation
 answers its generation-tagged PING, HANG has been kernel-applied and timed out
