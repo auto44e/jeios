@@ -809,6 +809,16 @@ typedef struct {
 #define UART_LEDGER_FREE 0u
 #define UART_LEDGER_LIVE 1u
 
+#define UART_SCENARIO_DEADLINE (JE_SVC_UART_DEADLINE * 2u)
+
+typedef struct {
+    uint32_t timeout_done;
+    uint32_t detach_done;
+    uint32_t revoke_done;
+    uint32_t hardened_done;
+    uint32_t client_i2_done;
+} uart_demo_checklist;
+
 static uint32_t uart_transaction = 1u;
 
 static uint32_t uart_send_config(uint64_t endpoint, uint32_t value)
@@ -1019,8 +1029,13 @@ static uint32_t uart_broker_channel(uart_service_state *service,
         | ((uint64_t)(JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV) << 32);
     je_svc_broker_grant grant = { response, service->generation, transaction };
     if (je_try_send_caps(client->control, &grant, sizeof grant,
-                         &client_cap, 1u) != JE_ABI_OK
-        || !uart_wait_ack(client->control, transaction, self_recv)) {
+                         &client_cap, 1u) != JE_ABI_OK) {
+        (void)je_handle_close(service_end);
+        (void)je_handle_close(client_end);
+        ledger[slot] = (uart_ledger_entry){0};
+        return 0u;
+    }
+    if (!uart_wait_ack(client->control, transaction, self_recv)) {
         (void)je_handle_close(service_end);
         (void)je_handle_close(client_end);
         ledger[slot] = (uart_ledger_entry){0};
@@ -1079,8 +1094,9 @@ static uint32_t uart_handle_request(uart_service_state *service,
             || status.state != JE_ABI_PROC_LIVE))
         service->live = 0u;
     if (service->live == 0u
-        && !uart_restart_service(service, launcher, admin, self_recv, ledger))
+        && !uart_restart_service(service, launcher, admin, self_recv, ledger)) {
         return 0u;
+    }
     uint32_t response = 0u;
     uint32_t channel = 0u;
     return uart_broker_channel(service, client, self_recv, ledger,
@@ -1182,7 +1198,8 @@ static uint32_t uart_detach_demo(uart_service_state *service,
 }
 
 static uint32_t uart_poll_hardened(uart_service_state *service,
-                                   uart_client_state *client, uint64_t admin)
+                                   uart_client_state *client, uint64_t admin,
+                                   uart_demo_checklist *checklist)
 {
     uint8_t bytes[JE_SVC_UART_REQUEST_LEN] = {0u};
     uint32_t minted[1] = {0u};
@@ -1210,6 +1227,7 @@ static uint32_t uart_poll_hardened(uart_service_state *service,
             return 0u;
         if (role.crash_before != 0u || role.reserved != 0u) return 0u;
         client->progress = role.incarnation;
+        if (checklist) checklist->hardened_done = 1u;
         return 1u;
     }
     if ((meta & UINT64_C(0xffffffff)) != JE_SVC_BROKER_REQUEST_LEN)
@@ -1236,7 +1254,7 @@ static uint32_t uart_poll_normal(uart_service_state *service,
                                  uart_client_state *client, uint64_t launcher,
                                  uint64_t admin, uint64_t self_recv,
                                  uart_ledger_entry *ledger,
-                                 report_state *report_values)
+                                 uart_demo_checklist *checklist)
 {
     uint8_t bytes[JE_SVC_UART_REQUEST_LEN] = {0u};
     uint32_t minted[1] = {0u};
@@ -1258,19 +1276,19 @@ static uint32_t uart_poll_normal(uart_service_state *service,
             return 0u;
         client->progress = progress.incarnation;
         if (client->progress == JE_UART_PROGRESS_I1
-            && report_values->restarts == 0u) {
+            && checklist && checklist->timeout_done == 0u) {
             rollback_go = JE_UART_COMMAND_HANG;
             if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT)
                 return 0u;
             uint32_t timeout_result =
                 uart_timeout_demo(service, self_recv, ledger);
             if (timeout_result != 1u) return timeout_result;
-            report_values->restarts = 1u;
+            checklist->timeout_done = 1u;
         } else if (client->progress == JE_UART_PROGRESS_I2
-                   && report_values->restarts == 1u) {
+                   && checklist && checklist->detach_done == 0u) {
             if (!uart_detach_demo(service, client, admin, self_recv))
                 return 0u;
-            report_values->restarts = 2u;
+            checklist->detach_done = 1u;
         }
         return 1u;
     }
@@ -1279,11 +1297,10 @@ static uint32_t uart_poll_normal(uart_service_state *service,
     je_svc_broker_request request = {0};
     memcpy(&request, bytes, sizeof request);
     if (request.op != JE_SVC_OP_BROKER_REQUEST
-        || request.service_id != JE_SVC_UART_SERVICE_ID
-        || !uart_handle_request(service, client, launcher, admin, self_recv,
-                                ledger))
+        || request.service_id != JE_SVC_UART_SERVICE_ID)
         return 0u;
-    return 1u;
+    return uart_handle_request(service, client, launcher, admin, self_recv,
+                               ledger);
 }
 
 static int64_t uart_mode15(uint64_t launcher, uint64_t admin,
@@ -1293,6 +1310,10 @@ static int64_t uart_mode15(uint64_t launcher, uint64_t admin,
     uart_client_state normal = {0};
     uart_client_state hardened = {0};
     uart_ledger_entry ledger[JE_SVC_UART_CLIENT_CAP] = {0};
+    uart_demo_checklist checklist = {0};
+    uint64_t scenario_start = 0u;
+    if (je_clock_ticks(&scenario_start) != JE_ABI_OK)
+        return failed(report_values, JE_SVC_FAIL_UART_DEADLINE);
     if (!uart_spawn_ready(launcher, self_recv, &service.process,
                           &service.control)
         || !uart_attach(admin, service.process, service.control, self_recv,
@@ -1324,21 +1345,27 @@ static int64_t uart_mode15(uint64_t launcher, uint64_t admin,
         uart_ledger_collect(ledger, &normal, &service);
         if (!hardened.closed) {
             uint32_t hardened_result =
-                uart_poll_hardened(&service, &hardened, admin);
+                uart_poll_hardened(&service, &hardened, admin, &checklist);
             if (hardened_result != 1u)
                 return failed(report_values, JE_SVC_FAIL_READINESS);
         }
         if (!normal.closed) {
             uint32_t normal_result =
                 uart_poll_normal(&service, &normal, launcher, admin,
-                                 self_recv, ledger, report_values);
+                                 self_recv, ledger, &checklist);
             if (normal_result != 1u)
                 return failed(report_values, JE_SVC_FAIL_READINESS);
         }
-        if (service.live == 0u && normal.progress == JE_UART_PROGRESS_I2) {
-            /* The first dead incarnation is restarted only by the client's
-             * broker request, preserving the timeout->PEER_CLOSED ordering. */
-        }
+        if (checklist.client_i2_done == 0u
+            && (normal.progress == JE_UART_PROGRESS_I2
+                || normal.progress == JE_UART_PROGRESS_D_SENT
+                || normal.progress == JE_UART_PROGRESS_R_SENT
+                || normal.progress == JE_UART_PROGRESS_DONE))
+            checklist.client_i2_done = 1u;
+        if (checklist.revoke_done == 0u
+            && normal.progress == JE_UART_PROGRESS_R_SENT
+            && service.generation == 3u)
+            checklist.revoke_done = 1u;
         je_abi_proc_status normal_status = {0};
         je_abi_proc_status hard_status = {0};
         if (je_proc_status(normal.process, &normal_status) != JE_ABI_OK
@@ -1351,10 +1378,19 @@ static int64_t uart_mode15(uint64_t launcher, uint64_t admin,
             && normal_status.state != JE_ABI_PROC_LIVE)
             normal.closed = 1u;
         if (normal.closed && hardened.closed && service.live != 0u
-            && service.generation == 3u) {
+            && service.generation == 3u
+            && checklist.timeout_done != 0u
+            && checklist.detach_done != 0u
+            && checklist.revoke_done != 0u
+            && checklist.hardened_done != 0u
+            && checklist.client_i2_done != 0u) {
             publish(JE_SVC_PHASE_DONE, JE_SVC_FAIL_NONE, report_values);
             return (int64_t)JE_SVC_UART_DONE_EXIT;
         }
+        uint64_t now = 0u;
+        if (je_clock_ticks(&now) != JE_ABI_OK
+            || now - scenario_start >= UART_SCENARIO_DEADLINE)
+            return failed(report_values, JE_SVC_FAIL_UART_DEADLINE);
         if (sleep_tick(self_recv) != JE_ABI_H_TIMED_OUT)
             return failed(report_values, JE_SVC_FAIL_SLEEP_CHANNEL);
     }

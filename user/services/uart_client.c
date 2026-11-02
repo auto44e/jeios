@@ -110,7 +110,7 @@ static uint32_t wait_grant(uint64_t control, uint32_t expected_op,
         if (result != 0u) return 0u;
         uint64_t now = 0u;
         if (je_clock_ticks(&now) != JE_ABI_OK
-            || now - start >= JE_SVC_UART_DEADLINE)
+            || now - start >= 2u * JE_SVC_UART_DEADLINE)
             return 0u;
         if (je_yield() != JE_ABI_OK) return 0u;
     }

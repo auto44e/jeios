@@ -756,7 +756,7 @@ static bool svc_phase_known(uint32_t phase)
 
 static bool svc_fail_code_known(uint32_t fail_code)
 {
-    return fail_code <= JE_SVC_FAIL_CRASHLOOP;
+    return fail_code <= JE_SVC_FAIL_UART_DEADLINE;
 }
 
 /*

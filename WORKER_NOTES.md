@@ -1,3 +1,101 @@
+# PR-I continuation — mode-15 UART scenario completion
+
+Observation time: `2026-11-02T00:07:42+00:00`. Repository
+`/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/wt-m4i-impl`; branch
+`wip/m4i-impl`; exact inspected commit
+`3b447d0aa7c194e55fa2beca1bdad41b64fd2f60`. Changes remain uncommitted.
+
+State: **implemented / tested / planned / not blocked**. This worker's
+cross-review was AI-assisted and is not independent human qualification.
+
+## Root cause and decisions
+
+The stall was not a missing kernel DEVICE transition. The supervisor started
+the first timeout demo after the client had reported `I1`; the service stopped
+answering, and the supervisor correctly waited through the 600-tick UART
+PING/PONG deadline before killing, waiting for DEAD, reassigning, and attaching
+the replacement. The normal client could issue its reconnect request while
+that sequence was still in progress, but its `wait_grant` budget was also only
+600 ticks. It exited before the supervisor could send the
+`BROKER_RESTARTED` grant, so the supervisor eventually saw `PEER_CLOSED`.
+
+Two changes preserve that contract rather than removing the timeout proof:
+
+- `uart_client.c` gives grant waits two UART deadlines, enough for the
+  supervisor's bounded timeout plus restart/attach work. Request and I/O
+  waits remain bounded.
+- `uart_service.c` closes the broker channels once on entering HANG and yields
+  on each nonblocking control poll. HANG therefore means "do not answer" while
+  allowing the single CPU to run the supervisor and making client
+  `PEER_CLOSED` observable. The supervisor still proves the actual timeout
+  through kernel service death and generation state.
+
+The previous generation-count-only exit condition was replaced with explicit
+`timeout_done`, `detach_done`, `revoke_done`, `hardened_done`, and
+`client_i2_done` facts, plus a two-deadline supervisor bound. The kernel now
+recognizes fail code `JE_SVC_FAIL_UART_DEADLINE` so a future orchestration
+stall is reported as a specific FAILED state.
+
+The broker handshake failure path was kept transactional: failed grant send or
+failed ACK closes both copied channel ends and clears the ledger entry. No
+control-message discard policy was weakened, and the hardened request still
+requires the kernel's `DEV_ASSIGN` flag path to return
+`JE_ABI_UNSUPPORTED` with `JE_ABI_DEV_PROFILE_LEGACY_PIO`.
+
+## Exact verification observed
+
+Baseline and final restored tree:
+
+- `ASAN_OPTIONS=detect_leaks=0 make check` — exit 0; hosted tests, including
+  the updated DEVICE decode case, passed.
+- `make smoke` — exit 0; mode 0 reached `M4f-s1` and zero-leak.
+- `make integration` — exit 0 before and after the temporary mutants; final
+  mode 15 printed:
+
+  ```text
+  M4i: UART PRESENT; timeout PING/PONG deadline corroborated
+  M4i: detach CLOSE + same-live reassign corroborated
+  M4i: admin revoke -> vector-13 fault and restart corroborated
+  M4i: hardened UNSUPPORTED refusal and zero-cap client corroborated
+  M4i-s1: UART service scenario completed
+  M4i: final device revoked; bitmap=0xff; IRQ3 masked
+  M4i: zero-leak identity baseline verified
+  COM2=b'I1I2'
+  ```
+
+- QEMU COM2 bytes were `49 31 49 32`; `I1` and `I2` were present, while
+  `D!` and `R!` were absent.
+- `python3 tools/smoke.py build/0/jeios.iso --cpu qemu64,-nx --memory 16M
+  --expect-nx absent` — exit 0.
+- `python3 tools/smoke.py build/0/jeios.iso --memory 1536M
+  --expect-nx present` — exit 0.
+- `make aarch64 && make smoke-aarch64 ARM_REQUIRE=1` — exit 0; existing
+  ARM linker RWX warning only.
+- `git diff --check` — exit 0; `user/services/uart_driver.c` had no diff.
+
+## Negative controls
+
+Each mutation was applied only with `apply_patch`, rebuilt with
+`make iso TEST_MODE=15`, booted under QEMU, and restored immediately:
+
+1. Hardened refusal mutant: after the kernel returned
+   `JE_ABI_UNSUPPORTED`, the supervisor sent no `BROKER_UNAVAIL` reply.
+   Observed `M4i: supervisor fail_code=0x0000000000000007`, no
+   `M4i-s1`, then clean zero-leak teardown. This proves the hardened refusal
+   is required for completion.
+2. Revoke mutant: skipped `je_dev_revoke(admin)` but still sent the client
+   `REVOKED` command. Observed the same fail code and COM2
+   `b'I1I2R!'`. The forbidden `R!` escaped, so the final QEMU absence check
+   and the kernel revoke transition are both meaningful.
+
+## Remaining limits and next step
+
+No remote CI or independent human qualification was observed. The result does
+not claim DMA containment, SMP safety, arbitrary hardware, dynamic loading,
+all UARTs/drivers, or a general application ABI. Next bounded task: lead
+integration and owner/human review, with pass criteria of preserving the
+kernel-state and QEMU-COM2 evidence above.
+
 # PR-H FIX pass — D9 security-proof hardening
 
 Observation time: `2026-11-01T21:00:37Z`. Repository `jeios`; branch

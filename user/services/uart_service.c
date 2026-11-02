@@ -266,16 +266,33 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t control,
     uint32_t brokerable = 0u;
     uint32_t channels[UART_CHANNEL_MAX] = {0u};
     uint32_t channel_count = 0u;
+    uint32_t hang_channels_closed = 0u;
     for (;;) {
         if (attached != 0u && uart_mode == JE_SVC_UART_MODE_HANG) {
+            if (hang_channels_closed == 0u) {
+                for (uint32_t i = 0u; i < channel_count; ++i) {
+                    if (channels[i] != 0u)
+                        (void)je_handle_close(channels[i]);
+                    channels[i] = 0u;
+                }
+                channel_count = 0u;
+                hang_channels_closed = 1u;
+            }
             uint8_t ignored[JE_SVC_UART_REQUEST_LEN] = {0u};
             uint64_t meta = 0u;
             uint64_t status = je_try_recv(control, ignored, sizeof ignored,
-                                          1u, &meta);
-            if (status != JE_ABI_H_TIMED_OUT
+                                          0u, &meta);
+            if (status != JE_ABI_H_EMPTY
                 && status != JE_ABI_OK
                 && status != JE_ABI_H_PEER_CLOSED)
                 return 93;
+            /*
+             * HANG means "do not answer", not "occupy the CPU".  This is a
+             * single-CPU fixture: yield after discarding each control record
+             * so the supervisor can observe the bounded PING deadline and
+             * perform the policy kill.  No broker channel is serviced here.
+             */
+            if (je_yield() != JE_ABI_OK) return 95;
             continue;
         }
         if (handle_control(control, &device, &attached, &brokerable,
@@ -295,6 +312,6 @@ int64_t je_main(uint64_t version, uint64_t n, uint64_t control,
             --channel_count;
             --i;
         }
-        if (je_yield() != JE_ABI_OK) return 95;
+        if (je_yield() != JE_ABI_OK) return 96;
     }
 }
