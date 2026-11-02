@@ -1,5 +1,28 @@
 # JeiOS
 
+Owner-approved [two-phase native shell and selectable shell roadmap](docs/SHELLS.md): recovery + original JeiOS sh, included native Bash/Zsh, and bring-your-own shell. PowerShell deferred. Planned, not runtime support.
+
+## Current ecosystem status — observed 2026-11-01T21:30:30-05:00
+
+Core main `0f702036c52d40d03bb4c8919d0dcae53ba9f2b1`: AMD64 M3 and scoped M4 complete; PR #70
+merged. ARM64 MP1 complete (#52); MP2 then MP3 remain. Main CI passed:
+https://github.com/auto44e/jeios/actions/runs/41376309893 . M4 qualifies bounded
+supervisor/broker/COM2 UART scenarios, not arbitrary hardware, DMA or a release.
+Mobile main `f1d9b0d87746e9dc353a2f48e7b9d27e7fe86d07` has passing planning CI:
+https://github.com/auto44e/jeios-mobile/actions/runs/39243515951 . Its core pin
+remains older M1/M2; upstream progress does not qualify that integration.
+No open PRs were observed before this refresh. M4 #53 is now closed as completed;
+MP2 (mobile #2) is next execution work; M5a #54 remains planned.
+
+Shell roadmap: SH1 recovery #71, SH2 original native sh #72, included native
+Bash/Zsh and custom-shell registration #73; mobile parity #12. PowerShell deferred.
+All shell implementation remains planned. Storage, networking, desktop, POSIX
+completion, LDAP, encryption, fleet/ISO 27001 features, RISC-V, accelerators and
+Android execution remain later gates. Standards adoption is not certification.
+This current status supersedes older next-task/status wording below; timestamped
+records remain evidence at their original revisions, not new test runs.
+
+
 Standards adopted as design requirements (2026-10-26): [standards and evidence](docs/STANDARDS.md)
 and [organizational ISO 27001 support features](docs/ORG_SECURITY.md). Implementation
 and formal qualification remain gated; these documents add no runtime behavior.
@@ -20,15 +43,12 @@ combines Unix interoperability, an NT-inspired object/service model, and an
 integrated, deeply customizable desktop. Privacy, explicit authority, recoverable
 operations and qualified hardware support are long-term goals.
 
-**Current stage: M3 complete on AMD64; ARM64 MP1 partially implemented.**
-The experimental single-CPU kernel has isolated userspace, checked syscalls,
-typed rights-bearing handles, bounded capability IPC, blocking receive and a
-kernel-seeded two-process bootstrap fixture. ARM64 entry, console and EL1 vectors
-run in QEMU; bounded DTB parsing remains before MP1 completion.
-
-There is no general service supervisor, SMP, filesystem, desktop, networking or
-Android runtime. This is not a daily-use or hardened OS. See the
-[M3 evidence](docs/M3C_RETRO.md) and [next phase](docs/NEXT_PHASE.md).
+**Current stage: scoped AMD64 M4 complete; ARM64 MP1 complete.**
+Protected memory, preemptive scheduling, userspace/handles/IPC, bounded process
+launch/reaping, supervisor/broker and controlled COM2 UART scenarios are tested.
+ARM64 boot/vectors/validated DTB run in remote QEMU CI; MP2/MP3 remain ahead.
+No interactive shell, filesystem, networking, GUI, SMP or Android runtime exists.
+See the current status above and NEXT_PHASE.md for qualification limits.
 
 ## Start here
 

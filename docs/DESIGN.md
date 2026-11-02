@@ -1,5 +1,7 @@
 # JeiOS system design
 
+Owner-approved [two-phase native shell and selectable shell roadmap](SHELLS.md): recovery + original JeiOS sh, included native Bash/Zsh, and bring-your-own shell. PowerShell deferred. Planned, not runtime support.
+
 Standards adopted as design requirements (2026-10-26): [standards and evidence](STANDARDS.md)
 and [organizational ISO 27001 support features](ORG_SECURITY.md). Implementation
 and formal qualification remain gated; these documents add no runtime behavior.

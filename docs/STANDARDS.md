@@ -1,5 +1,7 @@
 # Ecosystem standards adoption
 
+Owner-approved [two-phase native shell and selectable shell roadmap](SHELLS.md): recovery + original JeiOS sh, included native Bash/Zsh, and bring-your-own shell. PowerShell deferred. Planned, not runtime support.
+
 Owner decision: 2026-10-26. Adopt the following standards as scoped engineering
 requirements across core, mobile, SDK, services and applications. This decision
 adds requirements and a verification process; it does not certify existing code.

@@ -11,8 +11,8 @@ owner requirements and task sequence. This file governs the whole repository.
    architecture operations. Do not introduce another core language by accident.
 2. Read the implementation before claiming a design feature exists. Update the
    implementation-status table and handoff in the same change as new behavior.
-3. Work on one roadmap gate at a time. M3 is complete; follow the dated current
-   HANDOFF and docs/NEXT_PHASE.md for MP1 completion, M4 and bounded M5a planning.
+3. Work on one roadmap gate at a time. Scoped M4 and MP1 are complete; follow the dated current
+   HANDOFF and docs/NEXT_PHASE.md for MP2, M5a and docs/SHELLS.md gates.
    A desktop mockup does not advance kernel readiness.
 4. Document contracts: ownership, lifetime, locking, caller context, bounds,
    privilege, error states, rollback, hardware prerequisites, and tests. Explain

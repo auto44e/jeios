@@ -1,5 +1,28 @@
 # Agent handoff: M1/M2 kernel foundation
 
+Refresh validation: Core `make check` hit environment LeakSanitizer inspection failure; `ASAN_OPTIONS=detect_leaks=0 make check` passed. Leak detection disabled. Local Markdown links and `git diff --check` passed. No emulator rerun for this docs-only change; cited remote CI is for inspected main, not the new documentation head. Board summary/history refreshed; shell issues #71–#73 and mobile #12 added Todo; M4 #53 Done. Single-agent docs contribution, no independent human qualification. Branch `docs/native-shell-refresh`; no ABI, runtime, dependency import or mobile pin change.
+
+## Current ecosystem status — observed 2026-11-01T21:30:30-05:00
+
+Core main `0f702036c52d40d03bb4c8919d0dcae53ba9f2b1`: AMD64 M3 and scoped M4 complete; PR #70
+merged. ARM64 MP1 complete (#52); MP2 then MP3 remain. Main CI passed:
+https://github.com/auto44e/jeios/actions/runs/41376309893 . M4 qualifies bounded
+supervisor/broker/COM2 UART scenarios, not arbitrary hardware, DMA or a release.
+Mobile main `f1d9b0d87746e9dc353a2f48e7b9d27e7fe86d07` has passing planning CI:
+https://github.com/auto44e/jeios-mobile/actions/runs/39243515951 . Its core pin
+remains older M1/M2; upstream progress does not qualify that integration.
+No open PRs were observed before this refresh. M4 #53 is now closed as completed;
+MP2 (mobile #2) is next execution work; M5a #54 remains planned.
+
+Shell roadmap: SH1 recovery #71, SH2 original native sh #72, included native
+Bash/Zsh and custom-shell registration #73; mobile parity #12. PowerShell deferred.
+All shell implementation remains planned. Storage, networking, desktop, POSIX
+completion, LDAP, encryption, fleet/ISO 27001 features, RISC-V, accelerators and
+Android execution remain later gates. Standards adoption is not certification.
+This current status supersedes older next-task/status wording below; timestamped
+records remain evidence at their original revisions, not new test runs.
+
+
 ## M4 PR-I (#53) — brokered UART service + D9 timeout/detach/revoke/UNSUPPORTED — observed 2026-11-02T01:12:33Z
 
 Branch `feat/m4i-uart`, based on main `af17af5` (#69 merged; main CI green);

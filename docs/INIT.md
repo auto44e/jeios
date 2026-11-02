@@ -1,5 +1,7 @@
 # Init and service management design
 
+Owner-approved [two-phase native shell and selectable shell roadmap](SHELLS.md): recovery + original JeiOS sh, included native Bash/Zsh, and bring-your-own shell. PowerShell deferred. Planned, not runtime support.
+
 Status refreshed 2026-10-19: M3c completed a kernel-seeded two-process bootstrap
 fixture with IPC, waits and clean teardown. The general userspace supervisor below
 remains planned for M4 (#53); the fixture does not implement it. See
