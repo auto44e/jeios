@@ -1,3 +1,40 @@
+# Next phase: ARM64 MP2 and the native shell foundation
+
+## Current ecosystem status — observed 2026-11-01T21:30:30-05:00
+
+Core main `0f702036c52d40d03bb4c8919d0dcae53ba9f2b1`: AMD64 M3 and scoped M4 complete; PR #70
+merged. ARM64 MP1 complete (#52); MP2 then MP3 remain. Main CI passed:
+https://github.com/auto44e/jeios/actions/runs/41376309893 . M4 qualifies bounded
+supervisor/broker/COM2 UART scenarios, not arbitrary hardware, DMA or a release.
+Mobile main `f1d9b0d87746e9dc353a2f48e7b9d27e7fe86d07` has passing planning CI:
+https://github.com/auto44e/jeios-mobile/actions/runs/39243515951 . Its core pin
+remains older M1/M2; upstream progress does not qualify that integration.
+No open PRs were observed before this refresh. M4 #53 is now closed as completed;
+MP2 (mobile #2) is next execution work; M5a #54 remains planned.
+
+Shell roadmap: SH1 recovery #71, SH2 original native sh #72, included native
+Bash/Zsh and custom-shell registration #73; mobile parity #12. PowerShell deferred.
+All shell implementation remains planned. Storage, networking, desktop, POSIX
+completion, LDAP, encryption, fleet/ISO 27001 features, RISC-V, accelerators and
+Android execution remain later gates. Standards adoption is not certification.
+This current status supersedes older next-task/status wording below; timestamped
+records remain evidence at their original revisions, not new test runs.
+
+## Current order
+
+1. MP2: ARM64 MMU/memory/timer/scheduling, then MP3 userspace parity (mobile #2).
+2. M5a #54: checked read-only initfs, bounded service loading and SH1 #71 recovery
+   console; one shared shell foundation, no second console parser.
+3. SH2 #72 under POSIX #15: original native sh scripting qualification.
+4. SH3 #73: included latest-stable Bash/Zsh native integration and user shell choice.
+5. Qualify mobile shell parity #12 and each additional ISA/product separately.
+
+See [SHELLS.md](SHELLS.md) for contracts and acceptance. No runtime or frozen ABI
+change is made by this refresh. Storage #13/#14, CI #18 and assurance #19 continue
+as bounded supporting tracks. No real-device flashing/formatting authorized.
+
+## Historical phase plan — 2026-10-19 (superseded ordering/status)
+
 # Next phase: native service foundation
 
 Owner requested this planning/docs/board update on 2026-10-19 after reviewing the
