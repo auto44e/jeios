@@ -1,5 +1,24 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## 2026-11-02T01:09:05-05:00 — native privilege tools, vi and developer environment
+
+Inspected core main `d76a201510bb79a579719ffb8ad43eed9d0d02ba` (PR #77 merged);
+branch `docs/native-security-tools`. Implemented: documentation only in
+NATIVE_PRODUCTS, README, ROADMAP, AGENT_START, SHELLS, SECURITY_KEYS and HANDOFF.
+Planned: stable-source doas enabled by default after qualification; optional sudo
+disabled without authority; nvi2 as planned vi implementation; Binutils/NASM,
+build tools and compiler/runtime dependencies. Added shared hardening and
+feature-preservation gates, critical elevation tests and explicit ISA/dialect
+coverage. Tracker #75 updated. No source imports, ABI/security invariant changes
+or native execution claims. Next: #75 bounded source/provenance/dependency
+inventory and feature/test matrices; existing MP2/M5a/shell priorities stand.
+
+Validation on this documentation branch: `make check` exited 2 at LeakSanitizer
+environment inspection (ptrace restriction). `ASAN_OPTIONS=detect_leaks=0 make
+check` passed, exit 0, leak detection disabled. Local Markdown link checks and
+`git diff --check` passed. No boot changes; smoke not rerun. Remote CI for this
+change not yet observed. Single-agent work; no independent human qualification.
+
 ## 2026-11-01T22:22:44-05:00 — coreutils preference clarification
 
 Inspected main `da4179d437670f2ac015fa2cef57b07bcb55536b` after PR #76 merged.
