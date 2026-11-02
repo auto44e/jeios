@@ -19,6 +19,7 @@
 #include <jeios/svc.h>
 #include <jeios/broker_test.h>
 #include <jeios/device.h>
+#include <jeios/uart_test.h>
 
 extern void je_sched_set_proc_pool(je_proc_pool *pool);
 extern je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id);
@@ -47,7 +48,7 @@ static je_proc_id vm_s3_proc_ids[JE_VM_MAX_PROCESSES];
  * terminal facts are retained in fixed per-image counters so corroboration can
  * still distinguish a reaped predecessor from its replacement.
  */
-#define M4F_IMAGE_COUNT 10u
+#define M4F_IMAGE_COUNT 12u
 typedef struct {
     bool active;
     bool terminal_seen;
@@ -102,6 +103,15 @@ typedef struct {
     uint32_t service_peer_count;
 } m4g_client_audit;
 static m4g_client_audit m4g_client_audits[JE_PROC_REC_MAX];
+#endif
+#if JE_TEST_MODE == 15
+static uint32_t m4i_cap_delivery_count[JE_PROC_REC_MAX];
+static uint32_t m4i_normal_client_cap_count;
+static uint32_t m4i_hardened_client_cap_count;
+static uint32_t m4i_normal_client_exit_count;
+static uint32_t m4i_hardened_client_exit_count;
+static bool m4i_bad_client_exit;
+static bool m4i_mode_command_applied;
 #endif
 static bool m4f_id_equal(je_proc_id left, je_proc_id right);
 #if JE_TEST_MODE == 13
@@ -291,6 +301,32 @@ void je_m4g_record_control_receive(je_vm *vm, uint32_t index,
 }
 #endif
 
+#if JE_TEST_MODE == 15
+void je_m4g_record_cap_delivery(je_vm *vm, uint32_t index,
+                                const je_ep_capdesc *descriptor)
+{
+    if (!vm || !descriptor || index >= JE_VM_MAX_PROCESSES
+        || !m4f_ledger_enabled
+        || descriptor->rights != (JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV))
+        return;
+    je_proc_id receiver = JE_PROC_ID_NONE;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        const je_proc_rec *record = &process_pool.rec[i];
+        if ((record->state == JE_PROC_LIVE || record->state == JE_PROC_DYING)
+            && record->run_linked && record->vm_index == index) {
+            receiver = (je_proc_id){i, record->gen};
+            break;
+        }
+    }
+    if (receiver.gen == 0u || receiver.index >= JE_PROC_REC_MAX) return;
+    if (m4f_children[receiver.index].active
+        && m4f_children[receiver.index].image_id == JE_IMAGE_UART_CLIENT
+        && m4f_id_equal(m4f_children[receiver.index].id, receiver))
+        ++m4i_cap_delivery_count[receiver.index];
+}
+
+#endif
+
 static bool m4f_id_equal(je_proc_id left, je_proc_id right)
 {
     return left.index == right.index && left.gen == right.gen;
@@ -301,6 +337,9 @@ static void m4f_ledger_reset(void)
     for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
         m4f_children[i] = (m4f_child_identity){0};
         m4f_run_proc_slots[i] = false;
+#if JE_TEST_MODE == 15
+        m4i_cap_delivery_count[i] = 0u;
+#endif
     }
     for (uint32_t image = 0u; image < M4F_IMAGE_COUNT; ++image) {
         m4f_spawn_count[image] = 0u;
@@ -317,6 +356,14 @@ static void m4f_ledger_reset(void)
     m4f_progress_serial = 0u;
     m4f_ledger_enabled = true;
     m4g_delivery_reset();
+#if JE_TEST_MODE == 15
+    m4i_normal_client_cap_count = 0u;
+    m4i_hardened_client_cap_count = 0u;
+    m4i_normal_client_exit_count = 0u;
+    m4i_hardened_client_exit_count = 0u;
+    m4i_bad_client_exit = false;
+    m4i_mode_command_applied = false;
+#endif
 }
 
 /* Called only after a spawn is committed, so a failed journal never enters the
@@ -670,7 +717,7 @@ static bool svc_phase_known(uint32_t phase)
 
 static bool svc_fail_code_known(uint32_t fail_code)
 {
-    return fail_code <= JE_SVC_FAIL_CRASHLOOP;
+    return fail_code <= JE_SVC_FAIL_UART_DEADLINE;
 }
 
 /*
@@ -804,6 +851,66 @@ static bool svc_report_word_write(uint32_t vm_index, uint64_t address,
     je_arch_irq_restore(flags);
     return true;
 }
+
+#if JE_TEST_MODE == 15
+static bool svc_report_word_read(uint32_t vm_index, uint64_t address,
+                                 uint32_t *out)
+{
+    if (!out || vm_index >= JE_VM_MAX_PROCESSES || !vm_s3.ops
+        || address < JE_VM_ARENA_BASE
+        || address - JE_VM_ARENA_BASE >= JE_VM_ARENA_SIZE
+        || (address & 3u) != 0u)
+        return false;
+    uint64_t off = address - JE_VM_ARENA_BASE;
+    uint64_t flags = je_arch_irq_save();
+    uint64_t physical = 0u;
+    je_vm_perm perm = (je_vm_perm)0;
+    int present = 0;
+    if (vm_s3.ops->read_user_pte(vm_s3.ops->context, vm_index,
+                                 off & ~(uint64_t)(JE_PAGE_SIZE - 1u),
+                                 &physical, &perm, &present) != JE_OK
+        || !present || perm != JE_VM_PERM_RW_NX) {
+        je_arch_irq_restore(flags);
+        return false;
+    }
+    (void)physical;
+    uint64_t kroot = je_arch_kernel_root_phys();
+    je_arch_cr3_load(vm_s3.procs[vm_index].root);
+    *out = *(volatile uint32_t *)(uintptr_t)address;
+    je_arch_cr3_load(kroot);
+    je_arch_irq_restore(flags);
+    return true;
+}
+
+static void m4i_apply_mode_command(uint32_t supervisor_vm)
+{
+    uint32_t command = JE_SVC_UART_MODE_NONE;
+    if (m4i_mode_command_applied
+        || !svc_report_word_read(supervisor_vm, JE_SVC_ROLLBACK_GO_VADDR,
+                                 &command)
+        || command != JE_SVC_UART_MODE_HANG)
+        return;
+    for (uint32_t i = 0u; i < JE_PROC_REC_MAX; ++i) {
+        const m4f_child_identity *child = &m4f_children[i];
+        if (!child->active || child->image_id != JE_IMAGE_UART_SVC)
+            continue;
+        const je_proc_rec *record = &process_pool.rec[i];
+        if (record->state != JE_PROC_LIVE || !record->run_linked
+            || record->vm_index >= JE_VM_MAX_PROCESSES
+            || !svc_report_word_write(record->vm_index,
+                                      JE_SVC_UART_MODE_VADDR,
+                                      JE_SVC_UART_MODE_HANG))
+            continue;
+        if (!svc_report_word_write(supervisor_vm,
+                                   JE_SVC_UART_MODE_ACK_VADDR,
+                                   JE_SVC_UART_MODE_HANG))
+            fail("JeiOS fatal: M4i mode acknowledgement\r\n");
+        m4i_mode_command_applied = true;
+        je_arch_console_write("M4i: kernel HANG command applied\r\n");
+        return;
+    }
+}
+#endif
 
 typedef struct {
     uint32_t state;
@@ -1046,6 +1153,20 @@ static void m4f_capture_terminal_children(void)
                 ++m4f_fault_vector_count[child->image_id]
                                 [child->terminal_vector];
         }
+#if JE_TEST_MODE == 15
+        if (child->image_id == JE_IMAGE_UART_CLIENT
+            && child->terminal_reason == JE_DEATH_EXIT) {
+            if (child->terminal_code == UINT64_C(0x5548)) {
+                ++m4i_hardened_client_exit_count;
+                m4i_hardened_client_cap_count = m4i_cap_delivery_count[i];
+            } else if (child->terminal_code == JE_SVC_UART_DONE_EXIT) {
+                ++m4i_normal_client_exit_count;
+                m4i_normal_client_cap_count = m4i_cap_delivery_count[i];
+            } else {
+                m4i_bad_client_exit = true;
+            }
+        }
+#endif
         if (child->image_id == JE_IMAGE_SPOOFER) {
             child->terminal_endpoint_shape = m4f_spoofer_endpoint_shape(rec);
             if (child->terminal_endpoint_shape) ++m4f_spoofer_shape_count;
@@ -1284,6 +1405,61 @@ static bool m4f_corroborate(je_proc_id supervisor,
         je_arch_console_write("M4h: ring-3 #GP isolation, revoke, and deny bitmap corroborated\r\n");
     }
     return ok;
+#elif JE_TEST_MODE == 15
+    (void)report;
+    const je_proc_rec *sup = &process_pool.rec[supervisor.index];
+    const je_device *device = je_kernel_device();
+    bool equal_owner = device->hardened_before_owner.index
+            == device->hardened_after_owner.index
+        && device->hardened_before_owner.gen
+            == device->hardened_after_owner.gen;
+    bool equal_hardened_io = device->hardened_before_com2_io
+            == device->hardened_after_com2_io
+        && device->hardened_before_irq3_unmasked
+            == device->hardened_after_irq3_unmasked;
+    bool ok = sup->state == JE_PROC_DYING
+        && sup->reason == JE_DEATH_EXIT
+        && sup->code == JE_SVC_UART_DONE_EXIT
+        && m4f_spawn_count[JE_IMAGE_UART_SVC] == 3u
+        && m4f_spawn_count[JE_IMAGE_UART_CLIENT] == 2u
+        && m4f_terminal_count[JE_IMAGE_UART_SVC] == 2u
+        && m4f_death_count[JE_IMAGE_UART_SVC][JE_DEATH_KILLED] == 1u
+        && m4f_death_count[JE_IMAGE_UART_SVC][JE_DEATH_FAULT] == 1u
+        && m4f_fault_vector_count[JE_IMAGE_UART_SVC][13u] == 1u
+        && m4f_terminal_count[JE_IMAGE_UART_CLIENT] == 2u
+        && m4f_death_count[JE_IMAGE_UART_CLIENT][JE_DEATH_EXIT] == 2u
+        && m4i_normal_client_exit_count == 1u
+        && m4i_hardened_client_exit_count == 1u
+        && !m4i_bad_client_exit
+        && m4i_normal_client_cap_count == 3u
+        && m4i_hardened_client_cap_count == 0u
+        && device->binding_gen == 7u
+        && device->revoke_admin_count == 1u
+        && device->revoke_close_count == 1u
+        && device->revoke_death_count == 1u
+        && device->admin_revoke_owner_death_count == 1u
+        && device->gp_after_admin_revoke == 1u
+        && device->admin_revoke_owner_death.index
+            == device->last_admin_revoke_owner.index
+        && device->admin_revoke_owner_death.gen
+            == device->last_admin_revoke_owner.gen
+        && !device->admin_revoke_pending_fault
+        && !device->admin_revoke_fault_seen
+        && device->hardened_refusal_count == 1u
+        && device->hardened_before_binding_gen
+            == device->hardened_after_binding_gen
+        && device->hardened_before_active == device->hardened_after_active
+        && equal_owner
+        && equal_hardened_io
+        && m4i_mode_command_applied
+        && device->active;
+    if (ok) {
+        je_arch_console_write("M4i: UART PRESENT; timeout PING/PONG deadline corroborated\r\n");
+        je_arch_console_write("M4i: detach CLOSE + same-live reassign corroborated\r\n");
+        je_arch_console_write("M4i: admin revoke -> vector-13 fault and restart corroborated\r\n");
+        je_arch_console_write("M4i: hardened UNSUPPORTED refusal and zero-cap client corroborated\r\n");
+    }
+    return ok;
 #else
     (void)report; /* report counters are diagnostics, never proof */
     if (m4f_unexpected_image
@@ -1364,6 +1540,8 @@ static _Noreturn void m4f_teardown(const m4f_baseline *baseline,
         je_arch_console_write("M4g-s1: broker scenario completed\r\n");
 #elif JE_TEST_MODE == 14
         je_arch_console_write("M4h-s1: D9 device scenario completed\r\n");
+#elif JE_TEST_MODE == 15
+        je_arch_console_write("M4i-s1: UART service scenario completed\r\n");
 #else
         je_arch_console_write("M4f-s1: supervisor scenario completed\r\n");
 #endif
@@ -1372,6 +1550,8 @@ static _Noreturn void m4f_teardown(const m4f_baseline *baseline,
         je_arch_console_write("M4g: supervisor lost (last_phase=");
 #elif JE_TEST_MODE == 14
         je_arch_console_write("M4h: supervisor lost (last_phase=");
+#elif JE_TEST_MODE == 15
+        je_arch_console_write("M4i: supervisor lost (last_phase=");
 #else
         je_arch_console_write("M4f: supervisor lost (last_phase=");
 #endif
@@ -1400,6 +1580,16 @@ static _Noreturn void m4f_teardown(const m4f_baseline *baseline,
     je_arch_console_write("M4g: zero-leak identity baseline verified\r\n");
 #elif JE_TEST_MODE == 14
     je_arch_console_write("M4h: zero-leak identity baseline verified\r\n");
+#elif JE_TEST_MODE == 15
+    if (success
+        && (je_kernel_device()->active
+            || je_kernel_device()->binding_gen != 8u
+            || je_arch_tss_com2_io() != 0xffu
+            || je_arch_irq3_is_unmasked()
+            || je_kernel_device()->revoke_death_count != 2u))
+        fail("JeiOS fatal: M4i final device state\r\n");
+    je_arch_console_write("M4i: final device revoked; bitmap=0xff; IRQ3 masked\r\n");
+    je_arch_console_write("M4i: zero-leak identity baseline verified\r\n");
 #else
     je_arch_console_write("M4f: zero-leak identity baseline verified\r\n");
 #endif
@@ -1442,12 +1632,18 @@ static _Noreturn void m4f_monitor(const m4f_baseline *baseline,
         je_svc_report report = {0};
         bool readable = status == JE_OK
             && svc_report_read(supervisor_vm, &report);
+#if JE_TEST_MODE == 15
+        if (status == JE_OK && state == JE_PROC_LIVE)
+            m4i_apply_mode_command(supervisor_vm);
+#endif
         if (status == JE_OK && state == JE_PROC_LIVE) {
             bool phase_progress = readable && report.phase != last_phase;
             if (readable && report.phase != last_phase) {
                 last_phase = report.phase;
 #if JE_TEST_MODE == 13
                 je_arch_console_write("M4g: supervisor phase=");
+#elif JE_TEST_MODE == 15
+                je_arch_console_write("M4i: supervisor phase=");
 #else
                 je_arch_console_write("M4f: supervisor phase=");
 #endif
@@ -1485,6 +1681,8 @@ static _Noreturn void m4f_monitor(const m4f_baseline *baseline,
                     last_phase = terminal_report.phase;
 #if JE_TEST_MODE == 13
                     je_arch_console_write("M4g: supervisor phase=");
+#elif JE_TEST_MODE == 15
+                    je_arch_console_write("M4i: supervisor phase=");
 #else
                     je_arch_console_write("M4f: supervisor phase=");
 #endif
@@ -1495,6 +1693,14 @@ static _Noreturn void m4f_monitor(const m4f_baseline *baseline,
                     terminal_readable
                     && terminal_report.phase == JE_SVC_PHASE_DONE
                     && m4f_corroborate(supervisor, &terminal_report);
+#if JE_TEST_MODE == 15
+                if (!terminal_success && terminal_readable
+                    && terminal_report.phase == JE_SVC_PHASE_FAILED) {
+                    je_arch_console_write("M4i: supervisor fail_code=");
+                    je_arch_console_hex(terminal_report.fail_code);
+                    je_arch_console_write("\r\n");
+                }
+#endif
                 m4f_teardown(baseline, supervisor, terminal_success,
                              verify_reason, last_phase);
             }
@@ -1513,6 +1719,13 @@ static _Noreturn void m4f_monitor(const m4f_baseline *baseline,
         m4f_capture_terminal_children();
         bool success = readable && report.phase == JE_SVC_PHASE_DONE
             && m4f_corroborate(supervisor, &report);
+#if JE_TEST_MODE == 15
+        if (!success && readable && report.phase == JE_SVC_PHASE_FAILED) {
+            je_arch_console_write("M4i: supervisor fail_code=");
+            je_arch_console_hex(report.fail_code);
+            je_arch_console_write("\r\n");
+        }
+#endif
         m4f_teardown(baseline, supervisor, success, reason, last_phase);
     }
 }

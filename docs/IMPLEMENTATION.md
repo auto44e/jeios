@@ -20,6 +20,54 @@ This file records current contracts and execution evidence as gates are built.
 DESIGN.md describes the broader target architecture. No entry below implies
 userspace isolation, SMP safety, driver containment or production readiness.
 
+## M4 PR-I — D9 brokered UART service / final M4 gate — 2026-11-02
+
+PR-I completes the bounded D9 brokered-UART demonstration in `TEST_MODE=15`.
+The kernel remains the only authority for DEVICE ownership, binding generation,
+TSS COM2 permission, revoke, process death and final teardown; the UART service
+owns the COM2 DEVICE after the supervisor's normal legacy-PIO assignment. The
+kernel console remains COM1. Real client writes are checked through QEMU's
+independent second-16550 file backend.
+
+The scenario now has an explicit five-fact checklist:
+timeout/restart, same-live detach/reassign, admin-revoke/fault restart,
+hardened refusal with zero caps, and the normal client's post-restart `I2`.
+It also requires both clients closed, service generation 3, and a live final
+service. A two-deadline supervisor bound reports
+`JE_SVC_FAIL_UART_DEADLINE` if any fact fails, so a future orchestration stall
+is diagnosable rather than becoming the slot-0 monitor deadline.
+
+The stall fix was causal. The client grant wait is two UART deadlines because
+the request can overlap the supervisor's bounded PING timeout and its
+kill/restart/DEV_ASSIGN/ATTACH sequence. The hung service incarnation yields
+after closing broker channels: it does not answer control traffic, but it also
+does not monopolize the single CPU, and the client observes `PEER_CLOSED`.
+The normal service path still uses real transmitter output (`MCR=0x0b`);
+loopback/self-report is not used as COM2 proof.
+
+**Observed local evidence at `2026-11-02T00:07:42+00:00`, branch
+`wip/m4i-impl`, exact inspected commit
+`3b447d0aa7c194e55fa2beca1bdad41b64fd2f60` (changes uncommitted):**
+
+- `ASAN_OPTIONS=detect_leaks=0 make check` — PASS.
+- `make smoke` — PASS; mode 0 remains unchanged.
+- `make integration` — PASS for modes 1–15. Mode 15 printed the timeout,
+  detach, revoke/vector-13, hardened-refusal, scenario-completed, final
+  `bitmap=0xff; IRQ3 masked`, and zero-leak markers.
+- The mode-15 COM2 file was `49 31 49 32` (`b'I1I2'`); `D!` and `R!` were
+  absent. This is the independent QEMU backend result.
+- The 16 MiB/no-NX and 1536 MiB/NX-present smoke profiles passed.
+- `make aarch64 && make smoke-aarch64 ARM_REQUIRE=1` passed; the existing ARM
+  linker RWX warning remained.
+- Temporary negative controls were restored. Removing the hardened refusal
+  yielded supervisor fail code `0x7` with no completion marker. Omitting
+  `DEV_REVOKE` yielded fail code `0x7` and COM2 `b'I1I2R!'`.
+- `git diff --check` passed. `user/services/uart_driver.c` is unchanged.
+
+Remote CI, independent human review, hardened/release qualification, DMA,
+SMP, arbitrary hardware, dynamic loading and all-driver support remain
+unclaimed. The next bounded task is lead integration and human qualification.
+
 ## M4 PR-H — D9 COM2 DEVICE / TSS I/O bitmap / IRQ3 — 2026-11-01
 
 PR-H adds the first direct ring-3 hardware-port authority. The device is a

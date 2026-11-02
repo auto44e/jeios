@@ -626,6 +626,34 @@ deadline, and the supervisor kills it and restarts it within budget. Clients see
 `UNSUPPORTED` with the profile name "legacy no-DMA PIO". This follows DESIGN:479
 and HARDWARE:71, and there is no false-green UI.
 
+> **D9 implementation note — hardened-request evidence (PR-I, 2026-11-01,
+> owner-approved: Option A, kernel-corroborated).** M4 has no hardened/IOMMU path,
+> so this is a refusal-only demo; PR-I design review asked how the refusal is
+> EVIDENCED. The owner chose Option A (kernel-corroborated) over Option B
+> (supervisor-attested only):
+> - `DEV_ASSIGN` gains an isolation-requirement input: `RDX` bit 0 =
+>   `JE_ABI_DEV_REQUIRE_DMA_CONTAINED` (RDX must otherwise be 0; the earlier "RDX
+>   reserved 0" wording is relaxed to this one flag). When set, the kernel performs
+>   NO binding, mask, bitmap or ownership change and returns `UNSUPPORTED`; it may
+>   report the legacy profile id in `RDX`. The refusal is thus a KERNEL fact: a
+>   test can observe that one refusal occurred and that the binding generation,
+>   ownership, IRQ mask and bitmap are all unchanged across it.
+> - A client expresses the requirement with a new 8-byte broker op
+>   `BROKER_REQUEST_HARDENED` (same length as `BROKER_REQUEST`, so the length-based
+>   control demux is unchanged). The supervisor makes the flagged `DEV_ASSIGN`,
+>   gets `UNSUPPORTED`, grants no cap, and relays a `BROKER_UNAVAILABLE` carrying a
+>   dedicated reason `JE_SVC_UNAVAIL_HARDENED`. No legacy fallback channel is created.
+> - Evidence: the kernel counts one hardened refusal with the binding untouched;
+>   the client's table at death holds zero brokered caps for that request (the
+>   m4g capture precedent). The driver never answers this; its report is untrusted.
+>
+> **Flex (revisit, owner direction 2026-11-01).** The A-vs-B choice is open for a
+> later discussion: if the kernel DEVICE profile surface is ever trimmed, the
+> refusal could move to supervisor-attested policy (Option B) with the handoff
+> stating it is supervisor-attested, not kernel-corroborated. v0 is not a stable
+> ABI (D11), so switching is a reviewed change, not a break. Revisit trigger: a
+> second isolation profile, or a decision to keep device policy entirely in ring 3.
+
 **Rejected devices** (from the debate):
 
 | Device | Reason rejected |

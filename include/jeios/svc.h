@@ -39,7 +39,9 @@ _Static_assert(JE_BROKER_MAX <= 6u, "ADR 0010 D11 broker bound");
 #define JE_IMAGE_CRASHLOOP   6u   /* crash-to-terminal child (PR-F) */
 #define JE_IMAGE_BROKER_SVC  7u   /* brokered service (PR-G) */
 #define JE_IMAGE_BROKER_CLI  8u   /* broker client (PR-G) */
-#define JE_IMAGE_UART_DRIVER 9u   /* D9 ring-3 COM2 driver */
+#define JE_IMAGE_UART_DRIVER 9u   /* D9 ring-3 COM2 driver (PR-H mode-14 harness) */
+#define JE_IMAGE_UART_SVC    10u  /* D9 brokered UART service (PR-I) */
+#define JE_IMAGE_UART_CLIENT 11u  /* D9 UART client (PR-I) */
 
 /*
  * v0 service messages (ADR 0010 D7/D11). NOT a stable ABI. All little-endian,
@@ -79,6 +81,7 @@ _Static_assert(sizeof(je_svc_config) == JE_SVC_CONFIG_LEN, "CONFIG size");
  * and service receive cap-bearing grants with hcap=1.
  */
 #define JE_SVC_OP_BROKER_REQUEST   0x51455242u /* "BREQ": client -> supervisor */
+#define JE_SVC_OP_BROKER_HARDENED  0x48455242u /* "BREH": client -> sup, hardened (D9 PR-I) */
 #define JE_SVC_OP_BROKER_GRANT     0x544e5247u /* "GRNT": sup -> client, +1 cap */
 #define JE_SVC_OP_BROKER_RESTARTED 0x54535352u /* "RSST": sup -> client, +1 cap */
 #define JE_SVC_OP_BROKER_UNAVAIL   0x5641564eu /* "NVAV": sup -> client, no cap, no cap-charge */
@@ -137,6 +140,72 @@ _Static_assert(sizeof(je_svc_broker_reply) == JE_SVC_BROKER_REPLY_LEN,
 #define JE_SVC_UNAVAIL_TERMINAL   2u /* service failed-terminal: no instance */
 #define JE_SVC_UNAVAIL_BAD_SERVICE 3u /* service_id out of range / not brokerable */
 #define JE_SVC_UNAVAIL_UNAUTH     4u /* client not authorized for this service */
+#define JE_SVC_UNAVAIL_HARDENED   5u /* hardened/IOMMU isolation requested; D9 refuses
+                                      * UNSUPPORTED "legacy no-DMA PIO" (PR-I) */
+
+/*
+ * v0 UART service protocol (ADR 0010 D9 / PR-I). Two channel kinds:
+ *  - CONTROL (supervisor <-> driver, bidirectional SEND|RECV): device attach and
+ *    health. ATTACH carries the DEVICE handle value as plain data (the driver
+ *    trusts it only from CONTROL). The driver replies ATTACH_OK{PRESENT|DEGRADED}
+ *    once it has probed COM2; the supervisor treats the service as brokerable only
+ *    after ATTACH_OK PRESENT. HEALTH_PING{seq}/PONG{seq} drive the D9 timeout:
+ *    the supervisor requires a PONG within JE_SVC_UART_DEADLINE ticks, else kills
+ *    and restarts. DETACHED announces a voluntary device close.
+ *  - BROKERED (client <-> driver, SEND|RECV no TRANSFER): WRITE/READ requests.
+ * All fixed-size, little-endian, op first, request-id (seq) for reply matching.
+ */
+#define JE_SVC_OP_UART_ATTACH    0x48545541u /* "AUTH"~: sup -> driver, +DEVICE handle */
+#define JE_SVC_OP_UART_ATTACH_OK 0x4b4f5541u /* "AUOK": driver -> sup, probe result */
+#define JE_SVC_OP_UART_PING      0x474e5055u /* "UPNG": sup -> driver */
+#define JE_SVC_OP_UART_PONG      0x474e4f55u /* "UONG": driver -> sup */
+#define JE_SVC_OP_UART_DETACHED  0x48544455u /* "UDTH": driver -> sup, voluntary detach */
+#define JE_SVC_OP_UART_WRITE     0x54525755u /* "UWRT": client -> driver */
+#define JE_SVC_OP_UART_READ      0x44525255u /* "URRD": client -> driver */
+#define JE_SVC_OP_UART_REPLY     0x594c5055u /* "UPLY": driver -> client */
+
+#define JE_SVC_UART_PRESENT  2u   /* COM2 probed and present */
+#define JE_SVC_UART_DEGRADED 1u   /* COM2 read 0xFF: no device; no grants */
+
+/* CONTROL: ATTACH (supervisor -> driver), DEVICE handle value as data. */
+typedef struct { uint32_t op; uint32_t device_handle; } je_svc_uart_attach;
+#define JE_SVC_UART_ATTACH_LEN 8u
+_Static_assert(sizeof(je_svc_uart_attach) == JE_SVC_UART_ATTACH_LEN, "UART ATTACH size");
+
+/* CONTROL: ATTACH_OK / PING / PONG / DETACHED all share this 8-byte shape. For
+ * ATTACH_OK `arg` = PRESENT/DEGRADED; for PING/PONG `arg` = seq; else 0. */
+typedef struct { uint32_t op; uint32_t arg; } je_svc_uart_control;
+#define JE_SVC_UART_CONTROL_LEN 8u
+_Static_assert(sizeof(je_svc_uart_control) == JE_SVC_UART_CONTROL_LEN, "UART control size");
+
+/* BROKERED: WRITE request (client -> driver). len <= JE_SVC_UART_PAYLOAD_MAX. */
+#define JE_SVC_UART_PAYLOAD_MAX 48u
+typedef struct {
+    uint32_t op;    /* UART_WRITE or UART_READ */
+    uint32_t seq;   /* request id, echoed in the reply */
+    uint32_t len;   /* WRITE: bytes to send; READ: max bytes requested */
+    uint32_t reserved;
+    uint8_t  bytes[JE_SVC_UART_PAYLOAD_MAX];
+} je_svc_uart_request;
+#define JE_SVC_UART_REQUEST_LEN 64u
+_Static_assert(sizeof(je_svc_uart_request) == JE_SVC_UART_REQUEST_LEN, "UART request size");
+
+/* BROKERED: reply (driver -> client). status is a JE_SVC_UART_IO_* value. */
+typedef struct {
+    uint32_t op;     /* JE_SVC_OP_UART_REPLY */
+    uint32_t seq;    /* matches the request */
+    uint32_t status; /* JE_SVC_UART_IO_* */
+    uint32_t len;    /* bytes written (WRITE) or returned (READ) */
+    uint8_t  bytes[JE_SVC_UART_PAYLOAD_MAX];
+} je_svc_uart_reply;
+#define JE_SVC_UART_REPLY_LEN 64u
+_Static_assert(sizeof(je_svc_uart_reply) == JE_SVC_UART_REPLY_LEN, "UART reply size");
+
+#define JE_SVC_UART_IO_OK        0u
+#define JE_SVC_UART_IO_EMPTY     1u  /* READ: no RX byte available (non-blocking) */
+#define JE_SVC_UART_IO_WOULDBLOCK 2u /* WRITE: THRE not ready within the bounded poll */
+#define JE_SVC_UART_IO_INVALID   3u  /* malformed request */
+#define JE_SVC_UART_IO_DETACHED  4u  /* driver has no device authority */
 
 
 /*
@@ -196,6 +265,7 @@ _Static_assert(sizeof(je_svc_report) == JE_SVC_REPORT_LEN, "report struct size")
 #define JE_SVC_FAIL_SLEEP_CHANNEL 4u  /* non-TIMED_OUT on the private sleep end */
 #define JE_SVC_FAIL_ROLLBACK      5u  /* failed-launch rollback did not hold */
 #define JE_SVC_FAIL_CRASHLOOP     6u  /* crash-loop attempt count was wrong */
+#define JE_SVC_FAIL_UART_DEADLINE 7u  /* PR-I UART scenario deadline expired */
 #define JE_SVC_DONE_EXIT          0x4d3446u /* nonzero clean supervisor exit */
 
 /*
@@ -226,6 +296,17 @@ _Static_assert(sizeof(je_svc_report) == JE_SVC_REPORT_LEN, "report struct size")
 #define JE_SVC_LOSS_GO 0xD1200001u
 #define JE_SVC_SPOOF_MAGIC 0x53504652u
 #define JE_SVC_SPOOF_EXPECTED_MASK 0x0007u
+
+/* PR-I UART service policy (TEST_MODE 15). A separate restart limit so the UART
+ * timeout + revoke demos can each restart without touching mode-13's shared
+ * JE_SVC_RESTART_LIMIT (ADR D11: "each service has restart_limit"). The UART
+ * client's lifetime broker cap is limit+1 so it can reconnect across both. */
+#define JE_SVC_UART_RESTART_LIMIT 2u
+#define JE_SVC_UART_DEADLINE 600u    /* ticks the supervisor waits for a PONG */
+#define JE_SVC_UART_CLIENT_CAP (JE_SVC_UART_RESTART_LIMIT + 1u)
+#define JE_SVC_UART_DONE_EXIT 0x67344475u /* mode-15 supervisor clean EXIT code */
+_Static_assert(JE_SVC_UART_CLIENT_CAP <= JE_BROKER_MAX,
+               "UART client cap within the live broker-channel bound");
 
 /* PR-G broker scenario policy (TEST_MODE 13). One brokered service (restart_limit
  * 1) and two clients: one reconnects through a service restart and then exhausts

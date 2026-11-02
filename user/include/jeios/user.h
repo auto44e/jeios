@@ -117,6 +117,13 @@ static inline uint64_t je_proc_kill(uint64_t h)
 static inline uint64_t je_dev_assign(uint64_t admin_h, uint64_t process_h, uint64_t *out)
 { return je_sys6(JE_SYS_DEV_ASSIGN, admin_h, process_h, 0, 0, 0, 0, out); }
 
+/* dev_assign with an isolation-requirement flags word in RDX (D9, PR-I). With
+ * JE_ABI_DEV_REQUIRE_DMA_CONTAINED set the kernel refuses UNSUPPORTED and *out
+ * (if any) carries the profile id; no binding is made. */
+static inline uint64_t je_dev_assign_flags(uint64_t admin_h, uint64_t process_h,
+                                           uint64_t flags, uint64_t *out)
+{ return je_sys6(JE_SYS_DEV_ASSIGN, admin_h, process_h, flags, 0, 0, 0, out); }
+
 /* dev_revoke(admin_h): needs ASSIGN. Idempotent. */
 static inline uint64_t je_dev_revoke(uint64_t admin_h)
 { return je_sys6(JE_SYS_DEV_REVOKE, admin_h, 0, 0, 0, 0, 0, (uint64_t *)0); }
