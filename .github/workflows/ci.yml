@@ -58,6 +58,9 @@ jobs:
       - name: ARM64 normal boot
         run: |
           make smoke-aarch64 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=30
+      - name: ARM64 physical allocator oracle
+        run: |
+          make smoke-aarch64 ARM_REQUIRE=1 ARM_PHYSALLOC=1 ARM_SMOKE_TIMEOUT=30
       - name: ARM64 deliberate vector fault
         run: |
           make smoke-aarch64 ARM_REQUIRE=1 ARM_VECTOR_TEST=1 ARM_SMOKE_TIMEOUT=30

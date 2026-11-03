@@ -1,5 +1,107 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## 2026-11-03T04:24:29+00:00 — MP2 PR-1a aarch64 physical allocator bring-up
+
+## 2026-11-03 — MP2 PR-1a aarch64 physical allocator bring-up (MMU still OFF)
+
+Observed repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/jeios`,
+branch `feat/mp2-aarch64-mmu`, built on commit
+`f09fd928495ab6b511f4fa58bf4cd751024a7b33` (ADR 0011 accepted). State:
+**implemented / tested locally / not blocked**. First of the stacked MP2 PR-1
+pair from ADR 0011 (D-SPLIT); PR-1b (MMU enable) is the follow-up and is NOT in
+this change. No page tables, no TCR/TTBR/SCTLR/MAIR, no W^X/linker symbols.
+
+Implemented:
+- `include/jeios/boot.h` + `include/jeios/alloc.h`: per-arch compile-time
+  physical window `JE_PHYSICAL_BASE`/`JE_PHYSICAL_LIMIT`/`JE_PHYSICAL_SPAN`
+  (`JE_ARCH_AARCH64` → 0x40000000/0x50000000; else 0/0x40000000, byte-identical
+  to the pre-ADR-0011 x86 behavior). `JE_PAGE_COUNT` now sizes to the window
+  SPAN, not the absolute limit. Added `je_page_free_pred` + `je_pages_init_pred`.
+  (ADR 0011 D5 — owner-approved tested-path change.)
+- `kernel/core/alloc.c`: default-deny `je_pages_init_pred` over a free-page
+  predicate; `je_pages_init` now wraps it with the x86 `je_boot_context`
+  predicate. alloc/free are base-relative (`JE_PHYSICAL_BASE + i*PAGE_SIZE`);
+  `je_pages_free` rejects out-of-window addresses via the single unsigned test
+  `(a-BASE) >= SPAN` BEFORE deriving an index (prevents an OOB `state[]` write).
+  Compile-time `_Static_assert`s on the window shape.
+- `kernel/arch/aarch64/physmem.{h,c}`: the frozen adapter contract + its
+  implementation. `je_arm_page_free` is the default-deny predicate: a page is
+  free iff its whole [pa,pa+4096) lies in exactly one FDT RAM range AND
+  intersects none of the kernel image, DTB source, initrd (if present), or any
+  kept reservation (incl. no-map). Half-open intersection, 64-bit, with a
+  top-of-address-space overflow guard so the predicate is total. `rsv_dynamic`
+  has no address → nothing to subtract (obligation recorded for a later PR).
+- `kernel/arch/aarch64/main.c`: file-scope `je_arm_facts` (stored by
+  `dtb_intake()` after validation) and `je_arm_pages` (128 KiB `.bss`, inside
+  `[_text,_end)` so the kernel-image reservation covers its own state).
+  `physmem_bringup()` runs in EVERY build after `dtb_intake()`, emits ordered
+  markers, and FATAL-halts on any failure.
+- `mk/aarch64.mk`: physmem.o + the arch-neutral alloc/bootctx/memory objects
+  added to the ARM link; build-neutral `ARM_PHYSALLOC` smoke selector.
+- `tests/test_physmem.c` (hosted, ASAN+UBSAN) + `tools/smoke_arm.py`
+  `--phys-alloc` oracle, written by a different author than the kernel code;
+  plus `tests/test_physmem_arm.c` (hosted at the aarch64 nonzero window,
+  `-DJE_ARCH_AARCH64`) added after cross-review to exercise the base-relative
+  alloc/free arithmetic and out-of-window rejection under ASan — the one gap both
+  code reviews independently flagged (base-0-only tests left it uncovered).
+
+Cross-lineage review fixes (transcripts: docs/adr/debates/0011-mp2-pr1a-review/):
+the nonzero-base hosted test above; a `range_intersects_page` overflow branch so
+the predicate fails SAFE on a wrapped reserved range (header promises totality);
+a `#error` guard so an aarch64 TU without JE_ARCH_AARCH64 cannot silently pick
+the x86 window; a `physmem unmanaged ram bytes=<hex>` degraded-profile marker
+(AGENTS rule 5) that the oracle recomputes independently (verified 0x10000000 at
+-m 512M); a CI `ARM_PHYSALLOC=1` step; and the "byte-identical" x86 claim
+corrected to "behavior-identical, alloc/free/heap code identical at -O2".
+
+Marker honesty note (important): an earlier draft emitted a `physmem rollback ok`
+marker by requesting `free_count+1` pages — but on the 65k-page window that
+exceeds the `JE_ALLOC_MAX_PAGES=256` API cap, so it returned `JE_ERR_INVALID`
+without ever running the allocator scan: a VACUOUS proof. It was replaced with
+two honest markers: `physmem allocmax pa=<hex>` (a real 256-page contiguous run
+IS allocated via the scan, then freed, free_count restored) and
+`physmem overcap rejected pages=<hex>` (an over-cap request is rejected as
+INVALID with state unchanged — labeled a BOUNDS check, not a rollback claim).
+The real "failed multi-page alloc frees nothing" rollback property is proven in
+`tests/test_physmem.c` on a small fragmented window (free_count>=n, no run of n;
+NOMEM leaves `state[]` byte-identical) — the only place it can be set up cheaply.
+
+Fixture limitation (recorded honestly): at `-m 256M` the single FDT RAM range
+covers the entire allocator window, so a predicate bug that DROPS the
+RAM-membership check is invisible to the ARM smoke oracle (the computed free
+count is unchanged). Only the hosted test catches it (it builds RAM ranges with
+gaps). The cross-lineage check confirmed the oracle's value: a predicate that
+ignores the DTB reservation passes default smoke but FAILS `--phys-alloc`
+(0xffc6 vs 0xfec6).
+
+Tested locally at this observation (QEMU 8.2.2; local only, NOT CI):
+
+```text
+ASAN_OPTIONS=detect_leaks=0 make check          PASS (incl. test_physmem)
+make aarch64                                    PASS
+make aarch64 ARM_BSS_CHECK=1 / VECTOR_TEST=1 / DTB_BAD=1   all PASS
+make smoke-aarch64 ARM_REQUIRE=1                PASS
+make smoke-aarch64 ARM_PHYSALLOC=1 ARM_REQUIRE=1  PASS (oracle 0xfec6 == kernel)
+git diff --check                                PASS
+```
+
+The ARM link still emits the pre-existing `LOAD segment with RWX permissions`
+warning; W^X is PR-1b. Value-carrying markers observed at the pinned fixture:
+window [0x40000000,0x50000000); kernel reserve base 0x40080000; dtb reserve base
+0x48000000 size 0x100000; free pages 0xfec6 (65222 = 65536 − 58 kernel − 256
+dtb); alloc1 pa 0x40000000; allocmax pa 0x400ba000; overcap rejected 0xfec6.
+
+AI-assisted multi-agent work (Codex implemented the kernel path, Claude wrote
+the tests + oracle, cross-lineage reviewed); this is NOT the independent human
+qualification the critical profile requires, and no remote CI is observed yet.
+
+Next bounded task: PR-1b (MMU enable) per ADR 0011 D2/D4/D6/D7 — identity map in
+TTBR0, W^X per-section, guard page, the corrected invalidate-only + TLBI/IC
+enable leaf, and the AT/PAR + fault-mode proofs. Pass criteria: non-identity
+translation proven via AT/PAR; write-to-code / execute-from-data /
+execute-from-rodata / stack-guard faults with exact ESR/FAR; the pre-enable W^X
+audit; MP1 + PR-1a markers still pass.
+
 ## 2026-11-02T01:09:05-05:00 — native privilege tools, vi and developer environment
 
 Inspected core main `d76a201510bb79a579719ffb8ad43eed9d0d02ba` (PR #77 merged);
