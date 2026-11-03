@@ -24,7 +24,11 @@ SECTIONS
     . = ALIGN(0x800);                       /* VBAR_EL1 requires 2 KiB alignment */
     .text.vectors : { KEEP(*(.text.vectors)) }
     .text      : { *(.text*) }
+    . = ALIGN(0x1000);                       /* W^X (ADR 0011 D4): .text ends on a page */
+    __text_end = .;
     .rodata    : { *(.rodata*) }
+    . = ALIGN(0x1000);                       /* W^X: .rodata ends on a page */
+    __rodata_end = .;
     .data      : { *(.data*) }
     . = ALIGN(16);
     _file_end = .;          /* end of file-backed (loaded) content, incl. .data */
@@ -37,9 +41,21 @@ SECTIONS
         . = ALIGN(16);
         __bss_end = .;
     }
+    . = ALIGN(0x1000);      /* W^X: all RW data (.data+.bss) ends on a page */
+    __data_end = .;
+
+    /* Unmapped stack GUARD page (ADR 0011 D4): one 4 KiB page the MMU PR leaves
+     * unmapped, placed DIRECTLY below the boot stack so a stack underflow/guard
+     * probe faults deterministically. NOLOAD (no file bytes); the allocator
+     * keeps it RESERVED (it is inside [_text,_end)). */
+    .stack_guard (NOLOAD) : {
+        . = ALIGN(0x1000);
+        __stack_guard = .;
+        . += 0x1000;
+    }
 
     .stack (NOLOAD) : {
-        . = ALIGN(16);
+        . = ALIGN(0x1000);     /* stack base page-aligned so the guard sits exactly below it */
         __stack_bottom = .;
         . += STACK_SIZE;
         . = ALIGN(16);
@@ -88,6 +104,18 @@ ASSERT((__bss_start   & 0xf) == 0, "BSS start must be 16-byte aligned");
 ASSERT((__bss_end     & 0xf) == 0, "BSS end must be 16-byte aligned");
 ASSERT((__stack_top   & 0xf) == 0, "stack top must be 16-byte aligned");
 ASSERT((__stack_bottom & 0xf) == 0, "stack bottom must be 16-byte aligned");
+/* W^X page boundaries (ADR 0011 D4): each section end is page-aligned so the MMU
+ * PR can map .text RX, .rodata R, and RW data XN at 4 KiB granularity without a
+ * page spanning two permission classes. */
+ASSERT((__text_end   & 0xfff) == 0, "__text_end must be page-aligned (W^X)");
+ASSERT((__rodata_end & 0xfff) == 0, "__rodata_end must be page-aligned (W^X)");
+ASSERT((__data_end   & 0xfff) == 0, "__data_end must be page-aligned (W^X)");
+ASSERT(__text_end <= __rodata_end, "rodata must follow text");
+ASSERT(__rodata_end <= __data_end, "data must follow rodata");
+/* Stack guard: a page-aligned unmapped page DIRECTLY below the stack. */
+ASSERT((__stack_guard & 0xfff) == 0, "stack guard must be page-aligned");
+ASSERT((__stack_bottom & 0xfff) == 0, "stack bottom must be page-aligned (guard adjacency)");
+ASSERT(__stack_guard + 0x1000 == __stack_bottom, "stack guard must sit directly below the stack");
 /* BSS and stack are after the file-backed image... */
 ASSERT(__bss_start   >= _file_end, "BSS must follow the file-backed image");
 ASSERT(__stack_bottom >= __bss_end, "stack must follow BSS (no overlap)");
