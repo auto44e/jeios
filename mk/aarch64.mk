@@ -10,13 +10,15 @@ ARM_OBJCOPY := aarch64-linux-gnu-objcopy
 ARM_BUILD   := build/aarch64
 ARM_ARCH    := kernel/arch/aarch64
 
-# The three test-build toggles below are MUTUALLY EXCLUSIVE: each selects its own
+# The four test-build toggles below are MUTUALLY EXCLUSIVE: each selects its own
 # build dir, and with more than one set the last assignment would silently win
 # and reuse that dir for a different flag combination (stale objects / a smoke
 # run asserting the wrong markers). Refuse the combination outright.
-ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD))),0)
-ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD))),1)
-$(error ARM_BSS_CHECK, ARM_VECTOR_TEST and ARM_DTB_BAD are mutually exclusive; set at most one to 1)
+# ARM_MMU_FAULT (a NAME, not 0/1) joins the group as a "1" when non-empty.
+ARM_MMU_FAULT_SET := $(if $(strip $(ARM_MMU_FAULT)),1,)
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET))),0)
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET))),1)
+$(error ARM_BSS_CHECK, ARM_VECTOR_TEST, ARM_DTB_BAD and ARM_MMU_FAULT are mutually exclusive; set at most one)
 endif
 endif
 
@@ -41,6 +43,29 @@ endif
 # dir so the toggle never reuses stale objects.
 ifeq ($(ARM_DTB_BAD),1)
 ARM_BUILD   := build/aarch64-dtbbad
+endif
+# Optional deliberate MMU-fault build (MP2 PR-1b, ADR 0011 D4/D7): after the MMU
+# markers, perform ONE access the W^X/guard contract must refuse and assert the
+# exact syndrome in je_arm_exception. ARM_MMU_FAULT selects which (one build per
+# mode, each in its OWN build dir so modes never share stale objects):
+#   text   write-to-text        DABT perm L3, WnR=1
+#   data   execute-from-data    IABT perm L3
+#   rodata execute-from-rodata  IABT perm L3 (WXN does not cover rodata)
+#   guard  stack-guard          DABT translation L3, WnR=1
+# `make aarch64 ARM_MMU_FAULT=text && make smoke-aarch64 ARM_MMU_FAULT=text`.
+ARM_MMU_FAULT_text   := 1
+ARM_MMU_FAULT_data   := 2
+ARM_MMU_FAULT_rodata := 3
+ARM_MMU_FAULT_guard  := 4
+ARM_MMU_FAULT_SMOKE_text   := write-to-text
+ARM_MMU_FAULT_SMOKE_data   := execute-from-data
+ARM_MMU_FAULT_SMOKE_rodata := execute-from-rodata
+ARM_MMU_FAULT_SMOKE_guard  := stack-guard
+ifneq ($(ARM_MMU_FAULT_SET),)
+ifeq ($(ARM_MMU_FAULT_$(ARM_MMU_FAULT)),)
+$(error ARM_MMU_FAULT=$(ARM_MMU_FAULT) is not one of: text data rodata guard)
+endif
+ARM_BUILD   := build/aarch64-mmufault-$(ARM_MMU_FAULT)
 endif
 
 # Freestanding, no PIC/stack-protector, STRICT alignment (pre-MMU RAM is
@@ -71,8 +96,12 @@ ifeq ($(ARM_DTB_BAD),1)
 ARM_CFLAGS  += -DJE_ARM_DTB_BAD
 ARM_ASFLAGS += -DJE_ARM_DTB_BAD
 endif
+ifneq ($(ARM_MMU_FAULT_SET),)
+ARM_CFLAGS  += -DJE_ARM_MMU_FAULT=$(ARM_MMU_FAULT_$(ARM_MMU_FAULT))
+ARM_ASFLAGS += -DJE_ARM_MMU_FAULT=$(ARM_MMU_FAULT_$(ARM_MMU_FAULT))
+endif
 
-ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/physmem.o $(ARM_BUILD)/alloc.o $(ARM_BUILD)/bootctx.o $(ARM_BUILD)/memory.o $(ARM_BUILD)/vectors.o $(ARM_BUILD)/fdt.o
+ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/physmem.o $(ARM_BUILD)/paging.o $(ARM_BUILD)/paging_enable.o $(ARM_BUILD)/alloc.o $(ARM_BUILD)/bootctx.o $(ARM_BUILD)/memory.o $(ARM_BUILD)/vectors.o $(ARM_BUILD)/fdt.o
 
 # Shared arch-neutral bounded DTB parser (issue #52), compiled with the ARM
 # freestanding/strict-align flags.
@@ -95,6 +124,14 @@ $(ARM_BUILD)/main.o: $(ARM_ARCH)/main.c $(ARM_ARCH)/trapframe.h $(wildcard inclu
 $(ARM_BUILD)/physmem.o: $(ARM_ARCH)/physmem.c $(ARM_ARCH)/physmem.h $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
+
+$(ARM_BUILD)/paging.o: $(ARM_ARCH)/paging.c $(ARM_ARCH)/paging.h $(ARM_ARCH)/physmem.h $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
+
+$(ARM_BUILD)/paging_enable.o: $(ARM_ARCH)/paging_enable.S
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_ASFLAGS) -c $< -o $@
 
 $(ARM_BUILD)/alloc.o: kernel/core/alloc.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
@@ -138,4 +175,4 @@ aarch64: $(ARM_BUILD)/Image
 # uses them).
 ARM_SMOKE_TIMEOUT ?= 15
 smoke-aarch64: $(ARM_BUILD)/Image
-	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_PHYSALLOC)),--phys-alloc,) $(if $(filter 1,$(ARM_REQUIRE)),--require,)
+	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_PHYSALLOC)),--phys-alloc,) $(if $(ARM_MMU_FAULT_SET),--mmu-fault $(ARM_MMU_FAULT_SMOKE_$(ARM_MMU_FAULT)),) $(if $(filter 1,$(ARM_REQUIRE)),--require,)

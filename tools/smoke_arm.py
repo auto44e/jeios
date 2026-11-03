@@ -59,7 +59,8 @@ Discipline (mirrors the x86 smoke harness + the ADR 0002 D6 evidence rule):
     virt-8.2 / cortex-a72 profile);
   - --phys-alloc (MP2 PR-1a, ADR 0011 D5) pins the physmem bring-up block and
     runs an INDEPENDENT oracle: the block must be contiguous, between the
-    "validated" and terminal lines, in the exact grammar order main.c emits;
+    "validated" and the MMU marker block, in the exact grammar order main.c
+    emits;
     every input it prints is cross-bound to a source the kernel does not
     control here (window == pinned constants, kernel reserve == ELF
     [_text,_end), dtb reserve == recorded dtb pointer + fixture totalsize,
@@ -67,6 +68,14 @@ Discipline (mirrors the x86 smoke harness + the ADR 0002 D6 evidence rule):
     then recomputed from first principles (page fully inside some RAM range
     AND touching no reservation) and the kernel's free/alloc1/allocmax/overcap
     values must agree with it. The kernel's own count is never trusted;
+  - every good-boot mode runs the MMU oracle (MP2 PR-1b, ADR 0011): the 7
+    mmu lines form one contiguous block and each value is recomputed from the
+    ELF symtab / DDI0487 layouts (map ranges, guard, root, leaf count, exact
+    SCTLR incl. M|C|I|WXN and EE=0, PAR F/PA/ATTR/SH/FST) — never trusted;
+  - --mmu-fault NAME (ARM_MMU_FAULT build) pins the deliberate W^X / guard
+    fault: AT probes, raw ESR fields (EC, IL, FSC, WnR, S1PTW/CM/EA/FnV),
+    FAR/ELR/VBAR against ELF symbols bound to the Image, the in-kernel PASS
+    line and the halted terminal. TCG has no caches: no cache evidence;
   - SKIP (exit 0, clearly labelled) if the aarch64 toolchain /
     qemu-system-aarch64 / image is unavailable — never report PASS when nothing
     ran. With --require (remote CI) every such SKIP is a FAIL (exit 1), and
@@ -573,7 +582,21 @@ DTB_PTR_RE = re.compile(rb"JeiOS/aarch64: dtb pointer recorded dtb=" + H)
 DTB_PARSED_RE = re.compile(rb"JeiOS/aarch64: dtb parsed ram=(\d+) rsv=(\d+) "
                            rb"ignored=(\d+) dynamic=(\d+) initrd=([01])")
 DTB_RAM_RE = re.compile(rb"JeiOS/aarch64:   ram\[(\d+)\] base=" + H + rb" size=" + H)
-
+MMU = b"JeiOS/aarch64: mmu "
+MMU_FAULT_PREFIX = MMU + b"fault "
+MMU_BUILD_RE = re.compile(MMU + rb"build root=" + H)
+MMU_MAP_RE = re.compile(
+    MMU + rb"map text=\[" + H + rb"," + H +
+    rb"\) rodata=\[" + H + rb"," + H +
+    rb"\) data=\[" + H + rb"," + H +
+    rb"\) device=" + H)
+MMU_AUDIT_RE = re.compile(MMU + rb"audit ok leaves=" + H)
+MMU_ENABLED_RE = re.compile(MMU + rb"enabled sctlr=" + H)
+MMU_XLATE_RE = re.compile(MMU + rb"xlate mapped va=" + H + rb" par=" + H)
+MMU_GUARD_RE = re.compile(MMU + rb"xlate guard va=" + H + rb" par=" + H)
+MMU_UART_RE = re.compile(MMU + rb"attr uart va=" + H + rb" par=" + H)
+MMU_BLOCK_RES = (MMU_BUILD_RE, MMU_MAP_RE, MMU_AUDIT_RE, MMU_ENABLED_RE,
+                 MMU_XLATE_RE, MMU_GUARD_RE, MMU_UART_RE)
 
 def phys_alloc_markers():
     """Ordered whole-line markers for the pinned -m 256M fixture (one RAM
@@ -593,6 +616,308 @@ def phys_alloc_markers():
         valued(PM + b"allocmax pa=<hex>", PM_ALLOCMAX_RE.pattern),
         valued(PM + b"overcap rejected pages=<hex>", PM_OVERCAP_RE.pattern),
     ]
+
+
+def mmu_markers():
+    """Ordered default MMU-enable markers (ADR 0011 D2/D3/D4/D6/D7)."""
+    return [
+        valued(MMU + b"build root=<hex>", MMU_BUILD_RE.pattern),
+        valued(MMU + b"map text/rodata/data/device", MMU_MAP_RE.pattern),
+        valued(MMU + b"audit ok leaves=<hex>", MMU_AUDIT_RE.pattern),
+        valued(MMU + b"enabled sctlr=<hex>", MMU_ENABLED_RE.pattern),
+        valued(MMU + b"xlate mapped va=<hex> par=<hex>", MMU_XLATE_RE.pattern),
+        valued(MMU + b"xlate guard va=<hex> par=<hex>", MMU_GUARD_RE.pattern),
+        valued(MMU + b"attr uart va=<hex> par=<hex>", MMU_UART_RE.pattern),
+    ]
+
+
+# ---- MMU oracle (MP2 PR-1b, ADR 0011 D2/D3/D4/D7) ---------------------------
+# Runs in EVERY good-boot mode. Nothing the kernel prints is trusted as a
+# verdict: every value is recomputed from the ELF symtab or from the
+# architecture's bit layouts (DDI0487 D19 PAR_EL1, D17.2 ESR_EL1) and compared.
+# QEMU TCG models no caches: none of this is cache-maintenance evidence; it
+# proves TRANSLATION and PERMISSIONS only.
+PL011_PA = 0x09000000
+SCTLR_INTERIM = 0x30D00808     # boot.S MP1 SCTLR_EL1 (RES1 + SA), MMU/caches off
+SCTLR_M, SCTLR_C, SCTLR_I, SCTLR_WXN, SCTLR_EE = 1 << 0, 1 << 2, 1 << 12, 1 << 19, 1 << 25
+SCTLR_SET = SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_WXN
+MAIR_NORMAL_WB, MAIR_DEVICE_NGNRNE = 0xFF, 0x00
+FSC_TRANSLATION_L3, FSC_PERMISSION_L3 = 0x07, 0x0F
+MMU_LAYOUT_SYMS = (b"_text", b"__text_end", b"__rodata_end", b"__data_end",
+                   b"__stack_guard", b"__stack_bottom", b"_end",
+                   b"je_arm_vectors")
+A64_RET = 0xD65F03C0
+# STR Xt, [Xn, #0] (unsigned-offset, 64-bit) with Rt == XZR; Rn free.
+A64_STR_XZR_MASK, A64_STR_XZR_BITS = 0xFFFFFC1F, 0xF900001F
+
+
+def resolve_syms(elf_path, names, what):
+    """{name: address} for each name, exactly one defined copy, from the ELF."""
+    try:
+        if os.path.getsize(elf_path) > ELF_MAX:
+            fail(f"{what}: --elf {elf_path} larger than {ELF_MAX} bytes")
+        with open(elf_path, "rb") as f:
+            data = f.read(ELF_MAX + 1)
+        syms = elf_defined_symbols(data, names)
+    except (OSError, ElfError) as e:
+        fail(f"{what}: cannot read symbols from --elf {elf_path}: {e}")
+    out = {}
+    for n in names:
+        if len(syms[n]) != 1:
+            fail(f"{what}: need exactly one defined {n.decode()} in {elf_path}, "
+                 f"found {syms[n]}")
+        out[n] = syms[n][0][0]
+    return out
+
+
+def image_word(image, text, addr, what):
+    off = addr - text
+    if off < 0 or off + 4 > len(image):
+        fail(f"{what}: 0x{addr:x} outside the Image [0x{text:x},+0x{len(image):x})")
+    return int.from_bytes(image[off:off + 4], "little")
+
+
+def par_expect_ok(par, va, attr, sh, what):
+    """PAR_EL1 after a successful AT (F=0): PA[47:12] must equal the probed VA's
+    frame (identity map, recomputed here), ATTR[63:56] and SH[8:7] as given."""
+    if par & 1:
+        fail(f"{what}: PAR=0x{par:016x} has F=1; VA 0x{va:x} must translate")
+    pa = par & 0x0000FFFFFFFFF000
+    if pa != (va & 0x0000FFFFFFFFF000):
+        fail(f"{what}: PAR.PA=0x{pa:x} != identity frame of VA 0x{va:x}")
+    if (par >> 56) & 0xFF != attr:
+        fail(f"{what}: PAR.ATTR=0x{(par >> 56) & 0xFF:02x} != 0x{attr:02x}")
+    if (par >> 7) & 3 != sh:
+        fail(f"{what}: PAR.SH=0b{(par >> 7) & 3:02b} != 0b{sh:02b}")
+
+
+def par_expect_fault(par, fst, what):
+    """PAR_EL1 after a faulting AT (F=1): FST[6:1] must be the given stage-1
+    fault, PTW[8]=0 (not a walk fault), S[9]=0 (stage 1)."""
+    if not par & 1:
+        fail(f"{what}: PAR=0x{par:016x} has F=0; the access must NOT translate")
+    if (par >> 1) & 0x3F != fst:
+        fail(f"{what}: PAR.FST=0x{(par >> 1) & 0x3F:02x} != 0x{fst:02x}")
+    if (par >> 8) & 1 or (par >> 9) & 1:
+        fail(f"{what}: PAR=0x{par:016x} reports PTW/S2 fault; expected stage-1 leaf fault")
+
+
+def mmu_expected_leaves(regions_pages, root):
+    """Independent leaf count for the audit line: every mapped 4 KiB page of the
+    requested regions, plus one RW identity leaf per page-table frame. The table
+    frames are modelled as a contiguous first-fit run [root, root + T pages)
+    from the PR-1a allocator (root is the first allocation); T is the number of
+    distinct L0/L1/L2/L3 tables the full VA set needs, iterated to a fixed point
+    because mapping a table frame can itself need a new table. If the allocator
+    ever stops being first-fit-contiguous this check FAILS (never false-passes)
+    and must be re-derived."""
+    base = set(regions_pages)
+    tables = 1
+    while True:
+        vas = base | {root + i * PHYS_PAGE for i in range(tables)}
+        need = 1 + len({va >> 39 for va in vas}) + len({va >> 30 for va in vas}) \
+            + len({va >> 21 for va in vas})
+        if need == tables:
+            return len(vas), tables
+        tables = need
+
+
+def check_mmu(lines, syms):
+    """Default MMU block: one contiguous block of the 7 lines, each value
+    recomputed independently. Returns the parsed block for later checks."""
+    idx = [i for i, ln in enumerate(lines)
+           if ln.startswith(MMU) and not ln.startswith(MMU_FAULT_PREFIX)]
+    if len(idx) != len(MMU_BLOCK_RES) or idx != list(range(idx[0], idx[0] + len(idx))):
+        fail(f"mmu: expected one contiguous block of {len(MMU_BLOCK_RES)} mmu lines, "
+             f"found {len(idx)} at {idx}")
+    m = []
+    for i, rx in zip(idx, MMU_BLOCK_RES):
+        g = rx.fullmatch(lines[i])
+        if g is None:
+            fail(f"mmu: unknown/out-of-order mmu line {lines[i].decode('ascii', 'replace')!r}")
+        m.append([int(x, 16) for x in g.groups()])
+    (root,), mp, (leaves,), (sctlr,), (x_va, x_par), (g_va, g_par), (u_va, u_par) = m
+
+    s = syms
+    want_map = [s[b"_text"], s[b"__text_end"], s[b"__text_end"], s[b"__rodata_end"],
+                s[b"__rodata_end"], s[b"__data_end"], PL011_PA]
+    if mp != want_map:
+        fail("mmu map: kernel " + " ".join(f"0x{v:x}" for v in mp) +
+             " != ELF " + " ".join(f"0x{v:x}" for v in want_map))
+    if s[b"__stack_guard"] != s[b"__data_end"] or \
+            s[b"__stack_bottom"] != s[b"__stack_guard"] + PHYS_PAGE:
+        fail(f"mmu: ELF guard layout broken: __data_end=0x{s[b'__data_end']:x} "
+             f"__stack_guard=0x{s[b'__stack_guard']:x} __stack_bottom=0x{s[b'__stack_bottom']:x}")
+    if root % PHYS_PAGE or not PHYS_WINDOW[0] <= root < PHYS_WINDOW[1] or \
+            s[b"_text"] <= root < s[b"_end"]:
+        fail(f"mmu build: root=0x{root:x} not a page in the allocator window "
+             f"outside the image [0x{s[b'_text']:x},0x{s[b'_end']:x})")
+
+    pages = []
+    for lo, hi in ((s[b"_text"], s[b"__data_end"]), (s[b"__stack_bottom"], s[b"_end"]),
+                   (PL011_PA, PL011_PA + PHYS_PAGE)):
+        pages += range(lo, hi, PHYS_PAGE)
+    if s[b"__stack_guard"] in pages:
+        fail("mmu: oracle bug: guard page in the mapped set")
+    want_leaves, tables = mmu_expected_leaves(pages, root)
+    if leaves != want_leaves:
+        fail(f"mmu audit: leaves=0x{leaves:x} != independent count 0x{want_leaves:x} "
+             f"({len(pages)} region pages + {tables} table frames)")
+
+    if sctlr & SCTLR_SET != SCTLR_SET:
+        fail(f"mmu enabled: sctlr=0x{sctlr:x} missing "
+             f"{[n for n, b in (('M', SCTLR_M), ('C', SCTLR_C), ('I', SCTLR_I), ('WXN', SCTLR_WXN)) if not sctlr & b]}")
+    if sctlr & SCTLR_EE:
+        fail(f"mmu enabled: sctlr=0x{sctlr:x} has EE=1 (must stay little-endian)")
+    if sctlr != SCTLR_INTERIM | SCTLR_SET:
+        fail(f"mmu enabled: sctlr=0x{sctlr:x} != interim 0x{SCTLR_INTERIM:x} | "
+             f"M|C|I|WXN (0x{SCTLR_INTERIM | SCTLR_SET:x}); a bit beyond the pinned set changed")
+
+    if x_va != s[b"_text"]:
+        fail(f"mmu xlate mapped: va=0x{x_va:x} != ELF _text 0x{s[b'_text']:x}")
+    # RAM probe: Normal WB (MAIR Attr0 0xff), Inner Shareable (0b11).
+    par_expect_ok(x_par, x_va, MAIR_NORMAL_WB, 0b11, "mmu xlate mapped")
+    if g_va != s[b"__stack_guard"]:
+        fail(f"mmu xlate guard: va=0x{g_va:x} != ELF __stack_guard 0x{s[b'__stack_guard']:x}")
+    par_expect_fault(g_par, FSC_TRANSLATION_L3, "mmu xlate guard")
+    if u_va != PL011_PA:
+        fail(f"mmu attr uart: va=0x{u_va:x} != PL011 0x{PL011_PA:x}")
+    # Device-nGnRnE (MAIR Attr1 0x00). PAR.SH reads 0b10 for Device memory
+    # (DDI0487 PAR_EL1.SH: Device / Normal-NC are reported Outer Shareable).
+    par_expect_ok(u_par, u_va, MAIR_DEVICE_NGNRNE, 0b10, "mmu attr uart")
+    print(f"mmu:   root=0x{root:x} leaves=0x{leaves:x} (== {len(pages)} region pages + "
+          f"{tables} tables, ELF) sctlr=0x{sctlr:x} (M|C|I|WXN, EE=0)")
+    print(f"mmu:   PAR mapped=0x{x_par:016x} (F=0 PA==VA ATTR=0xff SH=IS) "
+          f"guard=0x{g_par:016x} (F=1 FST=xlate L3) uart=0x{u_par:016x} "
+          f"(F=0 PA==VA ATTR=0x00)")
+
+
+# ---- --mmu-fault (MP2 PR-1b deliberate W^X / guard faults) ------------------
+# name -> (target symbol, ESR EC, FSC, WnR, data-abort?, PAR_R spec, PAR_W spec,
+#          section-range symbols the target must lie in)
+# PAR spec: None = must translate (Normal WB, IS), int = must fault with FST.
+MMU_FAULTS = {
+    "write-to-text": (b"je_arm_mmu_fault_text_target", 0x25, FSC_PERMISSION_L3, 1,
+                      None, FSC_PERMISSION_L3, (b"_text", b"__text_end")),
+    "execute-from-data": (b"je_arm_mmu_fault_data_insn", 0x21, FSC_PERMISSION_L3, 0,
+                          None, None, (b"__rodata_end", b"__data_end")),
+    "execute-from-rodata": (b"je_arm_mmu_fault_rodata_insn", 0x21, FSC_PERMISSION_L3, 0,
+                            None, FSC_PERMISSION_L3, (b"__text_end", b"__rodata_end")),
+    "stack-guard": (b"__stack_guard", 0x25, FSC_TRANSLATION_L3, 1,
+                    FSC_TRANSLATION_L3, FSC_TRANSLATION_L3, (b"__stack_guard", b"__stack_bottom")),
+}
+MMU_FAULT_PASS = {
+    "write-to-text": b"JeiOS/aarch64: mmu fault self-test PASS write-to-text (DABT_CUR ec=0x25 dfsc=0x0f permission L3 WnR=1; FAR==.text target; ELR==store site)",
+    "execute-from-data": b"JeiOS/aarch64: mmu fault self-test PASS execute-from-data (IABT_CUR ec=0x21 ifsc=0x0f permission L3; FAR==ELR==.data buffer proven RW)",
+    "execute-from-rodata": b"JeiOS/aarch64: mmu fault self-test PASS execute-from-rodata (IABT_CUR ec=0x21 ifsc=0x0f permission L3; FAR==ELR==.rodata target)",
+    "stack-guard": b"JeiOS/aarch64: mmu fault self-test PASS stack-guard (DABT_CUR ec=0x25 dfsc=0x07 translation L3 WnR=1; FAR==__stack_guard; ELR==store site)",
+}
+STORE_SITE_SYM = b"je_arm_mmu_fault_store_site"
+MMU_FAULT_TEST_RE = re.compile(MMU_FAULT_PREFIX + rb"test ([a-z-]+) target=" + H
+                               + rb" par_r=" + H + rb" par_w=" + H)
+EXC_ESR_RE = re.compile(rb"JeiOS/aarch64:   esr=" + H + rb" elr=" + H + rb" spsr=" + H)
+EXC_FAR_RE = re.compile(rb"JeiOS/aarch64:   far=" + H + rb" vbar=" + H)
+
+
+def mmu_fault_expect(name, elf_path, image_path, syms):
+    """Expected values for one fault mode, all from the ELF + architecture
+    encodings, with the ELF bound to the booted Image by instruction words."""
+    tsym, ec, fsc, wnr, _, _, (lo, hi) = MMU_FAULTS[name]
+    fs = resolve_syms(elf_path, (tsym, STORE_SITE_SYM) if wnr else (tsym,),
+                      f"--mmu-fault {name}")
+    target = fs[tsym]
+    if not syms[lo] <= target < syms[hi]:
+        fail(f"--mmu-fault {name}: target 0x{target:x} not inside "
+             f"[{lo.decode()}=0x{syms[lo]:x},{hi.decode()}=0x{syms[hi]:x})")
+    with open(image_path, "rb") as f:
+        image = f.read()
+    text = syms[b"_text"]
+    if name != "stack-guard":
+        w = image_word(image, text, target, f"--mmu-fault {name}")
+        if w != A64_RET:
+            fail(f"--mmu-fault {name}: Image word at target is 0x{w:08x}, not RET; "
+                 f"ELF/Image mismatch")
+    if wnr:
+        elr = fs[STORE_SITE_SYM]
+        w = image_word(image, text, elr, f"--mmu-fault {name}")
+        if w & A64_STR_XZR_MASK != A64_STR_XZR_BITS:
+            fail(f"--mmu-fault {name}: Image word at store site is 0x{w:08x}, not "
+                 f"STR XZR,[Xn]; ELF/Image mismatch")
+    else:
+        elr = target          # instruction abort: the faulting fetch IS the target
+    # ISS = FSC | WnR<<6; ISV/SAS/SRT (ISS[24:14]) are 0 for an EL1-taken abort
+    # on QEMU 8.2 (pinned); CM/S1PTW/EA/FnV must be 0. IL=1 (32-bit insn).
+    iss = fsc | (wnr << 6)
+    esr = (ec << 26) | (1 << 25) | iss
+    return target, elr, esr, iss, ec
+
+
+def mmu_fault_markers(name, exp):
+    target, elr, esr, iss, ec = exp
+    return [
+        valued(MMU_FAULT_PREFIX + b"test " + name.encode() + b" target=<hex> par_r=<hex> par_w=<hex>",
+               re.escape(MMU_FAULT_PREFIX + b"test " + name.encode() + b" target=" + hx(target))
+               + rb" par_r=" + HEX16 + rb" par_w=" + HEX16),
+        exact(b"JeiOS/aarch64: EXCEPTION vector=0x0000000000000004 ec=" + hx(ec)
+              + b" il=0x0000000000000001 iss=" + hx(iss)),
+        valued(b"JeiOS/aarch64:   esr=<exact> elr=<exact> spsr=<hex>",
+               re.escape(b"JeiOS/aarch64:   esr=" + hx(esr) + b" elr=" + hx(elr)
+                         + b" spsr=") + HEX16),
+        valued(b"JeiOS/aarch64:   far=<exact> vbar=<hex>",
+               re.escape(b"JeiOS/aarch64:   far=" + hx(target) + b" vbar=") + HEX16),
+        exact(MMU_FAULT_PASS[name]),
+        exact(b"JeiOS/aarch64: exception handled; halted"),
+    ]
+
+
+def check_mmu_fault(lines, name, exp, syms):
+    """Re-decode the raw syndrome lines field by field (not only the in-kernel
+    PASS), and the pre-access AT probes, so a bug in the kernel's comparator or
+    a wrong mapping class cannot yield a false PASS."""
+    target, elr, esr, _, ec = exp
+    _, _, fsc, wnr, par_r_spec, par_w_spec, _ = MMU_FAULTS[name]
+    t = [MMU_FAULT_TEST_RE.fullmatch(ln) for ln in lines]
+    t = [g for g in t if g]
+    if len(t) != 1 or t[0].group(1).decode() != name:
+        fail(f"--mmu-fault {name}: expected exactly one 'mmu fault test {name}' line")
+    tgt, par_r, par_w = (int(x, 16) for x in t[0].groups()[1:])
+    ti = next(i for i, ln in enumerate(lines) if MMU_FAULT_TEST_RE.fullmatch(ln))
+    if MMU_UART_RE.fullmatch(lines[ti - 1]) is None:
+        fail(f"--mmu-fault {name}: fault test line must directly follow the MMU block")
+    if tgt != target:
+        fail(f"--mmu-fault {name}: target=0x{tgt:x} != ELF 0x{target:x}")
+    for par, spec, what in ((par_r, par_r_spec, "par_r (AT S1E1R)"),
+                            (par_w, par_w_spec, "par_w (AT S1E1W)")):
+        if spec is None:
+            par_expect_ok(par, target, MAIR_NORMAL_WB, 0b11, f"--mmu-fault {name} {what}")
+        else:
+            par_expect_fault(par, spec, f"--mmu-fault {name} {what}")
+    e = [EXC_ESR_RE.fullmatch(ln) for ln in lines]
+    e = [g for g in e if g]
+    f = [EXC_FAR_RE.fullmatch(ln) for ln in lines]
+    f = [g for g in f if g]
+    if len(e) != 1 or len(f) != 1:
+        fail(f"--mmu-fault {name}: expected exactly one esr and one far line "
+             f"(a second exception means the handler itself faulted)")
+    r_esr, r_elr, r_spsr = (int(x, 16) for x in e[0].groups())
+    r_far, r_vbar = (int(x, 16) for x in f[0].groups())
+    iss = r_esr & 0x1FFFFFF
+    got = {"EC": r_esr >> 26 & 0x3F, "IL": r_esr >> 25 & 1, "FSC": iss & 0x3F,
+           "WnR": iss >> 6 & 1, "S1PTW": iss >> 7 & 1, "CM": iss >> 8 & 1,
+           "EA": iss >> 9 & 1, "FnV": iss >> 10 & 1}
+    want = {"EC": ec, "IL": 1, "FSC": fsc, "WnR": wnr, "S1PTW": 0, "CM": 0,
+            "EA": 0, "FnV": 0}
+    if got != want or r_esr != esr:
+        fail(f"--mmu-fault {name}: ESR=0x{r_esr:x} fields {got} != {want}")
+    if r_far != target or r_elr != elr:
+        fail(f"--mmu-fault {name}: FAR=0x{r_far:x} ELR=0x{r_elr:x}, want "
+             f"FAR=0x{target:x} ELR=0x{elr:x}")
+    if r_spsr & 0x1F != 0x5 or (r_spsr >> 6) & 0xF != 0xF:
+        fail(f"--mmu-fault {name}: SPSR=0x{r_spsr:x} not EL1h with DAIF masked")
+    if r_vbar != syms[b"je_arm_vectors"]:
+        fail(f"--mmu-fault {name}: VBAR=0x{r_vbar:x} != ELF je_arm_vectors")
+    print(f"fault: {name} ESR=0x{r_esr:08x} (EC=0x{ec:02x} FSC=0x{fsc:02x} WnR={wnr}) "
+          f"FAR=0x{r_far:x} ELR=0x{r_elr:x} par_r=0x{par_r:016x} par_w=0x{par_w:016x}")
 
 
 def one(lines, rx, what):
@@ -642,14 +967,18 @@ def check_phys_alloc(lines, fx, image_extent):
     # Grammar: all physmem lines form ONE contiguous block right after the
     # "validated" line and right before the terminal line, in main.c's order:
     # window, kernel, dtb, [initrd], ram+, rsv*, free, alloc1, free1, allocmax,
-    # overcap. Any unknown physmem line is a FAIL.
+    # overcap. Any unknown physmem line is a FAIL. PR-1b then emits the
+    # contiguous MMU marker block before the terminal line.
     idx = [i for i, ln in enumerate(lines) if ln.startswith(PM)]
     if not idx or idx != list(range(idx[0], idx[0] + len(idx))):
         fail("--phys-alloc: physmem lines missing or not one contiguous block")
     if VALIDATED_RE.fullmatch(lines[idx[0] - 1]) is None:
         fail("--phys-alloc: physmem block does not directly follow 'validated'")
-    if lines[idx[-1] + 1] != TERM_DEFAULT:
-        fail("--phys-alloc: physmem block not directly followed by the terminal line")
+    after = idx[-1] + 1
+    while after < len(lines) and lines[after].startswith(MMU):
+        after += 1
+    if after >= len(lines) or lines[after] != TERM_DEFAULT:
+        fail("--phys-alloc: physmem block not followed by the MMU block and terminal line")
     block = [lines[i] for i in idx]
     pos = 0
 
@@ -799,6 +1128,9 @@ def main():
     ap.add_argument("--phys-alloc", action="store_true",
                     help="assert the physmem bring-up block and recompute its "
                          "free-page count with an independent oracle")
+    ap.add_argument("--mmu-fault", choices=sorted(MMU_FAULTS), metavar="NAME",
+                    help="expect the ARM_MMU_FAULT deliberate fault: "
+                         + ", ".join(sorted(MMU_FAULTS)))
     ap.add_argument("--require", action="store_true",
                     help="missing QEMU/toolchain/image is a FAIL, not a SKIP")
     ap.add_argument("--elf", metavar="PATH",
@@ -820,6 +1152,9 @@ def main():
              "rejection halts before the BRK)")
     if args.phys_alloc and (args.dtb_bad or args.vector_test):
         fail("--phys-alloc is only valid with the default good-boot build")
+    if args.mmu_fault and (args.dtb_bad or args.vector_test or args.phys_alloc
+                           or args.bss_verified):
+        fail("--mmu-fault is only valid alone (its build excludes the other toggles)")
     qemu = args.qemu
     if shutil.which(qemu) is None:
         skip(f"{qemu} not installed")
@@ -845,11 +1180,14 @@ def main():
     elf = args.elf or os.path.join(os.path.dirname(args.image), "jeios-arm.elf")
     # The ELF is the only source of the expected ELR, so under --vector-test it
     # is mandatory (FAIL, never SKIP); --require demands it in every mode.
-    if not os.path.isfile(elf) and (args.vector_test or args.phys_alloc
-                                    or args.require):
-        fail(f"{'--vector-test' if args.vector_test else '--phys-alloc' if args.phys_alloc else '--require'}: "
-             f"ELF {elf} not found")
+    # Every good-boot mode runs the MMU oracle, which needs the ELF: missing is
+    # a FAIL (never a SKIP) outside --dtb-bad.
+    if not os.path.isfile(elf) and (not args.dtb_bad or args.require):
+        fail(f"{'--require' if args.dtb_bad else 'MMU oracle'}: ELF {elf} not found")
     image_extent = resolve_image_extent(elf) if args.phys_alloc else None
+    mmu_syms = None if args.dtb_bad else resolve_syms(elf, MMU_LAYOUT_SYMS, "mmu")
+    fault_exp = (mmu_fault_expect(args.mmu_fault, elf, args.image, mmu_syms)
+                 if args.mmu_fault else None)
 
     markers = list(BASE_MARKERS)
     markers[3] = exact(b"JeiOS/aarch64: bss clear verified" if args.bss_verified
@@ -865,11 +1203,14 @@ def main():
         ]
     else:
         markers += dtb_good_markers()
+        if args.phys_alloc:
+            markers += phys_alloc_markers()
+        markers += mmu_markers()
         if args.vector_test:
             markers += vector_test_markers(resolve_brk_site(elf, args.image))
+        elif args.mmu_fault:
+            markers += mmu_fault_markers(args.mmu_fault, fault_exp)
         else:
-            if args.phys_alloc:
-                markers += phys_alloc_markers()
             markers += [exact(TERM_DEFAULT)]
     # Every mode ends on a fixed (exact) line; that line is the terminal marker.
     final_line = markers[-1][0]
@@ -951,6 +1292,10 @@ def main():
     check_dtb_copied(lines, fx)
     if args.phys_alloc:
         check_phys_alloc(lines, fx, image_extent)
+    if not args.dtb_bad:
+        check_mmu(lines, mmu_syms)
+    if args.mmu_fault:
+        check_mmu_fault(lines, args.mmu_fault, fault_exp, mmu_syms)
 
     if early:
         # Defensive: an early stop means a FATAL / forbidden marker was seen,
