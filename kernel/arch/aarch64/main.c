@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <jeios/fdt.h>
+#include "physmem.h"
 #include "trapframe.h"
 
 /* MP1 reentrancy guard (vectors.S): 0 outside a handler, 1 inside. A nested
@@ -271,6 +272,8 @@ _Static_assert(JE_FDT_MAX_COPY == 0x10000u,
                "linker.ld copy-buffer ASSERT hard-codes 64 KiB");
 uint8_t je_arm_dtb_copy[JE_FDT_MAX_COPY] __attribute__((aligned(16)));
 static je_boot_ctx je_arm_boot_ctx;
+static je_boot_facts je_arm_facts;
+static je_pages je_arm_pages;
 extern uint8_t _text[], _end[];   /* IMAGE extent [_text, _end), linker.ld */
 
 static inline uint64_t read_id_aa64mmfr0_el1(void)
@@ -481,6 +484,158 @@ static void dtb_intake(void)
     console_write("JeiOS/aarch64: boot context validated pa_bits=");
     console_dec(pa_bits);
     console_write("\r\n");
+    je_arm_facts.kernel_image = facts.kernel_image;
+    je_arm_facts.dtb_src = facts.dtb_src;
+    je_arm_facts.pa_bits = facts.pa_bits;
+}
+
+/*
+ * Marker sequence emitted by every successful physmem bring-up:
+ *   JeiOS/aarch64: physmem window base=<hex> limit=<hex>
+ *   JeiOS/aarch64: physmem reserve kind=kernel base=<hex> size=<hex>
+ *   JeiOS/aarch64: physmem reserve kind=dtb base=<hex> size=<hex>
+ *   JeiOS/aarch64: physmem reserve kind=initrd base=<hex> size=<hex>
+ *   JeiOS/aarch64: physmem ram base=<hex> size=<hex>
+ *   JeiOS/aarch64: physmem reserve kind=rsv base=<hex> size=<hex> nomap=<0|1>
+ *   JeiOS/aarch64: physmem unmanaged ram bytes=<hex>
+ *   JeiOS/aarch64: physmem free pages=<hex> bytes=<hex>
+ *   JeiOS/aarch64: physmem alloc1 pa=<hex>
+ *   JeiOS/aarch64: physmem free1 ok
+ *   JeiOS/aarch64: physmem allocmax pa=<hex>
+ *   JeiOS/aarch64: physmem overcap rejected pages=<hex>
+ *
+ * The initrd line is conditional, and RAM/reservation lines repeat in input
+ * order. The exact marker order is window, kernel, DTB, optional initrd, RAM,
+ * kept reservations, free summary, alloc/free proof, max-run alloc, over-cap reject.
+ */
+static void physmem_print_range(const char *kind, je_range range)
+{
+    console_write("JeiOS/aarch64: physmem reserve kind=");
+    console_write(kind);
+    console_write(" base=");
+    console_hex(range.base);
+    console_write(" size=");
+    console_hex(range.size);
+    console_write("\r\n");
+}
+
+_Noreturn static void physmem_fatal(const char *operation, je_status status)
+{
+    console_write("JeiOS/aarch64: FATAL physmem ");
+    console_write(operation);
+    console_write(" status=");
+    console_dec((uint64_t)status);
+    console_write("\r\n");
+    halt();
+}
+
+static void physmem_bringup(void)
+{
+    je_arm_physmem_view view = {
+        .ctx = &je_arm_boot_ctx,
+        .kernel = je_arm_facts.kernel_image,
+        .dtb = je_arm_facts.dtb_src,
+    };
+    je_status status = je_arm_physmem_init(&je_arm_pages, &view);
+    if (status != JE_OK) physmem_fatal("init", status);
+
+    console_write("JeiOS/aarch64: physmem window base=");
+    console_hex(JE_PHYSICAL_BASE);
+    console_write(" limit=");
+    console_hex(JE_PHYSICAL_LIMIT);
+    console_write("\r\n");
+    physmem_print_range("kernel", view.kernel);
+    physmem_print_range("dtb", view.dtb);
+    if (view.ctx->has_initrd) physmem_print_range("initrd", view.ctx->initrd);
+    for (uint32_t i = 0u; i < view.ctx->ram_count && i < JE_FDT_MAX_RAM; ++i) {
+        console_write("JeiOS/aarch64: physmem ram base=");
+        console_hex(view.ctx->ram[i].base);
+        console_write(" size=");
+        console_hex(view.ctx->ram[i].size);
+        console_write("\r\n");
+    }
+    for (uint32_t i = 0u; i < view.ctx->rsv_count && i < JE_FDT_MAX_RSV; ++i) {
+        console_write("JeiOS/aarch64: physmem reserve kind=rsv base=");
+        console_hex(view.ctx->rsv[i].base);
+        console_write(" size=");
+        console_hex(view.ctx->rsv[i].size);
+        console_write(" nomap=");
+        console_putc(view.ctx->rsv_nomap[i] != 0u ? '1' : '0');
+        console_write("\r\n");
+    }
+
+    /*
+     * Degraded-profile honesty (AGENTS.md rule 5): the allocator window is fixed
+     * at [JE_PHYSICAL_BASE, JE_PHYSICAL_LIMIT). Any DTB RAM lying OUTSIDE that
+     * window (e.g. booting with -m > 256M, or RAM below the base) is not managed
+     * by this PR. Report those bytes EXPLICITLY rather than silently dropping
+     * them, so an operator sees the kernel is using less RAM than the board has.
+     * Widening the window to 64-bit dynamic sizing is a recorded ADR 0011 flex.
+     */
+    uint64_t unmanaged = 0u;
+    for (uint32_t i = 0u; i < view.ctx->ram_count && i < JE_FDT_MAX_RAM; ++i) {
+        uint64_t b = view.ctx->ram[i].base;
+        uint64_t e = b + view.ctx->ram[i].size;      /* parser guarantees no overflow */
+        if (b < JE_PHYSICAL_BASE)  unmanaged += (e < JE_PHYSICAL_BASE  ? e : JE_PHYSICAL_BASE)  - b;
+        if (e > JE_PHYSICAL_LIMIT) unmanaged += e - (b > JE_PHYSICAL_LIMIT ? b : JE_PHYSICAL_LIMIT);
+    }
+    console_write("JeiOS/aarch64: physmem unmanaged ram bytes=");
+    console_hex(unmanaged);
+    console_write("\r\n");
+
+    size_t free_count = je_arm_pages.free_count;
+    console_write("JeiOS/aarch64: physmem free pages=");
+    console_hex((uint64_t)free_count);
+    console_write(" bytes=");
+    console_hex((uint64_t)free_count * JE_PAGE_SIZE);
+    console_write("\r\n");
+
+    uint64_t physical = 0u;
+    status = je_pages_alloc(&je_arm_pages, 1u, &physical);
+    if (status != JE_OK) physmem_fatal("alloc1", status);
+    console_write("JeiOS/aarch64: physmem alloc1 pa=");
+    console_hex(physical);
+    console_write("\r\n");
+    status = je_pages_free(&je_arm_pages, physical, 1u);
+    if (status != JE_OK) physmem_fatal("free1", status);
+    console_write("JeiOS/aarch64: physmem free1 ok\r\n");
+
+    free_count = je_arm_pages.free_count;
+
+    /*
+     * Real multi-page allocation over the scan path: request the maximum legal
+     * run (JE_ALLOC_MAX_PAGES), which actually walks state[] and commits a
+     * contiguous extent, then free it. This exercises the base-relative
+     * alloc/free arithmetic on a run > 1 (not just the single page above) and
+     * must restore free_count exactly.
+     */
+    uint64_t run = 0u;
+    status = je_pages_alloc(&je_arm_pages, JE_ALLOC_MAX_PAGES, &run);
+    if (status != JE_OK || je_arm_pages.free_count != free_count - JE_ALLOC_MAX_PAGES)
+        physmem_fatal("allocmax", status);
+    console_write("JeiOS/aarch64: physmem allocmax pa=");
+    console_hex(run);
+    console_write("\r\n");
+    status = je_pages_free(&je_arm_pages, run, JE_ALLOC_MAX_PAGES);
+    if (status != JE_OK || je_arm_pages.free_count != free_count)
+        physmem_fatal("freemax", status);
+
+    /*
+     * Over-cap bounds proof (NOT a rollback claim): a request larger than
+     * JE_ALLOC_MAX_PAGES is rejected as INVALID input by the allocator's tested
+     * contract BEFORE any scan, and must not touch state. The exhaustive
+     * "failed multi-page alloc frees nothing" rollback property is proven on a
+     * small fragmented window by the hosted test (tests/test_physmem.c), which
+     * can force free_count>=n with no contiguous run of n — impossible to set up
+     * cheaply on this 65k-page live window. Keeping this marker honestly labeled
+     * avoids a vacuous "rollback ok" that would pass even if rollback were broken.
+     */
+    status = je_pages_alloc(&je_arm_pages, JE_ALLOC_MAX_PAGES + 1u, &run);
+    if (status != JE_ERR_INVALID || je_arm_pages.free_count != free_count)
+        physmem_fatal("overcap", status);
+    console_write("JeiOS/aarch64: physmem overcap rejected pages=");
+    console_hex((uint64_t)je_arm_pages.free_count);
+    console_write("\r\n");
 }
 
 _Noreturn void je_arm_main(void)
@@ -541,6 +696,7 @@ _Noreturn void je_arm_main(void)
      * diagnostic, and before the vector self-test so every build exercises it.
      * Halts (FATAL marker) on any rejection. */
     dtb_intake();
+    physmem_bringup();
 #ifdef JE_ARM_VECTOR_TEST
     /* Deliberate synchronous exception: trigger the planted BRK. It vectors into
      * je_arm_exception, which asserts the exact syndrome, prints PASS, and halts

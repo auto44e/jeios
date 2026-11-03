@@ -79,10 +79,12 @@ $(BUILD)/kernel/core/image.o: kernel/core/image.c $(USER_GENERATED) $(USER_GENER
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_device
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_device
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
+	./$(BUILD)/test_physmem
+	./$(BUILD)/test_physmem_arm
 	./$(BUILD)/test_vm
 	./$(BUILD)/test_uframe
 	./$(BUILD)/test_syscall
@@ -127,6 +129,18 @@ $(BUILD)/test_boot: tests/test_boot.c kernel/core/boot.c $(wildcard include/jeio
 $(BUILD)/test_alloc: tests/test_alloc.c kernel/core/alloc.c kernel/core/boot.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_alloc.c kernel/core/alloc.c kernel/core/boot.c -o $@
+
+$(BUILD)/test_physmem: tests/test_physmem.c kernel/arch/aarch64/physmem.c kernel/arch/aarch64/physmem.h kernel/core/alloc.c kernel/core/boot.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Ikernel/arch/aarch64 -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_physmem.c kernel/arch/aarch64/physmem.c kernel/core/alloc.c kernel/core/boot.c -o $@
+
+# Second hosted build at the aarch64 nonzero window (-DJE_ARCH_AARCH64), so the
+# base-relative alloc/free arithmetic and the out-of-window wrap rejection in
+# je_pages_free actually run under ASan+UBSan (ADR 0011 D5; both PR-1a code
+# reviews flagged that base-0-only tests leave this uncovered).
+$(BUILD)/test_physmem_arm: tests/test_physmem_arm.c kernel/core/alloc.c kernel/core/boot.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -DJE_ARCH_AARCH64 -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_physmem_arm.c kernel/core/alloc.c kernel/core/boot.c -o $@
 
 $(BUILD)/test_vm: tests/test_vm.c tests/vm_fake.c kernel/core/vm.c kernel/core/alloc.c kernel/core/boot.c kernel/core/handle.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)

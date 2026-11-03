@@ -49,8 +49,10 @@ endif
 ARM_CFLAGS  := -Iinclude -std=c11 -O2 -g -Wall -Wextra -Werror -Wconversion \
                -Wshadow -Wstrict-prototypes -ffreestanding -fno-builtin \
                -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables \
-               -mstrict-align -mgeneral-regs-only -mcpu=cortex-a72
-ARM_ASFLAGS := -Iinclude -mstrict-align -mgeneral-regs-only -mcpu=cortex-a72
+               -mstrict-align -mgeneral-regs-only -mcpu=cortex-a72 \
+               -DJE_ARCH_AARCH64
+ARM_ASFLAGS := -Iinclude -mstrict-align -mgeneral-regs-only -mcpu=cortex-a72 \
+               -DJE_ARCH_AARCH64
 # Orphan sections (.got, .data.rel.ro, .init_array, ...) must not be silently
 # placed outside the image extent — make an unhandled section a build error.
 ARM_LDFLAGS := -nostdlib --orphan-handling=error
@@ -70,7 +72,7 @@ ARM_CFLAGS  += -DJE_ARM_DTB_BAD
 ARM_ASFLAGS += -DJE_ARM_DTB_BAD
 endif
 
-ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/vectors.o $(ARM_BUILD)/fdt.o
+ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/physmem.o $(ARM_BUILD)/alloc.o $(ARM_BUILD)/bootctx.o $(ARM_BUILD)/memory.o $(ARM_BUILD)/vectors.o $(ARM_BUILD)/fdt.o
 
 # Shared arch-neutral bounded DTB parser (issue #52), compiled with the ARM
 # freestanding/strict-align flags.
@@ -89,6 +91,22 @@ $(ARM_BUILD)/vectors.o: $(ARM_ARCH)/vectors.S $(ARM_ARCH)/trapframe.h
 $(ARM_BUILD)/main.o: $(ARM_ARCH)/main.c $(ARM_ARCH)/trapframe.h $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
+
+$(ARM_BUILD)/physmem.o: $(ARM_ARCH)/physmem.c $(ARM_ARCH)/physmem.h $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
+
+$(ARM_BUILD)/alloc.o: kernel/core/alloc.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
+
+$(ARM_BUILD)/bootctx.o: kernel/core/boot.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
+
+$(ARM_BUILD)/memory.o: kernel/core/memory.c
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
 
 $(ARM_BUILD)/jeios-arm.elf: $(ARM_OBJS) $(ARM_ARCH)/linker.ld
 	$(ARM_LD) $(ARM_LDFLAGS) -T $(ARM_ARCH)/linker.ld -o $@ $(ARM_OBJS)
@@ -120,4 +138,4 @@ aarch64: $(ARM_BUILD)/Image
 # uses them).
 ARM_SMOKE_TIMEOUT ?= 15
 smoke-aarch64: $(ARM_BUILD)/Image
-	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_REQUIRE)),--require,)
+	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_PHYSALLOC)),--phys-alloc,) $(if $(filter 1,$(ARM_REQUIRE)),--require,)

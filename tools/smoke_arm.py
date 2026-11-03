@@ -57,6 +57,16 @@ Discipline (mirrors the x86 smoke harness + the ADR 0002 D6 evidence rule):
     a SKIP); --require additionally demands the ELF exist in every mode;
   - assert pa_bits EXACTLY (--expect-pa-bits, default 44 for the pinned
     virt-8.2 / cortex-a72 profile);
+  - --phys-alloc (MP2 PR-1a, ADR 0011 D5) pins the physmem bring-up block and
+    runs an INDEPENDENT oracle: the block must be contiguous, between the
+    "validated" and terminal lines, in the exact grammar order main.c emits;
+    every input it prints is cross-bound to a source the kernel does not
+    control here (window == pinned constants, kernel reserve == ELF
+    [_text,_end), dtb reserve == recorded dtb pointer + fixture totalsize,
+    ram/rsv/initrd lines == the earlier "dtb parsed" lines); the free set is
+    then recomputed from first principles (page fully inside some RAM range
+    AND touching no reservation) and the kernel's free/alloc1/allocmax/overcap
+    values must agree with it. The kernel's own count is never trusted;
   - SKIP (exit 0, clearly labelled) if the aarch64 toolchain /
     qemu-system-aarch64 / image is unavailable — never report PASS when nothing
     ran. With --require (remote CI) every such SKIP is a FAIL (exit 1), and
@@ -539,6 +549,221 @@ def dtb_good_markers():
     ]
 
 
+# ---- --phys-alloc (MP2 PR-1a, ADR 0011 D5) ---------------------------------
+# Pinned allocator window for the aarch64 build (include/jeios/boot.h). The
+# oracle uses THIS, not the kernel's printed window, and requires they agree.
+PHYS_WINDOW = (0x40000000, 0x50000000)
+PHYS_PAGE = 4096
+PHYS_ALLOC_MAX_PAGES = 256  # JE_ALLOC_MAX_PAGES, include/jeios/alloc.h
+PM = rb"JeiOS/aarch64: physmem "
+H = rb"0x([0-9a-f]{16})"
+PM_WINDOW_RE = re.compile(PM + rb"window base=" + H + rb" limit=" + H)
+PM_RESERVE_RE = re.compile(PM + rb"reserve kind=(kernel|dtb|initrd) base=" + H
+                           + rb" size=" + H)
+PM_RAM_RE = re.compile(PM + rb"ram base=" + H + rb" size=" + H)
+PM_RSV_RE = re.compile(PM + rb"reserve kind=rsv base=" + H + rb" size=" + H
+                       + rb" nomap=([01])")
+PM_UNMANAGED_RE = re.compile(PM + rb"unmanaged ram bytes=" + H)
+PM_FREE_RE = re.compile(PM + rb"free pages=" + H + rb" bytes=" + H)
+PM_ALLOC1_RE = re.compile(PM + rb"alloc1 pa=" + H)
+PM_FREE1 = PM + b"free1 ok"
+PM_ALLOCMAX_RE = re.compile(PM + rb"allocmax pa=" + H)
+PM_OVERCAP_RE = re.compile(PM + rb"overcap rejected pages=" + H)
+DTB_PTR_RE = re.compile(rb"JeiOS/aarch64: dtb pointer recorded dtb=" + H)
+DTB_PARSED_RE = re.compile(rb"JeiOS/aarch64: dtb parsed ram=(\d+) rsv=(\d+) "
+                           rb"ignored=(\d+) dynamic=(\d+) initrd=([01])")
+DTB_RAM_RE = re.compile(rb"JeiOS/aarch64:   ram\[(\d+)\] base=" + H + rb" size=" + H)
+
+
+def phys_alloc_markers():
+    """Ordered whole-line markers for the pinned -m 256M fixture (one RAM
+    range, no rsv, no initrd). The oracle below re-derives every value."""
+    return [
+        exact(PM + b"window base=" + hx(PHYS_WINDOW[0]) + b" limit="
+              + hx(PHYS_WINDOW[1])),
+        valued(PM + b"reserve kind=kernel base=<hex> size=<hex>",
+               PM + rb"reserve kind=kernel base=" + HEX16 + rb" size=" + HEX16),
+        valued(PM + b"reserve kind=dtb base=<hex> size=<hex>",
+               PM + rb"reserve kind=dtb base=" + HEX16 + rb" size=" + HEX16),
+        valued(PM + b"ram base=<hex> size=<hex>", PM_RAM_RE.pattern),
+        valued(PM + b"unmanaged ram bytes=<hex>", PM_UNMANAGED_RE.pattern),
+        valued(PM + b"free pages=<hex> bytes=<hex>", PM_FREE_RE.pattern),
+        valued(PM + b"alloc1 pa=<hex>", PM_ALLOC1_RE.pattern),
+        exact(PM_FREE1),
+        valued(PM + b"allocmax pa=<hex>", PM_ALLOCMAX_RE.pattern),
+        valued(PM + b"overcap rejected pages=<hex>", PM_OVERCAP_RE.pattern),
+    ]
+
+
+def one(lines, rx, what):
+    found = [m for m in map(rx.fullmatch, lines) if m]
+    if len(found) != 1:
+        fail(f"--phys-alloc: expected exactly one {what} line, found {len(found)}")
+    return found[0]
+
+
+def resolve_image_extent(elf_path):
+    """[_text, _end) from the ELF symtab (the kernel_image fact main.c uses)."""
+    try:
+        if os.path.getsize(elf_path) > ELF_MAX:
+            fail(f"--elf {elf_path} larger than {ELF_MAX} bytes")
+        with open(elf_path, "rb") as f:
+            data = f.read(ELF_MAX + 1)
+        syms = elf_defined_symbols(data, (b"_text", b"_end"))
+    except (OSError, ElfError) as e:
+        fail(f"--phys-alloc: cannot resolve _text/_end from --elf {elf_path}: {e}")
+    if len(syms[b"_text"]) != 1 or len(syms[b"_end"]) != 1:
+        fail(f"--phys-alloc: need exactly one defined _text and _end in {elf_path}")
+    text, end = syms[b"_text"][0][0], syms[b"_end"][0][0]
+    if end <= text:
+        fail(f"--phys-alloc: ELF _end=0x{end:x} <= _text=0x{text:x}")
+    return text, end
+
+
+def physmem_free_pages(window, ram, reserved):
+    """From-first-principles free set: page p in [base, limit) step 4096 is free
+    iff [p, p+4096) is a subset of SOME ram range AND intersects NO reserved
+    range (all half-open). Returns the sorted list of free page addresses."""
+    base, limit = window
+    free = []
+    for p in range(base, limit, PHYS_PAGE):
+        e = p + PHYS_PAGE
+        if not any(rb <= p and e <= rb + rs for rb, rs in ram):
+            continue
+        if any(p < qb + qs and qb < e for qb, qs in reserved):
+            continue
+        free.append(p)
+    return free
+
+
+def check_phys_alloc(lines, fx, image_extent):
+    """The --phys-alloc block grammar, cross-bindings and independent oracle.
+    Calls fail() on any mismatch; returns the oracle's free-page count."""
+    # Grammar: all physmem lines form ONE contiguous block right after the
+    # "validated" line and right before the terminal line, in main.c's order:
+    # window, kernel, dtb, [initrd], ram+, rsv*, free, alloc1, free1, allocmax,
+    # overcap. Any unknown physmem line is a FAIL.
+    idx = [i for i, ln in enumerate(lines) if ln.startswith(PM)]
+    if not idx or idx != list(range(idx[0], idx[0] + len(idx))):
+        fail("--phys-alloc: physmem lines missing or not one contiguous block")
+    if VALIDATED_RE.fullmatch(lines[idx[0] - 1]) is None:
+        fail("--phys-alloc: physmem block does not directly follow 'validated'")
+    if lines[idx[-1] + 1] != TERM_DEFAULT:
+        fail("--phys-alloc: physmem block not directly followed by the terminal line")
+    block = [lines[i] for i in idx]
+    pos = 0
+
+    def take(rx, what, optional=False):
+        nonlocal pos
+        m = rx.fullmatch(block[pos]) if pos < len(block) else None
+        if m is None:
+            if optional:
+                return None
+            got = block[pos].decode("ascii", "replace") if pos < len(block) else "<end>"
+            fail(f"--phys-alloc: expected {what} at block line {pos}, got {got!r}")
+        pos += 1
+        return m
+
+    def ints(m, *groups):
+        return tuple(int(m.group(g), 16) for g in groups)
+
+    window = ints(take(PM_WINDOW_RE, "window"), 1, 2)
+    reserves = {}
+    for kind in (b"kernel", b"dtb", b"initrd"):
+        m = take(PM_RESERVE_RE, f"reserve kind={kind.decode()}", optional=kind == b"initrd")
+        if m is None:
+            continue
+        if m.group(1) != kind:
+            fail(f"--phys-alloc: reserve kind={m.group(1).decode()} where "
+                 f"kind={kind.decode()} expected")
+        reserves[kind] = ints(m, 2, 3)
+    ram = []
+    while (m := take(PM_RAM_RE, "ram", optional=bool(ram))) is not None:
+        ram.append(ints(m, 1, 2))
+    rsv = []
+    while (m := take(PM_RSV_RE, "rsv", optional=True)) is not None:
+        rsv.append(ints(m, 1, 2))
+    unmanaged, = ints(take(PM_UNMANAGED_RE, "unmanaged"), 1)
+    free_pages, free_bytes = ints(take(PM_FREE_RE, "free"), 1, 2)
+    alloc1, = ints(take(PM_ALLOC1_RE, "alloc1"), 1)
+    if pos >= len(block) or block[pos] != PM_FREE1:
+        fail("--phys-alloc: expected 'physmem free1 ok' after alloc1")
+    pos += 1
+    allocmax, = ints(take(PM_ALLOCMAX_RE, "allocmax"), 1)
+    overcap, = ints(take(PM_OVERCAP_RE, "overcap"), 1)
+    if pos != len(block):
+        fail(f"--phys-alloc: unexpected trailing physmem line "
+             f"{block[pos].decode('ascii', 'replace')!r}")
+
+    # Cross-bindings: every oracle input must equal a source independent of
+    # the physmem code path.
+    if window != PHYS_WINDOW:
+        fail(f"--phys-alloc: window {window} != pinned {PHYS_WINDOW}")
+    ktext, kend = image_extent
+    if reserves[b"kernel"] != (ktext, kend - ktext):
+        fail(f"--phys-alloc: kernel reserve {reserves[b'kernel']} != ELF "
+             f"[_text=0x{ktext:x}, _end=0x{kend:x})")
+    dtb_ptr, = ints(one(lines, DTB_PTR_RE, "'dtb pointer recorded'"), 1)
+    if reserves[b"dtb"] != (dtb_ptr, fx.totalsize):
+        fail(f"--phys-alloc: dtb reserve {reserves[b'dtb']} != (dtb pointer "
+             f"0x{dtb_ptr:x}, fixture totalsize 0x{fx.totalsize:x})")
+    parsed = one(lines, DTB_PARSED_RE, "'dtb parsed'")
+    n_ram, n_rsv, n_init = int(parsed.group(1)), int(parsed.group(2)), int(parsed.group(5))
+    dtb_ram = [(int(m.group(2), 16), int(m.group(3), 16))
+               for m in map(DTB_RAM_RE.fullmatch, lines) if m]
+    if ram != dtb_ram or len(ram) != n_ram:
+        fail(f"--phys-alloc: physmem ram {ram} != dtb parsed ram {dtb_ram} (n={n_ram})")
+    if len(rsv) != n_rsv or (b"initrd" in reserves) != bool(n_init):
+        fail(f"--phys-alloc: rsv/initrd lines ({len(rsv)}, "
+             f"{b'initrd' in reserves}) != dtb parsed (rsv={n_rsv}, initrd={n_init})")
+
+    reserved = list(reserves.values()) + rsv
+    free = physmem_free_pages(PHYS_WINDOW, ram, reserved)
+    want = len(free)
+    print(f"physmem oracle: window=[0x{PHYS_WINDOW[0]:x},0x{PHYS_WINDOW[1]:x}) "
+          f"ram={[(hex(b), hex(z)) for b, z in ram]} "
+          f"reserved={[(hex(b), hex(z)) for b, z in reserved]} -> "
+          f"computed free pages={want} (0x{want:x}); kernel says 0x{free_pages:x}")
+    if free_pages != want:
+        fail(f"--phys-alloc: kernel free pages=0x{free_pages:x} != oracle 0x{want:x}")
+    if free_bytes != want * PHYS_PAGE:
+        fail(f"--phys-alloc: free bytes=0x{free_bytes:x} != pages*4096")
+    # Independent recompute of the degraded-profile "unmanaged RAM" figure: RAM
+    # bytes lying outside the managed window. Derived from the parsed ram ranges
+    # and the pinned window, not from the kernel's own number.
+    wbase, wlimit = PHYS_WINDOW
+    want_unmanaged = 0
+    for rb, rs in ram:
+        re_ = rb + rs
+        if rb < wbase:
+            want_unmanaged += min(re_, wbase) - rb
+        if re_ > wlimit:
+            want_unmanaged += re_ - max(rb, wlimit)
+    if unmanaged != want_unmanaged:
+        fail(f"--phys-alloc: kernel unmanaged bytes=0x{unmanaged:x} != "
+             f"oracle 0x{want_unmanaged:x}")
+    free_set = set(free)
+    # Hard property: what the allocator hands out is genuinely free. The
+    # equality to the lowest free page / first free 256-run additionally pins
+    # the allocator's first-fit scan (tested contract, tests/test_alloc.c).
+    if alloc1 not in free_set:
+        fail(f"--phys-alloc: alloc1 pa=0x{alloc1:x} is NOT an oracle-free page")
+    if alloc1 != free[0]:
+        fail(f"--phys-alloc: alloc1 pa=0x{alloc1:x} != lowest free 0x{free[0]:x}")
+    run = [allocmax + i * PHYS_PAGE for i in range(PHYS_ALLOC_MAX_PAGES)]
+    if not all(p in free_set for p in run):
+        fail(f"--phys-alloc: allocmax run at 0x{allocmax:x} covers a non-free page")
+    first_run = next((p for p in free if all(p + i * PHYS_PAGE in free_set
+                                             for i in range(PHYS_ALLOC_MAX_PAGES))), None)
+    if allocmax != first_run:
+        fail(f"--phys-alloc: allocmax pa=0x{allocmax:x} != first free "
+             f"{PHYS_ALLOC_MAX_PAGES}-page run {first_run}")
+    if overcap != want:
+        fail(f"--phys-alloc: overcap pages=0x{overcap:x} != oracle 0x{want:x} "
+             f"(allocations were not fully rolled back)")
+    return want
+
+
 def timeout_arg(text):
     """argparse type: a finite number of seconds > 0 (nan/inf/0/negative are
     parse errors — a non-finite deadline would never expire)."""
@@ -571,6 +796,9 @@ def main():
                     help="expect the deliberate-BRK vector self-test markers")
     ap.add_argument("--dtb-bad", action="store_true",
                     help="expect the JE_ARM_DTB_BAD parser rejection (BAD_TOKEN)")
+    ap.add_argument("--phys-alloc", action="store_true",
+                    help="assert the physmem bring-up block and recompute its "
+                         "free-page count with an independent oracle")
     ap.add_argument("--require", action="store_true",
                     help="missing QEMU/toolchain/image is a FAIL, not a SKIP")
     ap.add_argument("--elf", metavar="PATH",
@@ -590,6 +818,8 @@ def main():
     if args.dtb_bad and args.vector_test:
         fail("--dtb-bad and --vector-test are mutually exclusive (the DTB "
              "rejection halts before the BRK)")
+    if args.phys_alloc and (args.dtb_bad or args.vector_test):
+        fail("--phys-alloc is only valid with the default good-boot build")
     qemu = args.qemu
     if shutil.which(qemu) is None:
         skip(f"{qemu} not installed")
@@ -615,9 +845,11 @@ def main():
     elf = args.elf or os.path.join(os.path.dirname(args.image), "jeios-arm.elf")
     # The ELF is the only source of the expected ELR, so under --vector-test it
     # is mandatory (FAIL, never SKIP); --require demands it in every mode.
-    if not os.path.isfile(elf) and (args.vector_test or args.require):
-        fail(f"{'--vector-test' if args.vector_test else '--require'}: "
+    if not os.path.isfile(elf) and (args.vector_test or args.phys_alloc
+                                    or args.require):
+        fail(f"{'--vector-test' if args.vector_test else '--phys-alloc' if args.phys_alloc else '--require'}: "
              f"ELF {elf} not found")
+    image_extent = resolve_image_extent(elf) if args.phys_alloc else None
 
     markers = list(BASE_MARKERS)
     markers[3] = exact(b"JeiOS/aarch64: bss clear verified" if args.bss_verified
@@ -636,6 +868,8 @@ def main():
         if args.vector_test:
             markers += vector_test_markers(resolve_brk_site(elf, args.image))
         else:
+            if args.phys_alloc:
+                markers += phys_alloc_markers()
             markers += [exact(TERM_DEFAULT)]
     # Every mode ends on a fixed (exact) line; that line is the terminal marker.
     final_line = markers[-1][0]
@@ -715,6 +949,8 @@ def main():
     # In every mode the copy precedes the parse; its CRC is over the copy taken
     # BEFORE the dtb-bad injection, so it must match the fixture in all modes.
     check_dtb_copied(lines, fx)
+    if args.phys_alloc:
+        check_phys_alloc(lines, fx, image_extent)
 
     if early:
         # Defensive: an early stop means a FATAL / forbidden marker was seen,

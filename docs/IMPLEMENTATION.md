@@ -41,6 +41,36 @@ This file records current contracts and execution evidence as gates are built.
 DESIGN.md describes the broader target architecture. No entry below implies
 userspace isolation, SMP safety, driver containment or production readiness.
 
+## MP2 PR-1a — aarch64 physical allocator, MMU still off — 2026-11-03
+
+State at the current implementation worktree: **implemented / tested / planned /
+not blocked**. The frozen ADR 0011 D5/D7 adapter is implemented in
+`kernel/arch/aarch64/physmem.c`; ARM glue consumes the validated FDT context and
+facts through static state, initializes the reservation-aware physical allocator
+in every build, and emits ordered evidence for the window, inputs, free count,
+allocation/free, a real 256-page (max-run) alloc+free, and an over-cap bounds
+rejection. The ARM make fragment links the shared
+allocator/runtime support objects and exposes build-neutral `ARM_PHYSALLOC`
+smoke selection. The MMU remains off; page tables, translation registers,
+MAIR/W^X/linker changes, and cache-maintenance claims remain PR-1b scope.
+
+Local evidence on `feat/mp2-aarch64-mmu` built on commit
+`f09fd928495ab6b511f4fa58bf4cd751024a7b33` (QEMU 8.2.2, local only):
+`make aarch64`, all three `ARM_BSS_CHECK=1`/`ARM_VECTOR_TEST=1`/`ARM_DTB_BAD=1`
+builds, `ASAN_OPTIONS=detect_leaks=0 make check` (incl. `test_physmem`),
+`make smoke-aarch64 ARM_REQUIRE=1`, `make smoke-aarch64 ARM_PHYSALLOC=1
+ARM_REQUIRE=1` (oracle independently computed 65222 free pages == kernel), and
+`git diff --check` all passed. The `JE_ALLOC_MAX_PAGES=256` API bound is smaller
+than the free count, so the max-run marker allocates exactly 256 pages via the
+real scan and the over-cap marker is an INVALID-input bounds rejection (NOT a
+rollback claim); the failed-multi-page-alloc-frees-nothing rollback property is
+proven in `tests/test_physmem.c` on a fragmented window. The smoke oracle cannot
+see a dropped RAM-membership check at `-m 256M` (one RAM range covers the window)
+— only the hosted test does. No allocator contract change is claimed beyond the
+owner-approved window parameterization. QEMU virtual-board evidence does not
+qualify physical ARM hardware, cache behavior, MMU behavior, or release safety;
+AI-assisted review is not independent human qualification.
+
 ## M4 PR-I — D9 brokered UART service / final M4 gate — 2026-11-02
 
 PR-I completes the bounded D9 brokered-UART demonstration in `TEST_MODE=15`.
