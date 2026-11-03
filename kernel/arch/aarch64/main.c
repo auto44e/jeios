@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <jeios/fdt.h>
+#include "paging.h"
 #include "physmem.h"
 #include "trapframe.h"
 
@@ -167,6 +168,131 @@ static int ec_far_valid(uint64_t ec, uint64_t esr)
     }
 }
 
+#ifdef JE_ARM_MMU_FAULT
+/* ---- MP2 PR-1b deliberate MMU fault proofs (ADR 0011 D4/D7). ----
+ *
+ * One build per mode (mk/aarch64.mk ARM_MMU_FAULT=<name>, mutually exclusive
+ * with the other test toggles, own build dir). After the default MMU markers,
+ * mmu_fault_trigger() performs exactly ONE access the W^X / guard contract must
+ * refuse; je_arm_exception() then calls mmu_fault_check(), which asserts the
+ * EXACT syndrome (EC, IL, FSC = ISS[5:0], WnR, and S1PTW/CM/EA/FnV == 0) plus
+ * FAR, ELR and SPSR, and prints a distinctive PASS line (or a FATAL). If the
+ * access does NOT fault, the trigger prints FATAL and halts: a broken property
+ * can never reach the PASS line. Fault class is pinned so an UNMAPPED target
+ * (translation fault, FSC 0b000111) cannot masquerade as the permission proof
+ * (FSC 0b001111, level 3 — DDI0487 D17.2 ESR_ELx DFSC/IFSC encodings).
+ *
+ *   1 write-to-text       STR to a .text word       -> DABT_CUR perm L3, WnR=1
+ *   2 execute-from-data   BLR to a .data `ret`      -> IABT_CUR perm L3
+ *   3 execute-from-rodata BLR to a .rodata `ret`    -> IABT_CUR perm L3
+ *   4 stack-guard         STR to __stack_guard      -> DABT_CUR xlate L3, WnR=1
+ *
+ * The rodata case matters separately from the data case: SCTLR.WXN only forces
+ * WRITABLE pages XN, so a rodata leaf with PXN=0 would be executable while the
+ * data test still passed. Targets/sites are GLOBAL symbols so smoke_arm.py
+ * resolves them from the ELF and checks FAR/ELR against them independently.
+ * TCG observes translation + permission faults; nothing here is cache evidence. */
+#define JE_ARM_MMU_FAULT_TEXT   1
+#define JE_ARM_MMU_FAULT_DATA   2
+#define JE_ARM_MMU_FAULT_RODATA 3
+#define JE_ARM_MMU_FAULT_GUARD  4
+#if JE_ARM_MMU_FAULT < JE_ARM_MMU_FAULT_TEXT || JE_ARM_MMU_FAULT > JE_ARM_MMU_FAULT_GUARD
+#error "JE_ARM_MMU_FAULT must be 1..4 (see mk/aarch64.mk ARM_MMU_FAULT)"
+#endif
+#define A64_RET 0xd65f03c0u   /* RET (x30), DDI0487 C6.2 */
+
+/* .text target: a dedicated never-called word, so a (broken) successful write
+ * corrupts nothing that runs. */
+__asm__(".pushsection .text\n"
+        ".balign 16\n"
+        ".globl je_arm_mmu_fault_text_target\n"
+        ".type je_arm_mmu_fault_text_target, %function\n"
+        "je_arm_mmu_fault_text_target:\n"
+        "    ret\n"
+        ".size je_arm_mmu_fault_text_target, .-je_arm_mmu_fault_text_target\n"
+        ".popsection");
+extern uint8_t je_arm_mmu_fault_text_target[];
+/* Non-const, initialized => .data (RW, must be XN). */
+uint32_t je_arm_mmu_fault_data_insn[4] __attribute__((aligned(16))) =
+    { A64_RET, A64_RET, A64_RET, A64_RET };
+/* const => .rodata (R, must be XN; NOT covered by WXN). */
+const uint32_t je_arm_mmu_fault_rodata_insn[4] __attribute__((aligned(16))) =
+    { A64_RET, A64_RET, A64_RET, A64_RET };
+extern uint8_t je_arm_mmu_fault_store_site[];
+extern uint8_t __stack_guard[];
+
+static uint64_t mmu_fault_target(void)
+{
+#if JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_TEXT
+    return (uint64_t)(uintptr_t)je_arm_mmu_fault_text_target;
+#elif JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_DATA
+    return (uint64_t)(uintptr_t)je_arm_mmu_fault_data_insn;
+#elif JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_RODATA
+    return (uint64_t)(uintptr_t)je_arm_mmu_fault_rodata_insn;
+#else
+    return (uint64_t)(uintptr_t)__stack_guard;
+#endif
+}
+
+static const char *mmu_fault_name(void)
+{
+#if JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_TEXT
+    return "write-to-text";
+#elif JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_DATA
+    return "execute-from-data";
+#elif JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_RODATA
+    return "execute-from-rodata";
+#else
+    return "stack-guard";
+#endif
+}
+
+static void mmu_fault_check(const je_arm_trapframe *tf, uint64_t ec)
+{
+    const uint64_t iss = ESR_ISS(tf->esr);
+    const uint64_t fsc = iss & 0x3fu;          /* DFSC/IFSC */
+    const uint64_t wnr = (iss >> 6) & 1u;      /* DABT WnR; RES0 for IABT */
+    const uint64_t s1ptw = (iss >> 7) & 1u;    /* fault on a table walk */
+    const uint64_t cm = (iss >> 8) & 1u;       /* cache maintenance; RES0 IABT */
+    const uint64_t ea = (iss >> 9) & 1u;       /* external abort */
+    const uint64_t fnv = (iss >> 10) & 1u;     /* FAR not valid */
+    const uint64_t target = mmu_fault_target();
+#if JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_TEXT || JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_GUARD
+    const uint64_t want_ec = EC_DABT_CUR, want_wnr = 1u;
+    const uint64_t want_elr = (uint64_t)(uintptr_t)je_arm_mmu_fault_store_site;
+#else
+    const uint64_t want_ec = EC_IABT_CUR, want_wnr = 0u;
+    const uint64_t want_elr = target;          /* the fetch itself faulted */
+#endif
+#if JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_GUARD
+    const uint64_t want_fsc = 0x07u;           /* translation fault, level 3 */
+#else
+    const uint64_t want_fsc = 0x0fu;           /* permission fault, level 3 */
+#endif
+    const bool ok = tf->vector == 4u && ec == want_ec &&
+                    ESR_IL(tf->esr) == 1u && fsc == want_fsc &&
+                    wnr == want_wnr && s1ptw == 0u && cm == 0u && ea == 0u &&
+                    fnv == 0u && tf->far == target && tf->elr == want_elr &&
+                    (tf->spsr & 0x1fu) == 0x5u /* EL1h */ &&
+                    ((tf->spsr >> 6) & 0xfu) == 0xfu /* DAIF masked */;
+    if (!ok) {
+        console_write("JeiOS/aarch64: FATAL mmu fault self-test MISMATCH ");
+        console_write(mmu_fault_name());
+        console_write("\r\n");
+        return;
+    }
+#if JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_TEXT
+    console_write("JeiOS/aarch64: mmu fault self-test PASS write-to-text (DABT_CUR ec=0x25 dfsc=0x0f permission L3 WnR=1; FAR==.text target; ELR==store site)\r\n");
+#elif JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_DATA
+    console_write("JeiOS/aarch64: mmu fault self-test PASS execute-from-data (IABT_CUR ec=0x21 ifsc=0x0f permission L3; FAR==ELR==.data buffer proven RW)\r\n");
+#elif JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_RODATA
+    console_write("JeiOS/aarch64: mmu fault self-test PASS execute-from-rodata (IABT_CUR ec=0x21 ifsc=0x0f permission L3; FAR==ELR==.rodata target)\r\n");
+#else
+    console_write("JeiOS/aarch64: mmu fault self-test PASS stack-guard (DABT_CUR ec=0x25 dfsc=0x07 translation L3 WnR=1; FAR==__stack_guard; ELR==store site)\r\n");
+#endif
+}
+#endif /* JE_ARM_MMU_FAULT */
+
 /* MP1 common C exception handler: bounded redacted diagnostic + halt. No
  * recovery, no allocation (ARM64.md). "Redacted" = we print the syndrome fields
  * (vector, EC, IL, ISS, ELR, SPSR, FAR-if-valid) and a VBAR readback, NOT the
@@ -215,6 +341,9 @@ _Noreturn void je_arm_exception(je_arm_trapframe *tf)
     } else {
         console_write("JeiOS/aarch64: FATAL vector self-test MISMATCH\r\n");
     }
+#endif
+#ifdef JE_ARM_MMU_FAULT
+    mmu_fault_check(tf, ec);
 #endif
     console_write("JeiOS/aarch64: exception handled; halted\r\n");
     for (;;) __asm__ volatile("wfe");
@@ -274,7 +403,11 @@ uint8_t je_arm_dtb_copy[JE_FDT_MAX_COPY] __attribute__((aligned(16)));
 static je_boot_ctx je_arm_boot_ctx;
 static je_boot_facts je_arm_facts;
 static je_pages je_arm_pages;
+extern je_arm_mmu je_arm_mmu_context;
+extern uint64_t je_arm_mmu_last_audit_leaves;
 extern uint8_t _text[], _end[];   /* IMAGE extent [_text, _end), linker.ld */
+extern uint8_t __text_end[], __rodata_end[], __data_end[];
+extern uint8_t __stack_guard[], __stack_bottom[];
 
 static inline uint64_t read_id_aa64mmfr0_el1(void)
 {
@@ -638,6 +771,221 @@ static void physmem_bringup(void)
     console_write("\r\n");
 }
 
+static uint64_t read_sctlr_el1(void)
+{
+    uint64_t value;
+    __asm__ volatile("mrs %0, SCTLR_EL1" : "=r"(value));
+    return value;
+}
+
+static bool par_fault(uint64_t par)
+{
+    return (par & UINT64_C(1)) != 0u;
+}
+
+static bool par_pa_is(uint64_t par, uint64_t physical)
+{
+    return !par_fault(par) &&
+           (par & UINT64_C(0x0000fffffffff000)) ==
+           (physical & UINT64_C(0x0000fffffffff000));
+}
+
+static bool par_attr_is(uint64_t par, uint64_t attr)
+{
+    return !par_fault(par) &&
+           ((par >> 56) & UINT64_C(0xff)) == attr;
+}
+
+/*
+ * Exact default-path marker order (complete lines; smoke_arm.py matches these):
+ *   JeiOS/aarch64: mmu build root=<hex>
+ *   JeiOS/aarch64: mmu map text=[<hex>,<hex>) rodata=[<hex>,<hex>) data=[<hex>,<hex>) device=<hex>
+ *   JeiOS/aarch64: mmu audit ok leaves=<hex>
+ *   JeiOS/aarch64: mmu enabled sctlr=<hex>
+ *   JeiOS/aarch64: mmu xlate mapped va=<hex> par=<hex>
+ *   JeiOS/aarch64: mmu xlate guard va=<hex> par=<hex>
+ *   JeiOS/aarch64: mmu attr uart va=<hex> par=<hex>
+ */
+static void mmu_bringup(void)
+{
+    /* PARange gate (ADR 0011 D3/D7): the MMU pins TCR.IPS to the 44-bit PA
+     * profile. A part reporting a NARROWER PARange than 44 cannot honor that
+     * IPS, so refuse rather than enable a translation regime wider than the
+     * implemented PA (AGENTS.md rule 5: refuse when a guarantee cannot be
+     * delivered). pa_bits_from_mmfr0 already maps the encoding to a bit count
+     * (0 for the reserved encoding, rejected in dtb_intake). cortex-a72 reports
+     * 44, so this does not fire on the pinned target; a fault-injection build
+     * could force a lower value. */
+    if (je_arm_facts.pa_bits < 44u) {
+        console_write("JeiOS/aarch64: FATAL mmu PARange below 44-bit profile pa_bits=");
+        console_dec((uint64_t)je_arm_facts.pa_bits);
+        console_write("\r\n");
+        halt();
+    }
+    const uint64_t text_start = (uint64_t)(uintptr_t)_text;
+    const uint64_t text_end = (uint64_t)(uintptr_t)__text_end;
+    const uint64_t rodata_start = text_end;
+    const uint64_t rodata_end = (uint64_t)(uintptr_t)__rodata_end;
+    const uint64_t data_start = rodata_end;
+    const uint64_t data_end = (uint64_t)(uintptr_t)__data_end;
+    const uint64_t stack_start = (uint64_t)(uintptr_t)__stack_bottom;
+    const uint64_t image_end = (uint64_t)(uintptr_t)_end;
+    const uint64_t guard = (uint64_t)(uintptr_t)__stack_guard;
+    const uint64_t device = (uint64_t)PL011_BASE;
+    const je_map_region regions[] = {
+        { text_start, text_end - text_start, JE_MAP_TEXT },
+        { rodata_start, rodata_end - rodata_start, JE_MAP_RODATA },
+        { data_start, data_end - data_start, JE_MAP_RW },
+        { stack_start, image_end - stack_start, JE_MAP_RW },
+        { device, JE_PAGE_SIZE, JE_MAP_DEVICE },
+    };
+    uint64_t root = 0u;
+    je_status status = je_arm_mmu_build(&je_arm_mmu_context, &je_arm_pages,
+                                         regions, sizeof(regions) / sizeof(regions[0]),
+                                         &root);
+    if (status != JE_OK) {
+        console_write("JeiOS/aarch64: FATAL mmu build status=");
+        console_dec((uint64_t)status);
+        console_write("\r\n");
+        halt();
+    }
+    console_write("JeiOS/aarch64: mmu build root=");
+    console_hex(root);
+    console_write("\r\n");
+    console_write("JeiOS/aarch64: mmu map text=[");
+    console_hex(text_start);
+    console_write(",");
+    console_hex(text_end);
+    console_write(") rodata=[");
+    console_hex(rodata_start);
+    console_write(",");
+    console_hex(rodata_end);
+    console_write(") data=[");
+    console_hex(data_start);
+    console_write(",");
+    console_hex(data_end);
+    console_write(") device=");
+    console_hex(device);
+    console_write("\r\n");
+
+    status = je_arm_mmu_audit(&je_arm_mmu_context, regions,
+                              sizeof(regions) / sizeof(regions[0]));
+    if (status != JE_OK) {
+        console_write("JeiOS/aarch64: FATAL mmu audit status=");
+        console_dec((uint64_t)status);
+        console_write("\r\n");
+        halt();
+    }
+    console_write("JeiOS/aarch64: mmu audit ok leaves=");
+    console_hex(je_arm_mmu_last_audit_leaves);
+    console_write("\r\n");
+
+    status = je_arm_mmu_enable(&je_arm_mmu_context);
+    if (status != JE_OK) {
+        console_write("JeiOS/aarch64: FATAL mmu enable status=");
+        console_dec((uint64_t)status);
+        console_write("\r\n");
+        halt();
+    }
+    uint64_t sctlr = read_sctlr_el1();
+    console_write("JeiOS/aarch64: mmu enabled sctlr=");
+    console_hex(sctlr);
+    console_write("\r\n");
+
+    uint64_t mapped_par = je_arm_at_s1e1(text_start, 0);
+    console_write("JeiOS/aarch64: mmu xlate mapped va=");
+    console_hex(text_start);
+    console_write(" par=");
+    console_hex(mapped_par);
+    console_write("\r\n");
+    uint64_t guard_par = je_arm_at_s1e1(guard, 0);
+    console_write("JeiOS/aarch64: mmu xlate guard va=");
+    console_hex(guard);
+    console_write(" par=");
+    console_hex(guard_par);
+    console_write("\r\n");
+    uint64_t uart_par = je_arm_at_s1e1(device, 0);
+    console_write("JeiOS/aarch64: mmu attr uart va=");
+    console_hex(device);
+    console_write(" par=");
+    console_hex(uart_par);
+    console_write("\r\n");
+
+    if ((sctlr & JE_ARM_SCTLR_SET) != JE_ARM_SCTLR_SET ||
+        !par_pa_is(mapped_par, text_start) || !par_fault(guard_par) ||
+        !par_attr_is(uart_par, UINT64_C(0x00))) {
+        console_write("JeiOS/aarch64: FATAL mmu probe mismatch\r\n");
+        halt();
+    }
+}
+
+#ifdef JE_ARM_MMU_FAULT
+#if JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_TEXT || JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_GUARD
+/* The one store both data-abort modes use; ELR must equal this label. */
+__attribute__((noinline, noclone))
+static void mmu_fault_store(uint64_t va)
+{
+    __asm__ volatile(".globl je_arm_mmu_fault_store_site\n"
+                     "je_arm_mmu_fault_store_site: str xzr, [%0]"
+                     :: "r"(va) : "memory");
+}
+
+#else
+/* Branch-with-link to `va`. If the target WERE executable it holds `ret`, so
+ * control returns here and the caller reports FATAL (no silent pass). */
+__attribute__((noinline, noclone))
+static void mmu_fault_exec(uint64_t va)
+{
+    __asm__ volatile("blr %0" :: "r"(va) : "x30", "memory");
+}
+#endif
+
+/* Marker (complete line, asserted by smoke_arm.py --mmu-fault):
+ *   JeiOS/aarch64: mmu fault test <name> target=<hex> par_r=<hex> par_w=<hex>
+ * par_r/par_w are AT S1E1R/S1E1W probes of the target taken BEFORE the access:
+ * independent translation-table evidence of the expected R/W state (e.g. the
+ * .data buffer must be R+W so its execute fault cannot be an unmapped-page false
+ * pass; the guard must not translate at all). */
+static void mmu_fault_trigger(void)
+{
+    const uint64_t target = mmu_fault_target();
+    const uint64_t par_r = je_arm_at_s1e1(target, 0);
+    const uint64_t par_w = je_arm_at_s1e1(target, 1);
+#if JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_DATA
+    /* Prove the buffer is ordinary readable+writable memory by an actual
+     * write/read-back round trip (not only the AT probe), then restore RET. */
+    volatile uint32_t *buf = (volatile uint32_t *)je_arm_mmu_fault_data_insn;
+    buf[0] = 0u;
+    const uint32_t zero_back = buf[0];
+    buf[0] = A64_RET;
+    const uint32_t ret_back = buf[0];
+    if (zero_back != 0u || ret_back != A64_RET) {
+        console_write("JeiOS/aarch64: FATAL mmu fault test .data buffer not RW\r\n");
+        halt();
+    }
+#endif
+    console_write("JeiOS/aarch64: mmu fault test ");
+    console_write(mmu_fault_name());
+    console_write(" target=");
+    console_hex(target);
+    console_write(" par_r=");
+    console_hex(par_r);
+    console_write(" par_w=");
+    console_hex(par_w);
+    console_write("\r\n");
+#if JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_TEXT || JE_ARM_MMU_FAULT == JE_ARM_MMU_FAULT_GUARD
+    mmu_fault_store(target);
+#else
+    mmu_fault_exec(target);
+#endif
+    /* Reached only if the access did NOT fault: the property is broken. */
+    console_write("JeiOS/aarch64: FATAL mmu fault test ");
+    console_write(mmu_fault_name());
+    console_write(" did not fault\r\n");
+    halt();
+}
+#endif
+
 _Noreturn void je_arm_main(void)
 {
     uint64_t el = read_currentel();
@@ -697,6 +1045,10 @@ _Noreturn void je_arm_main(void)
      * Halts (FATAL marker) on any rejection. */
     dtb_intake();
     physmem_bringup();
+    mmu_bringup();
+#ifdef JE_ARM_MMU_FAULT
+    mmu_fault_trigger();   /* faults into je_arm_exception, or FATAL-halts */
+#endif
 #ifdef JE_ARM_VECTOR_TEST
     /* Deliberate synchronous exception: trigger the planted BRK. It vectors into
      * je_arm_exception, which asserts the exact syndrome, prints PASS, and halts

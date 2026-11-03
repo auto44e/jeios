@@ -79,12 +79,13 @@ $(BUILD)/kernel/core/image.o: kernel/core/image.c $(USER_GENERATED) $(USER_GENER
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_device
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_paging_bits $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_device
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
 	./$(BUILD)/test_physmem
 	./$(BUILD)/test_physmem_arm
+	./$(BUILD)/test_paging_bits
 	./$(BUILD)/test_vm
 	./$(BUILD)/test_uframe
 	./$(BUILD)/test_syscall
@@ -141,6 +142,14 @@ $(BUILD)/test_physmem: tests/test_physmem.c kernel/arch/aarch64/physmem.c kernel
 $(BUILD)/test_physmem_arm: tests/test_physmem_arm.c kernel/core/alloc.c kernel/core/boot.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -DJE_ARCH_AARCH64 -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_physmem_arm.c kernel/core/alloc.c kernel/core/boot.c -o $@
+
+# MP2 PR-1b (ADR 0011 D3/D4/D7): aarch64 page-table builder/encoder/audit and
+# the pinned MAIR/TCR/SCTLR constants, checked against an INDEPENDENT DDI0487
+# oracle. Hosted at the ARM window (-DJE_ARCH_AARCH64); the test maps that
+# window at its physical address so table PAs are identity pointers.
+$(BUILD)/test_paging_bits: tests/test_paging_bits.c kernel/arch/aarch64/paging.c kernel/arch/aarch64/paging.h kernel/core/alloc.c kernel/core/boot.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -DJE_ARCH_AARCH64 -DJE_ARM_PAGING_HOSTED_TEST -Ikernel/arch/aarch64 -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_paging_bits.c kernel/arch/aarch64/paging.c kernel/core/alloc.c kernel/core/boot.c -o $@
 
 $(BUILD)/test_vm: tests/test_vm.c tests/vm_fake.c kernel/core/vm.c kernel/core/alloc.c kernel/core/boot.c kernel/core/handle.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)

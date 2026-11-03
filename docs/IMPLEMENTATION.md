@@ -71,6 +71,63 @@ owner-approved window parameterization. QEMU virtual-board evidence does not
 qualify physical ARM hardware, cache behavior, MMU behavior, or release safety;
 AI-assisted review is not independent human qualification.
 
+## MP2 PR-1b — aarch64 MMU enable, identity W^X map — 2026-11-03
+
+Current worktree state on `feat/mp2-aarch64-mmu-enable`: **implemented / tested /
+planned / not blocked**. This implements ADR 0011 D2/D3/D4/D6/D7 for the pinned
+QEMU `virt-8.2` / `cortex-a72` profile: symbolic and statically checked
+MAIR/TCR/SCTLR values; 4 KiB, four-level L3 page-table construction from the
+PR-1a allocator; identity mappings for `.text`, `.rodata`, RW image data/stack
+and PL011 Device-nGnRnE; an unmapped stack guard; table-frame RW identity
+mapping; descriptor W^X/alias tracking; and the pre-enable descriptor audit.
+`paging_enable.S` contains the stack-free two-range `DC IVAC`/barrier/TLBI/
+SCTLR/`IC IALLU` sequence. `main.c` enables the MMU in every ARM build and
+probes mapped text, the guard fault and UART `PAR_EL1.ATTR`.
+`tools/smoke_arm.py` validates the new MMU marker block while preserving the
+independent PR-1a allocator oracle.
+
+Observed locally at `2026-11-03T10:37:28+00:00`, repository
+`/home/ANT.AMAZON.COM/lubuel/oss/jeios`, branch
+`feat/mp2-aarch64-mmu-enable`, inspected commit
+`b58c84951df6e239ff40c55c57e8ab6034c898f7` plus the uncommitted worktree
+patch:
+
+- `make check` — PASS.
+- `ASAN_OPTIONS=detect_leaks=0 make check` — PASS.
+- `make smoke` — PASS (existing AMD64 profile).
+- `make aarch64` — PASS under GCC 13.3.0; the pre-existing single-ELF
+  `LOAD segment with RWX permissions` linker warning remains.
+- `make smoke-aarch64 ARM_REQUIRE=1` — PASS on QEMU 8.2.2.
+- `make smoke-aarch64 ARM_BSS_CHECK=1 ARM_REQUIRE=1` — PASS.
+- `make smoke-aarch64 ARM_VECTOR_TEST=1 ARM_REQUIRE=1` — PASS, including the
+  exact BRK syndrome after MMU enable.
+- `make smoke-aarch64 ARM_DTB_BAD=1 ARM_REQUIRE=1` — PASS for the expected
+  fail-closed `BAD_TOKEN` marker before MMU bring-up.
+- `make smoke-aarch64 ARM_PHYSALLOC=1 ARM_REQUIRE=1` — PASS; the independent
+  oracle computed `0xfeb3` free pages, matching the kernel.
+- `git diff --check` — PASS.
+
+Default ARM smoke markers observed: root
+`0x0000000040000000`; audit leaves `0x0000000000000053`; SCTLR
+`0x0000000030d8180d`; mapped text PAR
+`0xff00000040080b80` (`F=0`, identity PA, Normal `ATTR=0xff`); guard PAR
+`0x000000000000080f` (`F=1`); UART PAR
+`0x0000000009000b00` (`F=0`, Device `ATTR=0x00`). The terminal marker after
+MMU enable was observed. These results qualify only the pinned QEMU virtual
+board/profile. QEMU TCG models no data/instruction caches, so `DC IVAC`,
+barriers and cache/TLB freshness are reviewed implementation evidence, not
+runtime-observed cache evidence. Update 2026-11-03T10:52:23+00:00 (test
+author): the deliberate faults are now implemented and locally tested —
+`ARM_MMU_FAULT=text|data|rodata|guard` (write-to-text / execute-from-data /
+execute-from-rodata permission L3, stack-guard translation L3, exact ESR/FAR/ELR
+checked in-kernel AND re-decoded by `smoke_arm.py`), the default MMU oracle
+recomputes PAR/SCTLR/leaf count from the ELF and architecture layouts, and
+`tests/test_paging_bits.c` checks constants, the leaf encoder (against an
+independent spec) and audit tampering; see HANDOFF. Remote CI not observed.
+No physical ARM, SMP, userspace, dynamic
+loading or release qualification is claimed. AI-assisted review is not
+independent human qualification.
+
 ## M4 PR-I — D9 brokered UART service / final M4 gate — 2026-11-02
 
 PR-I completes the bounded D9 brokered-UART demonstration in `TEST_MODE=15`.

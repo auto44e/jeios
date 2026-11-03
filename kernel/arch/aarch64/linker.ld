@@ -29,7 +29,10 @@ SECTIONS
     .rodata    : { *(.rodata*) }
     . = ALIGN(0x1000);                       /* W^X: .rodata ends on a page */
     __rodata_end = .;
-    .data      : { *(.data*) }
+    .data      : {
+        __data_start = .;
+        *(.data*)
+    }
     . = ALIGN(16);
     _file_end = .;          /* end of file-backed (loaded) content, incl. .data */
 
@@ -110,6 +113,7 @@ ASSERT((__stack_bottom & 0xf) == 0, "stack bottom must be 16-byte aligned");
 ASSERT((__text_end   & 0xfff) == 0, "__text_end must be page-aligned (W^X)");
 ASSERT((__rodata_end & 0xfff) == 0, "__rodata_end must be page-aligned (W^X)");
 ASSERT((__data_end   & 0xfff) == 0, "__data_end must be page-aligned (W^X)");
+ASSERT((__data_start & 0xfff) == 0, "__data_start must be page-aligned");
 ASSERT(__text_end <= __rodata_end, "rodata must follow text");
 ASSERT(__rodata_end <= __data_end, "data must follow rodata");
 /* Stack guard: a page-aligned unmapped page DIRECTLY below the stack. */

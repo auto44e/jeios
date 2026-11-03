@@ -64,6 +64,11 @@ jobs:
       - name: ARM64 deliberate vector fault
         run: |
           make smoke-aarch64 ARM_REQUIRE=1 ARM_VECTOR_TEST=1 ARM_SMOKE_TIMEOUT=30
+      - name: ARM64 MMU W^X and stack-guard faults
+        run: |
+          for m in text data rodata guard; do
+            make smoke-aarch64 ARM_REQUIRE=1 ARM_MMU_FAULT=$m ARM_SMOKE_TIMEOUT=30
+          done
       - name: ARM64 malformed DTB rejection
         run: |
           make smoke-aarch64 ARM_REQUIRE=1 ARM_DTB_BAD=1 ARM_SMOKE_TIMEOUT=30

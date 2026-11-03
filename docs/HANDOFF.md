@@ -1,5 +1,200 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## 2026-11-03T10:52:23+00:00 — MP2 PR-1b W^X/guard fault proofs + hardened MMU oracle (test author)
+
+Observed repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/jeios`,
+branch `feat/mp2-aarch64-mmu-enable`, inspected commit
+`b58c84951df6e239ff40c55c57e8ab6034c898f7` plus the uncommitted PR-1b worktree
+(implementor's patch + this test patch). Author: Claude (test author, a
+DIFFERENT agent from the MMU implementor, per the AGENTS.md split). State:
+**implemented / tested locally / remote CI not observed / not blocked**.
+Supersedes the "Next bounded task" of the 10:37:28 entry below (that entry is
+kept as history).
+
+Added / changed:
+
+- `mk/aarch64.mk`: `ARM_MMU_FAULT=text|data|rodata|guard` toggle; own build dir
+  `build/aarch64-mmufault-<name>`; joins the mutually-exclusive group (any
+  non-empty value counts as set; an unknown name is a make error). The smoke
+  target passes `--mmu-fault <write-to-text|execute-from-data|execute-from-rodata|stack-guard>`.
+- `kernel/arch/aarch64/main.c` (`#ifdef JE_ARM_MMU_FAULT` only): after the MMU
+  block, prints `mmu fault test <name> target=.. par_r=.. par_w=..` (AT S1E1R/W
+  of the target), performs ONE forbidden access (labelled `str xzr` site or
+  `blr` to a `ret`), and on no fault prints FATAL. `je_arm_exception` asserts
+  vector 4, EC, IL=1, FSC=ISS[5:0], WnR, S1PTW/CM/EA/FnV=0, FAR, ELR and SPSR
+  EL1h+DAIF, then prints a distinctive PASS line. The execute-from-data case
+  first proves the buffer RW by write/read-back.
+- `tools/smoke_arm.py`: the implementor's MMU check was regex-only (any hex
+  accepted). Replaced with an independent oracle in EVERY good-boot mode:
+  map line == ELF symbols; guard == `__data_end` == `__stack_bottom`-4 KiB;
+  root a window page outside the image; audit leaf count recomputed (region
+  pages + table frames, fixed-point over L0..L2 prefixes assuming first-fit
+  contiguous table frames; a non-contiguous allocator FAILs, never false
+  passes); SCTLR == 0x30D00808|M|C|I|WXN exactly, EE=0; mapped PAR F=0,
+  PA==VA frame, ATTR=0xff, SH=0b11; guard PAR F=1, FST=0x07; UART PAR F=0,
+  PA==VA, ATTR=0x00, SH=0b10. `--mmu-fault` re-decodes the raw ESR fields,
+  FAR/ELR/VBAR against ELF symbols, binds ELF to Image (RET at targets,
+  `STR XZR,[Xn]` at the store site), and checks the AT probes.
+- `kernel/arch/aarch64/paging.c`: test-only seam under
+  `JE_ARM_PAGING_HOSTED_TEST` (exports `je_arm_leaf_desc_hosted`, compiles out
+  the AT asm). No change to the ARM build; frozen `paging.h` untouched.
+- `tests/test_paging_bits.c` + `Makefile test:`: hosted ASan/UBSan test. Maps
+  the ARM window at 0x40000000 (MAP_FIXED_NOREPLACE; failure is a FAIL) so the
+  real builder/audit run. Checks MAIR/TCR/SCTLR field by field; every class's
+  leaf against an independent DDI0487 spec encoder; bad builds incl. a text
+  region over allocator frames and NOMEM with full rollback; 23 audit tamper
+  rejections each followed by restore + audit OK; enable gating and exact
+  enable-leaf arguments.
+- `.github/workflows/ci.yml`: one step running the four fault modes.
+
+Observed values (QEMU 8.2.2, GCC 13.3.0, pinned virt-8.2/cortex-a72/256M):
+
+```text
+write-to-text       ESR=0x9600004f FAR=0x40080f90 ELR=0x40080ff0 (store site) par_r=0xff00000040080b80 par_w=0x081f (F=1 FST=perm L3)
+execute-from-data   ESR=0x8600000f FAR=ELR=0x40087000              par_r=par_w=0xff00000040087b80 (RW)
+execute-from-rodata ESR=0x8600000f FAR=ELR=0x40086b60              par_r=0xff00000040086b80 par_w=0x081f
+stack-guard         ESR=0x96000047 FAR=0x400c8000 ELR=0x40080ff0  par_r=par_w=0x080f (F=1 FST=xlate L3)
+```
+
+Commands run locally (all PASS): `make check`; `git diff --check`;
+`make aarch64 [toggle] && make smoke-aarch64 [toggle] ARM_REQUIRE=1` for
+default, `ARM_PHYSALLOC=1`, `ARM_MMU_FAULT=text|data|rodata|guard`,
+`ARM_VECTOR_TEST=1`, `ARM_DTB_BAD=1`, `ARM_BSS_CHECK=1`. `make smoke` (x86)
+was NOT rerun by this test patch (no x86 file changed). Remote CI: not observed.
+
+Mutation evidence (scratch copy, not committed): rodata PXN=0 -> default smoke,
+audit and data test all still PASS; only `ARM_MMU_FAULT=rodata` FAILs ("did
+not fault") and `test_paging_bits` FAILs. Guard mapped -> default smoke FAILs
+on the leaf count, guard mode "did not fault". Guard mapped RO with the kernel
+comparator also mutated to expect a permission fault -> kernel printed PASS,
+harness FAILed on the raw ESR. SCTLR without WXN -> kernel self-check passes
+(same constant), harness FAILs. UART AttrIdx 0 -> harness FAILs on PAR.ATTR,
+hosted test FAILs on the encoder. AF/nG/device-SH encoder mutants and removing
+the audit's W+X+alias checks FAIL the hosted test.
+
+Findings from cross-lineage review — RESOLVED by the lead (transcripts +
+resolution: docs/adr/debates/0011-mp2-pr1b-review/):
+
+1. FIXED. `je_arm_mmu_audit` originally compared each leaf against the SAME
+   `leaf_descriptor()` the builder used, so an encoder bug passed the audit
+   (observed: rodata PXN=0, UART AttrIdx 0). It now compares the WHOLE
+   non-address part of each leaf against a per-class LITERAL
+   (TEXT/RODATA/RW/DEVICE) and requires OA < 2^44 — so any stray bit
+   (Contiguous/DBM/NS/software) is rejected too, not just the named fields. The
+   Contiguous-bit W^X hole and the rodata-PXN=0 bug now FATAL-halt at the boot
+   audit (validated by mutation).
+2. FIXED. The audit now requires every table descriptor's output frame to be one
+   of the builder's own `table_pa` frames, closing the "table pointer redirected
+   into a .data frame passes, then post-enable writes rewrite live translations"
+   hole. (The install-time `record_frame_flags` ledger remains defence-in-depth;
+   identity-uniqueness + this table-membership check are the load-bearing
+   enforcement for the identity-only MP2 map.)
+3. FIXED. The audit now requires VA==PA for region leaves too (not only table
+   frames) — the identity contract (ADR 0011 D2).
+4. FIXED (related). A PARange below the 44-bit profile now FATAL-halts in
+   `mmu_bringup` (ADR D3/D7, AGENTS rule 5); previously IPS was hardcoded 44 with
+   no refusal. No effect on cortex-a72 (reports 44).
+
+Lower / recorded (not code-changed): no write-to-.rodata deliberate-fault mode
+(covered by ARM_MMU_FAULT=rodata + the hosted test, not default boot); the DC
+IVAC range is [_text,_end) vs the ADR's [__data_start,_end)+DTB (wider is safe);
+the smoke leaf-count oracle pins the count + first-fit layout, not full table
+placement; the enable assembly is argument-tested only (cache/barrier
+maintenance is review-only under TCG); SMP will need the TLBI …IS broadcast
+variants (single-core NSH is correct now).
+
+NOT enforced / honesty: QEMU TCG has no caches, so none of this is evidence for
+`DC IVAC`/barriers/TLB/I-cache maintenance. The expected ESR pins ISV=0, which is
+QEMU 8.2 behaviour for EL1-taken aborts; hardware may set ISV (kernel-side check
+deliberately ignores ISS[24:11]; the harness pins it for the QEMU profile). The
+leaf-count oracle assumes first-fit contiguous table frames. AI-assisted test
+authoring/review is not independent human qualification.
+
+Next bounded task: PR-1b is complete; later MP2 steps are the GIC + architected
+timer + scheduling, then MP3 (the per-process je_vm_ops backend + the high-half
+TTBR1 kernel VA split).
+and observe remote CI for the new `ARM64 MMU W^X and stack-guard faults` step.
+
+## 2026-11-03T10:37:28+00:00 — MP2 PR-1b aarch64 MMU enable
+
+Observed repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/jeios`,
+branch `feat/mp2-aarch64-mmu-enable`, exact inspected commit
+`b58c84951df6e239ff40c55c57e8ab6034c898f7` plus an uncommitted worktree patch.
+State: **implemented / tested / planned / not blocked**. This is PR-1b stacked
+on PR-1a; ADR 0011 D2/D3/D4/D6/D7 are pinned and were not relitigated.
+
+Implemented files and contracts:
+
+- `kernel/arch/aarch64/paging.c`: symbolic `_Static_assert`-checked
+  `MAIR_EL1=0x00000000000000ff`, `TCR_EL1=0x0000000480903510` and
+  `SCTLR` enable bits `0x0000000000081005`; zeroed L0-L3 tables from
+  `je_pages`; 4 KiB identity leaves; table-frame RW mappings; TEXT/RODATA/RW/
+  DEVICE descriptor classes; install-time W^X physical-frame tracking;
+  descriptor walk audit; `AT S1E1R/W` + `PAR_EL1`; root accessor.
+- `kernel/arch/aarch64/paging_enable.S`: one stack-free leaf. It invalidates
+  the table range and image superset range with `DC IVAC` using
+  `CTR_EL0.DminLine`, then performs the pinned DSB/ISB, MAIR/TCR/TTBR,
+  `TLBI VMALLE1`, one `SCTLR_EL1` OR/write for M|C|I|WXN, and `IC IALLU`
+  sequence. The image range includes `.data`, `.bss`, the DTB copy and stack.
+- `kernel/arch/aarch64/main.c`: builds text/rodata/data/stack/PL011 regions,
+  audits/enables in every ARM build, emits the exact default marker block,
+  and checks mapped identity translation, guard translation fault and UART
+  Device attribute.
+- `kernel/arch/aarch64/linker.ld`: adds page-aligned `__data_start`.
+- `mk/aarch64.mk`: links and compiles `paging.o` and `paging_enable.o`.
+- `tools/smoke_arm.py`: requires the MMU marker block and accepts it between
+  the PR-1a physmem block and the terminal/fault proof.
+- `docs/IMPLEMENTATION.md`: current implementation/evidence status.
+
+Exact default marker lines observed in order:
+
+```text
+JeiOS/aarch64: mmu build root=0x0000000040000000
+JeiOS/aarch64: mmu map text=[0x0000000040080000,0x0000000040086000) rodata=[0x0000000040086000,0x0000000040087000) data=[0x0000000040087000,0x00000000400c8000) device=0x0000000009000000
+JeiOS/aarch64: mmu audit ok leaves=0x0000000000000053
+JeiOS/aarch64: mmu enabled sctlr=0x0000000030d8180d
+JeiOS/aarch64: mmu xlate mapped va=0x0000000040080000 par=0xff00000040080b80
+JeiOS/aarch64: mmu xlate guard va=0x00000000400c8000 par=0x000000000000080f
+JeiOS/aarch64: mmu attr uart va=0x0000000009000000 par=0x0000000009000b00
+```
+
+Verification actually run locally:
+
+```text
+make check                                      PASS
+ASAN_OPTIONS=detect_leaks=0 make check          PASS
+make smoke                                      PASS
+make aarch64                                    PASS
+make smoke-aarch64 ARM_REQUIRE=1               PASS
+make smoke-aarch64 ARM_BSS_CHECK=1 ARM_REQUIRE=1 PASS
+make smoke-aarch64 ARM_VECTOR_TEST=1 ARM_REQUIRE=1 PASS
+make smoke-aarch64 ARM_DTB_BAD=1 ARM_REQUIRE=1 PASS
+make smoke-aarch64 ARM_PHYSALLOC=1 ARM_REQUIRE=1 PASS (oracle 0xfeb3 pages)
+git diff --check                                PASS
+```
+
+The ARM build used GCC 13.3.0 and QEMU 8.2.2 with the pinned
+`virt-8.2,gic-version=2,virtualization=off,secure=off,dtb-randomness=off`,
+`cortex-a72`, one CPU and 256 MiB RAM command generated by
+`tools/smoke_arm.py`. The linker still reports the known single-ELF RWX
+segment warning; descriptor-level W^X is audited and observed, while ELF
+program-header separation remains future work.
+
+Honesty and open issues: QEMU TCG has no cache model, so the `DC IVAC`,
+barrier, TLBI-freshness and instruction-cache claims are reviewed, not
+observed by smoke. QEMU did observe the identity translation, guard
+translation fault and Device UART attribute. The separate W^X audit/fault-mode
+author still needs to add deliberate write-to-text, execute-from-data,
+execute-from-rodata and exact ESR/FAR proofs. No remote CI result, physical ARM
+execution, SMP, userspace, dynamic loading, arbitrary-driver support or
+independent human qualification is claimed. PR/issue publication state was not
+changed.
+
+Next bounded task: add the independent W^X/fault-mode tests against this frozen
+builder and marker contract. Pass criteria are exact ordered complete-line
+markers, permission-vs-translation ESR/ISS/FAR evidence, preservation of the
+default/MP1/PR-1a markers, and no marker after an expected halted fault.
+
 ## 2026-11-03T04:24:29+00:00 — MP2 PR-1a aarch64 physical allocator bring-up
 
 ## 2026-11-03 — MP2 PR-1a aarch64 physical allocator bring-up (MMU still OFF)
