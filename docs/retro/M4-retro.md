@@ -91,5 +91,9 @@ alongside the unchanged default boot and the ARM profiles.
 
 Per `docs/NEXT_PHASE.md` (owner refresh): MP2 (ARM64 MMU/memory/timer/scheduling,
 mobile #2) is the next execution work, then M5a #54 (read-only initfs + SH1 #71
-recovery console) and the shell roadmap (#71–#73). The next PR begins MP2 in the
-`jeios-mobile` repo and ships with this retro.
+recovery console) and the shell roadmap (#71–#73). The next PR begins MP2 — PR-1
+is the aarch64 kernel MMU + physical memory slice — and ships with this retro.
+Per the mobile repo's AGENTS.md ("kernel code belongs in auto44e/jeios; submit
+shared ARM64/driver changes there"), MP2 kernel work lands in the **core** repo
+under a new core ADR (0011), cross-linked from mobile ADR 0002; the mobile repo
+pins the reviewed core commit rather than carrying kernel code.
