@@ -41,6 +41,88 @@ This file records current contracts and execution evidence as gates are built.
 DESIGN.md describes the broader target architecture. No entry below implies
 userspace isolation, SMP safety, driver containment or production readiness.
 
+## MP2 PR-2b — aarch64 returning EL1h IRQ path — observed 2026-11-05
+
+Observed in repository
+`/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/jeios`, branch
+`feat/mp2-aarch64-irq-return`, exact inspected commit
+`bf4725ba20876bfb1471f37464acc3727c3caa94` plus the uncommitted PR-2b
+worktree. State: **implemented / tested locally / planned (independent
+timer-test smoke oracle and remote CI) / not blocked**. This is AI-assisted
+review and execution evidence, not independent human qualification or a
+physical ARM result.
+
+Implemented:
+
+- `kernel/arch/aarch64/vectors.S`: only slot 5 changed in the vector table; its
+  dedicated four-instruction veneer spills the real x16-x19 before scratch use.
+  `je_arm_irq_common` saves the remaining GPRs at the frozen offsets, validates
+  `SPSR_EL1.M == EL1h`, stores vector 5 from an immediate, sets a transient
+  `je_arm_in_handler` guard after the frame is complete, calls `je_arm_irq`, then
+  clears the guard, restores ELR/SPSR and x0-x30, unwinds with `add sp,#304`
+  and returns with `eret`. The existing fatal common saver and stack-free
+  double-fault body were not edited.
+- `kernel/arch/aarch64/main.c`: `je_arm_irq` samples `ISR_EL1` before the
+  GICC_IAR/ACK/EOI operation, calls the PR-2a handler with the stored timer
+  interval, records bounded per-tick evidence without console I/O, treats
+  `JE_ERR_BUSY` as a benign non-tick wakeup, and supplies the ARM_TIMER_TEST
+  canary/BRK proof body.
+- `kernel/arch/aarch64/gic.h` / `gic.c`: exposes the last full IAR value so the
+  IRQ handler does not re-read GICC_IAR.
+- `mk/aarch64.mk`: adds the mutually-exclusive `ARM_TIMER_TEST=1` selector,
+  `build/aarch64-timertest`, `-DJE_ARM_TIMER_TEST`, and `--timer-test`
+  pass-through. `trapframe.h` documents that only the fatal MP1 path has the
+  old x16-x18 scratch deviation; returning IRQ frames are complete.
+
+Exact test markers emitted by the implementation:
+
+```text
+JeiOS/aarch64: irq tick n=<hex> vector=<hex> intid=0x..1e isr=<hex> spsr=<hex> sp=<hex> cntpct=<hex> hb=<hex>
+JeiOS/aarch64: irq timer PASS ticks=0x...4
+JeiOS/aarch64: triggering deliberate IRQ-path BRK #0xb2b2 ...
+JeiOS/aarch64: EXCEPTION vector=0x0000000000000004 ec=0x000000000000003c ...
+JeiOS/aarch64: exception handled; halted
+```
+
+Observed with GCC 13.3.0 and QEMU 8.2.2 using the pinned
+`virt-8.2,gic-version=2,virtualization=off,secure=off`, `cortex-a72`, one
+CPU, 256 MiB profile. The final timer-test Image SHA-256 was
+`bd9519f2cf798867ca40edad963c233900aef881a74772a1ee756aafdb62963e`.
+The direct boot command was:
+
+```text
+timeout 3 qemu-system-aarch64 -M virt-8.2,gic-version=2,virtualization=off,secure=off,dtb-randomness=off -cpu cortex-a72 -smp 1 -m 256M -display none -serial file:build/aarch64-timertest/direct-serial.log -no-reboot -kernel build/aarch64-timertest/Image
+```
+
+The command reached the terminal BRK halt (the shell timeout then stopped the
+intentionally halted emulator). Four observed records had vector 5, INTID 30,
+`ISR_EL1=0x80`, and the same `SP=0x400cde40`:
+
+```text
+cntpct: 0x1c5679, 0x25fbc2, 0x2f91b2, 0x3922e1
+heartbeat: 0x11ca8, 0x2054d, 0x30856, 0x43183
+```
+
+CNTPCT deltas were `632137`, `628208`, and `626991`, all greater than the
+runtime interval `0x98968` (QEMU TCG timing remains a lower-bound observation).
+The negative control observed vector 4, EC `0x3c`, ESR
+`0xf200b2b2`, ELR `0x40080fe0`, and the normal `exception handled; halted`
+marker; no double-fault marker appeared.
+
+The first timer-test run deliberately exposed a proof-order defect: ISR_EL1
+was sampled after ACK/EOI and printed zero. That run still reached four returns
+and the BRK control but was not accepted as proof. The handler was changed to
+sample ISR_EL1 before `je_gic_handle_one`; the evidence above is from the
+corrected run.
+
+Not yet observed here: the separate `--timer-test` smoke oracle (the current
+script has no such option), remote CI, physical ARM, or independent human
+review. `make check`, x86 smoke, default ARM, timer-poll, vector, BSS, DTB-bad,
+physalloc, and all four MMU-fault ARM profiles were observed passing after the
+implementation. The default build leaves DAIF.I masked and the timer-test proof
+is the only build that unmasks it. No scheduler, SMP, generic IRQ framework,
+arbitrary hardware support, or release qualification is claimed.
+
 ## MP2 PR-2a — aarch64 GICv2 + CNTP timer, polled with IRQs masked — 2026-11-05
 
 > SUPERSEDED STATUS NOTE (lead, 2026-11-05): the "exits FAIL / independent hosted

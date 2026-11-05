@@ -10,15 +10,15 @@ ARM_OBJCOPY := aarch64-linux-gnu-objcopy
 ARM_BUILD   := build/aarch64
 ARM_ARCH    := kernel/arch/aarch64
 
-# The five test-build toggles below are MUTUALLY EXCLUSIVE: each selects its own
+# The six test-build toggles below are MUTUALLY EXCLUSIVE: each selects its own
 # build dir, and with more than one set the last assignment would silently win
 # and reuse that dir for a different flag combination (stale objects / a smoke
 # run asserting the wrong markers). Refuse the combination outright.
 # ARM_MMU_FAULT (a NAME, not 0/1) joins the group as a "1" when non-empty.
 ARM_MMU_FAULT_SET := $(if $(strip $(ARM_MMU_FAULT)),1,)
-ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL))),0)
-ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL))),1)
-$(error ARM_BSS_CHECK, ARM_VECTOR_TEST, ARM_DTB_BAD, ARM_MMU_FAULT and ARM_TIMER_POLL are mutually exclusive; set at most one)
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL) $(ARM_TIMER_TEST))),0)
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL) $(ARM_TIMER_TEST))),1)
+$(error ARM_BSS_CHECK, ARM_VECTOR_TEST, ARM_DTB_BAD, ARM_MMU_FAULT, ARM_TIMER_POLL and ARM_TIMER_TEST are mutually exclusive; set at most one)
 endif
 endif
 
@@ -74,6 +74,12 @@ endif
 ifeq ($(ARM_TIMER_POLL),1)
 ARM_BUILD   := build/aarch64-timerpoll
 endif
+# Optional returning IRQ/timer proof (MP2 PR-2b, ADR 0012 D5/D8): unmask only
+# PSTATE.I in the hand-written register-canary loop, collect N=4 returning
+# timer frames, then run the BRK negative control. Separate build dir.
+ifeq ($(ARM_TIMER_TEST),1)
+ARM_BUILD   := build/aarch64-timertest
+endif
 
 # Freestanding, no PIC/stack-protector, STRICT alignment (pre-MMU RAM is
 # Device-nGnRnE so unaligned accesses fault), and general-regs-only (a stray
@@ -106,6 +112,10 @@ endif
 ifeq ($(ARM_TIMER_POLL),1)
 ARM_CFLAGS  += -DJE_ARM_TIMER_POLL
 ARM_ASFLAGS += -DJE_ARM_TIMER_POLL
+endif
+ifeq ($(ARM_TIMER_TEST),1)
+ARM_CFLAGS  += -DJE_ARM_TIMER_TEST
+ARM_ASFLAGS += -DJE_ARM_TIMER_TEST
 endif
 ifneq ($(ARM_MMU_FAULT_SET),)
 ARM_CFLAGS  += -DJE_ARM_MMU_FAULT=$(ARM_MMU_FAULT_$(ARM_MMU_FAULT))
@@ -190,4 +200,4 @@ aarch64: $(ARM_BUILD)/Image
 # uses them).
 ARM_SMOKE_TIMEOUT ?= 15
 smoke-aarch64: $(ARM_BUILD)/Image
-	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_PHYSALLOC)),--phys-alloc,) $(if $(filter 1,$(ARM_TIMER_POLL)),--timer-poll,) $(if $(ARM_MMU_FAULT_SET),--mmu-fault $(ARM_MMU_FAULT_SMOKE_$(ARM_MMU_FAULT)),) $(if $(filter 1,$(ARM_REQUIRE)),--require,)
+	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_PHYSALLOC)),--phys-alloc,) $(if $(filter 1,$(ARM_TIMER_POLL)),--timer-poll,) $(if $(filter 1,$(ARM_TIMER_TEST)),--timer-test,) $(if $(ARM_MMU_FAULT_SET),--mmu-fault $(ARM_MMU_FAULT_SMOKE_$(ARM_MMU_FAULT)),) $(if $(filter 1,$(ARM_REQUIRE)),--require,)

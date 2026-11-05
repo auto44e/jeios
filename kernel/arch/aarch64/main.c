@@ -343,6 +343,18 @@ _Noreturn void je_arm_exception(je_arm_trapframe *tf)
         console_write("JeiOS/aarch64: FATAL vector self-test MISMATCH\r\n");
     }
 #endif
+#ifdef JE_ARM_TIMER_TEST
+    /* Negative control: after the returning IRQ proof, this is a synchronous
+     * BRK in slot 4. It must retain the MP1 fatal diagnostic and must not take
+     * the transient-guard double-fault path. */
+    extern uint8_t je_arm_irq_brk_site[];
+    if (tf->vector != 4u || tf->esr != UINT64_C(0xF200B2B2) ||
+        tf->elr != (uint64_t)(uintptr_t)je_arm_irq_brk_site ||
+        (tf->spsr & 0x1fu) != 0x5u ||
+        ((tf->spsr >> 6) & 0xfu) != 0xfu) {
+        console_write("JeiOS/aarch64: FATAL IRQ-path BRK control mismatch\r\n");
+    }
+#endif
 #ifdef JE_ARM_MMU_FAULT
     mmu_fault_check(tf, ec);
 #endif
@@ -961,6 +973,31 @@ static void mmu_bringup(void)
 
 static uint64_t je_arm_timer_freq;
 static uint32_t je_arm_timer_interval;
+volatile uint64_t je_arm_irq_tick_count;
+
+typedef struct {
+    uint64_t vector;
+    uint64_t intid;
+    uint64_t isr;
+    uint64_t spsr;
+    uint64_t elr;
+    uint64_t sp;
+    uint64_t cntpct;
+    uint64_t heartbeat;
+} je_arm_irq_record;
+
+#define JE_ARM_IRQ_EVIDENCE_CAP 4u
+static je_arm_irq_record je_arm_irq_records[JE_ARM_IRQ_EVIDENCE_CAP];
+static je_arm_irq_record je_arm_irq_last_busy_wakeup;
+static volatile uint64_t je_arm_irq_busy_wakeups;
+static volatile uint64_t je_arm_irq_invalid_wakeups;
+
+#ifdef JE_ARM_TIMER_TEST
+volatile uint64_t je_arm_canary_heartbeat;
+volatile uint64_t je_arm_canary_fail_reg = UINT64_MAX;
+extern void je_arm_canary_loop(void);
+extern void je_arm_canary_hi_loop(void);
+#endif
 
 /*
  * GIC/timer marker order (complete lines, after all MMU markers):
@@ -969,6 +1006,8 @@ static uint32_t je_arm_timer_interval;
  *   JeiOS/aarch64: timer cntfrq=<hex> interval=<hex> intid=0x000000000000001e
  *   [JE_ARM_TIMER_POLL only] JeiOS/aarch64: timer poll n=<hex> intid=0x000000000000001e cntpct=<hex> ticks=<hex>
  *   [JE_ARM_TIMER_POLL only] JeiOS/aarch64: timer poll PASS cycles=0x0000000000000004
+ *   [JE_ARM_TIMER_TEST only] JeiOS/aarch64: irq tick n=<hex> vector=<hex> intid=0x..1e isr=<hex> spsr=<hex> elr=<hex> sp=<hex> cntpct=<hex> hb=<hex>
+ *   [JE_ARM_TIMER_TEST only] JeiOS/aarch64: irq timer PASS ticks=0x...4
  *   JeiOS/aarch64: initialization complete; halted
  *
  * PR-2a intentionally has no spurious injection in the live QEMU path: the
@@ -1022,6 +1061,171 @@ static void timer_poll_proof(void)
     console_write("JeiOS/aarch64: timer poll PASS cycles=");
     console_hex((uint64_t)cycles);
     console_write("\r\n");
+}
+#endif
+
+/* Returning IRQ handler (ADR 0012 D5/D6/D8). Caller context is EL1h with I
+ * masked by exception entry. This path performs no allocation, blocking,
+ * console I/O or unmasking. The assembly saver owns the transient guard and
+ * restores ELR/SPSR/GPRs after this function returns. */
+void je_arm_irq(const je_arm_trapframe *tf)
+{
+    /* Sample at handler entry, before ACK/EOI can change interrupt status. */
+    const uint64_t isr = je_arm_read_isr_el1();
+    bool was_spurious = false;
+    uint64_t cntpct = 0u;
+    const je_status status = je_gic_handle_one(je_arm_timer_interval,
+                                               &was_spurious, &cntpct);
+    const uint32_t iar = je_gic_last_iar();
+
+    if (status == JE_OK && !was_spurious) {
+        ++je_arm_irq_tick_count;
+        const uint64_t tick = je_arm_irq_tick_count;
+        if (tick <= (uint64_t)JE_ARM_IRQ_EVIDENCE_CAP) {
+            je_arm_irq_record *const evidence =
+                &je_arm_irq_records[tick - UINT64_C(1)];
+            evidence->vector = tf->vector;
+            evidence->intid = (uint64_t)(iar & UINT32_C(0x3ff));
+            evidence->isr = isr;
+            evidence->spsr = tf->spsr;
+            evidence->elr = tf->elr;
+            evidence->sp = tf->sp;
+            evidence->cntpct = cntpct;
+#ifdef JE_ARM_TIMER_TEST
+            evidence->heartbeat = je_arm_canary_heartbeat;
+#else
+            evidence->heartbeat = 0u;
+#endif
+        }
+    } else if (status == JE_ERR_BUSY) {
+        /* A timer line that re-pended benignly was acknowledged and EOIRed by
+         * gic.c but did not produce a tick. Retain the last wakeup evidence
+         * without pretending that the scheduler-visible counter advanced. */
+        je_arm_irq_last_busy_wakeup.vector = tf->vector;
+        je_arm_irq_last_busy_wakeup.intid =
+            (uint64_t)(iar & UINT32_C(0x3ff));
+        je_arm_irq_last_busy_wakeup.isr = isr;
+        je_arm_irq_last_busy_wakeup.spsr = tf->spsr;
+        je_arm_irq_last_busy_wakeup.elr = tf->elr;
+        je_arm_irq_last_busy_wakeup.sp = tf->sp;
+        je_arm_irq_last_busy_wakeup.cntpct = cntpct;
+#ifdef JE_ARM_TIMER_TEST
+        je_arm_irq_last_busy_wakeup.heartbeat = je_arm_canary_heartbeat;
+#else
+        je_arm_irq_last_busy_wakeup.heartbeat = 0u;
+#endif
+        ++je_arm_irq_busy_wakeups;
+    } else if (status != JE_OK) {
+        /* status == JE_ERR_INVALID: an UNEXPECTED non-spurious INTID. Only
+         * INTID 30 is ever enabled (je_gic_init), so this is a hard invariant
+         * break (gic.c already EOIR'd it to avoid a stuck-active line). ADR 0012
+         * D6 requires FATAL. Halting from IRQ context is correct for an
+         * unrecoverable break; emit one bounded FATAL line and halt (this is a
+         * terminal line, not a torn proof marker). */
+        ++je_arm_irq_invalid_wakeups;
+        console_write("JeiOS/aarch64: FATAL irq unexpected intid=");
+        console_hex((uint64_t)(iar & UINT32_C(0x3ff)));
+        console_write("\r\n");
+        halt();
+    }
+}
+
+#ifdef JE_ARM_TIMER_TEST
+static void irq_timer_test_fatal(const char *reason)
+{
+    console_write("JeiOS/aarch64: FATAL irq timer test ");
+    console_write(reason);
+    console_write("\r\n");
+    halt();
+}
+
+static void print_irq_timer_evidence(void)
+{
+    const uint64_t ticks = je_arm_irq_tick_count;
+    if (ticks < UINT64_C(4) ||
+        je_arm_irq_busy_wakeups != 0u ||
+        je_arm_irq_invalid_wakeups != 0u) {
+        irq_timer_test_fatal("invariant");
+    }
+    /* The PASS line reports the number of RECORDED+verified evidence ticks
+     * (capped at the evidence array size), not the live counter — which keeps
+     * the marker deterministic even though the (b) canary-hi phase advances the
+     * live counter by JE_ARM_CANARY_HI_TICKS more ticks after these were
+     * recorded. */
+    const uint64_t recorded = ticks < (uint64_t)JE_ARM_IRQ_EVIDENCE_CAP
+                                  ? ticks : (uint64_t)JE_ARM_IRQ_EVIDENCE_CAP;
+
+    for (uint64_t i = 0u; i < ticks &&
+                           i < (uint64_t)JE_ARM_IRQ_EVIDENCE_CAP; ++i) {
+        const je_arm_irq_record *const evidence = &je_arm_irq_records[i];
+        console_write("JeiOS/aarch64: irq tick n=");
+        console_hex(i + UINT64_C(1));
+        console_write(" vector=");
+        console_hex(evidence->vector);
+        console_write(" intid=");
+        console_hex(evidence->intid);
+        console_write(" isr=");
+        console_hex(evidence->isr);
+        console_write(" spsr=");
+        console_hex(evidence->spsr);
+        console_write(" elr=");
+        console_hex(evidence->elr);
+        console_write(" sp=");
+        console_hex(evidence->sp);
+        console_write(" cntpct=");
+        console_hex(evidence->cntpct);
+        console_write(" hb=");
+        console_hex(evidence->heartbeat);
+        console_write("\r\n");
+    }
+    console_write("JeiOS/aarch64: irq timer PASS ticks=");
+    console_hex(recorded);
+    console_write("\r\n");
+}
+
+__attribute__((noinline, noclone))
+static void trigger_irq_brk(void)
+{
+    __asm__ volatile(".globl je_arm_irq_brk_site\n"
+                     "je_arm_irq_brk_site: brk #0xB2B2");
+}
+
+static void irq_timer_test(void)
+{
+    je_arm_irq_tick_count = 0u;
+    je_arm_canary_heartbeat = 0u;
+    je_arm_canary_fail_reg = UINT64_MAX;
+    je_arm_irq_busy_wakeups = 0u;
+    je_arm_irq_invalid_wakeups = 0u;
+    je_arm_canary_loop();
+    if (je_arm_canary_fail_reg != UINT64_MAX) {
+        console_write("JeiOS/aarch64: FATAL irq canary mismatch reg=");
+        console_dec(je_arm_canary_fail_reg);
+        console_write("\r\n");
+        halt();
+    }
+    /* (b) Rotating-scratch phase: the primary loop proved x0..x28 survive an IRQ
+     * return but cannot check its own scratch/LR (x29,x30). This second phase
+     * checks exactly x29,x30 using already-proven x0..x2 as scratch, over
+     * JE_ARM_CANARY_HI_TICKS more live ticks, with a final I-masked re-check. */
+    je_arm_canary_fail_reg = UINT64_MAX;
+    je_arm_canary_hi_loop();
+    if (je_arm_canary_fail_reg != UINT64_MAX) {
+        console_write("JeiOS/aarch64: FATAL irq canary-hi mismatch reg=");
+        console_dec(je_arm_canary_fail_reg);
+        console_write("\r\n");
+        halt();
+    }
+    console_write("JeiOS/aarch64: irq canary-hi PASS (x29,x30)\r\n");
+    print_irq_timer_evidence();
+    /* Exact ordered negative-control marker literals for the smoke author:
+     *   JeiOS/aarch64: triggering deliberate IRQ-path BRK #0xb2b2 ...
+     *   JeiOS/aarch64: EXCEPTION vector=0x0000000000000004 ec=0x000000000000003c ...
+     *   JeiOS/aarch64: exception handled; halted */
+    console_write("JeiOS/aarch64: triggering deliberate IRQ-path BRK #0xb2b2 ...\r\n");
+    trigger_irq_brk();
+    console_write("JeiOS/aarch64: FATAL IRQ-path BRK did not vector\r\n");
+    halt();
 }
 #endif
 
@@ -1205,6 +1409,12 @@ _Noreturn void je_arm_main(void)
     physmem_bringup();
     mmu_bringup();
     gic_timer_bringup();
+#ifdef JE_ARM_TIMER_TEST
+    /* gic_timer_bringup has configured and armed the source; vectors were
+     * installed before DTB/MMU/GIC work above. The canary loop performs the
+     * first and only DAIF.I unmask, then prints evidence after it returns. */
+    irq_timer_test();
+#endif
 #ifdef JE_ARM_MMU_FAULT
     mmu_fault_trigger();   /* faults into je_arm_exception, or FATAL-halts */
 #endif

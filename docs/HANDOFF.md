@@ -1,5 +1,175 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## 2026-11-05T01:27:58Z — MP2 PR-2b `--timer-test` smoke oracle + canary review (test author)
+
+Observed repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/jeios`,
+branch `feat/mp2-aarch64-irq-return`, exact commit
+`bf4725ba20876bfb1471f37464acc3727c3caa94` plus the uncommitted PR-2b
+worktree. Author: Claude (test author; a different author from the IRQ asm/C).
+State: **oracle implemented / tested locally (QEMU 8.2.2 TCG) / two canary
+coverage gaps open (flagged to lead, asm NOT edited) / remote CI not observed**.
+AI-assisted work; not independent human qualification.
+
+Files (test author):
+
+- `tools/smoke_arm.py`: `--timer-test` (mutually exclusive with every other
+  mode). Independently re-judges the block that must directly follow the timer
+  line: exactly 4 `irq tick` lines n=1..4; per tick vector==5, intid==0x1e,
+  isr==0x80 (only ISR_EL1.I), SPSR M==EL1h, SPSR I=0 with D=A=F=1, no
+  IL/SS/PAN/BTYPE/high bits; ELR inside the canary loop's IRQ-unmasked window
+  `[msr daifclr #2 + 4, first msr daifset #2]` derived from the Image bytes at
+  `je_arm_canary_loop` (ELF symbol has no `.size`; first word must be
+  `sub sp,sp,#128`); sp identical across ticks, 16-aligned, inside
+  `[__stack_bottom, __stack_top)`; cntpct strictly increasing, delta >=
+  625000 (TCG lower bound only); heartbeat strictly increasing (eret-resume
+  proof); `irq timer PASS ticks=4`; then exactly the 5-line BRK control
+  (trigger, EXCEPTION vector 4 EC 0x3c ISS 0xb2b2, esr 0xf200b2b2 with
+  ELR==`je_arm_irq_brk_site` whose Image word is BRK #0xb2b2 and SPSR EL1h
+  DAIF=0xf, far=n/a with vbar==installed vbar, terminal). Any `double fault`
+  text is a FAIL; irq lines outside `--timer-test` are a FAIL.
+- `kernel/arch/aarch64/main.c`: print-only change — the tick line now also
+  prints the already-recorded `elr=` field (needed for the ELR-window check).
+- `tools/test_smoke_arm_timer.py` (new): replays the captured good serial log
+  through unmodified `smoke_arm.py` via a fake-QEMU `--qemu` shim; baseline
+  must PASS, 27 doctored logs must each FAIL with the expected reason.
+
+Commands and observed results (local, QEMU 8.2.2, aarch64-linux-gnu-gcc 13.3.0):
+
+- `make aarch64 ARM_TIMER_TEST=1 && make smoke-aarch64 ARM_TIMER_TEST=1
+  ARM_REQUIRE=1` — PASS (ELR window `[0x40084b40, 0x40084dfc]`, sp
+  `0x400cde40` stable).
+- Same pair for default, `ARM_TIMER_POLL=1`, `ARM_MMU_FAULT=text|data|rodata|guard`,
+  `ARM_VECTOR_TEST=1`, `ARM_DTB_BAD=1`, `ARM_BSS_CHECK=1`, `ARM_PHYSALLOC=1` —
+  all PASS.
+- `python3 tools/test_smoke_arm_timer.py` — PASS (baseline + 27 mutations
+  rejected: frozen/decreasing heartbeat, vector=4, varying sp, sp off-stack,
+  double-fault with/without FATAL, ELR out of window/misaligned, isr 0/0xc0,
+  intid 31, SPSR EL1t / I set / A clear, cntpct non-monotonic / short delta,
+  wrong n, 3 ticks, PASS ticks=5, BRK vector 5 / wrong ELR / I unmasked, stray
+  irq line, line after terminal, log without flag, flag conflict).
+- `make check` (includes ASAN/UBSAN hosted tests) — PASS. `git diff --check` — PASS.
+- Throwaway asm mutants in a scratch copy (`/tmp/mp2b/mut`, not committed):
+  `mov x16|x17|x18, #0` before `eret` -> `FATAL irq canary mismatch reg=16|17|18`
+  -> smoke FAIL (the frozen-MP1 hazard IS caught). `mov x30, #0` before `eret`
+  -> smoke **PASS** (gap 1). `x0` cleared only on the 4th tick's return ->
+  smoke **PASS** (gap 2).
+
+Open findings (for the lead; asm is owner-frozen, not edited by the test author):
+
+1. x30 restore is effectively unverified: x30 is the CANARY_CHECK temporary,
+   so a corrupted x30 is overwritten by the next `adrp` and finally reloaded
+   from `[sp,#80]`; it is live as a canary for only ~3 of ~180 loop
+   instructions. x29/x30 corruption is likewise masked inside the heartbeat
+   and tick-count `stp/ldp [sp,#104]` windows. Proposed fix: temp-free compares
+   (`cmp xN, #imm12, lsl #12` with distinct non-zero patterns such as
+   `(0x800+N)<<12`), leaving only the heartbeat window masked and documented.
+2. The 4th tick's restore is only partially verified: the loop exits on
+   `ticks>=4` without a full post-tick check pass. Proposed fix: on seeing
+   ticks>=4, `msr daifset,#2`, reload x29/x30 and run one complete x0..x30
+   check before `.Lcanary_restore`.
+
+Not covered / residual: x16-x18 are genuinely owned (never written in the
+loop) and caught for every tick that is followed by a full check pass. No
+hosted test of `je_arm_irq`: it lives in `main.c` with inline asm and console
+dependencies and has no fake `je_gic_handle_one` seam; the JE_OK/BUSY/spurious
+branching is proven only on QEMU (BUSY/spurious not exercised at all in the
+live run). Moving `je_arm_irq` to `irq.c` would make a hosted fake possible.
+The `ticks==4` pin can false-FAIL if a 5th tick lands in the 3-instruction
+window between the count check and `daifset` (fail-closed, not observed).
+Next bounded task: lead fixes gaps 1-2 (owner-approved asm), then rerun the
+mutants above expecting `reg=30` and tick-4 FAILs; then remote CI.
+
+## 2026-11-05T01:14:25Z — MP2 PR-2b returning IRQ implementation (single-agent worktree)
+
+Observed repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/jeios`,
+branch `feat/mp2-aarch64-irq-return`, exact inspected commit
+`bf4725ba20876bfb1471f37464acc3727c3caa94` plus uncommitted changes. State:
+**implemented / tested locally / planned / not blocked**. The timestamp is
+recorded at day precision because this entry was authored from the current
+session; the exact runtime commands and values below are the evidence. Remote
+CI and independent human qualification were not observed.
+
+Verification refresh observed 2026-11-05T01:18:05Z at the same repository,
+branch, and exact commit: **implemented / tested locally / planned / not
+blocked**. The relocated IRQ common block was rebuilt and boot-tested; the
+linked frozen common-plus-double-fault prefix compared byte-identically against
+the committed vector object linked with the current non-vector objects.
+
+Files changed:
+
+- `kernel/arch/aarch64/vectors.S`: dedicated slot-5 veneer, returning saver,
+  transient guard, frozen-frame restore, `eret`, and the test-only register
+  canary loop. Slots 0-4 and 6-15 retain the original stub source; the
+  existing fatal common path and stack-free double-fault body were not edited.
+- `kernel/arch/aarch64/main.c`: returning handler, bounded tick evidence,
+  entry-time ISR_EL1 sample, ARM_TIMER_TEST proof/markers, and BRK `0xB2B2`
+  negative control.
+- `kernel/arch/aarch64/gic.h`, `kernel/arch/aarch64/gic.c`: last-IAR getter
+  populated from the one existing GICC_IAR read.
+- `kernel/arch/aarch64/trapframe.h`: documents the distinction between the
+  fatal MP1 scratch frame and complete PR-2b IRQ frames.
+- `mk/aarch64.mk`: ARM_TIMER_TEST toggle/build directory/smoke pass-through.
+- `docs/IMPLEMENTATION.md`: current status, evidence, workflow, and gaps.
+
+Decision and invariant record: the dedicated veneer is required because the
+frozen `mov w16,#idx` veneer would destroy interrupted x16. The new common path
+saves all other GPRs before scratch use, checks EL1h from SPSR, writes vector 5
+from an immediate, and sets the guard only after frame construction so a fault
+inside `je_arm_irq` takes the existing double-fault path. On successful return
+it clears the guard, restores ELR/SPSR and every GPR, uses `add sp,#304`
+instead of loading `tf->sp`, and executes `eret`; no SPSel write is used.
+The C handler has no allocation, blocking, console I/O, or unmask operation.
+It treats `JE_ERR_BUSY` as an acknowledged non-tick wakeup and never re-reads
+GICC_IAR. The canary loop preserves the caller's callee-saved registers,
+deliberately keeps x16-x18/x30 live across an I-only unmask, increments a
+heartbeat, checks all x0-x30, and exits after four successful IRQ ticks.
+
+Commands and observed results:
+
+- `make aarch64` — PASS; default image linked with DAIF.I still masked.
+- `make aarch64 ARM_TIMER_TEST=1` — PASS; timer-test image linked under
+  `-mstrict-align -mgeneral-regs-only -Werror -Wconversion`.
+- `make smoke-aarch64 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=30` — PASS on QEMU
+  8.2.2 for the default image; the existing MMU/GIC/timer markers and terminal
+  marker were observed.
+- Pinned direct timer-test boot:
+  `timeout 8 qemu-system-aarch64 -M
+  virt-8.2,gic-version=2,virtualization=off,secure=off,dtb-randomness=off
+  -cpu cortex-a72 -smp 1 -m 256M -display none -serial
+  file:build/aarch64-timertest/direct-serial.log -no-reboot -kernel
+  build/aarch64-timertest/Image` — reached four vector-5 records, PASS,
+  and the vector-4 BRK halt. The timeout exit `124` is expected because the
+  kernel intentionally halts after the negative control; it is not treated as
+  a smoke pass.
+- `git diff --check` — PASS.
+
+Observed timer-test records:
+
+```text
+1: vector=5 intid=0x1e isr=0x80 sp=0x400cde40 cntpct=0x1c5679 hb=0x11ca8
+2: vector=5 intid=0x1e isr=0x80 sp=0x400cde40 cntpct=0x25fbc2 hb=0x2054d
+3: vector=5 intid=0x1e isr=0x80 sp=0x400cde40 cntpct=0x2f91b2 hb=0x30856
+4: vector=5 intid=0x1e isr=0x80 sp=0x400cde40 cntpct=0x3922e1 hb=0x43183
+```
+
+CNTPCT deltas were `632137`, `628208`, and `626991`; heartbeat deltas were
+`59557`, `66313`, and `76077`. The BRK control emitted vector 4, EC `0x3c`, ESR `0xf200b2b2`, ELR
+`0x40080fe0`, and `exception handled; halted`; no double-fault marker was
+observed. The first run sampled ISR_EL1 after ACK/EOI and showed zero; it was
+rejected and corrected before recording the evidence above.
+
+Planned handoff: the different test author must add and run the
+independent `--timer-test` smoke oracle (including ELF canary-loop range,
+heartbeat monotonicity, interval lower bound, exact marker order, and absence
+of double-fault), then rerun remote CI. `make check` and all prior local ARM
+modes now pass at this worktree; remote CI remains unobserved. Next bounded
+task: independent smoke/oracle integration and full regression verification.
+Pass criteria: timer-test smoke accepts exactly four vector-5/IAR-30/ISR-I
+records and the vector-4 BRK control, all prior modes remain green, and no new
+fatal marker appears. The current smoke invocation fails at argument parsing
+because `tools/smoke_arm.py` has not yet added `--timer-test`; that is an
+inter-agent handoff, not a timer-path runtime failure.
+
 ## 2026-11-05T01:03:50Z — MP2 PR-2a test/oracle hardening after cross review (test author)
 
 Observed repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/jeios`,

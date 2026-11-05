@@ -1062,6 +1062,203 @@ def check_gic(lines, timer_poll, next_ok):
           f"each cntpct delta >= {VIRT82_INTERVAL} (TCG: lower bound only; IRQs masked)")
 
 
+# ---- --timer-test (MP2 PR-2b returning EL1h IRQ, ADR 0012 D5/D8) -------------
+# The kernel prints per-tick evidence recorded IN the IRQ handler after the
+# register-canary loop (vectors.S je_arm_canary_loop) returns, then runs a BRK
+# negative control. Every field is judged here against architecture semantics
+# and the ELF/Image, never against the kernel's own PASS. QEMU TCG has no
+# latency model: cntpct deltas are a lower-bound sanity check only.
+IRQ_TICK_PREFIX = b"JeiOS/aarch64: irq "
+IRQ_TICK_RE = re.compile(rb"JeiOS/aarch64: irq tick n=" + H + rb" vector=" + H
+                         + rb" intid=" + H + rb" isr=" + H + rb" spsr=" + H
+                         + rb" elr=" + H + rb" sp=" + H + rb" cntpct=" + H
+                         + rb" hb=" + H)
+IRQ_PASS_RE = re.compile(rb"JeiOS/aarch64: irq timer PASS ticks=" + H)
+IRQ_CANARY_HI = b"JeiOS/aarch64: irq canary-hi PASS (x29,x30)"
+IRQ_TICKS = 4                  # JE_ARM_IRQ_EVIDENCE_CAP; loop exits at >= 4
+IRQ_VECTOR = 5                 # VBAR+0x280: Current EL, SP_ELx, IRQ
+ISR_EL1_I = 1 << 7             # DDI0487 D19 ISR_EL1.I (IRQ pending)
+SPSR_M_EL1H = 0x5              # SPSR.M[3:0] EL1h; M[4]=0 (AArch64)
+SPSR_D, SPSR_A, SPSR_I, SPSR_F = 1 << 9, 1 << 8, 1 << 7, 1 << 6
+IRQ_BRK_SYM = b"je_arm_irq_brk_site"
+CANARY_SYM = b"je_arm_canary_loop"
+CANARY_HI_SYM = b"je_arm_canary_hi_loop"   # (b) rotating-scratch x29/x30 phase
+STACK_SYMS = (b"__stack_bottom", b"__stack_top")
+BRK_B2B2_INSN = 0xD4200000 | (0xB2B2 << 5)
+# A64 encodings (DDI0487 C6.2): SUB (imm) sp,sp,#128; MSR DAIFClr/DAIFSet #2.
+CANARY_ENTRY_INSN = 0xD10203FF
+MSR_DAIFCLR_I = 0xD50342FF
+MSR_DAIFSET_I = 0xD50342DF
+CANARY_SCAN_MAX = 4096         # bytes scanned from the symbol for the window
+IRQ_BRK_TRIGGER = b"JeiOS/aarch64: triggering deliberate IRQ-path BRK #0xb2b2 ..."
+IRQ_BRK_EXC = (b"JeiOS/aarch64: EXCEPTION vector=0x0000000000000004 "
+               b"ec=0x000000000000003c il=0x0000000000000001 iss=0x000000000000b2b2")
+IRQ_BRK_ESR_RE = re.compile(rb"JeiOS/aarch64:   esr=0x00000000f200b2b2 elr=" + H
+                            + rb" spsr=" + H)
+IRQ_BRK_FAR_RE = re.compile(rb"JeiOS/aarch64:   far=n/a vbar=" + H)
+VBAR_RE = re.compile(rb"JeiOS/aarch64: vectors installed vbar=" + H)
+TERM_EXC = b"JeiOS/aarch64: exception handled; halted"
+DOUBLE_FAULT = b"double fault"
+
+
+def timer_test_expect(elf_path, image_path):
+    """Resolve the canary loop's IRQ-unmasked window, the BRK site and the
+    kernel stack bounds from the ELF, each bound to the booted Image.
+
+    The canary symbol carries no .size, so the window is derived from the
+    Image bytes instead of a next-symbol guess: the symbol's first word must be
+    the loop's `sub sp, sp, #128`; the single `msr daifclr, #2` that follows
+    opens the window, and the first `msr daifset, #2` after it closes it. With
+    I clear, an IRQ is taken before the next instruction executes, so a valid
+    ELR is in [daifclr + 4, daifset] (inclusive: an IRQ taken just before the
+    daifset executes has ELR == daifset). The failure path's second daifset
+    lies after the first and is therefore OUTSIDE the window — a tick that
+    interrupted the FAIL path is rejected."""
+    syms = resolve_syms(elf_path, (CANARY_SYM, CANARY_HI_SYM, IRQ_BRK_SYM,
+                        IMAGE_BASE_SYM) + STACK_SYMS, "timer-test")
+    with open(image_path, "rb") as f:
+        image = f.read()
+    text, loop = syms[IMAGE_BASE_SYM], syms[CANARY_SYM]
+    if image_word(image, text, loop, "timer-test canary") != CANARY_ENTRY_INSN:
+        fail(f"timer-test: Image word at {CANARY_SYM.decode()}=0x{loop:x} is not "
+             f"`sub sp, sp, #128` (ELF/Image mismatch or loop changed)")
+    # Scan only the PRIMARY loop's body — stop at je_arm_canary_hi_loop, the (b)
+    # phase, which has its own daifclr/daifset. The printed `irq tick` evidence
+    # lines (cap 4) are all from the primary loop, so their ELRs belong to THIS
+    # window; the hi-loop's ticks are not printed as tick lines.
+    hi = syms[CANARY_HI_SYM]
+    scan_end = min(CANARY_SCAN_MAX, hi - loop) if hi > loop else CANARY_SCAN_MAX
+    words = [(loop + k, image_word(image, text, loop + k, "timer-test canary"))
+             for k in range(0, scan_end, 4) if loop + k + 4 - text <= len(image)]
+    clr = [a for a, w in words if w == MSR_DAIFCLR_I]
+    if len(clr) != 1:
+        fail(f"timer-test: expected exactly one `msr daifclr, #2` within "
+             f"{CANARY_SCAN_MAX} bytes of {CANARY_SYM.decode()}, found {len(clr)}")
+    sets = [a for a, w in words if w == MSR_DAIFSET_I and a > clr[0]]
+    if not sets:
+        fail("timer-test: no `msr daifset, #2` after the canary unmask")
+    brk = syms[IRQ_BRK_SYM]
+    if image_word(image, text, brk, "timer-test brk") != BRK_B2B2_INSN:
+        fail(f"timer-test: Image word at {IRQ_BRK_SYM.decode()}=0x{brk:x} is not "
+             f"BRK #0xb2b2 (0x{BRK_B2B2_INSN:08x})")
+    exp = {"lo": clr[0] + 4, "hi": sets[0], "brk": brk,
+           "stack": (syms[STACK_SYMS[0]], syms[STACK_SYMS[1]])}
+    print(f"irq:   canary unmasked window ELR in [0x{exp['lo']:x}, 0x{exp['hi']:x}] "
+          f"(Image-derived from {CANARY_SYM.decode()}=0x{loop:x}); "
+          f"{IRQ_BRK_SYM.decode()}=0x{brk:x} == BRK #0xb2b2")
+    return exp
+
+
+def check_timer_test(lines, exp):
+    """The timer-test block must directly follow the timer line: IRQ_TICKS
+    tick lines, the kernel PASS, then the BRK negative control ending on the
+    terminal line. Every tick is re-judged independently."""
+    tm = [i for i, ln in enumerate(lines) if TIMER_RE.fullmatch(ln)]
+    if len(tm) != 1:
+        fail(f"timer-test: expected exactly one timer line, found {len(tm)}")
+    start = tm[0] + 1
+    # (b) rotating-scratch x29/x30 proof prints its PASS line first, right after
+    # the timer line and before the recorded tick evidence.
+    if start >= len(lines) or lines[start] != IRQ_CANARY_HI:
+        fail("timer-test: missing 'irq canary-hi PASS (x29,x30)' line directly "
+             "after the timer line (the (b) rotating-scratch proof)")
+    start += 1
+    irq = [k for k, ln in enumerate(lines)
+           if k >= start and ln.startswith(IRQ_TICK_PREFIX)]
+    want = list(range(start, start + IRQ_TICKS + 1))
+    if irq != want:
+        fail(f"timer-test: expected {IRQ_TICKS} irq tick lines + PASS directly after "
+             f"the timer line (lines {want}), found irq lines at {irq}")
+    if any(DOUBLE_FAULT in ln for ln in lines):
+        fail("timer-test: double-fault marker present (transient guard not cleared "
+             "or a fault inside the IRQ path)")
+    lo, hi = exp["lo"], exp["hi"]
+    s_lo, s_hi = exp["stack"]
+    prev = None
+    sp0 = None
+    for n, k in enumerate(want[:-1], start=1):
+        m = IRQ_TICK_RE.fullmatch(lines[k])
+        if m is None:
+            fail(f"timer-test: malformed tick line {lines[k].decode('ascii', 'replace')!r}")
+        tn, vec, intid, isr, spsr, elr, sp, pct, hb = (int(x, 16) for x in m.groups())
+        where = f"tick {n}"
+        if tn != n:
+            fail(f"timer-test: {where} has n={tn} (want strictly 1..{IRQ_TICKS})")
+        if vec != IRQ_VECTOR:
+            fail(f"timer-test: {where} vector={vec}, want {IRQ_VECTOR} (EL1h IRQ); "
+                 f"4 would be a synchronous exception misrouted")
+        if intid != TIMER_INTID:
+            fail(f"timer-test: {where} intid=0x{intid:x} != 0x{TIMER_INTID:x}")
+        # ISR_EL1 bits other than A/I/F are RES0 here (no FEAT_NMI); a pending
+        # SError/FIQ alongside the IRQ is unexpected, so pin exactly I.
+        if isr != ISR_EL1_I:
+            fail(f"timer-test: {where} isr=0x{isr:x}, want 0x{ISR_EL1_I:x} (only "
+                 f"ISR_EL1.I: async IRQ pending at handler entry)")
+        if spsr & 0x1F != SPSR_M_EL1H:
+            fail(f"timer-test: {where} spsr=0x{spsr:x} M[4:0] != 0b00101 (EL1h)")
+        # The interrupted context had I CLEAR (else the IRQ could not be taken)
+        # and D/A/F still SET (only `daifclr #2` was issued). NZCV is free.
+        if spsr & SPSR_I or (spsr & (SPSR_D | SPSR_A | SPSR_F)) != (SPSR_D | SPSR_A | SPSR_F):
+            fail(f"timer-test: {where} spsr=0x{spsr:x}: want I=0 and D=A=F=1")
+        if spsr & 0x0FFFFC20 or spsr >> 32:
+            fail(f"timer-test: {where} spsr=0x{spsr:x} has unexpected bits set "
+                 f"(IL/SS/PAN/BTYPE/high)")
+        if not lo <= elr <= hi or elr & 3:
+            fail(f"timer-test: {where} elr=0x{elr:x} outside the canary unmasked "
+                 f"window [0x{lo:x}, 0x{hi:x}] (IRQ did not interrupt the loop)")
+        if sp0 is None:
+            sp0 = sp
+            if sp & 0xF or not s_lo <= sp < s_hi:
+                fail(f"timer-test: {where} sp=0x{sp:x} not 16-aligned inside "
+                     f"[__stack_bottom 0x{s_lo:x}, __stack_top 0x{s_hi:x})")
+        elif sp != sp0:
+            fail(f"timer-test: {where} sp=0x{sp:x} != tick 1 sp=0x{sp0:x} "
+                 f"(frame leak / SP not restored)")
+        if prev is not None:
+            p_pct, p_hb = prev
+            if pct <= p_pct:
+                fail(f"timer-test: {where} cntpct not strictly increasing")
+            if pct - p_pct < VIRT82_INTERVAL:
+                fail(f"timer-test: {where} cntpct delta {pct - p_pct} < interval "
+                     f"{VIRT82_INTERVAL} (re-arm broken)")
+            if hb <= p_hb:
+                fail(f"timer-test: {where} heartbeat 0x{hb:x} <= previous 0x{p_hb:x} "
+                     f"(interrupted loop did not resume: no eret return)")
+        prev = (pct, hb)
+    pm = IRQ_PASS_RE.fullmatch(lines[want[-1]])
+    if pm is None or int(pm.group(1), 16) != IRQ_TICKS:
+        fail(f"timer-test: PASS line missing/malformed or ticks != {IRQ_TICKS} "
+             f"(a tick beyond the evidence cap is unrecorded)")
+    # BRK negative control, contiguous, ending on the terminal line.
+    tail = lines[want[-1] + 1:]
+    if len(tail) != 5:
+        fail(f"timer-test: expected exactly 5 BRK-control lines after PASS, got "
+             f"{len(tail)}")
+    if tail[0] != IRQ_BRK_TRIGGER or tail[1] != IRQ_BRK_EXC:
+        fail("timer-test: BRK control trigger/EXCEPTION line mismatch (want vector 4, "
+             "EC 0x3c, ISS 0xb2b2)")
+    em = IRQ_BRK_ESR_RE.fullmatch(tail[2])
+    if em is None:
+        fail("timer-test: BRK control esr line != esr=0xf200b2b2 elr=<hex> spsr=<hex>")
+    b_elr, b_spsr = int(em.group(1), 16), int(em.group(2), 16)
+    if b_elr != exp["brk"]:
+        fail(f"timer-test: BRK elr=0x{b_elr:x} != {IRQ_BRK_SYM.decode()} 0x{exp['brk']:x}")
+    if b_spsr & 0x1F != SPSR_M_EL1H or (b_spsr >> 6) & 0xF != 0xF:
+        fail(f"timer-test: BRK spsr=0x{b_spsr:x}: want EL1h with DAIF all masked "
+             f"(I re-masked after the proof)")
+    fm = IRQ_BRK_FAR_RE.fullmatch(tail[3])
+    vb = [VBAR_RE.fullmatch(ln) for ln in lines if VBAR_RE.fullmatch(ln)]
+    if fm is None or len(vb) != 1 or fm.group(1) != vb[0].group(1):
+        fail("timer-test: BRK control far/vbar line missing or vbar != installed vbar")
+    if tail[4] != TERM_EXC:
+        fail("timer-test: BRK control did not end on 'exception handled; halted'")
+    print(f"irq:   {IRQ_TICKS} returning IRQ ticks via vector 5: intid {TIMER_INTID}, "
+          f"ISR_EL1.I set, SPSR EL1h I=0/DAF=1, ELR in canary window, sp=0x{sp0:x} "
+          f"stable, cntpct deltas >= {VIRT82_INTERVAL} (TCG lower bound), heartbeat "
+          f"strictly increasing; BRK control -> vector 4 EC 0x3c ELR==site, "
+          f"no double fault")
+
+
 # ---- --mmu-fault (MP2 PR-1b deliberate W^X / guard faults) ------------------
 # name -> (target symbol, ESR EC, FSC, WnR, data-abort?, PAR_R spec, PAR_W spec,
 #          section-range symbols the target must lie in)
@@ -1407,6 +1604,10 @@ def main():
     ap.add_argument("--timer-poll", action="store_true",
                     help="expect the ARM_TIMER_POLL polled GIC/timer proof "
                          "(4 ACK/EOI cycles, IRQs masked)")
+    ap.add_argument("--timer-test", action="store_true",
+                    help="expect the ARM_TIMER_TEST returning-IRQ proof (4 ticks "
+                         "via vector 5 interrupting the register-canary loop, "
+                         "then the BRK #0xb2b2 negative control)")
     ap.add_argument("--require", action="store_true",
                     help="missing QEMU/toolchain/image is a FAIL, not a SKIP")
     ap.add_argument("--elf", metavar="PATH",
@@ -1435,6 +1636,11 @@ def main():
                             or args.bss_verified):
         fail("--timer-poll is only valid with the default good-boot build "
              "(optionally --phys-alloc)")
+    if args.timer_test and (args.dtb_bad or args.vector_test or args.mmu_fault
+                            or args.bss_verified or args.timer_poll
+                            or args.phys_alloc):
+        fail("--timer-test is only valid alone (its build excludes the other "
+             "toggles)")
     qemu = args.qemu
     if shutil.which(qemu) is None:
         skip(f"{qemu} not installed")
@@ -1468,6 +1674,7 @@ def main():
     mmu_syms = None if args.dtb_bad else resolve_syms(elf, MMU_LAYOUT_SYMS, "mmu")
     fault_exp = (mmu_fault_expect(args.mmu_fault, elf, args.image, mmu_syms)
                  if args.mmu_fault else None)
+    tt_exp = timer_test_expect(elf, args.image) if args.timer_test else None
 
     markers = list(BASE_MARKERS)
     markers[3] = exact(b"JeiOS/aarch64: bss clear verified" if args.bss_verified
@@ -1493,6 +1700,15 @@ def main():
             markers += vector_test_markers(resolve_brk_site(elf, args.image))
         elif args.mmu_fault:
             markers += mmu_fault_markers(args.mmu_fault, fault_exp)
+        elif args.timer_test:
+            markers += [exact(IRQ_CANARY_HI)]
+            markers += [valued(b"JeiOS/aarch64: irq tick n=" + hx(n) + b" ...",
+                               re.escape(b"JeiOS/aarch64: irq tick n=" + hx(n) + b" ")
+                               + rb".*")
+                        for n in range(1, IRQ_TICKS + 1)]
+            markers += [valued(b"JeiOS/aarch64: irq timer PASS ticks=<hex>",
+                               IRQ_PASS_RE.pattern),
+                        exact(IRQ_BRK_TRIGGER), exact(IRQ_BRK_EXC), exact(TERM_EXC)]
         else:
             markers += [exact(TERM_DEFAULT)]
     # Every mode ends on a fixed (exact) line; that line is the terminal marker.
@@ -1583,9 +1799,15 @@ def main():
             next_ok = lambda ln: ln == vector_test_markers(0)[0][0]
         elif args.mmu_fault:
             next_ok = lambda ln: MMU_FAULT_TEST_RE.fullmatch(ln) is not None
+        elif args.timer_test:
+            next_ok = lambda ln: ln == IRQ_CANARY_HI
         else:
             next_ok = lambda ln: ln == TERM_DEFAULT
         check_gic(lines, args.timer_poll, next_ok)
+        if args.timer_test:
+            check_timer_test(lines, tt_exp)
+        elif any(ln.startswith(IRQ_TICK_PREFIX) or DOUBLE_FAULT in ln for ln in lines):
+            fail("irq/double-fault lines present without --timer-test (wrong build?)")
     if args.mmu_fault:
         check_mmu_fault(lines, args.mmu_fault, fault_exp, mmu_syms)
 

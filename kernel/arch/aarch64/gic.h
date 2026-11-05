@@ -89,6 +89,10 @@ uint64_t je_arm_timer_ticks(void);
  * become 1 in the spurious test). */
 uint64_t je_arm_spurious_count(void);
 
+/* Last full GICC_IAR value consumed by je_gic_handle_one(). The handler uses
+ * this readback for proof evidence; it does not re-read GICC_IAR. */
+uint32_t je_gic_last_iar(void);
+
 /* Current raw ISR_EL1 (bit 7 = I pending) and CNTPCT_EL0 — small readback
  * helpers the proof + oracle use; pure sysreg reads. */
 uint64_t je_arm_read_isr_el1(void);
