@@ -1,5 +1,7 @@
 # Coding-agent starting guide
 
+[Dynamic clustering roadmap](CLUSTERING.md): authorized personal device pools through enterprise distributed computing; intuitive defaults, programmable policy and staged security/failure qualification. Planned; tracker [core #82](https://github.com/auto44e/jeios/issues/82).
+
 [Included native software portfolio](NATIVE_PRODUCTS.md): latest-stable source policy, stable GNU C coreutils with selective uutils improvements, doas/optional sudo, vi, C/C++ and assembly tools, SSH/TLS, curl, FIDO, zlib and QEMU; shared hardening and feature-preservation gates. Planned integration; no runtime support added.
 
 Owner-approved [two-phase native shell and selectable shell roadmap](SHELLS.md): recovery + original JeiOS sh, included native Bash/Zsh, and bring-your-own shell. PowerShell deferred. Planned, not runtime support.

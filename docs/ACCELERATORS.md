@@ -1,5 +1,7 @@
 # Accelerators, compute offloading and media integration
 
+[Dynamic clustering roadmap](CLUSTERING.md): authorized personal device pools through enterprise distributed computing; intuitive defaults, programmable policy and staged security/failure qualification. Planned; tracker [core #82](https://github.com/auto44e/jeios/issues/82).
+
 Status: owner requirements and proposed architecture, 2026-10-13. No GPU/NPU
 or media runtime is implemented. M3a remains the next kernel gate.
 
