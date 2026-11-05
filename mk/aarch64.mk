@@ -10,15 +10,15 @@ ARM_OBJCOPY := aarch64-linux-gnu-objcopy
 ARM_BUILD   := build/aarch64
 ARM_ARCH    := kernel/arch/aarch64
 
-# The four test-build toggles below are MUTUALLY EXCLUSIVE: each selects its own
+# The five test-build toggles below are MUTUALLY EXCLUSIVE: each selects its own
 # build dir, and with more than one set the last assignment would silently win
 # and reuse that dir for a different flag combination (stale objects / a smoke
 # run asserting the wrong markers). Refuse the combination outright.
 # ARM_MMU_FAULT (a NAME, not 0/1) joins the group as a "1" when non-empty.
 ARM_MMU_FAULT_SET := $(if $(strip $(ARM_MMU_FAULT)),1,)
-ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET))),0)
-ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET))),1)
-$(error ARM_BSS_CHECK, ARM_VECTOR_TEST, ARM_DTB_BAD and ARM_MMU_FAULT are mutually exclusive; set at most one)
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL))),0)
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL))),1)
+$(error ARM_BSS_CHECK, ARM_VECTOR_TEST, ARM_DTB_BAD, ARM_MMU_FAULT and ARM_TIMER_POLL are mutually exclusive; set at most one)
 endif
 endif
 
@@ -67,6 +67,13 @@ $(error ARM_MMU_FAULT=$(ARM_MMU_FAULT) is not one of: text data rodata guard)
 endif
 ARM_BUILD   := build/aarch64-mmufault-$(ARM_MMU_FAULT)
 endif
+# Optional polled GIC/timer proof (MP2 PR-2a, ADR 0012 D8): after the default
+# GIC/timer markers, poll the CNTP PPI 4 times with DAIF.I still MASKED and run
+# the full ACK/handle/EOI chain each time. `make aarch64 ARM_TIMER_POLL=1 &&
+# make smoke-aarch64 ARM_TIMER_POLL=1`. Separate build dir (no stale objects).
+ifeq ($(ARM_TIMER_POLL),1)
+ARM_BUILD   := build/aarch64-timerpoll
+endif
 
 # Freestanding, no PIC/stack-protector, STRICT alignment (pre-MMU RAM is
 # Device-nGnRnE so unaligned accesses fault), and general-regs-only (a stray
@@ -96,12 +103,16 @@ ifeq ($(ARM_DTB_BAD),1)
 ARM_CFLAGS  += -DJE_ARM_DTB_BAD
 ARM_ASFLAGS += -DJE_ARM_DTB_BAD
 endif
+ifeq ($(ARM_TIMER_POLL),1)
+ARM_CFLAGS  += -DJE_ARM_TIMER_POLL
+ARM_ASFLAGS += -DJE_ARM_TIMER_POLL
+endif
 ifneq ($(ARM_MMU_FAULT_SET),)
 ARM_CFLAGS  += -DJE_ARM_MMU_FAULT=$(ARM_MMU_FAULT_$(ARM_MMU_FAULT))
 ARM_ASFLAGS += -DJE_ARM_MMU_FAULT=$(ARM_MMU_FAULT_$(ARM_MMU_FAULT))
 endif
 
-ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/physmem.o $(ARM_BUILD)/paging.o $(ARM_BUILD)/paging_enable.o $(ARM_BUILD)/alloc.o $(ARM_BUILD)/bootctx.o $(ARM_BUILD)/memory.o $(ARM_BUILD)/vectors.o $(ARM_BUILD)/fdt.o
+ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/gic.o $(ARM_BUILD)/physmem.o $(ARM_BUILD)/paging.o $(ARM_BUILD)/paging_enable.o $(ARM_BUILD)/alloc.o $(ARM_BUILD)/bootctx.o $(ARM_BUILD)/memory.o $(ARM_BUILD)/vectors.o $(ARM_BUILD)/fdt.o
 
 # Shared arch-neutral bounded DTB parser (issue #52), compiled with the ARM
 # freestanding/strict-align flags.
@@ -118,6 +129,10 @@ $(ARM_BUILD)/vectors.o: $(ARM_ARCH)/vectors.S $(ARM_ARCH)/trapframe.h
 	$(ARM_CC) $(ARM_ASFLAGS) -I$(ARM_ARCH) -c $< -o $@
 
 $(ARM_BUILD)/main.o: $(ARM_ARCH)/main.c $(ARM_ARCH)/trapframe.h $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
+
+$(ARM_BUILD)/gic.o: $(ARM_ARCH)/gic.c $(ARM_ARCH)/gic.h $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
 
@@ -175,4 +190,4 @@ aarch64: $(ARM_BUILD)/Image
 # uses them).
 ARM_SMOKE_TIMEOUT ?= 15
 smoke-aarch64: $(ARM_BUILD)/Image
-	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_PHYSALLOC)),--phys-alloc,) $(if $(ARM_MMU_FAULT_SET),--mmu-fault $(ARM_MMU_FAULT_SMOKE_$(ARM_MMU_FAULT)),) $(if $(filter 1,$(ARM_REQUIRE)),--require,)
+	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_PHYSALLOC)),--phys-alloc,) $(if $(filter 1,$(ARM_TIMER_POLL)),--timer-poll,) $(if $(ARM_MMU_FAULT_SET),--mmu-fault $(ARM_MMU_FAULT_SMOKE_$(ARM_MMU_FAULT)),) $(if $(filter 1,$(ARM_REQUIRE)),--require,)
