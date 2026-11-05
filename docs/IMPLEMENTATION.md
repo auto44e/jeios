@@ -41,6 +41,94 @@ This file records current contracts and execution evidence as gates are built.
 DESIGN.md describes the broader target architecture. No entry below implies
 userspace isolation, SMP safety, driver containment or production readiness.
 
+## MP2 PR-2a — aarch64 GICv2 + CNTP timer, polled with IRQs masked — 2026-11-05
+
+> SUPERSEDED STATUS NOTE (lead, 2026-11-05): the "exits FAIL / independent hosted
+> test + oracle planned" wording below reflects the mid-PR snapshot BEFORE the
+> test author's work and the cross-review fixes landed. CURRENT state: the hosted
+> test (`tests/test_gic_bits.c`, 1503 checks) + the `--timer-poll` smoke oracle +
+> the updated MMU oracle are all present and GREEN; all 10 ARM smoke modes pass;
+> the repo path is `oss/jeios-workspace/jeios`. See the HANDOFF entry dated
+> 2026-11-05T01:03:50Z and docs/adr/debates/0012-mp2-pr2a-review/ for the current
+> evidence. The paragraph below is retained as history.
+
+
+Observed 2026-11-05T00:33:15Z in repository
+`/home/ANT.AMAZON.COM/lubuel/oss/jeios`, branch
+`feat/mp2-aarch64-gic-timer`, exact inspected commit
+`f8d7de6ab691acb1502908a61d61ec3623efa5fc` plus the uncommitted PR-2a
+worktree. State: **implemented / tested locally / planned (independent hosted
+tests and smoke-oracle update) / not blocked**. This is PR-2a only: no vector
+change, no exception-path change, no DAIF.I unmask, no scheduler, and no
+physical-hardware qualification.
+
+Implemented:
+
+- `kernel/arch/aarch64/gic.c`: strict-alignment 32-bit Device MMIO helpers;
+  ADR 0012 D2/D3/D4/D6 GICv2 identification/configuration with static register
+  assertions and fail-closed readbacks; CNTP frequency/interval validation and
+  arm sequence; one-IAR ACK/handle/EOI processing; bounded pending polling; and
+  static volatile timer/spurious counters. The GICD/GICC IIDRs require the
+  pinned ARM implementer `0x43b`; SecurityExtn, group, priority, enable, CTLR
+  and PMR mismatches refuse.
+- `kernel/arch/aarch64/main.c`: maps GICD `0x08000000` and GICC `0x08010000` as
+  separate 4 KiB Device regions, extends the MMU marker with both bases, calls
+  GIC/timer bring-up after MMU enable in every build, and emits the pinned
+  GIC/config/timer markers. The optional `JE_ARM_TIMER_POLL` body performs four
+  bounded pending-to-IAR-to-rearm-to-EOI cycles. The live QEMU path does not
+  inject INTID 1023; the independent hosted fake is expected to cover the
+  no-EOIR spurious case.
+- `mk/aarch64.mk`: links and compiles `gic.o`. The test author owns adding the
+  `JE_ARM_TIMER_POLL` make selector and updating the MMU/smoke oracle.
+
+Local evidence actually observed:
+
+- `make aarch64` — PASS under `aarch64-linux-gnu-gcc` 13.3.0; the existing
+  single-ELF RWX linker warning remains.
+- A separate `JE_ARM_TIMER_POLL` build with the same strict flags — PASS.
+- Pinned QEMU 8.2.2 (`virt-8.2,gic-version=2,virtualization=off,secure=off`,
+  `cortex-a72`, one CPU, 256 MiB) booted through the terminal marker in both
+  default and poll-toggle images. Default observed:
+  `gicd_typer=0x0000000000000008`,
+  `gicd_iidr=0x000000000000043b`,
+  `gicc_iidr=0x000000000002043b`,
+  `gicc_ctlr=0x0000000000000001`,
+  `gicc_pmr=0x00000000000000ff`,
+  `gicd_ctlr=0x0000000000000001`,
+  `isenabler0=0x000000004000ffff`,
+  `cntfrq=0x0000000003b9aca0`,
+  `interval=0x0000000000098968`,
+  `intid=0x000000000000001e`, and MMU leaves `0x57`.
+- Poll-toggle observed four complete proof lines with `ticks=1..4` and
+  `cntpct=0x24777d, 0x2e0cf5, 0x37adb5, 0x413fdd`; successive deltas were
+  `628088`, `630976`, and `627240`, all at least `625000`. The final
+  `timer poll PASS cycles=0x0000000000000004` and terminal marker were
+  observed.
+
+The existing `tools/smoke_arm.py` currently exits FAIL because its MMU oracle
+still expects the pre-PR-2a `mmu map ... device=` line; the serial logs reached
+the complete terminal marker, so this is a stale test-author oracle failure,
+not a boot halt. No independent hosted GIC test, updated leaf-count oracle,
+remote CI result, physical ARM result, or independent human qualification is
+claimed yet. QEMU TCG timing is a loose lower-bound observation, not a
+precision or real-interrupt-latency claim.
+
+### PR-2a test/oracle hardening — observed 2026-11-05T01:03:50Z
+
+Same branch/commit plus worktree. State: **tested locally** (remote CI not
+observed). `tests/test_gic_bits.c` (1503 checks) now models CNTP re-arm /
+ISTATUS / PPI level, a one-shot GICC_IAR, separate GICD_CTLR disable and
+post-enable faults, any-width EOIR detection and universal fake-violation
+failure, and asserts the lead's contract changes (ISTATUS==0 -> `JE_ERR_BUSY`
+with exact-IAR EOIR and no tick; `interval > INT32_MAX` refused before any
+access; identify-before-write). `main.c` emits `mmu xlate gicd|gicc|gicc_dir`
+AT probes (GICD/GICC identity Device ATTR 0x00; GICC_DIR unmapped, L3
+translation fault) and `igroupr0=`/`prio30=` on the gic config marker;
+`smoke_arm.py` decodes them independently and validates the full DTB timer
+cells (`0x104`). All ten ARM smoke modes, `make check` and `make smoke` PASS
+locally; details and the mutation battery are in HANDOFF.md. The earlier
+"stale oracle" note above is superseded. AI-assisted testing only.
+
 ## MP2 PR-1a — aarch64 physical allocator, MMU still off — 2026-11-03
 
 State at the current implementation worktree: **implemented / tested / planned /

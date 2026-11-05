@@ -79,13 +79,14 @@ $(BUILD)/kernel/core/image.o: kernel/core/image.c $(USER_GENERATED) $(USER_GENER
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_paging_bits $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_device
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_paging_bits $(BUILD)/test_gic_bits $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_device
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
 	./$(BUILD)/test_physmem
 	./$(BUILD)/test_physmem_arm
 	./$(BUILD)/test_paging_bits
+	./$(BUILD)/test_gic_bits
 	./$(BUILD)/test_vm
 	./$(BUILD)/test_uframe
 	./$(BUILD)/test_syscall
@@ -150,6 +151,13 @@ $(BUILD)/test_physmem_arm: tests/test_physmem_arm.c kernel/core/alloc.c kernel/c
 $(BUILD)/test_paging_bits: tests/test_paging_bits.c kernel/arch/aarch64/paging.c kernel/arch/aarch64/paging.h kernel/core/alloc.c kernel/core/boot.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -DJE_ARCH_AARCH64 -DJE_ARM_PAGING_HOSTED_TEST -Ikernel/arch/aarch64 -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_paging_bits.c kernel/arch/aarch64/paging.c kernel/core/alloc.c kernel/core/boot.c -o $@
+
+# MP2 PR-2a (ADR 0012): hosted GICv2 + CNTP test. -DJE_ARM_GIC_HOSTED_TEST routes
+# every gic.c MMIO/sysreg access through gic_hosted.h hooks implemented by the
+# test over a fake register file (the kernel build keeps raw MMIO + mrs/msr).
+$(BUILD)/test_gic_bits: tests/test_gic_bits.c kernel/arch/aarch64/gic.c kernel/arch/aarch64/gic.h kernel/arch/aarch64/gic_hosted.h kernel/core/status.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -DJE_ARCH_AARCH64 -DJE_ARM_GIC_HOSTED_TEST -Ikernel/arch/aarch64 -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_gic_bits.c kernel/arch/aarch64/gic.c kernel/core/status.c -o $@
 
 $(BUILD)/test_vm: tests/test_vm.c tests/vm_fake.c kernel/core/vm.c kernel/core/alloc.c kernel/core/boot.c kernel/core/handle.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)

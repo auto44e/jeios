@@ -219,11 +219,15 @@ class Fixture:
         self.crc32 = define("QEMU_VIRT82_DTB_CRC32")
         self.length = define("QEMU_VIRT82_DTB_LEN")
         self.totalsize = define("QEMU_VIRT82_DTB_TOTALSIZE")
-        body = src.split("{", 1)[1]
-        hdr = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]{2})", body)[:40])
-        if len(hdr) != 40:
+        body = src.split("{", 1)[1].split("}", 1)[0]
+        blob = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]{2})", body))
+        if len(blob) < 40:
             raise ValueError(f"fixture {path}: fewer than 40 header bytes")
-        self.off_dt_struct = int.from_bytes(hdr[8:12], "big")
+        if len(blob) != self.length:
+            raise ValueError(f"fixture {path}: {len(blob)} bytes != "
+                             f"QEMU_VIRT82_DTB_LEN {self.length}")
+        self.blob = blob
+        self.off_dt_struct = int.from_bytes(blob[8:12], "big")
 
 
 # Bound on the ELF read: the kernel ELF (with DWARF) is far smaller; anything
@@ -589,14 +593,20 @@ MMU_MAP_RE = re.compile(
     MMU + rb"map text=\[" + H + rb"," + H +
     rb"\) rodata=\[" + H + rb"," + H +
     rb"\) data=\[" + H + rb"," + H +
-    rb"\) device=" + H)
+    rb"\) device=" + H + rb" gicd=" + H + rb" gicc=" + H)
 MMU_AUDIT_RE = re.compile(MMU + rb"audit ok leaves=" + H)
 MMU_ENABLED_RE = re.compile(MMU + rb"enabled sctlr=" + H)
 MMU_XLATE_RE = re.compile(MMU + rb"xlate mapped va=" + H + rb" par=" + H)
 MMU_GUARD_RE = re.compile(MMU + rb"xlate guard va=" + H + rb" par=" + H)
 MMU_UART_RE = re.compile(MMU + rb"attr uart va=" + H + rb" par=" + H)
+# MP2 PR-2a (ADR 0012 D2): independent AT S1E1R probes of the GIC frames.
+MMU_GICD_RE = re.compile(MMU + rb"xlate gicd va=" + H + rb" par=" + H)
+MMU_GICC_RE = re.compile(MMU + rb"xlate gicc va=" + H + rb" par=" + H)
+MMU_GICC_DIR_RE = re.compile(MMU + rb"xlate gicc_dir va=" + H + rb" par=" + H)
 MMU_BLOCK_RES = (MMU_BUILD_RE, MMU_MAP_RE, MMU_AUDIT_RE, MMU_ENABLED_RE,
-                 MMU_XLATE_RE, MMU_GUARD_RE, MMU_UART_RE)
+                 MMU_XLATE_RE, MMU_GUARD_RE, MMU_UART_RE,
+                 MMU_GICD_RE, MMU_GICC_RE, MMU_GICC_DIR_RE)
+MMU_BLOCK_LAST_RE = MMU_BLOCK_RES[-1]
 
 def phys_alloc_markers():
     """Ordered whole-line markers for the pinned -m 256M fixture (one RAM
@@ -622,12 +632,15 @@ def mmu_markers():
     """Ordered default MMU-enable markers (ADR 0011 D2/D3/D4/D6/D7)."""
     return [
         valued(MMU + b"build root=<hex>", MMU_BUILD_RE.pattern),
-        valued(MMU + b"map text/rodata/data/device", MMU_MAP_RE.pattern),
+        valued(MMU + b"map text/rodata/data/device/gicd/gicc", MMU_MAP_RE.pattern),
         valued(MMU + b"audit ok leaves=<hex>", MMU_AUDIT_RE.pattern),
         valued(MMU + b"enabled sctlr=<hex>", MMU_ENABLED_RE.pattern),
         valued(MMU + b"xlate mapped va=<hex> par=<hex>", MMU_XLATE_RE.pattern),
         valued(MMU + b"xlate guard va=<hex> par=<hex>", MMU_GUARD_RE.pattern),
         valued(MMU + b"attr uart va=<hex> par=<hex>", MMU_UART_RE.pattern),
+        valued(MMU + b"xlate gicd va=<hex> par=<hex>", MMU_GICD_RE.pattern),
+        valued(MMU + b"xlate gicc va=<hex> par=<hex>", MMU_GICC_RE.pattern),
+        valued(MMU + b"xlate gicc_dir va=<hex> par=<hex>", MMU_GICC_DIR_RE.pattern),
     ]
 
 
@@ -638,6 +651,13 @@ def mmu_markers():
 # QEMU TCG models no caches: none of this is cache-maintenance evidence; it
 # proves TRANSLATION and PERMISSIONS only.
 PL011_PA = 0x09000000
+# MP2 PR-2a (ADR 0012 D2): pinned GICv2 frames, one 4 KiB Device page each.
+# Cross-checked at startup against the committed fixture DTB (which the boot's
+# CRC binds to the DTB QEMU actually passed): /intc@8000000 compatible
+# "arm,cortex-a15-gic" reg = <0x0 0x08000000 0x0 0x10000  0x0 0x08010000 0x0
+# 0x10000>; /timer interrupts[1] = <GIC_PPI 14 0x104> -> INTID 16+14 = 30.
+GICD_PA, GICC_PA = 0x08000000, 0x08010000
+TIMER_INTID = 30
 SCTLR_INTERIM = 0x30D00808     # boot.S MP1 SCTLR_EL1 (RES1 + SA), MMU/caches off
 SCTLR_M, SCTLR_C, SCTLR_I, SCTLR_WXN, SCTLR_EE = 1 << 0, 1 << 2, 1 << 12, 1 << 19, 1 << 25
 SCTLR_SET = SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_WXN
@@ -723,7 +743,7 @@ def mmu_expected_leaves(regions_pages, root):
 
 
 def check_mmu(lines, syms):
-    """Default MMU block: one contiguous block of the 7 lines, each value
+    """Default MMU block: one contiguous block of the 10 lines, each value
     recomputed independently. Returns the parsed block for later checks."""
     idx = [i for i, ln in enumerate(lines)
            if ln.startswith(MMU) and not ln.startswith(MMU_FAULT_PREFIX)]
@@ -736,11 +756,12 @@ def check_mmu(lines, syms):
         if g is None:
             fail(f"mmu: unknown/out-of-order mmu line {lines[i].decode('ascii', 'replace')!r}")
         m.append([int(x, 16) for x in g.groups()])
-    (root,), mp, (leaves,), (sctlr,), (x_va, x_par), (g_va, g_par), (u_va, u_par) = m
+    ((root,), mp, (leaves,), (sctlr,), (x_va, x_par), (g_va, g_par), (u_va, u_par),
+     (gd_va, gd_par), (gc_va, gc_par), (dir_va, dir_par)) = m
 
     s = syms
     want_map = [s[b"_text"], s[b"__text_end"], s[b"__text_end"], s[b"__rodata_end"],
-                s[b"__rodata_end"], s[b"__data_end"], PL011_PA]
+                s[b"__rodata_end"], s[b"__data_end"], PL011_PA, GICD_PA, GICC_PA]
     if mp != want_map:
         fail("mmu map: kernel " + " ".join(f"0x{v:x}" for v in mp) +
              " != ELF " + " ".join(f"0x{v:x}" for v in want_map))
@@ -755,7 +776,8 @@ def check_mmu(lines, syms):
 
     pages = []
     for lo, hi in ((s[b"_text"], s[b"__data_end"]), (s[b"__stack_bottom"], s[b"_end"]),
-                   (PL011_PA, PL011_PA + PHYS_PAGE)):
+                   (PL011_PA, PL011_PA + PHYS_PAGE), (GICD_PA, GICD_PA + PHYS_PAGE),
+                   (GICC_PA, GICC_PA + PHYS_PAGE)):
         pages += range(lo, hi, PHYS_PAGE)
     if s[b"__stack_guard"] in pages:
         fail("mmu: oracle bug: guard page in the mapped set")
@@ -785,11 +807,259 @@ def check_mmu(lines, syms):
     # Device-nGnRnE (MAIR Attr1 0x00). PAR.SH reads 0b10 for Device memory
     # (DDI0487 PAR_EL1.SH: Device / Normal-NC are reported Outer Shareable).
     par_expect_ok(u_par, u_va, MAIR_DEVICE_NGNRNE, 0b10, "mmu attr uart")
+    # GIC frames (ADR 0012 D2): each pinned page translates identity as
+    # Device-nGnRnE; GICC_DIR (GICC + 0x1000, IHI0048B 4.4.16) must NOT
+    # translate — an EOImode=1/DIR path would take a stage-1 L3 translation
+    # fault (GICD, GICC and GICC+0x1000 share one 2 MiB L2 slot, so the L3
+    # table exists and the missing leaf is reported at level 3).
+    if (gd_va, gc_va) != (GICD_PA, GICC_PA):
+        fail(f"mmu xlate gicd/gicc: va=0x{gd_va:x}/0x{gc_va:x} != pinned "
+             f"0x{GICD_PA:x}/0x{GICC_PA:x}")
+    par_expect_ok(gd_par, gd_va, MAIR_DEVICE_NGNRNE, 0b10, "mmu xlate gicd")
+    par_expect_ok(gc_par, gc_va, MAIR_DEVICE_NGNRNE, 0b10, "mmu xlate gicc")
+    if dir_va != GICC_PA + PHYS_PAGE:
+        fail(f"mmu xlate gicc_dir: va=0x{dir_va:x} != GICC+0x1000 "
+             f"0x{GICC_PA + PHYS_PAGE:x}")
+    if (GICC_PA >> 21) != (dir_va >> 21):
+        fail("mmu: oracle bug: GICC_DIR not in GICC's 2 MiB slot")
+    par_expect_fault(dir_par, FSC_TRANSLATION_L3, "mmu xlate gicc_dir")
     print(f"mmu:   root=0x{root:x} leaves=0x{leaves:x} (== {len(pages)} region pages + "
           f"{tables} tables, ELF) sctlr=0x{sctlr:x} (M|C|I|WXN, EE=0)")
     print(f"mmu:   PAR mapped=0x{x_par:016x} (F=0 PA==VA ATTR=0xff SH=IS) "
           f"guard=0x{g_par:016x} (F=1 FST=xlate L3) uart=0x{u_par:016x} "
           f"(F=0 PA==VA ATTR=0x00)")
+    print(f"mmu:   PAR gicd=0x{gd_par:016x} gicc=0x{gc_par:016x} (F=0 PA==VA "
+          f"ATTR=0x00 Device) gicc_dir=0x{dir_par:016x} (F=1 FST=xlate L3, unmapped)")
+
+
+# ---- GIC + CNTP timer (MP2 PR-2a, ADR 0012 D2/D3/D4/D6/D8) -----------------
+# Runs in EVERY good-boot mode (gic_timer_bringup follows mmu_bringup in every
+# build). IRQs stay MASKED in PR-2a: this proves the GIC configuration and, in
+# --timer-poll, the polled acknowledge/handle/EOI chain — NOT interrupt
+# delivery or the vector path (PR-2b). QEMU TCG models no real interrupt
+# latency: the cntpct deltas are a loose lower-bound sanity check, never a
+# timing-precision claim.
+GIC_INIT_RE = re.compile(rb"JeiOS/aarch64: gic init gicd_typer=" + H
+                         + rb" gicd_iidr=" + H + rb" gicc_iidr=" + H)
+GIC_CONFIG_RE = re.compile(rb"JeiOS/aarch64: gic config gicc_ctlr=" + H
+                           + rb" gicc_pmr=" + H + rb" gicd_ctlr=" + H
+                           + rb" isenabler0=" + H + rb" igroupr0=" + H
+                           + rb" prio30=" + H)
+TIMER_RE = re.compile(rb"JeiOS/aarch64: timer cntfrq=" + H + rb" interval=" + H
+                      + rb" intid=" + H)
+TIMER_POLL_RE = re.compile(rb"JeiOS/aarch64: timer poll n=" + H + rb" intid=" + H
+                           + rb" cntpct=" + H + rb" ticks=" + H)
+TIMER_POLL_PREFIX = b"JeiOS/aarch64: timer poll "
+TIMER_POLL_CYCLES = 4
+TIMER_POLL_PASS = TIMER_POLL_PREFIX + b"PASS cycles=" + hx(TIMER_POLL_CYCLES)
+# Machine-type-fixed for QEMU 8.2 virt (TCG generic timer: 62.5 MHz). Pinned,
+# NOT recomputed from the kernel's printed cntfrq (that would be circular).
+VIRT82_CNTFRQ = 62500000
+VIRT82_INTERVAL = VIRT82_CNTFRQ // 100     # 100 Hz (ADR 0012 D6) = 625000
+# Observed QEMU 8.2 GICv2 identity (IHI0048B 4.3.3 / 4.4.15): Arm implementer
+# 0x43b in [11:0] of both IIDRs.
+GIC_ARM_IMPLEMENTER = 0x43B
+GICD_TYPER_SECEXT = 1 << 10
+GICC_CTLR_ENGRP0, GICC_CTLR_FIQEN, GICC_CTLR_EOIMODE = 1 << 0, 1 << 3, 1 << 9
+GIC_TIMER_PRIORITY = 0x80      # ADR 0012 D3 pinned INTID 30 priority
+
+
+def gic_markers():
+    return [
+        valued(b"JeiOS/aarch64: gic init gicd_typer=<hex> gicd_iidr=<hex> gicc_iidr=<hex>",
+               GIC_INIT_RE.pattern),
+        valued(b"JeiOS/aarch64: gic config gicc_ctlr=<hex> gicc_pmr=<hex> "
+               b"gicd_ctlr=<hex> isenabler0=<hex> igroupr0=<hex> prio30=<hex>",
+               GIC_CONFIG_RE.pattern),
+        valued(b"JeiOS/aarch64: timer cntfrq=<hex> interval=<hex> intid=0x..1e",
+               TIMER_RE.pattern),
+    ]
+
+
+def timer_poll_markers():
+    return [valued(TIMER_POLL_PREFIX + b"n=" + hx(n) +
+                   b" intid=<hex> cntpct=<hex> ticks=<hex>",
+                   re.escape(TIMER_POLL_PREFIX + b"n=" + hx(n)) + rb" intid="
+                   + HEX16 + rb" cntpct=" + HEX16 + rb" ticks=" + HEX16)
+            for n in range(1, TIMER_POLL_CYCLES + 1)] + [exact(TIMER_POLL_PASS)]
+
+
+def fdt_walk(blob):
+    """Bounded FDT structure walk of the committed fixture: yields
+    (node_path, prop_name, value). Any malformed token/offset is a FAIL."""
+    if len(blob) < 40 or blob[:4] != b"\xd0\x0d\xfe\xed":
+        fail("fixture DTB: bad magic/header")
+    off_s, off_str = struct.unpack(">II", blob[8:16])
+    size_s = struct.unpack(">I", blob[36:40])[0]
+    i, end, path = off_s, off_s + size_s, []
+    if end > len(blob):
+        fail("fixture DTB: struct block outside the blob")
+    while i + 4 <= end:
+        (tok,) = struct.unpack(">I", blob[i:i + 4])
+        i += 4
+        if tok == 1:            # FDT_BEGIN_NODE
+            e = blob.find(b"\0", i, end)
+            if e < 0:
+                fail("fixture DTB: unterminated node name")
+            path.append(blob[i:e].decode("ascii", "replace"))
+            i = (e + 4) & ~3
+        elif tok == 2:          # FDT_END_NODE
+            if not path:
+                fail("fixture DTB: unbalanced END_NODE")
+            path.pop()
+        elif tok == 3:          # FDT_PROP
+            ln, no = struct.unpack(">II", blob[i:i + 8])
+            i += 8
+            if i + ln > end:
+                fail("fixture DTB: property overruns struct block")
+            e = blob.find(b"\0", off_str + no)
+            yield "/".join(path), blob[off_str + no:e], blob[i:i + ln]
+            i = (i + ln + 3) & ~3
+        elif tok == 4:          # FDT_NOP
+            continue
+        elif tok == 9:          # FDT_END
+            return
+        else:
+            fail(f"fixture DTB: unknown token 0x{tok:x}")
+    fail("fixture DTB: no FDT_END")
+
+
+def check_dtb_gic_timer(fx):
+    """Cross-check the pinned GIC bases + CNTP INTID against the fixture DTB
+    (the booted DTB is CRC-bound to it). Root #address/#size-cells are 2."""
+    props = {}
+    for node, name, val in fdt_walk(fx.blob):
+        props.setdefault(node, {})[name] = val
+    gic = [n for n, p in props.items()
+           if p.get(b"compatible", b"").split(b"\0")[0] == b"arm,cortex-a15-gic"]
+    timer = [n for n, p in props.items()
+             if b"arm,armv8-timer" in p.get(b"compatible", b"").split(b"\0")]
+    if len(gic) != 1 or len(timer) != 1:
+        fail(f"fixture DTB: expected one GICv2 and one armv8-timer node, got "
+             f"{gic} {timer}")
+    reg = props[gic[0]].get(b"reg", b"")
+    if len(reg) < 32:
+        fail(f"fixture DTB: {gic[0]} reg too short")
+    d_base, d_size, c_base, c_size = struct.unpack(">QQQQ", reg[:32])
+    if (d_base, c_base) != (GICD_PA, GICC_PA) or d_size < PHYS_PAGE or c_size < PHYS_PAGE:
+        fail(f"fixture DTB: GIC reg GICD=0x{d_base:x}+0x{d_size:x} GICC=0x{c_base:x}"
+             f"+0x{c_size:x} != pinned GICD=0x{GICD_PA:x} GICC=0x{GICC_PA:x}")
+    irq = props[timer[0]].get(b"interrupts", b"")
+    if len(irq) != 48:
+        fail(f"fixture DTB: timer interrupts has {len(irq)} bytes, want 4 triples")
+    # binding order (arm,arch_timer.yaml): secure phys, NON-SECURE EL1 PHYS
+    # (CNTP), virt, hyp -> QEMU virt PPIs 13, 14, 11, 10. GICv2 3-cell flags
+    # (arm,gic.yaml): [3:0] trigger (4 = level-high), [15:8] PPI CPU mask
+    # (QEMU: (1 << smp) - 1 = 0x01 for the pinned single CPU), all else 0.
+    # Validate the FULL cell, not only the trigger nibble.
+    triples = [struct.unpack(">III", irq[k:k + 12]) for k in range(0, 48, 12)]
+    want_flags = (0x01 << 8) | 4
+    for (k_, n_, f_), want_num in zip(triples, (13, 14, 11, 10)):
+        if k_ != 1 or n_ != want_num or f_ != want_flags:
+            fail(f"fixture DTB: timer interrupt <{k_} {n_} 0x{f_:x}> != "
+                 f"<1 {want_num} 0x{want_flags:x}> (PPI, level-high, cpumask 0x01)")
+    kind, num, flags = triples[1]
+    if kind != 1 or 16 + num != TIMER_INTID or flags != 0x104:
+        fail(f"fixture DTB: CNTP interrupt <{kind} {num} 0x{flags:x}> is not "
+             f"<1 {TIMER_INTID - 16} 0x104> (level-high PPI INTID {TIMER_INTID})")
+    print(f"dtb:   gicd=0x{d_base:x} gicc=0x{c_base:x} cntp=PPI {num} "
+          f"(INTID {16 + num}, flags 0x{flags:x} = level-high, cpumask 0x01) == pinned")
+
+
+def check_gic(lines, timer_poll, next_ok):
+    """GIC/timer block: three lines directly after the MMU block, each value
+    judged against GICv2/DDI0487 semantics and machine-fixed constants (never
+    against the kernel's own expectations). In --timer-poll the poll block must
+    follow immediately and is re-checked line by line; otherwise no poll line
+    may appear at all (a stale poll build in the default dir is a FAIL)."""
+    idx = [i for i, ln in enumerate(lines) if GIC_INIT_RE.fullmatch(ln)]
+    if len(idx) != 1:
+        fail(f"gic: expected exactly one 'gic init' line, found {len(idx)}")
+    i = idx[0]
+    if MMU_BLOCK_LAST_RE.fullmatch(lines[i - 1]) is None:
+        fail("gic: 'gic init' must directly follow the MMU block")
+    if i + 2 >= len(lines):
+        fail("gic: block truncated")
+    gi = GIC_INIT_RE.fullmatch(lines[i])
+    gc = GIC_CONFIG_RE.fullmatch(lines[i + 1])
+    tm = TIMER_RE.fullmatch(lines[i + 2])
+    if gc is None or tm is None:
+        fail("gic: 'gic init', 'gic config', 'timer' must be contiguous in order")
+    typer, d_iidr, c_iidr = (int(x, 16) for x in gi.groups())
+    c_ctlr, pmr, d_ctlr, isen, igrp, prio = (int(x, 16) for x in gc.groups())
+    freq, interval, intid = (int(x, 16) for x in tm.groups())
+    if typer & GICD_TYPER_SECEXT:
+        fail(f"gic init: GICD_TYPER=0x{typer:x} reports SecurityExtn (secure=off pinned)")
+    for nm, v in (("gicd_iidr", d_iidr), ("gicc_iidr", c_iidr)):
+        if v == 0 or v >> 32 or v & 0xFFF != GIC_ARM_IMPLEMENTER:
+            fail(f"gic init: {nm}=0x{v:x} not an Arm (0x43b) GICv2 identity")
+    if pmr != 0xFF:
+        fail(f"gic config: gicc_pmr=0x{pmr:x} != 0xff")
+    if not c_ctlr & GICC_CTLR_ENGRP0 or c_ctlr & (GICC_CTLR_FIQEN | GICC_CTLR_EOIMODE) \
+            or c_ctlr != 1:
+        fail(f"gic config: gicc_ctlr=0x{c_ctlr:x}: want EnableGrp0=1 FIQEn=0 "
+             f"EOImode=0 (exactly 0x1)")
+    if d_ctlr != 1:
+        fail(f"gic config: gicd_ctlr=0x{d_ctlr:x} != 0x1")
+    if not isen >> TIMER_INTID & 1 or isen >> 32:
+        fail(f"gic config: isenabler0=0x{isen:x} lacks bit {TIMER_INTID}")
+    if isen & ~(0xFFFF | 1 << TIMER_INTID):
+        fail(f"gic config: isenabler0=0x{isen:x} enables a PPI other than "
+             f"INTID {TIMER_INTID} (SGIs 0-15 are always-enabled on GICv2)")
+    # ADR 0012 D3: INTID 30 in group 0 (IHI0048B 4.3.4 IGROUPR bit 30 = 0) at
+    # priority 0x80 (IPRIORITYR byte 30, 4.3.11), strictly below PMR 0xff.
+    if igrp >> TIMER_INTID & 1 or igrp >> 32:
+        fail(f"gic config: igroupr0=0x{igrp:x}: INTID {TIMER_INTID} must be group 0")
+    if prio != GIC_TIMER_PRIORITY:
+        fail(f"gic config: prio30=0x{prio:x} != 0x{GIC_TIMER_PRIORITY:x}")
+    if not prio < pmr:
+        fail(f"gic config: prio30=0x{prio:x} not below PMR 0x{pmr:x} (masked)")
+    if freq != VIRT82_CNTFRQ or interval != VIRT82_INTERVAL:
+        fail(f"timer: cntfrq={freq} interval={interval}, virt-8.2 pins "
+             f"{VIRT82_CNTFRQ}/{VIRT82_INTERVAL}")
+    if intid != TIMER_INTID:
+        fail(f"timer: intid=0x{intid:x} != 0x{TIMER_INTID:x}")
+    print(f"gic:   typer=0x{typer:x} iidr=0x{d_iidr:x}/0x{c_iidr:x} gicc_ctlr=0x{c_ctlr:x} "
+          f"pmr=0x{pmr:x} gicd_ctlr=0x{d_ctlr:x} isenabler0=0x{isen:x} "
+          f"igroupr0=0x{igrp:x} (INTID {TIMER_INTID} group 0) prio30=0x{prio:x}")
+    print(f"timer: cntfrq={freq} interval={interval} intid={intid} (pinned virt-8.2)")
+
+    poll = [k for k, ln in enumerate(lines) if ln.startswith(TIMER_POLL_PREFIX)]
+    if not timer_poll:
+        if poll:
+            fail("timer poll lines present without --timer-poll (wrong build?)")
+        if i + 3 >= len(lines) or not next_ok(lines[i + 3]):
+            fail("gic: timer line not directly followed by the mode's next marker")
+        return
+    want = list(range(i + 3, i + 3 + TIMER_POLL_CYCLES + 1))
+    if poll != want:
+        fail(f"timer poll: expected {TIMER_POLL_CYCLES} poll lines + PASS directly "
+             f"after the timer line, found at {poll}")
+    prev_pct = None
+    for n, k in enumerate(want[:-1], start=1):
+        m = TIMER_POLL_RE.fullmatch(lines[k])
+        if m is None:
+            fail(f"timer poll: malformed line {lines[k].decode('ascii', 'replace')!r}")
+        pn, pid, pct, ticks = (int(x, 16) for x in m.groups())
+        if pn != n or pid != TIMER_INTID:
+            fail(f"timer poll: line {n} has n={pn} intid=0x{pid:x}")
+        # Only handle_one bumps ticks and nothing ran before the proof, so the
+        # count must be exactly n (strict 1..4), not merely increasing.
+        if ticks != n:
+            fail(f"timer poll: ticks={ticks} at n={n}, want exactly {n}")
+        if prev_pct is not None:
+            if pct <= prev_pct:
+                fail(f"timer poll: cntpct not increasing at n={n}")
+            if pct - prev_pct < VIRT82_INTERVAL:
+                fail(f"timer poll: cntpct delta {pct - prev_pct} < interval "
+                     f"{VIRT82_INTERVAL} at n={n} (re-arm/ISTATUS broken)")
+        prev_pct = pct
+    if lines[want[-1]] != TIMER_POLL_PASS:
+        fail("timer poll: PASS line missing or malformed")
+    if want[-1] + 1 >= len(lines) or not next_ok(lines[want[-1] + 1]):
+        fail("timer poll: PASS line not directly followed by the terminal line")
+    print(f"poll:  {TIMER_POLL_CYCLES} polled ACK/EOI cycles, ticks 1..{TIMER_POLL_CYCLES}, "
+          f"each cntpct delta >= {VIRT82_INTERVAL} (TCG: lower bound only; IRQs masked)")
 
 
 # ---- --mmu-fault (MP2 PR-1b deliberate W^X / guard faults) ------------------
@@ -882,8 +1152,9 @@ def check_mmu_fault(lines, name, exp, syms):
         fail(f"--mmu-fault {name}: expected exactly one 'mmu fault test {name}' line")
     tgt, par_r, par_w = (int(x, 16) for x in t[0].groups()[1:])
     ti = next(i for i, ln in enumerate(lines) if MMU_FAULT_TEST_RE.fullmatch(ln))
-    if MMU_UART_RE.fullmatch(lines[ti - 1]) is None:
-        fail(f"--mmu-fault {name}: fault test line must directly follow the MMU block")
+    if TIMER_RE.fullmatch(lines[ti - 1]) is None:
+        fail(f"--mmu-fault {name}: fault test line must directly follow the "
+             f"MMU + GIC/timer block")
     if tgt != target:
         fail(f"--mmu-fault {name}: target=0x{tgt:x} != ELF 0x{target:x}")
     for par, spec, what in ((par_r, par_r_spec, "par_r (AT S1E1R)"),
@@ -968,7 +1239,8 @@ def check_phys_alloc(lines, fx, image_extent):
     # "validated" line and right before the terminal line, in main.c's order:
     # window, kernel, dtb, [initrd], ram+, rsv*, free, alloc1, free1, allocmax,
     # overcap. Any unknown physmem line is a FAIL. PR-1b then emits the
-    # contiguous MMU marker block before the terminal line.
+    # contiguous MMU marker block, and PR-2a the GIC/timer block (checked by
+    # check_gic up to the terminal line).
     idx = [i for i, ln in enumerate(lines) if ln.startswith(PM)]
     if not idx or idx != list(range(idx[0], idx[0] + len(idx))):
         fail("--phys-alloc: physmem lines missing or not one contiguous block")
@@ -977,8 +1249,9 @@ def check_phys_alloc(lines, fx, image_extent):
     after = idx[-1] + 1
     while after < len(lines) and lines[after].startswith(MMU):
         after += 1
-    if after >= len(lines) or lines[after] != TERM_DEFAULT:
-        fail("--phys-alloc: physmem block not followed by the MMU block and terminal line")
+    if after >= len(lines) or GIC_INIT_RE.fullmatch(lines[after]) is None:
+        fail("--phys-alloc: physmem block not followed by the MMU block and the "
+             "GIC/timer block")
     block = [lines[i] for i in idx]
     pos = 0
 
@@ -1131,6 +1404,9 @@ def main():
     ap.add_argument("--mmu-fault", choices=sorted(MMU_FAULTS), metavar="NAME",
                     help="expect the ARM_MMU_FAULT deliberate fault: "
                          + ", ".join(sorted(MMU_FAULTS)))
+    ap.add_argument("--timer-poll", action="store_true",
+                    help="expect the ARM_TIMER_POLL polled GIC/timer proof "
+                         "(4 ACK/EOI cycles, IRQs masked)")
     ap.add_argument("--require", action="store_true",
                     help="missing QEMU/toolchain/image is a FAIL, not a SKIP")
     ap.add_argument("--elf", metavar="PATH",
@@ -1155,6 +1431,10 @@ def main():
     if args.mmu_fault and (args.dtb_bad or args.vector_test or args.phys_alloc
                            or args.bss_verified):
         fail("--mmu-fault is only valid alone (its build excludes the other toggles)")
+    if args.timer_poll and (args.dtb_bad or args.vector_test or args.mmu_fault
+                            or args.bss_verified):
+        fail("--timer-poll is only valid with the default good-boot build "
+             "(optionally --phys-alloc)")
     qemu = args.qemu
     if shutil.which(qemu) is None:
         skip(f"{qemu} not installed")
@@ -1206,6 +1486,9 @@ def main():
         if args.phys_alloc:
             markers += phys_alloc_markers()
         markers += mmu_markers()
+        markers += gic_markers()
+        if args.timer_poll:
+            markers += timer_poll_markers()
         if args.vector_test:
             markers += vector_test_markers(resolve_brk_site(elf, args.image))
         elif args.mmu_fault:
@@ -1220,6 +1503,8 @@ def main():
     # injection was not rejected. The checks below then fail with a clear
     # message; this only shortens the wait, it never makes a run PASS.
     early_stop = VALIDATED if args.dtb_bad else b"FATAL"
+    if not args.dtb_bad:
+        check_dtb_gic_timer(fx)   # static: pinned bases/INTID vs fixture DTB
 
     # Evidence: image hash + tool versions.
     with open(args.image, "rb") as f:
@@ -1294,6 +1579,13 @@ def main():
         check_phys_alloc(lines, fx, image_extent)
     if not args.dtb_bad:
         check_mmu(lines, mmu_syms)
+        if args.vector_test:
+            next_ok = lambda ln: ln == vector_test_markers(0)[0][0]
+        elif args.mmu_fault:
+            next_ok = lambda ln: MMU_FAULT_TEST_RE.fullmatch(ln) is not None
+        else:
+            next_ok = lambda ln: ln == TERM_DEFAULT
+        check_gic(lines, args.timer_poll, next_ok)
     if args.mmu_fault:
         check_mmu_fault(lines, args.mmu_fault, fault_exp, mmu_syms)
 

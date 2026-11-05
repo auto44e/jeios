@@ -1,5 +1,171 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## 2026-11-05T01:03:50Z — MP2 PR-2a test/oracle hardening after cross review (test author)
+
+Observed repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/jeios`,
+branch `feat/mp2-aarch64-gic-timer`, exact inspected commit
+`f8d7de6ab691acb1502908a61d61ec3623efa5fc` plus the uncommitted PR-2a
+worktree (lead's gic.c contract changes + this patch). Author: Claude (test
+author, a different agent from the gic.c implementor). State: **implemented /
+tested locally / remote CI not observed / not blocked**. Polled proof only,
+DAIF.I masked; this is AI-assisted testing, not independent human
+qualification. Supersedes the "stale oracle" status of the 00:33:15Z entry
+below (kept as history).
+
+Lead contract changes now asserted by the hosted test:
+`je_gic_handle_one` ISTATUS==0 returns `JE_ERR_BUSY` (EOIRs the exact IAR, no
+tick, no re-arm); `interval > INT32_MAX` (and 0) refused with
+`JE_ERR_INVALID` before any access; `je_gic_init` reads TYPER/IIDR/GICC_IIDR
+before the first MMIO write (first GIC access must be a TYPER/IIDR READ;
+identification refusals perform zero MMIO writes). The pre-hardening test
+FAILED against the new gic.c (it expected firmware GICD_CTLR cleared on a
+SecurityExtn refusal), so the update was required.
+
+Changed files:
+
+- `tests/test_gic_bits.c` (1503 checks, ASan/UBSan): fake now MODELS CNTP
+  (TVAL write -> CVAL = CNTPCT + SignExtend(TVAL); ISTATUS = ENABLE && CNTPCT
+  >= CVAL; PPI level = ISTATUS && !IMASK, reflected in ISPENDR0 bit 30), advances
+  CNTPCT on each TVAL write, makes GICC_IAR a one-shot ack (later reads 1023),
+  splits GICD_CTLR disable vs post-enable faults, checks EOIR at any width,
+  ends EVERY case with `violations == 0`, and self-tests the violation
+  detector and models. 300 GHz CNTFRQ asserts the deterministic masked
+  outcome (freq 3647256576, interval 36472565). IAR read exactly once on
+  timer/spurious/unexpected/busy paths.
+- `kernel/arch/aarch64/gic.h` / `gic.c` (small, coordinated): `je_gic_evidence`
+  gains `igroupr0` and `ipriority30`, filled from readbacks gic.c already
+  performed. No behaviour change.
+- `kernel/arch/aarch64/main.c`: three AT S1E1R probe lines after `mmu attr
+  uart` and an extended config marker; the in-kernel probe check now also
+  fails closed on GICD/GICC not identity Device or GICC_DIR translating.
+- `tools/smoke_arm.py`: MMU block 7 -> 10 lines; GICD/GICC PAR F=0, PA==VA,
+  ATTR=0x00, SH=0b10; GICC_DIR (GICC+0x1000) PAR F=1, FST=0x07 (L3
+  translation); config `igroupr0` bit 30 == 0, `prio30 == 0x80 < PMR`; DTB
+  timer cells validated in full (`<1 13|14|11|10 0x104>`, cpumask 0x01).
+
+New/changed marker literals:
+
+```text
+JeiOS/aarch64: mmu xlate gicd va=<hex> par=<hex>
+JeiOS/aarch64: mmu xlate gicc va=<hex> par=<hex>
+JeiOS/aarch64: mmu xlate gicc_dir va=<hex> par=<hex>
+JeiOS/aarch64: gic config gicc_ctlr=<hex> gicc_pmr=<hex> gicd_ctlr=<hex> isenabler0=<hex> igroupr0=<hex> prio30=<hex>
+```
+
+Observed (QEMU 8.2.2, GCC 13.3.0, pinned virt-8.2/cortex-a72/1 CPU/256M):
+gicd par `0x8000b00`, gicc par `0x8010b00`, gicc_dir par `0x80f`,
+igroupr0 `0x0`, prio30 `0x80`; poll cntpct `0x198891, 0x2326fe, 0x2cc2b4,
+0x365d63` (deltas 630381/629686/629423 >= 625000; TCG lower bound only).
+
+Commands run locally (all PASS): `make check`;
+`ASAN_OPTIONS=detect_leaks=0 make check`; `make smoke` (x86);
+`git diff --check`; `make aarch64 [t] && make smoke-aarch64 [t] ARM_REQUIRE=1
+ARM_SMOKE_TIMEOUT=60` for default, `ARM_BSS_CHECK=1`, `ARM_VECTOR_TEST=1`,
+`ARM_DTB_BAD=1`, `ARM_PHYSALLOC=1`, `ARM_TIMER_POLL=1`,
+`ARM_MMU_FAULT=text|data|rodata|guard`. Remote CI not observed.
+
+Mutation battery (local, scripted copies of gic.c; not committed): 22 of 23
+killed, each by its targeted assertion — sample-after-rearm, TVAL=0 /
+negative / deleted / CTL-toggle instead of TVAL (killed by the modelled
+ISTATUS check), deleted post-enable and disable GICD_CTLR readbacks, double
+IAR read (timer use-first/use-second, unexpected, busy), spurious EOIR 8- and
+32-bit, BUSY->IO, busy bumps ticks, busy skips EOIR, missing INT32_MAX arg
+check, write-before-identify, 300 GHz refuse, FIQEn, igroupr0 evidence from
+constant. Survivor: `ipriority30` evidence taken from the constant — an
+EQUIVALENT mutant (init refuses any readback != 0x80, so a successful init
+always reports 0x80); the oracle's prio30 check therefore guards marker
+emission only. Oracle mutants on the captured log/fixture (12/12 killed):
+GICD ATTR Normal, GICC wrong PA / faulting, GICC_DIR mapped / permission
+fault / wrong VA, deleted probe line, prio30 0x40, igroupr0 bit 30, DTB flags
+0x304 / 0x004 / 0x10104.
+
+Not enforced / open: the in-kernel GIC probe fail-closed branch was not
+exercised by a mutant boot (only the oracle side was mutated); the fake models
+CNTP/GIC behaviour from the spec and is not proof QEMU or hardware matches;
+no live spurious injection; no IRQ vector path or unmask (PR-2b).
+
+Next bounded task: lead review of this patch, then PR-2a commit/PR; PR-2b
+(returning IRQ vector, first DAIF.I unmask) reuses `je_gic_handle_one` and must
+treat `JE_ERR_BUSY` as handled-not-fatal.
+
+## 2026-11-05T00:33:15Z — MP2 PR-2a GICv2 + CNTP polled proof
+
+Observed repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios`, branch
+`feat/mp2-aarch64-gic-timer`, exact inspected commit
+`f8d7de6ab691acb1502908a61d61ec3623efa5fc` plus the uncommitted worktree.
+State: **implemented / tested locally / planned / not blocked**. PR-2a remains
+strictly polled with DAIF.I masked; vectors, exception assembly and IRQ
+unmasking are untouched and remain PR-2b.
+
+Changed files:
+
+- `kernel/arch/aarch64/gic.c` implements the frozen `gic.h` contract: GICD/GICC
+  Device MMIO, IIDR/SecurityExtn/group/priority/enable/PMR/CTLR refusals and
+  readbacks, CNTP arm, exact-IAR ACK/EOI handling, bounded pending polling and
+  counters/readback helpers.
+- `kernel/arch/aarch64/main.c` maps GICD/GICC as two 4 KiB Device leaves,
+  appends `gicd=<hex> gicc=<hex>` to the MMU map marker, performs bring-up after
+  MMU in every build, and provides the `JE_ARM_TIMER_POLL` four-cycle proof
+  body. It deliberately does not inject a live spurious INTID; the hosted fake
+  test is the intended proof for no-EOIR spurious handling.
+- `mk/aarch64.mk` adds `gic.o` and its compile rule. The independent test author
+  still needs to wire the poll build selector and update `tools/smoke_arm.py`.
+- `docs/IMPLEMENTATION.md` records the current evidence and limits.
+
+Exact new marker literals, in order:
+
+```text
+JeiOS/aarch64: gic init gicd_typer=<hex> gicd_iidr=<hex> gicc_iidr=<hex>
+JeiOS/aarch64: gic config gicc_ctlr=<hex> gicc_pmr=<hex> gicd_ctlr=<hex> isenabler0=<hex>
+JeiOS/aarch64: timer cntfrq=<hex> interval=<hex> intid=0x000000000000001e
+JeiOS/aarch64: timer poll n=<hex> intid=0x000000000000001e cntpct=<hex> ticks=<hex>
+JeiOS/aarch64: timer poll PASS cycles=0x0000000000000004
+JeiOS/aarch64: initialization complete; halted
+```
+
+Observed pinned QEMU evidence (QEMU 8.2.2, GCC 13.3.0,
+`virt-8.2,gic-version=2,virtualization=off,secure=off`, `cortex-a72`, one
+CPU, `-m 256M`):
+
+```text
+gicd_typer=0x0000000000000008 gicd_iidr=0x000000000000043b gicc_iidr=0x000000000002043b
+gicc_ctlr=0x0000000000000001 gicc_pmr=0x00000000000000ff gicd_ctlr=0x0000000000000001 isenabler0=0x000000004000ffff
+cntfrq=0x0000000003b9aca0 interval=0x0000000000098968 intid=0x000000000000001e
+```
+
+The poll-toggle QEMU serial log reached all four proof lines and the terminal:
+`cntpct=0x24777d, 0x2e0cf5, 0x37adb5, 0x413fdd`, `ticks=1,2,3,4`; deltas
+`628088, 630976, 627240` were all at least `625000`. This is a polled
+acknowledge/handle/re-arm/EOI proof, not evidence of vector delivery or
+precision interrupt latency.
+
+Commands/evidence:
+
+- `make aarch64` — PASS.
+- Separate poll-toggle strict build — PASS.
+- `make smoke-aarch64 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=30` — QEMU booted
+  through the terminal, but the command correctly exited FAIL because the
+  current smoke oracle still expects the old MMU map marker. The poll-toggle
+  run likewise reached the complete terminal and then failed only on that
+  stale oracle expectation.
+- `make check` — PASS (hosted/unit suite, ELF checks and image checks).
+- `make smoke` — PASS (existing x86 QEMU regression).
+- `git diff --check` — PASS at this observation.
+- Remote CI is not observed for this worktree. The independent hosted GIC tests
+  and updated ARM oracle remain planned work owned by the other author.
+
+Open hazards/not enforced: no live spurious injection in QEMU; no IRQ vector
+path or DAIF unmask; no SMP/per-CPU GIC support; no physical ARM hardware;
+QEMU TCG does not model real interrupt latency; AI-assisted review is not
+independent human qualification.
+
+Next bounded task: the different test author adds the fake-MMIO GIC tests,
+updates the smoke map/leaf oracle for two Device leaves, and wires the
+`JE_ARM_TIMER_POLL` build. Pass criteria are exact complete-line marker order,
+independent refusal/readback/ACK-EOI coverage including IAR==1023 with no EOIR,
+preservation of MP1/PR-1a markers, and a green pinned-QEMU smoke result. PR-2b
+then owns the dedicated returning IRQ vector and the first IRQ unmask.
+
 ## 2026-11-04T19:10:58-05:00 — dynamic clustering roadmap
 
 Inspected main `b1ebbdab6d89dc581e4cd96e317460ab597e3dfb` (merged MP2 PR #81);

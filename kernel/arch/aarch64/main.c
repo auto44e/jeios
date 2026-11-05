@@ -25,6 +25,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <jeios/fdt.h>
+#include "gic.h"
 #include "paging.h"
 #include "physmem.h"
 #include "trapframe.h"
@@ -799,12 +800,21 @@ static bool par_attr_is(uint64_t par, uint64_t attr)
 /*
  * Exact default-path marker order (complete lines; smoke_arm.py matches these):
  *   JeiOS/aarch64: mmu build root=<hex>
- *   JeiOS/aarch64: mmu map text=[<hex>,<hex>) rodata=[<hex>,<hex>) data=[<hex>,<hex>) device=<hex>
+ *   JeiOS/aarch64: mmu map text=[<hex>,<hex>) rodata=[<hex>,<hex>) data=[<hex>,<hex>) device=<hex> gicd=<hex> gicc=<hex>
  *   JeiOS/aarch64: mmu audit ok leaves=<hex>
  *   JeiOS/aarch64: mmu enabled sctlr=<hex>
  *   JeiOS/aarch64: mmu xlate mapped va=<hex> par=<hex>
  *   JeiOS/aarch64: mmu xlate guard va=<hex> par=<hex>
  *   JeiOS/aarch64: mmu attr uart va=<hex> par=<hex>
+ *   JeiOS/aarch64: mmu xlate gicd va=<hex> par=<hex>
+ *   JeiOS/aarch64: mmu xlate gicc va=<hex> par=<hex>
+ *   JeiOS/aarch64: mmu xlate gicc_dir va=<hex> par=<hex>
+ *
+ * The three GIC probes (MP2 PR-2a, ADR 0012 D2) are independent AT S1E1R
+ * checks that GICD/GICC translate identity as Device-nGnRnE (MAIR Attr 0x00)
+ * and that GICC_DIR (GICC + 0x1000, the second GICC page) is deliberately
+ * UNMAPPED (PAR.F=1), so an EOImode=1 / GICC_DIR write would fault rather than
+ * silently deactivate. smoke_arm.py re-decodes each PAR field by field.
  */
 static void mmu_bringup(void)
 {
@@ -832,12 +842,16 @@ static void mmu_bringup(void)
     const uint64_t image_end = (uint64_t)(uintptr_t)_end;
     const uint64_t guard = (uint64_t)(uintptr_t)__stack_guard;
     const uint64_t device = (uint64_t)PL011_BASE;
+    const uint64_t gicd = JE_GICD_BASE;
+    const uint64_t gicc = JE_GICC_BASE;
     const je_map_region regions[] = {
         { text_start, text_end - text_start, JE_MAP_TEXT },
         { rodata_start, rodata_end - rodata_start, JE_MAP_RODATA },
         { data_start, data_end - data_start, JE_MAP_RW },
         { stack_start, image_end - stack_start, JE_MAP_RW },
         { device, JE_PAGE_SIZE, JE_MAP_DEVICE },
+        { gicd, JE_GIC_PAGE, JE_MAP_DEVICE },
+        { gicc, JE_GIC_PAGE, JE_MAP_DEVICE },
     };
     uint64_t root = 0u;
     je_status status = je_arm_mmu_build(&je_arm_mmu_context, &je_arm_pages,
@@ -866,6 +880,10 @@ static void mmu_bringup(void)
     console_hex(data_end);
     console_write(") device=");
     console_hex(device);
+    console_write(" gicd=");
+    console_hex(gicd);
+    console_write(" gicc=");
+    console_hex(gicc);
     console_write("\r\n");
 
     status = je_arm_mmu_audit(&je_arm_mmu_context, regions,
@@ -910,13 +928,153 @@ static void mmu_bringup(void)
     console_write(" par=");
     console_hex(uart_par);
     console_write("\r\n");
+    const uint64_t gicc_dir = gicc + JE_GIC_PAGE;
+    uint64_t gicd_par = je_arm_at_s1e1(gicd, 0);
+    console_write("JeiOS/aarch64: mmu xlate gicd va=");
+    console_hex(gicd);
+    console_write(" par=");
+    console_hex(gicd_par);
+    console_write("\r\n");
+    uint64_t gicc_par = je_arm_at_s1e1(gicc, 0);
+    console_write("JeiOS/aarch64: mmu xlate gicc va=");
+    console_hex(gicc);
+    console_write(" par=");
+    console_hex(gicc_par);
+    console_write("\r\n");
+    uint64_t gicc_dir_par = je_arm_at_s1e1(gicc_dir, 0);
+    console_write("JeiOS/aarch64: mmu xlate gicc_dir va=");
+    console_hex(gicc_dir);
+    console_write(" par=");
+    console_hex(gicc_dir_par);
+    console_write("\r\n");
 
     if ((sctlr & JE_ARM_SCTLR_SET) != JE_ARM_SCTLR_SET ||
         !par_pa_is(mapped_par, text_start) || !par_fault(guard_par) ||
-        !par_attr_is(uart_par, UINT64_C(0x00))) {
+        !par_attr_is(uart_par, UINT64_C(0x00)) ||
+        !par_pa_is(gicd_par, gicd) || !par_attr_is(gicd_par, UINT64_C(0x00)) ||
+        !par_pa_is(gicc_par, gicc) || !par_attr_is(gicc_par, UINT64_C(0x00)) ||
+        !par_fault(gicc_dir_par)) {
         console_write("JeiOS/aarch64: FATAL mmu probe mismatch\r\n");
         halt();
     }
+}
+
+static uint64_t je_arm_timer_freq;
+static uint32_t je_arm_timer_interval;
+
+/*
+ * GIC/timer marker order (complete lines, after all MMU markers):
+ *   JeiOS/aarch64: gic init gicd_typer=<hex> gicd_iidr=<hex> gicc_iidr=<hex>
+ *   JeiOS/aarch64: gic config gicc_ctlr=<hex> gicc_pmr=<hex> gicd_ctlr=<hex> isenabler0=<hex> igroupr0=<hex> prio30=<hex>
+ *   JeiOS/aarch64: timer cntfrq=<hex> interval=<hex> intid=0x000000000000001e
+ *   [JE_ARM_TIMER_POLL only] JeiOS/aarch64: timer poll n=<hex> intid=0x000000000000001e cntpct=<hex> ticks=<hex>
+ *   [JE_ARM_TIMER_POLL only] JeiOS/aarch64: timer poll PASS cycles=0x0000000000000004
+ *   JeiOS/aarch64: initialization complete; halted
+ *
+ * PR-2a intentionally has no spurious injection in the live QEMU path: the
+ * test author covers the IAR==1023/no-EOIR case with the hosted fake backend.
+ */
+#ifdef JE_ARM_TIMER_POLL
+static void timer_poll_fatal(const char *reason)
+{
+    console_write("JeiOS/aarch64: FATAL timer poll ");
+    console_write(reason);
+    console_write("\r\n");
+    halt();
+}
+
+static void timer_poll_proof(void)
+{
+    const uint32_t cycles = 4u;
+    const uint64_t max_wait = (uint64_t)je_arm_timer_interval * 2u;
+    uint64_t previous_ticks = je_arm_timer_ticks();
+    uint64_t previous_cntpct = 0u;
+
+    for (uint32_t n = 1u; n <= cycles; ++n) {
+        if (!je_timer_poll_pending(max_wait)) timer_poll_fatal("no-tick");
+
+        bool was_spurious = false;
+        uint64_t cntpct = 0u;
+        je_status status = je_gic_handle_one(je_arm_timer_interval,
+                                             &was_spurious, &cntpct);
+        if (status != JE_OK) timer_poll_fatal("handle-failed");
+        if (was_spurious) timer_poll_fatal("unexpected-spurious");
+
+        const uint64_t ticks = je_arm_timer_ticks();
+        if (ticks <= previous_ticks ||
+            (n > 1u && cntpct - previous_cntpct <
+                       (uint64_t)je_arm_timer_interval))
+            timer_poll_fatal("invariant");
+
+        console_write("JeiOS/aarch64: timer poll n=");
+        console_hex((uint64_t)n);
+        console_write(" intid=");
+        console_hex((uint64_t)JE_TIMER_INTID);
+        console_write(" cntpct=");
+        console_hex(cntpct);
+        console_write(" ticks=");
+        console_hex(ticks);
+        console_write("\r\n");
+        previous_ticks = ticks;
+        previous_cntpct = cntpct;
+    }
+
+    console_write("JeiOS/aarch64: timer poll PASS cycles=");
+    console_hex((uint64_t)cycles);
+    console_write("\r\n");
+}
+#endif
+
+static void gic_timer_bringup(void)
+{
+    je_gic_evidence evidence = { 0 };
+    je_status status = je_gic_init(&evidence);
+    if (status != JE_OK) {
+        console_write("JeiOS/aarch64: FATAL gic init status=");
+        console_dec((uint64_t)status);
+        console_write("\r\n");
+        halt();
+    }
+
+    console_write("JeiOS/aarch64: gic init gicd_typer=");
+    console_hex((uint64_t)evidence.gicd_typer);
+    console_write(" gicd_iidr=");
+    console_hex((uint64_t)evidence.gicd_iidr);
+    console_write(" gicc_iidr=");
+    console_hex((uint64_t)evidence.gicc_iidr);
+    console_write("\r\n");
+    console_write("JeiOS/aarch64: gic config gicc_ctlr=");
+    console_hex((uint64_t)evidence.gicc_ctlr);
+    console_write(" gicc_pmr=");
+    console_hex((uint64_t)evidence.gicc_pmr);
+    console_write(" gicd_ctlr=");
+    console_hex((uint64_t)evidence.gicd_ctlr);
+    console_write(" isenabler0=");
+    console_hex((uint64_t)evidence.isenabler0);
+    console_write(" igroupr0=");
+    console_hex((uint64_t)evidence.igroupr0);
+    console_write(" prio30=");
+    console_hex((uint64_t)evidence.ipriority30);
+    console_write("\r\n");
+
+    status = je_timer_arm(&je_arm_timer_freq, &je_arm_timer_interval);
+    if (status != JE_OK) {
+        console_write("JeiOS/aarch64: FATAL timer arm status=");
+        console_dec((uint64_t)status);
+        console_write("\r\n");
+        halt();
+    }
+    console_write("JeiOS/aarch64: timer cntfrq=");
+    console_hex(je_arm_timer_freq);
+    console_write(" interval=");
+    console_hex((uint64_t)je_arm_timer_interval);
+    console_write(" intid=");
+    console_hex((uint64_t)JE_TIMER_INTID);
+    console_write("\r\n");
+
+#ifdef JE_ARM_TIMER_POLL
+    timer_poll_proof();
+#endif
 }
 
 #ifdef JE_ARM_MMU_FAULT
@@ -1046,6 +1204,7 @@ _Noreturn void je_arm_main(void)
     dtb_intake();
     physmem_bringup();
     mmu_bringup();
+    gic_timer_bringup();
 #ifdef JE_ARM_MMU_FAULT
     mmu_fault_trigger();   /* faults into je_arm_exception, or FATAL-halts */
 #endif
