@@ -1,5 +1,24 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## 2026-11-04T19:10:58-05:00 — dynamic clustering roadmap
+
+Inspected main `b1ebbdab6d89dc581e4cd96e317460ab597e3dfb` (merged MP2 PR #81);
+branch `docs/dynamic-clustering`. Implemented: planning documentation only.
+Added CLUSTERING.md and links in README, ROADMAP, AGENT_START and ACCELERATORS.
+Planned: personal device pools through enterprise distributed compute with
+explicit opt-in, programmable policy, scoped authority and staged failure tests.
+Core #82, mobile #14 and roadmap #9 track it. No new dependencies, runtime
+clustering, protocol freeze or changes to tested kernel/ADR contracts.
+Next bounded cluster task: CL0 threat model and versioned job/membership/authority
+contracts, then CL1 deterministic fault harness. Existing execution milestones
+remain authoritative; this plan does not claim MP2 completion.
+
+Validation: `make check` exited 2 at environment LeakSanitizer inspection
+(ptrace restriction); `ASAN_OPTIONS=detect_leaks=0 make check` passed, exit 0,
+leak checking disabled. Local Markdown links and `git diff --check` passed.
+No boot changes; smoke not rerun. No remote CI for this change observed.
+Single-agent planning contribution, not independent human qualification.
+
 ## 2026-11-03T10:52:23+00:00 — MP2 PR-1b W^X/guard fault proofs + hardened MMU oracle (test author)
 
 Observed repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/jeios`,
