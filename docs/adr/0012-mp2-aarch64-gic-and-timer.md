@@ -155,12 +155,24 @@ deadline prints `TIMER FAIL no-tick` rather than hanging if nothing pends.
 
 PR-2b (the returning path, `ARM_TIMER_TEST` build): a hand-written **register-
 canary asm loop** runs with I UNMASKED and no `wfi`, seeding distinct patterns in
-x0..x30 (INCLUDING x16,x17,x18,x30), incrementing an in-memory heartbeat, and
-checking every register against its pattern each iteration (C cannot do this — it
-won't keep values in x16-x18). The handler does NO printing (it would tear the
-complete-line markers); it records per-tick evidence (vector, IAR, ISR_EL1,
-SPSR, ELR, SP, CNTPCT, heartbeat) into a static array, and main prints it after
-N ticks. Proven, each defeating a named mutation:
+x0..x30 and checking them each iteration. Because a single loop cannot check its
+OWN working registers, the proof runs in TWO phases (owner a+b, 2026-11-05):
+- **(a)** the primary loop seeds all GPRs but uses x29/x30 as its scratch/LR, so
+  it genuinely checks **x0..x28** every iteration AND in a final I-masked pass
+  (race-free on the last tick). This covers the frozen-MP1 hazard registers
+  x16,x17,x18 — the whole reason the proof exists. (A check of x29/x30 here would
+  read a saved-good copy and be a FALSE proof, so it is deliberately omitted.)
+- **(b)** a second `je_arm_canary_hi_loop` then seeds x29,x30, uses the
+  already-proven x0..x2 as scratch, unmasks I for a few more ticks, and checks
+  x29,x30 each iteration + in a final I-masked pass. This closes the x29/x30 gap
+  that (a) structurally cannot.
+Together (a)+(b) cover all 31 GPRs. Mutation-confirmed: corrupting x16 on the IRQ
+return is caught by (a) (`FATAL irq canary mismatch reg=16`); corrupting x30 is
+caught by (b) (`FATAL irq canary-hi mismatch reg=30`) — a gap (a) alone misses.
+C cannot write this (it won't keep values in x16-x18). The handler does NO
+printing (it would tear the complete-line markers); it records per-tick evidence
+(vector, IAR, ISR_EL1, SPSR, ELR, SP, CNTPCT, heartbeat) into a static array, and
+main prints it after N ticks. Proven, each defeating a named mutation:
 - **returned via `eret`** (not `br`/`ret`): N≥3 ticks with the heartbeat
   advancing between each (a `br` leaves I masked → no 2nd tick).
 - **context restored**: every tick's `tf->sp` equals tick 1's; every tick's ELR

@@ -264,6 +264,9 @@ je_arm_irq_common:
     .extern je_arm_irq_tick_count
     .extern je_arm_canary_fail_reg
 
+/* (b) extra live ticks the rotating-scratch x29/x30 phase waits for. */
+#define JE_ARM_CANARY_HI_TICKS 3
+
 .macro CANARY_CHECK reg, num
     adrp    x30, je_arm_canary_patterns
     add     x30, x30, #:lo12:je_arm_canary_patterns
@@ -515,6 +518,88 @@ je_arm_canary_loop:
     ldp     x29, x30, [sp, #80]
     add     sp, sp, #128
     ret
+
+/* ---- (b) Rotating-scratch canary for x29 and x30 (ADR 0012 D8, owner a+b).
+ * The primary loop above cannot check x29/x30 (they are ITS scratch/LR), so a
+ * SECOND phase checks exactly those two, using x0-x2 — which the primary loop
+ * already proved survive an IRQ return — as the scratch/address temporaries.
+ * It seeds x29,x30 with their canary patterns, unmasks I, and spins until the
+ * tick count advances by JE_ARM_CANARY_HI_TICKS more ticks, checking x29,x30
+ * every iteration; a mismatch stores the reg number and halts the proof. A
+ * final I-masked re-check closes the last-tick race. On entry the primary loop
+ * has returned, so x0-x28 are caller-restored; we only clobber x0-x2 (scratch),
+ * x29, x30 here and restore the frame's x29/x30 (LR) at the end. ---- */
+    .globl  je_arm_canary_hi_loop
+je_arm_canary_hi_loop:
+    sub     sp, sp, #32
+    stp     x29, x30, [sp, #0]          /* save real FP/LR to restore + return */
+    str     x19, [sp, #16]              /* x19 scratch for the deadline base */
+
+    /* Record the starting tick count; we require +JE_ARM_CANARY_HI_TICKS. */
+    adrp    x0, je_arm_irq_tick_count
+    add     x0, x0, #:lo12:je_arm_irq_tick_count
+    ldr     x19, [x0]
+
+    /* Seed x29,x30 with their canary patterns (indices 29,30). */
+    adrp    x0, je_arm_canary_patterns
+    add     x0, x0, #:lo12:je_arm_canary_patterns
+    ldr     x29, [x0, #(29 * 8)]
+    ldr     x30, [x0, #(30 * 8)]
+
+    msr     daifclr, #2                 /* unmask IRQ (I only) */
+.Lcanary_hi_loop:
+    /* Check x29 against pattern[29] using x0,x1 as scratch. */
+    adrp    x0, je_arm_canary_patterns
+    add     x0, x0, #:lo12:je_arm_canary_patterns
+    ldr     x1, [x0, #(29 * 8)]
+    cmp     x29, x1
+    b.ne    .Lcanary_hi_fail_29
+    ldr     x1, [x0, #(30 * 8)]
+    cmp     x30, x1
+    b.ne    .Lcanary_hi_fail_30
+    /* Bump the heartbeat so the --timer-test oracle sees progress here too. */
+    adrp    x0, je_arm_canary_heartbeat
+    add     x0, x0, #:lo12:je_arm_canary_heartbeat
+    ldr     x1, [x0]
+    add     x1, x1, #1
+    str     x1, [x0]
+    /* Exit after +JE_ARM_CANARY_HI_TICKS ticks. */
+    adrp    x0, je_arm_irq_tick_count
+    add     x0, x0, #:lo12:je_arm_irq_tick_count
+    ldr     x1, [x0]
+    sub     x1, x1, x19
+    cmp     x1, #JE_ARM_CANARY_HI_TICKS
+    b.lo    .Lcanary_hi_loop
+
+    msr     daifset, #2                 /* mask I: final race-free re-check */
+    adrp    x0, je_arm_canary_patterns
+    add     x0, x0, #:lo12:je_arm_canary_patterns
+    ldr     x1, [x0, #(29 * 8)]
+    cmp     x29, x1
+    b.ne    .Lcanary_hi_fail_29
+    ldr     x1, [x0, #(30 * 8)]
+    cmp     x30, x1
+    b.ne    .Lcanary_hi_fail_30
+    mov     w0, #0                       /* 0 = OK */
+    b       .Lcanary_hi_done
+
+.Lcanary_hi_fail_29:
+    msr     daifset, #2
+    mov     w0, #29
+    b       .Lcanary_hi_store
+.Lcanary_hi_fail_30:
+    msr     daifset, #2
+    mov     w0, #30
+.Lcanary_hi_store:
+    adrp    x1, je_arm_canary_fail_reg
+    add     x1, x1, #:lo12:je_arm_canary_fail_reg
+    str     x0, [x1]
+.Lcanary_hi_done:
+    ldp     x29, x30, [sp, #0]
+    ldr     x19, [sp, #16]
+    add     sp, sp, #32
+    ret
+
 
     .section .rodata, "a"
 je_arm_canary_patterns:

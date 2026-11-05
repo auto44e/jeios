@@ -20,13 +20,15 @@ control, x16-corruption caught (FATAL canary mismatch reg=16).
 ## Fixes applied by the lead
 1. Canary proof (Claude #1,#2 / Codex #1): added a final I-masked x0..x28 check
    pass (closes the "corruption on the Nth return never re-checked" gap AND
-   covers x16-x18 race-free). x29/x30 are HONESTLY excluded — they are the loop's
-   scratch/LR, saved+reloaded across every check, so a corrupted live value is
-   always overwritten before a compare; a check would be a FALSE proof. Confirmed
-   by mutation: x16=0-on-return caught; x30=0-on-return cannot be (documented).
-   >>> OWNER NOTE: ADR 0012 D8 wrote "x0..x30 (including x30)"; the honest proof
-   covers x0..x28 (incl. the x16-x18 frozen-MP1 hazard). This is a recorded
-   scope reduction, surfaced to the owner.
+   covers x16-x18 race-free). x29/x30 cannot be checked by the PRIMARY loop (they
+   are its scratch/LR — a check would read a saved-good copy = false proof).
+   >>> OWNER DECISION (2026-11-05): do BOTH (a)+(b). (a) is the primary x0..x28
+   loop above; (b) a SECOND je_arm_canary_hi_loop seeds x29,x30, uses the
+   already-proven x0..x2 as scratch, and checks x29,x30 over a few more live
+   ticks + a final I-masked pass. Together they cover all 31 GPRs. Mutation-
+   confirmed: x16=0-on-return caught by (a) (reg=16); x30=0-on-return caught by
+   (b) (canary-hi reg=30) — the exact mutant (a) alone missed. ADR 0012 D8
+   amended to describe both phases.
 2. Unexpected-INTID now FATAL (Codex #2 / ADR D6): je_arm_irq emits a bounded
    FATAL + halt on an unexpected non-spurious INTID (only INTID 30 is enabled;
    gic.c already EOIR'd it). Was: silently counted.
@@ -34,7 +36,6 @@ control, x16-corruption caught (FATAL canary mismatch reg=16).
    tools/test_smoke_arm_timer.py oracle self-test to ci.yml.
 
 ## Recorded residuals
-- x29/x30 not register-checked in the canary proof (structural; see owner note).
 - ISTATUS==1 is proven by the PR-2a hosted test, not the --timer-test oracle
   (cross-PR coverage, recorded).
 - je_arm_irq lives in main.c (no hosted seam); its OK/BUSY/spurious branching is

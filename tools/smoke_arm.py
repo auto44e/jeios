@@ -1074,6 +1074,7 @@ IRQ_TICK_RE = re.compile(rb"JeiOS/aarch64: irq tick n=" + H + rb" vector=" + H
                          + rb" elr=" + H + rb" sp=" + H + rb" cntpct=" + H
                          + rb" hb=" + H)
 IRQ_PASS_RE = re.compile(rb"JeiOS/aarch64: irq timer PASS ticks=" + H)
+IRQ_CANARY_HI = b"JeiOS/aarch64: irq canary-hi PASS (x29,x30)"
 IRQ_TICKS = 4                  # JE_ARM_IRQ_EVIDENCE_CAP; loop exits at >= 4
 IRQ_VECTOR = 5                 # VBAR+0x280: Current EL, SP_ELx, IRQ
 ISR_EL1_I = 1 << 7             # DDI0487 D19 ISR_EL1.I (IRQ pending)
@@ -1081,6 +1082,7 @@ SPSR_M_EL1H = 0x5              # SPSR.M[3:0] EL1h; M[4]=0 (AArch64)
 SPSR_D, SPSR_A, SPSR_I, SPSR_F = 1 << 9, 1 << 8, 1 << 7, 1 << 6
 IRQ_BRK_SYM = b"je_arm_irq_brk_site"
 CANARY_SYM = b"je_arm_canary_loop"
+CANARY_HI_SYM = b"je_arm_canary_hi_loop"   # (b) rotating-scratch x29/x30 phase
 STACK_SYMS = (b"__stack_bottom", b"__stack_top")
 BRK_B2B2_INSN = 0xD4200000 | (0xB2B2 << 5)
 # A64 encodings (DDI0487 C6.2): SUB (imm) sp,sp,#128; MSR DAIFClr/DAIFSet #2.
@@ -1112,16 +1114,22 @@ def timer_test_expect(elf_path, image_path):
     daifset executes has ELR == daifset). The failure path's second daifset
     lies after the first and is therefore OUTSIDE the window — a tick that
     interrupted the FAIL path is rejected."""
-    syms = resolve_syms(elf_path, (CANARY_SYM, IRQ_BRK_SYM, IMAGE_BASE_SYM)
-                        + STACK_SYMS, "timer-test")
+    syms = resolve_syms(elf_path, (CANARY_SYM, CANARY_HI_SYM, IRQ_BRK_SYM,
+                        IMAGE_BASE_SYM) + STACK_SYMS, "timer-test")
     with open(image_path, "rb") as f:
         image = f.read()
     text, loop = syms[IMAGE_BASE_SYM], syms[CANARY_SYM]
     if image_word(image, text, loop, "timer-test canary") != CANARY_ENTRY_INSN:
         fail(f"timer-test: Image word at {CANARY_SYM.decode()}=0x{loop:x} is not "
              f"`sub sp, sp, #128` (ELF/Image mismatch or loop changed)")
+    # Scan only the PRIMARY loop's body — stop at je_arm_canary_hi_loop, the (b)
+    # phase, which has its own daifclr/daifset. The printed `irq tick` evidence
+    # lines (cap 4) are all from the primary loop, so their ELRs belong to THIS
+    # window; the hi-loop's ticks are not printed as tick lines.
+    hi = syms[CANARY_HI_SYM]
+    scan_end = min(CANARY_SCAN_MAX, hi - loop) if hi > loop else CANARY_SCAN_MAX
     words = [(loop + k, image_word(image, text, loop + k, "timer-test canary"))
-             for k in range(0, CANARY_SCAN_MAX, 4) if loop + k + 4 - text <= len(image)]
+             for k in range(0, scan_end, 4) if loop + k + 4 - text <= len(image)]
     clr = [a for a, w in words if w == MSR_DAIFCLR_I]
     if len(clr) != 1:
         fail(f"timer-test: expected exactly one `msr daifclr, #2` within "
@@ -1149,7 +1157,14 @@ def check_timer_test(lines, exp):
     if len(tm) != 1:
         fail(f"timer-test: expected exactly one timer line, found {len(tm)}")
     start = tm[0] + 1
-    irq = [k for k, ln in enumerate(lines) if ln.startswith(IRQ_TICK_PREFIX)]
+    # (b) rotating-scratch x29/x30 proof prints its PASS line first, right after
+    # the timer line and before the recorded tick evidence.
+    if start >= len(lines) or lines[start] != IRQ_CANARY_HI:
+        fail("timer-test: missing 'irq canary-hi PASS (x29,x30)' line directly "
+             "after the timer line (the (b) rotating-scratch proof)")
+    start += 1
+    irq = [k for k, ln in enumerate(lines)
+           if k >= start and ln.startswith(IRQ_TICK_PREFIX)]
     want = list(range(start, start + IRQ_TICKS + 1))
     if irq != want:
         fail(f"timer-test: expected {IRQ_TICKS} irq tick lines + PASS directly after "
@@ -1686,6 +1701,7 @@ def main():
         elif args.mmu_fault:
             markers += mmu_fault_markers(args.mmu_fault, fault_exp)
         elif args.timer_test:
+            markers += [exact(IRQ_CANARY_HI)]
             markers += [valued(b"JeiOS/aarch64: irq tick n=" + hx(n) + b" ...",
                                re.escape(b"JeiOS/aarch64: irq tick n=" + hx(n) + b" ")
                                + rb".*")
@@ -1784,7 +1800,7 @@ def main():
         elif args.mmu_fault:
             next_ok = lambda ln: MMU_FAULT_TEST_RE.fullmatch(ln) is not None
         elif args.timer_test:
-            next_ok = lambda ln: ln.startswith(b"JeiOS/aarch64: irq tick n=" + hx(1) + b" ")
+            next_ok = lambda ln: ln == IRQ_CANARY_HI
         else:
             next_ok = lambda ln: ln == TERM_DEFAULT
         check_gic(lines, args.timer_poll, next_ok)

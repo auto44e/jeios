@@ -996,6 +996,7 @@ static volatile uint64_t je_arm_irq_invalid_wakeups;
 volatile uint64_t je_arm_canary_heartbeat;
 volatile uint64_t je_arm_canary_fail_reg = UINT64_MAX;
 extern void je_arm_canary_loop(void);
+extern void je_arm_canary_hi_loop(void);
 #endif
 
 /*
@@ -1146,6 +1147,13 @@ static void print_irq_timer_evidence(void)
         je_arm_irq_invalid_wakeups != 0u) {
         irq_timer_test_fatal("invariant");
     }
+    /* The PASS line reports the number of RECORDED+verified evidence ticks
+     * (capped at the evidence array size), not the live counter — which keeps
+     * the marker deterministic even though the (b) canary-hi phase advances the
+     * live counter by JE_ARM_CANARY_HI_TICKS more ticks after these were
+     * recorded. */
+    const uint64_t recorded = ticks < (uint64_t)JE_ARM_IRQ_EVIDENCE_CAP
+                                  ? ticks : (uint64_t)JE_ARM_IRQ_EVIDENCE_CAP;
 
     for (uint64_t i = 0u; i < ticks &&
                            i < (uint64_t)JE_ARM_IRQ_EVIDENCE_CAP; ++i) {
@@ -1171,7 +1179,7 @@ static void print_irq_timer_evidence(void)
         console_write("\r\n");
     }
     console_write("JeiOS/aarch64: irq timer PASS ticks=");
-    console_hex(ticks);
+    console_hex(recorded);
     console_write("\r\n");
 }
 
@@ -1196,6 +1204,19 @@ static void irq_timer_test(void)
         console_write("\r\n");
         halt();
     }
+    /* (b) Rotating-scratch phase: the primary loop proved x0..x28 survive an IRQ
+     * return but cannot check its own scratch/LR (x29,x30). This second phase
+     * checks exactly x29,x30 using already-proven x0..x2 as scratch, over
+     * JE_ARM_CANARY_HI_TICKS more live ticks, with a final I-masked re-check. */
+    je_arm_canary_fail_reg = UINT64_MAX;
+    je_arm_canary_hi_loop();
+    if (je_arm_canary_fail_reg != UINT64_MAX) {
+        console_write("JeiOS/aarch64: FATAL irq canary-hi mismatch reg=");
+        console_dec(je_arm_canary_fail_reg);
+        console_write("\r\n");
+        halt();
+    }
+    console_write("JeiOS/aarch64: irq canary-hi PASS (x29,x30)\r\n");
     print_irq_timer_evidence();
     /* Exact ordered negative-control marker literals for the smoke author:
      *   JeiOS/aarch64: triggering deliberate IRQ-path BRK #0xb2b2 ...
