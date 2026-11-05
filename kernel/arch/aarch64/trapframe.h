@@ -13,16 +13,14 @@
  * (AArch64 has no architectural x31 in GPR context; SP is a separate field),
  * per the owner's DECISION 2.
  *
- * KNOWN DEVIATION (owner-acknowledged, MP1): gpr[16], gpr[17], gpr[18] do NOT
- * hold the interrupted x16/x17/x18. The vector stub uses x16 to carry the vector
- * index and the common saver uses x17/x18 for the reentrancy guard BEFORE the GPR
- * save, so the saved frame records: gpr[16] = vector index (low 32), gpr[17] =
- * &je_arm_in_handler, gpr[18] = 1. This is harmless for the MP1 diagnostic
- * (fatal, non-returning — the frame is read for ESR/FAR/ELR/vector only, never
- * restored). A future RETURNING handler (MP3 fixup / IRQ) MUST preserve x16-x18
- * properly (e.g. spill them to a scratch sysreg before the guard) — restoring
- * this frame's gpr[16..18] as-is would corrupt live registers. The offsets are
- * frozen; this deviation is part of the recorded MP1 contract.
+ * KNOWN MP1 DEVIATION (owner-acknowledged): fatal frames from the shared
+ * mov-w16/common saver do NOT hold the interrupted x16/x17/x18. That path uses
+ * x16 for the vector index and x17/x18 for the reentrancy guard before saving,
+ * so its diagnostic-only frame records those scratch values and is never
+ * restored. The returning PR-2b IRQ frame uses the dedicated slot-5 veneer,
+ * which spills the real x16-x19 before any scratch use; its frozen-offset GPR
+ * fields are therefore complete and are restored before `eret`. The offsets
+ * remain unchanged for both frame kinds.
  *
  * Total size 304 bytes, 16-byte aligned (AArch64 requires SP 16-aligned on
  * exception entry and for stp). elr/spsr and esr/far form 16-aligned stp pairs.
@@ -68,6 +66,8 @@ _Static_assert((JE_TF_SIZE % 16) == 0, "arm trapframe 16-aligned");
 
 /* The common C exception handler (MP1: diagnose + halt; no recovery). */
 _Noreturn void je_arm_exception(je_arm_trapframe *tf);
+/* Returning IRQ handler (MP2 PR-2b): no allocation, I unmask, or console I/O. */
+void je_arm_irq(const je_arm_trapframe *tf);
 #endif /* __ASSEMBLER__ */
 
 #endif /* JEIOS_AARCH64_TRAPFRAME_H */

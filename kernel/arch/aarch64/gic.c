@@ -75,6 +75,7 @@ _Static_assert((uint64_t)INT32_MAX >= UINT64_C(0x7fffffff),
 
 static volatile uint64_t je_arm_ticks;
 static volatile uint64_t je_arm_spurious;
+static volatile uint32_t je_arm_last_iar;
 
 #ifdef JE_ARM_GIC_HOSTED_TEST
 /* Hosted-test seam (gic_hosted.h): every access goes through one test hook so
@@ -305,6 +306,7 @@ je_status je_gic_handle_one(uint32_t interval, bool *was_spurious,
 
     *was_spurious = false;
     const uint32_t iar = gic_read32(JE_GICC_BASE, GICC_IAR);
+    je_arm_last_iar = iar;
     const uint32_t intid = iar & UINT32_C(0x3ff);
 
     if (intid >= JE_GIC_SPURIOUS_MIN) {
@@ -363,6 +365,11 @@ uint64_t je_arm_timer_ticks(void)
 uint64_t je_arm_spurious_count(void)
 {
     return je_arm_spurious;
+}
+
+uint32_t je_gic_last_iar(void)
+{
+    return je_arm_last_iar;
 }
 
 uint64_t je_arm_read_isr_el1(void)
