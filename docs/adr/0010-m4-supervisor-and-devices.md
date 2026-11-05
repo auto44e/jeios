@@ -389,9 +389,10 @@ It then sleeps one tick with `TRY_RECV(timeout=1)` on a private channel. Nobody
 sends on that channel, so it always times out.
 
 `CLOCK_TICKS` (op 13) is appended. It takes no arguments and needs no authority. RDX
-is the monotonic count of 100 Hz PIT ticks since boot (`je_sched_ticks()`). It is not
-wall time and never decreases. The hosted test currently expects op 13 to return
-UNSUPPORTED; it is updated.
+is the monotonic count of 100 Hz timer ticks since boot (`je_sched_ticks()` on
+x86, backed by the PIT; the architected-timer tick counter on aarch64 — ADR
+0012). It is not wall time and never decreases. The hosted test currently expects
+op 13 to return UNSUPPORTED; it is updated.
 
 All supervisor deadlines and restart windows are computed from `CLOCK_TICKS`.
 Manifest milliseconds are converted at 100 Hz, rounding up. A deadline longer than
