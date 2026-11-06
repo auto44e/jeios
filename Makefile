@@ -31,7 +31,7 @@ USER_IMAGE := $(BUILD)/user/hello.elf
 USER_GENERATED := $(BUILD)/gen/image_c_hello.c
 USER_IMAGE_OBJECT := $(BUILD)/gen/image_c_hello.o
 OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(SOURCES)) $(BUILD)/kernel/arch/x86_64/boot.o $(BUILD)/kernel/arch/x86_64/trap_entry.o $(BUILD)/kernel/arch/x86_64/register_probe.o $(BUILD)/kernel/arch/x86_64/user_demo.o $(BUILD)/kernel/arch/x86_64/usercopy.o $(USER_IMAGE_OBJECT) $(USER_IMAGE_OBJECTS)
-.PHONY: all check test iso smoke clean
+.PHONY: all check test iso smoke clean mutants
 all: $(BUILD)/jeios.elf
 $(BUILD)/jeios.elf: $(OBJECTS) kernel/arch/x86_64/linker.ld
 	$(LD) -nostdlib -z max-page-size=0x1000 -T kernel/arch/x86_64/linker.ld -o $@ $(OBJECTS)
@@ -108,6 +108,17 @@ check: all test
 	@! grep -qE '^[[:space:]]*#[[:space:]]*include.*(status|handle)\.h' include/jeios/abi.h
 	@echo "Dev-inject isolation: the fixup-injection path must be absent from the default kernel"
 	@! nm $(BUILD)/jeios.elf | grep -qiE 'copy_fixup_inject|user_inject'
+# Critical-mutant assurance (issue #18/#19, "curl-style" local CI). For each named
+# critical mutant, tools/mutants.py applies a precise reversible source transform
+# that BREAKS one security/correctness invariant, rebuilds the one hosted test that
+# is supposed to prove it (forcing a recompile, so an #included-but-not-prerequisite
+# TU like sched.c cannot yield a stale-binary false survivor), and asserts the test
+# now FAILS (the mutant is KILLED). A SURVIVED mutant = a test that does not prove
+# its invariant; a BLOCKED mutant = source drift or a build break (never a kill).
+# Production code carries NO mutation macros. Not part of `check` (it rebuilds
+# targets); run explicitly or in the dedicated CI job.
+mutants:
+	$(PYTHON) tools/mutants.py
 iso: all
 	grub-file --is-x86-multiboot2 $(BUILD)/jeios.elf
 	@mkdir -p $(BUILD)/iso/boot/grub
