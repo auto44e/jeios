@@ -1,5 +1,19 @@
 # Current ecosystem status
 
+Observed 2026-11-06T02:10:28-05:00. Core main `e4bd9c24d69de4fc6798d733b1f2e6398522748f`;
+mobile main `9221701ab2d5333978a294f54574ee384f4216e3` (pin unchanged).
+PRs #89/#90 add audit and mutation tooling/provenance; #91 adds accepted ADR 0013;
+#92 adds builder/container CI. Six enabled mutants and four disabled gap markers
+exist. Baseline core CI 42177874117 passed; this does not resolve the audit defects.
+ARM scheduler implementation is still planned; ADR 0013 is now on main.
+
+**Next work: [current-code stabilization](audit/2026-11-fix-gate.md), before new
+implementations.** Confirmed reaper, ARM alias-audit and assurance-runner defects
+and remaining boundary tests need repair. The response PR adds no runtime fixes.
+Architecture capability limits in the historical matrix below remain applicable.
+
+# Historical checkpoint before PRs #89–#92
+
 Observed 2026-11-05T23:37:57-05:00. This is the canonical current checkpoint; older status
 blocks elsewhere are retained as historical evidence, not current instructions.
 

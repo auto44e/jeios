@@ -1,5 +1,7 @@
 # JeiOS code-improvability audit and curl-style local assurance
 
+> 2026-11-06 final review: see the [repair-first response](2026-11-fix-gate.md) for corrected findings, reproduced defects, and required acceptance work. In particular, the ARM cycle mechanism below is superseded by the bounded-depth/unsafe-sibling analysis. Original review text is retained as history.
+
 Observed 2026-11-06, repository `auto44e/jeios`, branch `main`, inspected commit
 `c6914ca9176b360ded82ed70c0884fafddbaf0e6` (the merge of audit PR #86 and docs
 response PR #88). This document is the second audit pass the planning agent asked

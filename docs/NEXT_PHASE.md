@@ -1,5 +1,7 @@
 # Next phase: ARM64 MP2 and the native shell foundation
 
+**Current work order — 2026-11-06T02:10:28-05:00:** [Current-code stabilization gate](audit/2026-11-fix-gate.md). Complete the existing-code repairs and acceptance ledger before new implementations; this supersedes older next-task wording. Repairs are planned, not completed by this documentation PR.
+
 Current checkpoint and work order: [STATUS.md](STATUS.md). Dated status and next-task statements below are historical when superseded by that checkpoint.
 
 ## Historical ecosystem status — observed 2026-11-01T21:30:30-05:00
