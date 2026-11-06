@@ -1,5 +1,15 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Audit refresh — 2026-11-06 UTC
+
+Implemented: canonical status routing and dated-history labels; core adds audit response and corrected security introduction. Tested: `make check` stopped in LeakSanitizer: unable to read /proc task data under this execution environment. `ASAN_OPTIONS=detect_leaks=0 make check` passed; ASan/UBSan remained enabled, leak detection was not validated. No smoke/integration/emulator rerun for this docs-only change. `git diff --check` passed.
+
+Reviewed audit PR #86 against fetched core main `fc8b8af931ee3fc79a82dcecc23356ba964c662b` and mobile main `d9a5146b1de5b870f495ccf5300ee7b679c3507e`. Both baseline main CI runs passed; this is not new-PR CI evidence. No runtime invariants changed.
+
+Next: core #87 tracks remaining MP2 scheduling, lifecycle design review before MP3, and ARM service parity; #18/#19 track named critical-mutant CI. Require explicit pass/fail runtime evidence for each implementation gate. Lifecycle extraction is a proposal requiring owner review, not authorization to change tested paths. Mobile stays unqualified. Original dirty checkouts were preserved using separate worktrees.
+
+Current checkpoint and work order: [STATUS.md](STATUS.md). Dated status and next-task statements below are historical when superseded by that checkpoint.
+
 ## 2026-11-05T01:27:58Z — MP2 PR-2b `--timer-test` smoke oracle + canary review (test author)
 
 Observed repository `/home/ANT.AMAZON.COM/lubuel/oss/jeios-workspace/jeios`,
@@ -701,7 +711,7 @@ Inspected core main `2c5bdb01c3726dbe551492f6d2ecd0e30b66308e`; shell PR #74 mer
 
 Refresh validation: Core `make check` hit environment LeakSanitizer inspection failure; `ASAN_OPTIONS=detect_leaks=0 make check` passed. Leak detection disabled. Local Markdown links and `git diff --check` passed. No emulator rerun for this docs-only change; cited remote CI is for inspected main, not the new documentation head. Board summary/history refreshed; shell issues #71–#73 and mobile #12 added Todo; M4 #53 Done. Single-agent docs contribution, no independent human qualification. Branch `docs/native-shell-refresh`; no ABI, runtime, dependency import or mobile pin change.
 
-## Current ecosystem status — observed 2026-11-01T21:30:30-05:00
+## Historical ecosystem status — observed 2026-11-01T21:30:30-05:00
 
 Core main `0f702036c52d40d03bb4c8919d0dcae53ba9f2b1`: AMD64 M3 and scoped M4 complete; PR #70
 merged. ARM64 MP1 complete (#52); MP2 then MP3 remain. Main CI passed:

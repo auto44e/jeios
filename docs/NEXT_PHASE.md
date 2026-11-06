@@ -1,6 +1,8 @@
 # Next phase: ARM64 MP2 and the native shell foundation
 
-## Current ecosystem status — observed 2026-11-01T21:30:30-05:00
+Current checkpoint and work order: [STATUS.md](STATUS.md). Dated status and next-task statements below are historical when superseded by that checkpoint.
+
+## Historical ecosystem status — observed 2026-11-01T21:30:30-05:00
 
 Core main `0f702036c52d40d03bb4c8919d0dcae53ba9f2b1`: AMD64 M3 and scoped M4 complete; PR #70
 merged. ARM64 MP1 complete (#52); MP2 then MP3 remain. Main CI passed:

@@ -1,12 +1,12 @@
 # Security and privacy design requirements
 
-**This remains an experimental kernel, not a hardened OS.** M1/M2 provides
-read-only kernel text/rodata, NX data on qualified CPUs, guarded kernel stacks,
-validated boot input and bounded allocation/rollback. Kernel faults stop the
-machine with diagnostics. All threads run at CPL0 in one address space.
-There is no userspace authority boundary, secure boot, encryption, randomness
-service or networking. Early bootstrap maps are temporarily RWX until replaced.
-The following threat model remains a requirement for future implementation.
+**This remains an experimental kernel, not a hardened OS.** See
+[STATUS.md](STATUS.md) for architecture-specific implemented checks and observed
+evidence. AMD64 has scoped userspace isolation and M4 service tests; ARM64 has
+merged MMU and timer/IRQ proofs but not userspace parity in this checkpoint.
+Physical-board, comprehensive DMA containment and hardened-release qualification
+are not established. The following sections state design requirements unless an
+exact implemented path and evidence are identified.
 
 ## Assets, adversaries, and boundaries
 
