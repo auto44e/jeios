@@ -1,5 +1,7 @@
 # Dynamic clustering and distributed computing
 
+Future [JTerminal native terminal and session roadmap](JTERMINAL.md): persistent local/remote sessions, ecosystem device connections and enterprise/cluster management. Planned after stabilization and prerequisite gates; no runtime support added.
+
 Owner requirement: 2026-11-04 (America/New_York). Status: planned; no runtime
 clustering, native distributed workload or security qualification is claimed.
 Trackers: [core #82](https://github.com/auto44e/jeios/issues/82),

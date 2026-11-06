@@ -1,5 +1,7 @@
 # Native shell and selectable shell ecosystem
 
+Future [JTerminal native terminal and session roadmap](JTERMINAL.md): persistent local/remote sessions, ecosystem device connections and enterprise/cluster management. Planned after stabilization and prerequisite gates; no runtime support added.
+
 [Included native software portfolio](NATIVE_PRODUCTS.md): latest-stable source policy, stable GNU C coreutils with selective uutils improvements, doas/optional sudo, vi, C/C++ and assembly tools, SSH/TLS, curl, FIDO, zlib and QEMU; shared hardening and feature-preservation gates. Planned integration; no runtime support added.
 
 Owner decision: 2026-11-01 (America/New_York). Accepted roadmap requirements;

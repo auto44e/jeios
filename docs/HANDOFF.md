@@ -1,5 +1,28 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## JTerminal future roadmap — 2026-11-06T10:31:01-05:00
+
+Inspected core main `a82352f405b8e4c4cb9336fdf847514ea9435734` (PR #94 merged), in isolated
+`docs/native-terminal-roadmap` worktree. Implemented documentation only:
+[JTerminal](JTERMINAL.md) with JT0–JT4, plus README/agent/roadmap/shell/cluster
+links. Runtime remains planned; current stabilization priority is unchanged.
+Name and scope follow owner direction: native app, persistent attached/detached
+sessions, open compatibility, ecosystem connections and enterprise distributed
+management. No source imports, frozen ABI changes or mobile pin changes.
+
+Verification: `make check` exit 2, LeakSanitizer /proc inspection failure.
+`ASAN_OPTIONS=detect_leaks=0 make check` exit 2: generated build/0/test_vm lacked
+execute permission (mode 0644); earlier tests ran but suite completion is blocked.
+Leak detection and full hosted PASS are not claimed. No boot changes, so no smoke
+rerun; no local native/container/hardware qualification. `git diff --check` and
+new-document relative links passed. No independent peer/human review claimed.
+
+Next: finish existing repair gate; then review JT0 contracts alongside SH2/M6.
+JT1 needs qualified PTYs/process control; UI waits for M7; remote/enterprise
+features wait for identity, networking and clustering qualification. Implementers
+must supply per-gate negative tests, exact-revision evidence and status updates.
+
+
 ## Current-code fix gate — 2026-11-06 UTC
 
 Reviewed core main `e4bd9c24d69de4fc6798d733b1f2e6398522748f`, merged PRs
