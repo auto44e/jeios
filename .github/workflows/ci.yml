@@ -35,6 +35,30 @@ jobs:
         # mutant means source drift or a build break. Exit nonzero on either, so
         # a regression in the assurance set fails CI like any other check.
         run: make mutants
+  container-parity:
+    # Proves the pinned builder image (.docker/Dockerfile) reproduces the same
+    # green result as the bare-runner jobs above. The bare jobs remain the
+    # primary signal; this is the reproducibility/local-parity guarantee (issue
+    # #18) — a contributor's `.docker/ci-run.sh check` runs this exact image.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the pinned builder image
+        # The image build itself asserts QEMU is 8.2.x (ADR 0002); a drifted
+        # toolchain fails here rather than at test time.
+        run: docker build -f .docker/Dockerfile -t jeios-builder .
+      - name: Record the pinned toolchain
+        run: docker run --rm jeios-builder cat /etc/jeios-toolchain
+      - name: check + mutants inside the container
+        # --network none and the host UID mirror ci-run.sh; no QEMU-system boot
+        # here (that stays in the bootstrap/aarch64 jobs), just the hosted build,
+        # test and mutant assurance that the image is responsible for.
+        run: |
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e ASAN_OPTIONS=detect_leaks=0 \
+            -v "$PWD":/src -w /src jeios-builder \
+            bash -c 'make check && make mutants'
   aarch64:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
