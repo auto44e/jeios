@@ -1,12 +1,14 @@
 # Gated roadmap
 
+Current checkpoint and work order: [STATUS.md](STATUS.md). Dated status and next-task statements below are historical when superseded by that checkpoint.
+
 [Dynamic clustering roadmap](CLUSTERING.md): authorized personal device pools through enterprise distributed computing; intuitive defaults, programmable policy and staged security/failure qualification. Planned; tracker [core #82](https://github.com/auto44e/jeios/issues/82).
 
 [Included native software portfolio](NATIVE_PRODUCTS.md): latest-stable source policy, stable GNU C coreutils with selective uutils improvements, doas/optional sudo, vi, C/C++ and assembly tools, SSH/TLS, curl, FIDO, zlib and QEMU; shared hardening and feature-preservation gates. Planned integration; no runtime support added.
 
 Owner-approved [two-phase native shell and selectable shell roadmap](SHELLS.md): recovery + original JeiOS sh, included native Bash/Zsh, and bring-your-own shell. PowerShell deferred. Planned, not runtime support.
 
-## Current ecosystem status — observed 2026-11-01T21:30:30-05:00
+## Historical ecosystem status — observed 2026-11-01T21:30:30-05:00
 
 Core main `0f702036c52d40d03bb4c8919d0dcae53ba9f2b1`: AMD64 M3 and scoped M4 complete; PR #70
 merged. ARM64 MP1 complete (#52); MP2 then MP3 remain. Main CI passed:
