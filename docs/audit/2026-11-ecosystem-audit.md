@@ -273,6 +273,80 @@ Action: keep the owner's preserve-history rule but rotate superseded entries int
 
 ---
 
+## 3b. Debate-sharpened positions (cross-talk, 2 rounds)
+
+Beyond the two independent reviews, the peers ran a **2-round cross-talk debate**
+on the five judgment calls where reasonable engineers could disagree (full
+transcript: `docs/audit/debate/01-debate-transcript.md`; seed:
+`.../00-debate-context.md`). Both checked the tree during the debate. Where the
+debate refined or went beyond §2, it is the more considered position:
+
+- **Q1 Parity (refines E3):** gate the **ABI/contract freeze, not the milestone
+  number**. x86 may build storage/shell internals, but a new user-visible
+  contract (first new syscall / handle-rights bit / blocking-completion
+  primitive — *earlier* than M5–M7) may only merge behind a **CI-enforced
+  `EXPERIMENTAL_ABI` marker** that cannot be removed until ARM runs that
+  contract's architecture-neutral conformance tests. A doc label is not enough —
+  CI must exclude experimental interfaces from the supported-ABI claim and
+  prevent them silently becoming dependencies of "stable" features. (Both peers
+  landed here; the debate noted storage behind existing handles is **not**
+  ABI-neutral.)
+- **Q2 SMP (refines F1):** split into an **SMP-*readiness* gate now** vs
+  **SMP-*capability* later**. Readiness now (cheap): inventory every mutable
+  file-scope object / `static` local / IRQ- or DMA-visible region (the debate
+  enumerated `sched.c`'s 8 scheduler globals + masking sites in `kheap.c`/
+  `endpoint_kern.c`/`vm.c`); a rule that new mutable global state carries an
+  owner/lifetime/concurrency record; an explicit `SINGLE_CPU` boot profile that
+  parks/refuses secondary cores and reports a degraded profile (AGENTS rule 5).
+  `je_irq_save()/restore()` may *name* the existing interrupt-exclusion invariant
+  but **must not be advertised as a lock precursor** (IRQ masking ≠ inter-CPU
+  exclusion / memory ordering / TLB shootdown); do **not** add a fake lock for a
+  checkbox. Name the one-core tests "single-core preemption tests," not "race
+  tests." Real multicore is required only before the first multicore
+  support-tier claim.
+- **Q3 Scheduler/lifecycle (sharpens C2 — a catch the single reviews missed):**
+  the **process lifecycle lives *inside* `sched.c`** (`process_pool`,
+  `registered_vm[]`/`registered_proc[]`, `je_proc_link` ~`sched.c:220`, the
+  "teardown-not-reap frees the kstack" rule ~`:29/:173`, `je_sched_reap_dead` +
+  the dying hook ~`:238`). So **ARM MP3 forces a tested-`sched.c` change either
+  way.** Resolution: before MP3, do a **lifecycle-only extraction** (proc/VM
+  registration, link, dying, reap, kstack-ownership) into a shared module with a
+  **single ownership boundary** and no run-queue change, gated on unchanged x86
+  `make check`/smoke + M3/M4 proofs + a shared conformance suite — **owner-gated**
+  (tested code). The run-queue migration of x86 `sched.c` onto `sched_rr.c` comes
+  *after*, with a committed trigger (next scheduler feature or any parity claim).
+  **ADR 0013's "flex: migrate later" has no trigger → amend it to record one.**
+- **Q4 Mutation (refines B1):** **no global kill-% gate** (it invites
+  mutant-specific assertions + equivalent-mutant noise). Instead a **committed
+  manifest of named critical mutants**, each tied to an invariant and a killer
+  **denial test that asserts rejection AND unchanged state**; the affected
+  manifest runs per-PR, broad operators run nightly, equivalent-mutant exemptions
+  need a committed rationale ("another AI agreed" is not evidence), and CI must
+  distinguish killed / skipped / blocked / equivalent (never silently green).
+  **Correction surfaced in the debate:** `test_image.c` is a mutated-*input*
+  corpus, not code mutants, and **no `JE_MUTANT`/mutant-build mechanism exists
+  yet** — so the per-PR mutant gate requires building that mechanism first (a
+  `make mutants` producing `-DJE_MUT_<ID>` variants each expected to fail).
+- **Q5 Human gate (sharpens D2):** three claim classes — (1) "check X is
+  implemented," (2) "tests passed at commit Y in env Z," (3) "this boundary is
+  enforced / this target is supported / this profile is hardened / this release
+  is qualified." Classes 1–2 stay AI-review + reproducible evidence (full
+  velocity); **class 3 requires a named human qualification record** (claim scope,
+  exact commit, profile, commands+results, hazards, human, revalidation date) —
+  merge-approval is not qualification, and two AI lineages are not two independent
+  reviewers (correlated blind spots). **Present-overclaim flagged:**
+  `SECURITY.md` / the M3a status already describe boundaries as "enforced"
+  (class-3 wording) with no human gate → a **one-time reclassification sweep** to
+  class 1/2 wording is needed now.
+
+### Two new owner-escalation items the debate produced
+- **A pre-MP3 lifecycle-only extraction from `sched.c`** (changes tested code;
+  single ownership boundary; no run-queue change) — this is on the ARM-userspace
+  critical path and is unavoidable, so it should be scheduled + owner-reviewed
+  deliberately rather than discovered mid-MP3.
+- **An ADR 0013 amendment** adding a concrete trigger for the x86
+  `sched.c`→`sched_rr.c` migration (so "later" is bounded, not permanent debt).
+
 ## 4. Appendix — evidence & provenance
 
 - Inventory: core 63 PRs (all merged), issues 9 closed / 13 open; mobile 6 PRs
@@ -290,7 +364,10 @@ Action: keep the owner's preserve-history rule but rotate superseded entries int
   mutation-in-CI gap, the real-hardware tier gap, the scheduler-convergence/
   arch-seam debt, and the park-the-backlog recommendation; the roadmap lens
   additionally surfaced the missing SMP gate and the missing ARM-parity gate,
-  both verified above.
+  both verified above. A subsequent **2-round cross-talk debate** (§3b;
+  transcript under `docs/audit/debate/`) refined the five judgment calls and
+  surfaced the `sched.c`-holds-the-lifecycle catch and the present-tense
+  "enforced" overclaim.
 
 Nothing in this document changes code, a frozen contract, or a status claim; it
 is a prioritized recommendation set for the main planning agent and the owner.
