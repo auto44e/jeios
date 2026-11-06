@@ -11,6 +11,7 @@
  * fake state.  Without that hook, the poisoned-backing assertion can cover
  * only USER_DATA and stack pages, not every user page.
  */
+#undef NDEBUG
 #include <assert.h>
 #include <limits.h>
 #include <stdbool.h>

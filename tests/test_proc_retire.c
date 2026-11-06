@@ -18,6 +18,7 @@
 #error "build with -DJE_PROC_GEN_MAX=3u for proc.c AND this file (see header comment)"
 #endif
 #include <jeios/proc.h>
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>

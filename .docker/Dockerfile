@@ -37,10 +37,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 # libFuzzer (gcc rejects -fsanitize=fuzzer) — the mutant+bounded-fuzz approach in
 # tools/ is what the project actually uses. libc6-dev provides the hosted C
 # headers (stdio.h/stdint.h) the hosted test suite compiles against; the
-# freestanding kernel build itself does not use them.
+# freestanding kernel build itself does not use them. git is required by
+# tools/mutants.py (it snapshots the tree with `git archive` for isolation).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-        gcc binutils libc6-dev make python3 \
+        gcc binutils libc6-dev make python3 git \
         grub-pc-bin grub-common xorriso qemu-system-x86 \
         gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-system-arm \
     && rm -rf /var/lib/apt/lists/* \
@@ -61,13 +62,26 @@ WORKDIR /src
 
 # Record the toolchain versions INTO the image so `docker run jeios-builder
 # cat /etc/jeios-toolchain` reproduces the exact evidence a PR should cite.
+# NOTE on reproducibility (fix-gate F02): the BASE is pinned by digest, but the
+# apt packages below come from moving Ubuntu repositories and are NOT version-
+# pinned, and the QEMU assertion only constrains major.minor. This image gives a
+# PINNED BASE + RECORDED package versions, which is reproducible-enough for a
+# consistent toolchain and local/CI parity — it is NOT a bit-for-bit clean-build
+# guarantee. The recorded dpkg versions below are the evidence a PR cites; to get
+# a stronger guarantee, pin each package against an immutable snapshot source.
 RUN { echo "# JeiOS builder image toolchain (captured at image build)"; \
       echo "base=ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852"; \
+      echo "host_arch=$(dpkg --print-architecture)"; \
       echo "gcc=$(gcc -dumpfullversion)"; \
       echo "aarch64-gcc=$(aarch64-linux-gnu-gcc -dumpfullversion)"; \
       echo "qemu-x86=$(qemu-system-x86_64 --version | awk 'NR==1{print $4}')"; \
       echo "qemu-aarch64=$(qemu-system-aarch64 --version | awk 'NR==1{print $4}')"; \
       echo "python3=$(python3 --version | awk '{print $2}')"; \
+      echo "# exact dpkg package versions (reproducibility evidence):"; \
+      dpkg-query -W -f='pkg ${Package} ${Version}\n' \
+        gcc binutils libc6-dev make python3 git \
+        grub-pc-bin grub-common xorriso qemu-system-x86 \
+        gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-system-arm; \
     } > /etc/jeios-toolchain
 
 CMD ["make", "check"]

@@ -10,6 +10,7 @@
  * so it lives in a separate binary: tests/test_proc_retire.c.
  */
 #include <jeios/proc.h>
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
