@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
+#undef NDEBUG
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>

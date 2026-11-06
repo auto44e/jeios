@@ -8,6 +8,7 @@
  */
 #include <jeios/endpoint.h>
 #include <jeios/vm.h>   /* constants only: the per-process table shape */
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>

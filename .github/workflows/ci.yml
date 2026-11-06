@@ -48,17 +48,18 @@ jobs:
         # The image build itself asserts QEMU is 8.2.x (ADR 0002); a drifted
         # toolchain fails here rather than at test time.
         run: docker build -f .docker/Dockerfile -t jeios-builder .
-      - name: Record the pinned toolchain
-        run: docker run --rm jeios-builder cat /etc/jeios-toolchain
-      - name: check + mutants inside the container
-        # --network none and the host UID mirror ci-run.sh; no QEMU-system boot
-        # here (that stays in the bootstrap/aarch64 jobs), just the hosted build,
-        # test and mutant assurance that the image is responsible for.
+      - name: Record the pinned toolchain and image identity
         run: |
-          docker run --rm --network none --user "$(id -u):$(id -g)" \
-            -e HOME=/tmp -e ASAN_OPTIONS=detect_leaks=0 \
-            -v "$PWD":/src -w /src jeios-builder \
-            bash -c 'make check && make mutants'
+          docker image inspect jeios-builder --format 'image_id={{.Id}}'
+          docker run --rm jeios-builder cat /etc/jeios-toolchain
+      - name: check + mutants in an ISOLATED clean copy
+        # ci-run.sh (default isolated mode) clones the tracked tree into a
+        # container-private dir and builds there, so a stale/poisoned host build/
+        # cannot make the test pass — this is a clean rebuild, not cached-image
+        # or bind-mount parity. No QEMU-system boot here (that stays in the
+        # bootstrap/aarch64 jobs); just the hosted build, test and mutant
+        # assurance the image is responsible for.
+        run: JEIOS_NOBUILD=1 .docker/ci-run.sh check && JEIOS_NOBUILD=1 .docker/ci-run.sh mutants
   aarch64:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

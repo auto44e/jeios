@@ -3,6 +3,7 @@
 #include <jeios/syscall.h>
 #include <jeios/endpoint.h>   /* JE_EP_CHILD_QUOTA_MAX (op 14 decode bound) */
 #include <jeios/vm.h>         /* JE_VM_HANDLE_QUOTA_MAX / _DEFAULT (op 14 decode bound) */
+#undef NDEBUG
 #include <assert.h>
 #include <stddef.h>
 #include <stdio.h>

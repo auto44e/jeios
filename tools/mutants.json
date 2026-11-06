@@ -1,5 +1,5 @@
 {
-  "_comment": "Critical-mutant manifest for tools/mutants.py (issue #18/#19, 'curl-style' assurance). Each entry BREAKS one security/correctness invariant by a precise reversible source transform; the named killer hosted test MUST then fail (the mutant is KILLED). A SURVIVED mutant = the test does not actually prove its invariant (a test defect). A BLOCKED mutant = the `find` pattern no longer matches exactly once (source drifted) and the mutant must be updated, OR the mutated source failed to build (not a kill). Production code carries NO mutation macros; mutants live entirely here + in tools/mutants.py so the kernel source stays clean. Keep the ENABLED set small and canonical (regression anchors whose killer test exists today). The DISABLED entries at the end are test-GAP markers: critical invariants whose killer test does NOT exist yet (the peer code audit, docs/audit/2026-11-code-audit.md, proved these mutants SURVIVE). They are intentionally enabled:false so `make mutants` stays green while documenting the missing coverage; enable each one when its killer test lands. Writing a deleter mutant as `if (0 && (<cond>))` keeps a variable used so -Werror does not turn a test gap into a false 'build failed' (BLOCKED). See docs/audit/2026-11-code-audit.md for provenance (AI-assisted review, not human qualification).",
+  "_comment": "Critical-mutant manifest for tools/mutants.py (issue #18/#19, 'curl-style' assurance). Each entry BREAKS one security/correctness invariant by a precise reversible source transform; the named killer hosted test, after PASSING clean on pristine source (the baseline preflight), MUST then fail under the mutation (the mutant is KILLED). A SURVIVED mutant = the clean-passing test does not actually prove its invariant (a test defect). A BLOCKED mutant = an untrustworthy verdict: the killer did not pass on pristine source, the `find` pattern does not match exactly once (source drift), the mutated source failed to build (a compile failure is NEVER a kill), a timeout on a non-liveness mutant, or any infrastructure failure. Production code carries NO mutation macros; mutants live entirely here + in tools/mutants.py and every build/run happens in a private disposable snapshot, so the kernel source and the caller's worktree stay untouched. Keep the ENABLED set small and canonical (regression anchors whose killer test exists AND passes clean today). The DISABLED entries at the end are test-GAP markers: critical invariants whose killer test does NOT exist yet; they are enabled:false so `make mutants` stays green while documenting the missing coverage; enable each one when its killer test lands (and remove the placeholder find-string). Writing a deleter mutant as `if (0 && (<cond>))` keeps a variable used so -Werror does not turn a test gap into a spurious build failure. See docs/audit/2026-11-code-audit.md and docs/audit/2026-11-fix-gate.md (F01/F04) for provenance; AI-assisted, not human qualification.",
   "mutants": [
     {
       "id": "ALLOC-FREE-OOB",
@@ -114,14 +114,14 @@
       "gap": true
     },
     {
-      "id": "GAP-ARM-AUDIT-CYCLE",
-      "invariant": "the AArch64 page-table audit terminates (fails closed) on a table-descriptor cycle instead of recursing forever",
+      "id": "GAP-ARM-AUDIT-FOREIGN-SIBLING",
+      "invariant": "the AArch64 page-table audit validates EVERY child table address (root membership + alignment) BEFORE dereferencing it, including in audit_alias_scan — a foreign/unvalidated sibling pointer is rejected, not followed",
       "file": "kernel/arch/aarch64/paging.c",
-      "find": "GAP-PLACEHOLDER-audit_table-visited-set",
+      "find": "GAP-PLACEHOLDER-audit-validate-before-deref",
       "replace": "",
       "build": "build/0/test_paging_bits",
       "run": "build/0/test_paging_bits",
-      "killer": "GAP: audit_table has no visited-set (peer audit A3). A table pointing back to an ancestor recurses until stack exhaustion. Add a visited bitmap + a hosted self-cycle test under a timeout, pin the find-string, then enable. OWNER-GATED (ARM paging, tested path).",
+      "killer": "GAP: CORRECTED per fix-gate F04. The earlier 'infinite recursion on a cycle' claim is WRONG — both walkers bound at level<3 and a root self-cycle already returns JE_ERR_INVALID. The REAL confirmed defect: audit_alias_scan (paging.c:456, reached via the recursive call at 466 from audit_table at 544) dereferences a child table address WITHOUT the root-membership check audit_table applies, so an otherwise-valid earlier leaf triggers an alias scan into an unvalidated later sibling (e.g. root[511]=0x30000000|3) -> ASan SEGV. Fix: a complete bounded structural pass that validates every table pointer before any alias/permission dereference; the foreign-sibling fixture must return INVALID, not crash. Add the hosted negative test, pin the find-string, then enable. OWNER-GATED (ARM paging, tested path).",
       "env": {"ASAN_OPTIONS": "detect_leaks=0"},
       "enabled": false,
       "gap": true

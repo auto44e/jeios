@@ -2,6 +2,7 @@
 /* Hosted unit tests for the M3a #4 step-3 user-frame validator/sanitizer. */
 #include <jeios/uframe.h>
 #include <jeios/abi.h>   /* JE_ABI_STARTUP_V1 */
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>

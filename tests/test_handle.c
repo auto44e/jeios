@@ -8,6 +8,7 @@
  * The width is selected by -D flags on the compile line, before this include.
  */
 #include <jeios/handle.h>
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>

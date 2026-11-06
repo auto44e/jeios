@@ -229,7 +229,7 @@ $(BUILD)/test_image: tests/test_image.c $(USER_GENERATED) kernel/core/vm.c kerne
 # ADR 0010 D12: hosted coverage uses the production scheduler and PROCESS pool.
 # Private scheduler state is exposed only by the test TU; section GC discards
 # unrelated architecture-dependent scheduler entry points.
-$(BUILD)/test_sched_killall: tests/test_sched_killall.c kernel/core/proc.c kernel/core/device.c $(wildcard include/jeios/*.h)
+$(BUILD)/test_sched_killall: tests/test_sched_killall.c kernel/core/sched.c kernel/core/proc.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -ffunction-sections -fdata-sections \
 	  -fsanitize=address,undefined -fno-sanitize-recover=all \
