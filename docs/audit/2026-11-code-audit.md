@@ -39,6 +39,10 @@ The lead then re-read the cited lines in the live tree and confirmed each
 load-bearing claim before recording it below. Where a claim could not be
 confirmed, it is omitted or flagged.
 
+The raw, unedited peer briefs and outputs are attached under
+[`docs/audit/code-review/`](code-review/README.md) for provenance, so a reviewer
+can check the reconciliation below against the underlying material.
+
 ## Genuine strengths (verified in-tree)
 
 These are not courtesy; they are the patterns the rest of the tree should copy.
