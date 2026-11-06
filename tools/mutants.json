@@ -1,0 +1,130 @@
+{
+  "_comment": "Critical-mutant manifest for tools/mutants.py (issue #18/#19, 'curl-style' assurance). Each entry BREAKS one security/correctness invariant by a precise reversible source transform; the named killer hosted test MUST then fail (the mutant is KILLED). A SURVIVED mutant = the test does not actually prove its invariant (a test defect). A BLOCKED mutant = the `find` pattern no longer matches exactly once (source drifted) and the mutant must be updated, OR the mutated source failed to build (not a kill). Production code carries NO mutation macros; mutants live entirely here + in tools/mutants.py so the kernel source stays clean. Keep the ENABLED set small and canonical (regression anchors whose killer test exists today). The DISABLED entries at the end are test-GAP markers: critical invariants whose killer test does NOT exist yet (the peer code audit, docs/audit/2026-11-code-audit.md, proved these mutants SURVIVE). They are intentionally enabled:false so `make mutants` stays green while documenting the missing coverage; enable each one when its killer test lands. Writing a deleter mutant as `if (0 && (<cond>))` keeps a variable used so -Werror does not turn a test gap into a false 'build failed' (BLOCKED). See docs/audit/2026-11-code-audit.md for provenance (AI-assisted review, not human qualification).",
+  "mutants": [
+    {
+      "id": "ALLOC-FREE-OOB",
+      "invariant": "je_pages_free rejects an out-of-window physical address BEFORE deriving a page index (prevents an OOB state[] write)",
+      "file": "kernel/core/alloc.c",
+      "find": " || (a-JE_PHYSICAL_BASE)>=JE_PHYSICAL_SPAN)",
+      "replace": ")",
+      "build": "build/0/test_physmem_arm",
+      "run": "build/0/test_physmem_arm",
+      "killer": "test_physmem_arm: out-of-window / window-crossing free rejection",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "ALLOC-DEFAULT-DENY",
+      "invariant": "je_pages_init_pred is default-DENY: a page the predicate does not approve is RESERVED (the PR-H .bss-zero=ALLOW defect class)",
+      "file": "kernel/core/alloc.c",
+      "find": "p->state[i]=free ? 0 : RESERVED;",
+      "replace": "p->state[i]=0;",
+      "build": "build/0/test_physmem",
+      "run": "build/0/test_physmem",
+      "killer": "test_physmem: init state[] vs independent byte-level reference; exhaustion excludes reserved frames",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "HANDLE-RIGHTS-REQUIRED",
+      "invariant": "resolve_slot denies a lookup whose handle lacks the required rights (a handle never grants more than it holds)",
+      "file": "kernel/core/handle.c",
+      "find": "    if ((s->rights & required_rights) != required_rights) return JE_HANDLE_DENIED;",
+      "replace": "    if (0 && ((s->rights & required_rights) != required_rights)) return JE_HANDLE_DENIED;",
+      "build": "build/0/test_handle",
+      "run": "build/0/test_handle",
+      "killer": "test_handle: lookup with insufficient rights is DENIED",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "HANDLE-ATTENUATE-SUPERSET",
+      "invariant": "je_handle_duplicate can only REMOVE rights: a dup requesting rights not held by the source is DENIED (no privilege escalation by duplication)",
+      "file": "kernel/core/handle.c",
+      "find": "    if ((new_rights & ~s->rights) != 0u) return JE_HANDLE_DENIED;",
+      "replace": "    if (0 && ((new_rights & ~s->rights) != 0u)) return JE_HANDLE_DENIED;",
+      "build": "build/0/test_handle",
+      "run": "build/0/test_handle",
+      "killer": "test_handle: duplicate requesting a superset of rights is DENIED",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "VM-IMAGE-OVERLAP",
+      "invariant": "je_vm_image_validate rejects a descriptor whose segments overlap (or collide with the stack/guard) at page granularity",
+      "file": "kernel/core/vm.c",
+      "find": "            if (used[p]) return JE_ERR_INVALID; /* overlap or stack/guard */",
+      "replace": "            if (0 && (used[p])) return JE_ERR_INVALID; /* overlap or stack/guard */",
+      "build": "build/0/test_vm",
+      "run": "build/0/test_vm",
+      "killer": "test_vm: overlapping-segment descriptor is rejected",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "FDT-MAGIC",
+      "invariant": "je_fdt_parse rejects a blob whose magic is not JE_FDT_MAGIC (an untrusted non-DTB blob is never parsed as a DTB)",
+      "file": "kernel/core/fdt.c",
+      "find": "    if (fdt_be32(blob, 0u) != JE_FDT_MAGIC) return JE_FDT_BAD_MAGIC;",
+      "replace": "    if (0 && (fdt_be32(blob, 0u) != JE_FDT_MAGIC)) return JE_FDT_BAD_MAGIC;",
+      "build": "build/0/test_fdt",
+      "run": "build/0/test_fdt",
+      "killer": "test_fdt: bad-magic blob is rejected (JE_FDT_BAD_MAGIC)",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+
+    {
+      "id": "GAP-VM-AUDIT-ONE-TO-ONE",
+      "invariant": "je_vm_audit rejects a page table where two arena offsets map the same physical frame (no user-visible aliasing of a single frame)",
+      "file": "kernel/core/vm.c",
+      "find": "            if (seen_phys[k] == phys) return JE_ERR_INVALID;",
+      "replace": "            if (0 && (seen_phys[k] == phys)) return JE_ERR_INVALID;",
+      "build": "build/0/test_vm",
+      "run": "build/0/test_vm",
+      "killer": "GAP: no hosted negative test pokes a one-to-one violation into vm_fake (peer audit: SURVIVES). Add a poke-based negative test, then enable.",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": false,
+      "gap": true
+    },
+    {
+      "id": "GAP-EP-WAIT-INFLIGHT",
+      "invariant": "wait_register pins the endpoint record with an inflight ref so a parked waiter's record cannot be freed while it sleeps (no use-after-free in the timeout sweep)",
+      "file": "kernel/core/endpoint.c",
+      "find": "GAP-PLACEHOLDER-wait_register-inflight-refs++",
+      "replace": "",
+      "build": "build/0/test_endpoint",
+      "run": "build/0/test_endpoint",
+      "killer": "GAP: peer audit's probe dropped the inflight ref and the mutant SURVIVED (close both handles while a thread is parked -> record freed under the sleeper). Add the killer test, pin the exact find-string, then enable.",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": false,
+      "gap": true
+    },
+    {
+      "id": "GAP-DEV-DISPATCH-OWNER",
+      "invariant": "je_device_apply_dispatch grants ring-3 port I/O only to the device's owner (identity, not merely active)",
+      "file": "kernel/core/device.c",
+      "find": "GAP-PLACEHOLDER-apply_dispatch-owner-identity",
+      "replace": "",
+      "build": "build/0/test_device",
+      "run": "build/0/test_device",
+      "killer": "GAP: je_device_apply_dispatch has no hosted test (peer audit: DISPATCH-ANY-USER SURVIVES). Add owner / non-owner / post-revoke / closed-handle cases, pin the find-string, then enable.",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": false,
+      "gap": true
+    },
+    {
+      "id": "GAP-ARM-AUDIT-CYCLE",
+      "invariant": "the AArch64 page-table audit terminates (fails closed) on a table-descriptor cycle instead of recursing forever",
+      "file": "kernel/arch/aarch64/paging.c",
+      "find": "GAP-PLACEHOLDER-audit_table-visited-set",
+      "replace": "",
+      "build": "build/0/test_paging_bits",
+      "run": "build/0/test_paging_bits",
+      "killer": "GAP: audit_table has no visited-set (peer audit A3). A table pointing back to an ancestor recurses until stack exhaustion. Add a visited bitmap + a hosted self-cycle test under a timeout, pin the find-string, then enable. OWNER-GATED (ARM paging, tested path).",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": false,
+      "gap": true
+    }
+  ]
+}

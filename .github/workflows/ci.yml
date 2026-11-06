@@ -21,6 +21,20 @@ jobs:
         run: python3 tools/smoke.py build/0/jeios.iso --memory 1536M --expect-nx present
       - name: CPU exception and protection faults
         run: make integration
+  mutants:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y gcc binutils make python3
+      - name: Critical-mutant assurance
+        # Each named critical mutant breaks one security/correctness invariant;
+        # the one hosted killer test MUST then fail (the mutant is KILLED). A
+        # surviving mutant means a test does not prove its invariant; a blocked
+        # mutant means source drift or a build break. Exit nonzero on either, so
+        # a regression in the assurance set fails CI like any other check.
+        run: make mutants
   aarch64:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
