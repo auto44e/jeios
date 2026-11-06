@@ -1,5 +1,29 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Current-code fix gate — 2026-11-06 UTC
+
+Reviewed core main `e4bd9c24d69de4fc6798d733b1f2e6398522748f`, merged PRs
+#89–#92, raw peer audits, and mobile main
+`9221701ab2d5333978a294f54574ee384f4216e3`. Implemented documentation only:
+[repair-first response](audit/2026-11-fix-gate.md), F01–F14 acceptance packages,
+current entrypoint/status routing, and [reproduction evidence](audit/evidence/2026-11-fix-gate.md).
+No repairs or new functionality are claimed complete. Original dirty worktrees
+were preserved. This single-agent review is not independent human qualification.
+
+Verification: `make check` exit 2 (LeakSanitizer environment limitation);
+`ASAN_OPTIONS=detect_leaks=0 make check` exit 0. `make mutants` exit 0, reported
+six killed/four skipped, subject to the independently reproduced false-green
+runner defect. ARM self-cycle rejected; foreign sibling pointer faults during
+alias scan. Main CI 42177874117 passed at the baseline, not this response commit.
+No local Docker/QEMU/hardware run. Final source diff is documentation only.
+
+Next: working agents close F01–F14 with exact-revision before/after evidence and
+reviewed dispositions before new implementations. Begin with runner/build
+trustworthiness, then reaper sign and unsafe ARM audit dereferences. ADR 0013 is
+accepted; scheduler implementation remains gated. Update #18/#19/#87 with repair
+PR evidence. Do not advance the mobile core pin without separate qualification.
+
+
 ## Audit refresh — 2026-11-06 UTC
 
 Implemented: canonical status routing and dated-history labels; core adds audit response and corrected security introduction. Tested: `make check` stopped in LeakSanitizer: unable to read /proc task data under this execution environment. `ASAN_OPTIONS=detect_leaks=0 make check` passed; ASan/UBSan remained enabled, leak detection was not validated. No smoke/integration/emulator rerun for this docs-only change. `git diff --check` passed.
