@@ -91,24 +91,72 @@ static je_abi_status assign_driver(je_proc_id target, je_handle *out)
 static void test_assign_statuses(void)
 {
     je_handle h = 0u;
+    uint32_t i;
+
     reset_fixture();
     CHECK(je_device_assign(&g_device, g_supervisor, g_supervisor, &g_vm,
                            g_supervisor.index, &h) == JE_ABI_INVALID,
           "supervisor target is invalid");
+    CHECK(h == 0u && !g_device.active && g_device.owner.gen == 0u,
+          "invalid supervisor assignment publishes no device state");
     CHECK(je_device_assign(&g_device, g_driver, g_driver, &g_vm,
                            g_driver.index, &h) == JE_ABI_INVALID,
           "self target is invalid");
+    CHECK(h == 0u && !g_device.active && g_device.owner.gen == 0u,
+          "invalid self assignment publishes no device state");
     CHECK(je_proc_on_dying(&g_procs, g_driver, JE_DEATH_KILLED, 0u) == JE_OK,
           "driver becomes non-LIVE");
     CHECK(je_device_assign(&g_device, g_supervisor, g_driver, &g_vm,
                            g_driver.index, &h) == JE_ABI_H_STALE,
           "non-LIVE target is stale");
+    CHECK(h == 0u && !g_device.active && g_device.owner.gen == 0u,
+          "stale target assignment publishes no device state");
 
     reset_fixture();
     CHECK(assign_driver(g_driver, &h) == JE_ABI_OK, "initial assign");
+    CHECK(h != 0u && g_device.active && g_device.owner.index == g_driver.index
+          && g_device.owner.gen == g_driver.gen,
+          "successful assignment publishes owner and active state");
     CHECK(je_device_assign(&g_device, g_supervisor, g_other, &g_vm,
                            g_other.index, &h) == JE_ABI_H_DENIED,
           "already-bound device is denied");
+    CHECK(h == 0u && g_device.active && g_device.owner.index == g_driver.index
+          && g_device.owner.gen == g_driver.gen,
+          "bound-device denial preserves the current binding");
+
+    reset_fixture();
+    h = UINT32_MAX;
+    CHECK(je_device_assign(&g_device, JE_PROC_ID_NONE, g_driver, &g_vm,
+                           g_driver.index, &h) == JE_ABI_INVALID,
+          "invalid caller is rejected");
+    CHECK(h == 0u && !g_device.active && g_device.owner.gen == 0u,
+          "invalid caller publishes no device state");
+
+    reset_fixture();
+    g_vm.procs[g_other.index].htable.quota = 0u;
+    h = UINT32_MAX;
+    CHECK(assign_driver(g_other, &h) == JE_ABI_H_QUOTA,
+          "quota-full target is rejected during preflight");
+    CHECK(h == 0u && !g_device.active && g_device.owner.gen == 0u
+          && g_vm.procs[g_other.index].htable.live == 0u,
+          "quota preflight leaves binding and target table unchanged");
+
+    reset_fixture();
+    g_vm.procs[g_other.index].htable.quota = JE_VM_HANDLE_CAP;
+    for (i = 0u; i < JE_VM_HANDLE_CAP; ++i) {
+        g_vm.procs[g_other.index].htable.slots[i].state = JE_HSLOT_RETIRED;
+        g_vm.procs[g_other.index].htable.slots[i].generation =
+            JE_HANDLE_GEN_MAX;
+        CHECK(g_vm.procs[g_other.index].htable.slots[i].state ==
+                  JE_HSLOT_RETIRED,
+              "retire target slots for no-slots preflight");
+    }
+    h = UINT32_MAX;
+    CHECK(assign_driver(g_other, &h) == JE_ABI_H_NOSLOTS,
+          "no-slots target is rejected during preflight");
+    CHECK(h == 0u && !g_device.active && g_device.owner.gen == 0u
+          && g_vm.procs[g_other.index].htable.live == 0u,
+          "no-slots preflight preserves the full target table");
 }
 
 static void test_revoke_and_generation(void)
@@ -121,6 +169,13 @@ static void test_revoke_and_generation(void)
     je_device_irq3(&g_device);
     CHECK(g_device.pending && g_device.irq3_pending_observed,
           "IRQ3 sets pending and records the transition");
+    pending = UINT32_MAX;
+    CHECK(je_device_irq_ack(&g_device, g_other, &g_vm, g_driver.index,
+                            h, &pending) == JE_ABI_H_STALE,
+          "non-owner ACK is stale");
+    CHECK(pending == 0u && g_device.pending,
+          "non-owner ACK leaves pending device state unchanged");
+    pending = 0u;
     CHECK(je_device_irq_ack(&g_device, g_driver, &g_vm, g_driver.index,
                             h, &pending) == JE_ABI_OK && pending == 1u,
           "ACK observes pending");
@@ -165,6 +220,67 @@ static void test_revoke_and_generation(void)
           "sentinel generation is retained and inactive");
 }
 
+static void test_dispatch_authority(void)
+{
+    je_handle h = 0u;
+    const je_proc_id gen_zero = {g_driver.index, 0u};
+
+    reset_fixture();
+    CHECK(assign_driver(g_driver, &h) == JE_ABI_OK,
+          "assign for dispatch authority");
+    je_device_apply_dispatch(&g_device, g_driver,
+                             &g_vm.procs[g_driver.index].htable, true);
+    CHECK(g_device.active && g_device.owner.index == g_driver.index
+          && g_device.owner.gen == g_driver.gen && g_bitmap == 0u,
+          "bound owner dispatch enables COM2 I/O");
+
+    je_device_apply_dispatch(&g_device, g_other,
+                             &g_vm.procs[g_other.index].htable, true);
+    CHECK(g_bitmap == 0xffu && g_device.active
+          && g_device.owner.index == g_driver.index,
+          "non-owner dispatch denies COM2 I/O");
+
+    je_device_apply_dispatch(&g_device, gen_zero,
+                             &g_vm.procs[g_driver.index].htable, true);
+    CHECK(g_bitmap == 0xffu && g_device.owner.gen == g_driver.gen,
+          "generation-zero dispatch denies COM2 I/O");
+
+    je_device_apply_dispatch(&g_device, JE_PROC_ID_NONE,
+                             &g_vm.procs[g_driver.index].htable, false);
+    CHECK(g_bitmap == 0xffu && g_device.active,
+          "kernel dispatch follows the user=false deny path");
+
+    CHECK(je_device_revoke(&g_device) == JE_ABI_OK,
+          "revoke for post-revoke dispatch");
+    CHECK(!g_device.active && g_device.owner.index == 0u
+          && g_device.owner.gen == 0u && g_bitmap == 0xffu,
+          "revoke clears binding and COM2 I/O");
+    je_device_apply_dispatch(&g_device, g_driver,
+                             &g_vm.procs[g_driver.index].htable, true);
+    CHECK(g_bitmap == 0xffu && !g_device.active,
+          "post-revoke owner dispatch remains denied");
+
+    reset_fixture();
+    je_device_apply_dispatch(&g_device, g_driver,
+                             &g_vm.procs[g_driver.index].htable, true);
+    CHECK(g_bitmap == 0xffu && !g_device.active,
+          "inactive device dispatch is denied");
+
+    reset_fixture();
+    CHECK(assign_driver(g_driver, &h) == JE_ABI_OK,
+          "assign for owner death");
+    je_device_apply_dispatch(&g_device, g_driver,
+                             &g_vm.procs[g_driver.index].htable, true);
+    CHECK(g_bitmap == 0u && g_device.active,
+          "owner death fixture starts with allowed dispatch");
+    je_device_on_process_dying(&g_device, g_driver);
+    CHECK(!g_device.active && g_device.owner.index == 0u
+          && g_device.owner.gen == 0u && !g_device.pending
+          && !g_device.rearm_pending && !je_arch_irq3_is_unmasked()
+          && g_bitmap == 0xffu,
+          "owner death revokes device and clears COM2 I/O");
+}
+
 static void test_irq7_and_tick_saturation(void)
 {
     je_handle h = 0u;
@@ -207,6 +323,7 @@ int main(void)
 {
     test_assign_statuses();
     test_revoke_and_generation();
+    test_dispatch_authority();
     test_irq7_and_tick_saturation();
     if (g_failures != 0u) {
         fprintf(stderr, "test_device: FAIL (%u of %u checks)\n",

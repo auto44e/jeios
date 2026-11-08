@@ -179,6 +179,17 @@ je_status je_thread_create_user_start(je_vm *vm, uint32_t index,
     je_vm_process *p = &vm->procs[index];
     if (p->state != JE_VM_READY || p->held_kstack != JE_VM_KSTACK_PAGES || !p->root)
         return JE_ERR_INVALID;
+    /* F08: one user thread per vm process, enforced EXPLICITLY. The waiter model
+     * (one BLOCKED_IPC slot per end, je_sched_drop_user matching the first
+     * THREAD_USER for (vm,index)) and the per-process guard page assume a single
+     * thread per process. Previously this held only incidentally — a second
+     * create would fail later on je_arch_page_guard of the already-guarded kstack
+     * or on je_proc_link. Make it a stated precondition so the invariant does not
+     * depend on a downstream failure. */
+    for (unsigned t = 1; t < JE_THREAD_MAX; ++t)
+        if (threads[t].kind == THREAD_USER && threads[t].vm == vm &&
+            threads[t].vm_index == index)
+            return JE_ERR_INVALID;
     unsigned slot=1;
     while (slot<JE_THREAD_MAX && threads[slot].state!=EMPTY) ++slot;
     if (slot==JE_THREAD_MAX) return JE_ERR_NOMEM;

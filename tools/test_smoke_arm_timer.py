@@ -131,6 +131,7 @@ def run(build, shim, args=()):
 def main():
     build = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / "build/aarch64-timertest")
     good = (build / "serial.log").read_bytes()
+    lines = good.split(b"\n")
     failures = 0
     with tempfile.TemporaryDirectory(prefix="jeios-timer-mut-") as td:
         td = Path(td)
@@ -153,6 +154,14 @@ def main():
         for name, data, needle in mutations(good):
             assert data != good, name
             case(name, data, False, needle)
+        stalled = next(k for k, ln in enumerate(lines)
+                       if ln.startswith(b"JeiOS/aarch64: timer cntfrq="))
+        stalled_log = b"\n".join(
+            lines[:stalled + 1] +
+            [b"JeiOS/aarch64: FATAL timer stalled"] +
+            lines[stalled + 1:])
+        case("stalled timer marker", stalled_log, False, "timer-stalled",
+             args=("--timer-test", "--stalled-timer"))
         # Mode discipline: the same timer-test log in the default mode, and a
         # default-mode expectation of no irq lines.
         case("timer-test log without --timer-test", good, False, "", args=())

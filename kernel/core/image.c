@@ -110,13 +110,24 @@ static bool report_vaddr_in_rw_segment(const je_vm_image *desc)
 je_status je_builtin_images_init(void)
 {
     if (builtin_images_ready) return JE_OK;
-    unsigned char *start = je_user_spawn_child_start;
-    unsigned char *end = je_user_spawn_child_end;
-    if (end <= start) return JE_ERR_INVALID;
+    /*
+     * Fix-gate F10: the spawn-child span is delimited by two DISTINCT linker
+     * symbols. A relational compare or subtraction of pointers to different
+     * objects is undefined in C11 (6.5.8p5, 6.5.6p9), so compute the span on
+     * uintptr_t (7.20.1.4) instead. Same reject condition and same length for
+     * the real symbols. uintptr_t and size_t are both 64-bit on every JeiOS
+     * target (x86_64, aarch64), so `e - s` (< e <= UINTPTR_MAX) always fits;
+     * the static assert pins that, so no runtime width check is needed.
+     */
+    _Static_assert(sizeof(uintptr_t) <= sizeof(size_t),
+                   "spawn-child span must fit size_t");
+    uintptr_t s = (uintptr_t)je_user_spawn_child_start;
+    uintptr_t e = (uintptr_t)je_user_spawn_child_end;
+    if (e <= s) return JE_ERR_INVALID;
 
     je_builtin_image *image = &builtin_images[JE_IMAGE_SPAWN_CHILD];
-    size_t length = (size_t)(end - start);
-    image->blob = start;
+    size_t length = (size_t)(e - s);
+    image->blob = je_user_spawn_child_start;
     image->blob_len = length;
     image->desc = (je_vm_image){0};
     image->desc.version = JE_VM_IMAGE_VERSION;

@@ -1099,6 +1099,15 @@ IRQ_BRK_FAR_RE = re.compile(rb"JeiOS/aarch64:   far=n/a vbar=" + H)
 VBAR_RE = re.compile(rb"JeiOS/aarch64: vectors installed vbar=" + H)
 TERM_EXC = b"JeiOS/aarch64: exception handled; halted"
 DOUBLE_FAULT = b"double fault"
+TIMER_STALLED = b"JeiOS/aarch64: FATAL timer stalled"
+LATE_LOW_SYM = b"je_arm_canary_late_low_site"
+LATE_HIGH_SYM = b"je_arm_canary_late_high_site"
+CANARY_NOP = 0xD503201F
+MOVZ_X0_ZERO = 0xD2800000
+MOVZ_X29_ZERO = MOVZ_X0_ZERO | 29
+MSR_CNTP_TVAL_MASK = 0xFFFFFFE0
+MSR_CNTP_TVAL_BITS = 0xD51BE200
+MSR_CNTP_CTL_ENABLE_X4 = 0xD51BE224
 
 
 def timer_test_expect(elf_path, image_path):
@@ -1147,6 +1156,69 @@ def timer_test_expect(elf_path, image_path):
           f"(Image-derived from {CANARY_SYM.decode()}=0x{loop:x}); "
           f"{IRQ_BRK_SYM.decode()}=0x{brk:x} == BRK #0xb2b2")
     return exp
+
+
+def make_timer_negative_image(elf_path, image_path, late_corruption,
+                              stalled_timer):
+    """Create a disposable timer-test Image with one deliberate proof fault.
+
+    The source image remains untouched. Late-register profiles replace the
+    named assembly NOP with MOVZ X0/X29,#0. The stalled-timer profile replaces
+    the initial CNTP_CTL enable (following the first CNTP_TVAL write in the
+    Image) with NOP, leaving the handler's re-arm write intact. All sites are
+    symbol/encoding checked so a changed Image layout fails closed.
+    """
+    if late_corruption is not None and stalled_timer:
+        fail("timer negative profiles are mutually exclusive")
+    if late_corruption is None and not stalled_timer:
+        return image_path
+
+    names = [IMAGE_BASE_SYM]
+    if late_corruption == "low":
+        names.append(LATE_LOW_SYM)
+    elif late_corruption == "high":
+        names.append(LATE_HIGH_SYM)
+    syms = resolve_syms(elf_path, tuple(names), "timer negative profile")
+    with open(image_path, "rb") as f:
+        image = bytearray(f.read())
+    text = syms[IMAGE_BASE_SYM]
+
+    if late_corruption is not None:
+        site = syms[LATE_LOW_SYM if late_corruption == "low"
+                    else LATE_HIGH_SYM]
+        old = image_word(image, text, site, "timer negative patch site")
+        if old != CANARY_NOP:
+            fail(f"timer negative profile: {late_corruption} site "
+                 f"0x{site:x} contains 0x{old:08x}, not NOP")
+        off = site - text
+        image[off:off + 4] = (MOVZ_X0_ZERO if late_corruption == "low"
+                               else MOVZ_X29_ZERO).to_bytes(4, "little")
+        print(f"negative: patched late-{late_corruption} canary site "
+              f"0x{site:x} in disposable Image")
+
+    if stalled_timer:
+        matches = [
+            off for off in range(0, len(image) - 3, 4)
+            if (int.from_bytes(image[off:off + 4], "little")
+                & MSR_CNTP_TVAL_MASK) == MSR_CNTP_TVAL_BITS
+        ]
+        if len(matches) != 2:
+            fail("timer negative profile: expected exactly two CNTP_TVAL "
+                 f"writes, found {len(matches)}")
+        enable_off = matches[0] + 8
+        enable = int.from_bytes(image[enable_off:enable_off + 4], "little")
+        if enable != MSR_CNTP_CTL_ENABLE_X4:
+            fail("timer negative profile: initial CNTP_TVAL is not followed "
+                 f"by the expected CNTP_CTL enable (0x{enable:08x})")
+        image[enable_off:enable_off + 4] = CANARY_NOP.to_bytes(4, "little")
+        print(f"negative: patched initial CNTP_CTL enable at Image offset "
+              f"0x{enable_off:x} in disposable Image")
+
+    fd, patched = tempfile.mkstemp(prefix="jeios-arm-timer-negative-",
+                                    suffix=".Image")
+    with os.fdopen(fd, "wb") as f:
+        f.write(image)
+    return patched
 
 
 def check_timer_test(lines, exp):
@@ -1608,6 +1680,14 @@ def main():
                     help="expect the ARM_TIMER_TEST returning-IRQ proof (4 ticks "
                          "via vector 5 interrupting the register-canary loop, "
                          "then the BRK #0xb2b2 negative control)")
+    ap.add_argument("--late-corruption", choices=("low", "high"),
+                    help="deliberately patch a timer-test Image copy at the "
+                         "late low/high canary site; this profile must FAIL "
+                         "with the diagnosed register marker")
+    ap.add_argument("--stalled-timer", action="store_true",
+                    help="deliberately suppress initial CNTP arming in an Image "
+                         "copy; this profile must FAIL with the internal "
+                         "timer-stalled marker")
     ap.add_argument("--require", action="store_true",
                     help="missing QEMU/toolchain/image is a FAIL, not a SKIP")
     ap.add_argument("--elf", metavar="PATH",
@@ -1641,6 +1721,10 @@ def main():
                             or args.phys_alloc):
         fail("--timer-test is only valid alone (its build excludes the other "
              "toggles)")
+    if (args.late_corruption is not None or args.stalled_timer) and not args.timer_test:
+        fail("--late-corruption/--stalled-timer require --timer-test")
+    if args.late_corruption is not None and args.stalled_timer:
+        fail("--late-corruption and --stalled-timer are mutually exclusive")
     qemu = args.qemu
     if shutil.which(qemu) is None:
         skip(f"{qemu} not installed")
@@ -1670,11 +1754,13 @@ def main():
     # a FAIL (never a SKIP) outside --dtb-bad.
     if not os.path.isfile(elf) and (not args.dtb_bad or args.require):
         fail(f"{'--require' if args.dtb_bad else 'MMU oracle'}: ELF {elf} not found")
+    boot_image = make_timer_negative_image(
+        elf, args.image, args.late_corruption, args.stalled_timer)
     image_extent = resolve_image_extent(elf) if args.phys_alloc else None
     mmu_syms = None if args.dtb_bad else resolve_syms(elf, MMU_LAYOUT_SYMS, "mmu")
     fault_exp = (mmu_fault_expect(args.mmu_fault, elf, args.image, mmu_syms)
                  if args.mmu_fault else None)
-    tt_exp = timer_test_expect(elf, args.image) if args.timer_test else None
+    tt_exp = timer_test_expect(elf, boot_image) if args.timer_test else None
 
     markers = list(BASE_MARKERS)
     markers[3] = exact(b"JeiOS/aarch64: bss clear verified" if args.bss_verified
@@ -1723,9 +1809,9 @@ def main():
         check_dtb_gic_timer(fx)   # static: pinned bases/INTID vs fixture DTB
 
     # Evidence: image hash + tool versions.
-    with open(args.image, "rb") as f:
+    with open(boot_image, "rb") as f:
         sha = hashlib.sha256(f.read()).hexdigest()
-    print(f"image: {args.image}  sha256={sha}")
+    print(f"image: {boot_image}  sha256={sha}")
     print(f"qemu:  {tool_version(qemu)}")
     print(f"cc:    {tool_version(TOOLCHAIN_CC)}")
     print(f"fixture: {os.path.normpath(FIXTURE)} crc32=0x{fx.crc32:08x} "
@@ -1743,13 +1829,18 @@ def main():
 
     cmd = [qemu, "-M", MACHINE, "-cpu", CPU, "-smp", "1", "-m", MEMORY,
            "-display", "none", "-serial", f"file:{serial_path}",
-           "-no-reboot", "-kernel", args.image]
+           "-no-reboot", "-kernel", boot_image]
     print("cmd:   " + " ".join(cmd))
 
     try:
         out, early, err = run_qemu(cmd, serial_path, final_line, early_stop,
                                    args.timeout)
     finally:
+        if boot_image != args.image:
+            try:
+                os.unlink(boot_image)
+            except OSError:
+                pass
         if args.log:
             print(f"log:   {serial_path}")
         else:
@@ -1764,6 +1855,27 @@ def main():
     # Everything below judges the FINAL log (re-read after QEMU was killed)
     # and the final stderr. stderr first: a QEMU-level error voids the run.
     check_stderr(err)
+    if args.late_corruption is not None or args.stalled_timer:
+        lines, partial = split_lines(out)
+        if partial:
+            fail("negative timer profile emitted an unterminated serial line")
+        if args.stalled_timer:
+            if TIMER_STALLED not in lines:
+                fail("stalled-timer profile did not emit the internal timer "
+                     "stalled marker")
+            fail("stalled-timer profile caught the fault with the internal "
+                 "timer-stalled marker")
+        want_reg = 0 if args.late_corruption == "low" else 29
+        reg = str(want_reg).encode("ascii")
+        want = (
+            b"JeiOS/aarch64: FATAL irq canary mismatch reg=" + reg,
+            b"JeiOS/aarch64: FATAL irq canary-hi mismatch reg=" + reg,
+        )
+        if not any(marker in lines for marker in want):
+            fail(f"late-{args.late_corruption} profile did not emit the "
+                 f"expected register marker reg={want_reg}")
+        fail(f"late-{args.late_corruption} corruption caught at "
+             f"reg={want_reg}")
     if args.dtb_bad:
         # Exactly one FATAL, and it must be the expected parser rejection.
         # Checked over the raw log so a FATAL in a partial tail is also seen.

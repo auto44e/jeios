@@ -995,6 +995,7 @@ static volatile uint64_t je_arm_irq_invalid_wakeups;
 #ifdef JE_ARM_TIMER_TEST
 volatile uint64_t je_arm_canary_heartbeat;
 volatile uint64_t je_arm_canary_fail_reg = UINT64_MAX;
+volatile uint64_t je_arm_canary_deadline;
 extern void je_arm_canary_loop(void);
 extern void je_arm_canary_hi_loop(void);
 #endif
@@ -1131,6 +1132,19 @@ void je_arm_irq(const je_arm_trapframe *tf)
 }
 
 #ifdef JE_ARM_TIMER_TEST
+static void arm_canary_set_deadline(void)
+{
+    const uint64_t budget = (uint64_t)je_arm_timer_interval * UINT64_C(1024);
+    const uint64_t now = je_arm_read_cntpct();
+    je_arm_canary_deadline = now + (budget != 0u ? budget : UINT64_C(1));
+}
+
+_Noreturn void je_arm_timer_stalled(void)
+{
+    console_write("JeiOS/aarch64: FATAL timer stalled\r\n");
+    halt();
+}
+
 static void irq_timer_test_fatal(const char *reason)
 {
     console_write("JeiOS/aarch64: FATAL irq timer test ");
@@ -1197,6 +1211,7 @@ static void irq_timer_test(void)
     je_arm_canary_fail_reg = UINT64_MAX;
     je_arm_irq_busy_wakeups = 0u;
     je_arm_irq_invalid_wakeups = 0u;
+    arm_canary_set_deadline();
     je_arm_canary_loop();
     if (je_arm_canary_fail_reg != UINT64_MAX) {
         console_write("JeiOS/aarch64: FATAL irq canary mismatch reg=");
@@ -1206,9 +1221,11 @@ static void irq_timer_test(void)
     }
     /* (b) Rotating-scratch phase: the primary loop proved x0..x28 survive an IRQ
      * return but cannot check its own scratch/LR (x29,x30). This second phase
-     * checks exactly x29,x30 using already-proven x0..x2 as scratch, over
-     * JE_ARM_CANARY_HI_TICKS more live ticks, with a final I-masked re-check. */
+     * checks all x0..x30 while using x0..x2 from the saved canary set as
+     * scratch, over JE_ARM_CANARY_HI_TICKS more live ticks, with a final
+     * I-masked re-check. */
     je_arm_canary_fail_reg = UINT64_MAX;
+    arm_canary_set_deadline();
     je_arm_canary_hi_loop();
     if (je_arm_canary_fail_reg != UINT64_MAX) {
         console_write("JeiOS/aarch64: FATAL irq canary-hi mismatch reg=");

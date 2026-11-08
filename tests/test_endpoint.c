@@ -591,6 +591,124 @@ static void test_ddev(void)
     fresh(QUOTA);
 }
 
+/* ===== Fix-gate F07: JE_EP_UNWIRED vs JE_EP_CORRUPT, and resolve precedence.
+ *
+ * F07 split the old overloaded JE_EP_CORRUPT: JE_EP_UNWIRED is the EXPECTED
+ * "vm has no endpoint-kernel wiring yet" status (returned by endpoint_kern.c
+ * create/dup/seed; the syscall glue maps it to JE_ABI_UNSUPPORTED), and
+ * JE_EP_CORRUPT is now an INTERNAL invariant break that the glue routes to the
+ * _Noreturn syscall_invariant fail-stop, never back to ring 3.
+ *
+ * WHAT THIS HOSTED BINARY CAN AND CANNOT PROVE. It links only endpoint.c (the
+ * pure layer) + handle.c + proc.c. It does NOT link endpoint_kern.c (the only
+ * producer of JE_EP_UNWIRED) nor syscall.c (ep_status_to_abi). So the routing
+ * UNWIRED -> JE_ABI_UNSUPPORTED and CORRUPT -> fail-stop is NOT tested here; it
+ * is QEMU-integration + code-review covered. What IS proven here is the safety
+ * precondition that makes the new fail-stop sound: je_endpoint_resolve returns
+ * the table's BADINDEX -> STALE -> WRONGTYPE verdict BEFORE object_to_end can
+ * run, so no malformed / not-live / wrong-type handle VALUE a user can present
+ * reaches CORRUPT (the fail-stop is not user-triggerable through resolve). The
+ * only route to CORRUPT shown below needs a kernel-internal je_handle_alloc of an
+ * ENDPOINT-typed slot bound to a non-pool or freed end — a corrupt table
+ * binding, which no syscall mints (every ENDPOINT-typed je_handle_alloc is in
+ * endpoint.c and binds &rec->end[s] of an allocated record; review-covered).
+ * Mutant EP-RESOLVE-PRECEDENCE (tools/mutants.json) is killed here. ===== */
+_Static_assert(JE_EP_UNWIRED != JE_EP_CORRUPT,
+               "F07: the expected unwired status must be distinct from CORRUPT");
+_Static_assert(JE_EP_UNWIRED != JE_EP_OK && JE_EP_CORRUPT != JE_EP_OK,
+               "F07: neither UNWIRED nor CORRUPT may alias success");
+
+static uint8_t g_f07_not_an_end;   /* an object that is not any pool end */
+
+/* Resolve h and require `want`, with NO side effect: out params untouched, pool
+ * accounting and table occupancy unchanged, and the result is never UNWIRED
+ * (the pure layer does not produce it) nor CORRUPT (unless asked for). */
+static void f07_resolve_expect(je_handle h, je_ep_status want)
+{
+    je_ep_channel *const rec_sentinel = (je_ep_channel *)&g_pool.rec[JE_EP_POOL_CAP - 1u];
+    je_ep_channel *rec = rec_sentinel;
+    uint8_t side = 0xA5u;
+    uint32_t alloc_before = je_endpoint_pool_allocated(&g_pool);
+    uint32_t live_before = g_t.live;
+    je_ep_status st = je_endpoint_resolve(&g_pool, &g_t, h, &rec, &side);
+    assert(st == want);
+    assert(st != JE_EP_UNWIRED);                       /* pure layer never emits it */
+    if (want != JE_EP_CORRUPT) assert(st != JE_EP_CORRUPT);
+    assert(rec == rec_sentinel && side == 0xA5u);      /* no out-param write */
+    assert(je_endpoint_pool_allocated(&g_pool) == alloc_before);
+    assert(g_t.live == live_before);
+}
+
+static void test_f07_resolve_precedence(void)
+{
+    fresh(QUOTA);
+    je_handle h0 = 0u, h1 = 0u;
+    make_pair(&h0, &h1);
+    uint32_t idx = 0u, gen = 0u;
+    je_handle_decode(h0, &idx, &gen);
+
+    /* 1. Malformed -> BADINDEX: zero handle; index beyond table capacity. */
+    f07_resolve_expect(0u, JE_EP_BADINDEX);
+    f07_resolve_expect(je_handle_encode(CAP, 1u), JE_EP_BADINDEX);
+    f07_resolve_expect(je_handle_encode(JE_HANDLE_INDEX_MASK, gen), JE_EP_BADINDEX);
+
+    /* 2. Not live -> STALE: right index of a LIVE endpoint slot but the wrong
+     *    generation; and a closed (FREE-slot) endpoint handle. Each would name a
+     *    real pool end if object_to_end ran first — STALE must win. */
+    uint32_t wrong_gen = (gen == JE_HANDLE_GEN_MAX) ? 1u : gen + 1u;
+    f07_resolve_expect(je_handle_encode(idx, wrong_gen), JE_EP_STALE);
+    je_handle c0 = 0u, c1 = 0u;
+    make_pair(&c0, &c1);
+    assert(je_endpoint_handle_close(&g_pool, &g_t, c0) == JE_EP_OK);
+    f07_resolve_expect(c0, JE_EP_STALE);
+
+    /* 3. Wrong type -> WRONGTYPE: a LIVE gen-matching SELF slot. Its object is
+     *    NULL, which object_to_end would report as CORRUPT — WRONGTYPE must win. */
+    je_handle self = 0u;
+    assert(je_handle_alloc(&g_t, (void *)0, JE_HANDLE_OBJ_SELF,
+                           JE_EP_RIGHT_INSPECT, &self) == JE_HANDLE_OK);
+    f07_resolve_expect(self, JE_EP_WRONGTYPE);
+    /* ...and a SELF slot bound (kernel-internally) to a REAL end is still
+     * WRONGTYPE: type is checked before the object is ever interpreted. */
+    {
+        je_ep_channel *r0; uint8_t s0;
+        assert(je_endpoint_resolve(&g_pool, &g_t, h0, &r0, &s0) == JE_EP_OK);
+        je_handle self_on_end = 0u;
+        assert(je_handle_alloc(&g_t, (void *)&r0->end[s0], JE_HANDLE_OBJ_SELF,
+                               JE_EP_RIGHT_INSPECT, &self_on_end) == JE_HANDLE_OK);
+        f07_resolve_expect(self_on_end, JE_EP_WRONGTYPE);
+    }
+
+    /* 4. The valid handles are unaffected by the refused lookups. */
+    {
+        je_ep_channel *r; uint8_t sd;
+        assert(je_endpoint_resolve(&g_pool, &g_t, h0, &r, &sd) == JE_EP_OK);
+        assert(r->allocated && r->end[sd].handle_refs == 1u);
+        assert(je_endpoint_resolve(&g_pool, &g_t, h1, &r, &sd) == JE_EP_OK);
+    }
+
+    /* 5. CORRUPT is reachable ONLY past the table gate, i.e. only from a
+     *    kernel-internal corrupt binding: a LIVE gen-matching ENDPOINT slot whose
+     *    object is (a) not a pool end, or (b) an end of a FREED record. Both fail
+     *    closed (no out-param write, no accounting change). */
+    {
+        je_handle bogus = 0u;
+        assert(je_handle_alloc(&g_t, (void *)&g_f07_not_an_end, JE_ENDPOINT_OBJ_TYPE,
+                               JE_EP_RIGHTS_ALL, &bogus) == JE_HANDLE_OK);
+        f07_resolve_expect(bogus, JE_EP_CORRUPT);
+
+        uint32_t freed = JE_EP_POOL_CAP;
+        for (uint32_t i = 0u; i < JE_EP_POOL_CAP; ++i)
+            if (!g_pool.rec[i].allocated) { freed = i; break; }
+        assert(freed < JE_EP_POOL_CAP);
+        je_handle dangling = 0u;
+        assert(je_handle_alloc(&g_t, (void *)&g_pool.rec[freed].end[1],
+                               JE_ENDPOINT_OBJ_TYPE, JE_EP_RIGHTS_ALL,
+                               &dangling) == JE_HANDLE_OK);
+        f07_resolve_expect(dangling, JE_EP_CORRUPT);
+    }
+}
+
 int main(void)
 {
     /* 1. Create: both ends OPEN, refs 1/1, one record allocated. */
@@ -1384,6 +1502,7 @@ int main(void)
     }
 
     test_ddev();
+    test_f07_resolve_precedence();
 
     printf("endpoint: PASS (create, split-ref close/destruction, dup "
            "acquire-before-commit, REFOVERFLOW, DENIED/WRONGTYPE, inflight keep-"
@@ -1392,6 +1511,7 @@ int main(void)
            "cap-transfer mint/dead-cap/cycle-reclaim, "
            "waits register/arbitrate-CAS/reserved-head/release/release-by-id/peer-close-EMPTY, "
            "D-DEV create_by charge/QUOTA/NOSLOTS-first/mint-unwind/transfer/dying/dead/"
-           "freed/reused/NONE/procs-NULL/create==create_by(NONE)/no stale creator on reuse)\n");
+           "freed/reused/NONE/procs-NULL/create==create_by(NONE)/no stale creator on reuse, "
+           "F07 resolve precedence BADINDEX/STALE/WRONGTYPE-before-CORRUPT)\n");
     return 0;
 }

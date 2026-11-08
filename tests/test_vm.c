@@ -26,6 +26,9 @@ void je_vm_fake_fail_at(unsigned n);
 size_t je_vm_fake_fallible_count(void);
 const unsigned char *je_vm_fake_peek(je_vm_ref frame);
 void je_vm_fake_poke_upper(uint32_t process, int level, uint32_t index, uint64_t value);
+void je_vm_fake_poke_alias(je_vm_ref ref, je_vm_alias al);
+void je_vm_fake_poke_extent_phys(uint32_t process, uint32_t extent,
+                                 uint64_t phys);
 
 static je_pages pages;
 static je_vm_ops ops;
@@ -33,6 +36,11 @@ static je_vm vm;
 static je_pages pages_before;
 static je_vm_process procs_before[JE_VM_MAX_PROCESSES];
 static unsigned char blob[256];
+
+#define FAKE_PTE_P  UINT64_C(0x1)
+#define FAKE_PTE_W  UINT64_C(0x2)
+#define FAKE_PTE_U  UINT64_C(0x4)
+#define FAKE_PTE_NX (UINT64_C(1) << 63)
 
 /* Free pages after init_pages: the 1 MiB fixture range is 256 pages, minus the
  * 3-page boot reservation. The single source for every "full pool" comparison;
@@ -158,6 +166,58 @@ static bool extents_overlap(const je_vm_extent *left, const je_vm_extent *right)
     const uint64_t right_end = right->physical + right_bytes;
 
     return left->physical < right_end && right->physical < left_end;
+}
+
+static uint64_t fake_pte(uint64_t physical, je_vm_perm perm)
+{
+    uint64_t flags = FAKE_PTE_P | FAKE_PTE_U;
+
+    if (perm == JE_VM_PERM_R_NX)
+        flags |= FAKE_PTE_NX;
+    else if (perm == JE_VM_PERM_RW_NX)
+        flags |= FAKE_PTE_W | FAKE_PTE_NX;
+    else
+        assert(perm == JE_VM_PERM_RX);
+    return physical | flags;
+}
+
+static uint64_t existing_pte(uint32_t process, uint64_t varena_offset)
+{
+    uint64_t physical;
+    je_vm_perm permission;
+    int present;
+
+    assert(ops.read_user_pte(ops.context, process, varena_offset, &physical,
+                             &permission, &present) == JE_OK);
+    assert(present != 0);
+    return fake_pte(physical, permission);
+}
+
+static uint32_t build_auditable_process(void)
+{
+    const je_vm_image image = image_fixture();
+    uint32_t index = UINT32_MAX;
+
+    init_blob();
+    reset_vm(0u);
+    assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, &index) == JE_OK);
+    assert(vm.procs[index].state == JE_VM_READY);
+    assert(je_vm_audit(&vm, index) == JE_OK);
+    return index;
+}
+
+static void build_two_auditable_processes(uint32_t *first, uint32_t *second)
+{
+    const je_vm_image image = image_fixture();
+
+    init_blob();
+    reset_vm(0u);
+    assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, first) == JE_OK);
+    assert(je_vm_build(&vm, &image, blob, sizeof blob, 1, second) == JE_OK);
+    assert(vm.procs[*first].state == JE_VM_READY);
+    assert(vm.procs[*second].state == JE_VM_READY);
+    assert(je_vm_audit(&vm, *first) == JE_OK);
+    assert(je_vm_audit(&vm, *second) == JE_OK);
 }
 
 static void assert_pte(uint32_t process, uint64_t varena_offset,
@@ -929,6 +989,255 @@ static void test_audit_rejects_stale_upper(void)
     assert(je_vm_audit(&vm, idx) == JE_OK);
 }
 
+static void test_audit_rejects_alias(void)
+{
+    uint32_t idx = build_auditable_process();
+    uint32_t extent = find_extent(&vm.procs[idx], JE_VM_USER_CODE, 1u);
+    const je_vm_ref ref = {idx, extent, 0u};
+    je_vm_alias alias;
+
+    assert(ops.read_alias(ops.context, ref, &alias) == JE_OK);
+    assert(alias == JE_VM_ALIAS_RO_NX);
+    je_vm_fake_poke_alias(ref, JE_VM_ALIAS_RW);
+    assert(ops.read_alias(ops.context, ref, &alias) == JE_OK);
+    assert(alias == JE_VM_ALIAS_RW);
+    assert(je_vm_audit(&vm, idx) == JE_ERR_INVALID);
+    je_vm_fake_poke_alias(ref, JE_VM_ALIAS_RO_NX);
+    assert(ops.read_alias(ops.context, ref, &alias) == JE_OK);
+    assert(alias == JE_VM_ALIAS_RO_NX);
+    assert(je_vm_audit(&vm, idx) == JE_OK);
+}
+
+static void test_audit_rejects_one_to_one_alias(void)
+{
+    const uint64_t second_offset = JE_VM_STACK_OFFSET + JE_PAGE_SIZE;
+    uint32_t idx = build_auditable_process();
+    uint32_t extent = find_extent(&vm.procs[idx], JE_VM_USER_DATA,
+                                  (size_t)JE_VM_STACK_PAGES);
+    uint64_t first_phys;
+    uint64_t second_phys;
+    uint64_t original_second;
+    je_vm_perm permission;
+    int present;
+
+    assert(ops.extent_frame_phys(ops.context, idx, extent, 0u, &first_phys) ==
+           JE_OK);
+    assert(ops.extent_frame_phys(ops.context, idx, extent, 1u, &second_phys) ==
+           JE_OK);
+    assert(first_phys != second_phys);
+    original_second = existing_pte(idx, second_offset);
+    assert(ops.read_user_pte(ops.context, idx, second_offset, &second_phys,
+                             &permission, &present) == JE_OK);
+    assert(present != 0 && permission == JE_VM_PERM_RW_NX);
+
+    /* Replace an existing leaf, preserving the present count and the
+     * USER_DATA/RW_NX/RW conditions, so completeness and kind/perm/alias
+     * checks cannot mask the one-to-one violation. */
+    je_vm_fake_poke_upper((uint32_t)idx, 1,
+                          (uint32_t)(second_offset / JE_PAGE_SIZE),
+                          fake_pte(first_phys, JE_VM_PERM_RW_NX));
+    assert(ops.read_user_pte(ops.context, idx, second_offset, &second_phys,
+                             &permission, &present) == JE_OK);
+    assert(present != 0 && permission == JE_VM_PERM_RW_NX);
+    assert(second_phys == first_phys);
+    assert(je_vm_audit(&vm, idx) == JE_ERR_INVALID);
+
+    je_vm_fake_poke_upper((uint32_t)idx, 1,
+                          (uint32_t)(second_offset / JE_PAGE_SIZE),
+                          original_second);
+    assert(ops.read_user_pte(ops.context, idx, second_offset, &second_phys,
+                             &permission, &present) == JE_OK);
+    assert(present != 0 && permission == JE_VM_PERM_RW_NX);
+    assert(second_phys != first_phys);
+    assert(je_vm_audit(&vm, idx) == JE_OK);
+}
+
+static void test_audit_rejects_guard_mapping(void)
+{
+    const uint64_t source_offset = 0u;
+    const uint32_t guard_page = (uint32_t)(JE_VM_GUARD_OFFSET / JE_PAGE_SIZE);
+    uint32_t idx = build_auditable_process();
+    uint64_t source_phys;
+    uint64_t guard_phys;
+    je_vm_perm permission;
+    int present;
+
+    assert(ops.read_user_pte(ops.context, idx, source_offset, &source_phys,
+                             &permission, &present) == JE_OK);
+    assert(present != 0 && permission == JE_VM_PERM_RX);
+    je_vm_fake_poke_upper(idx, 1, guard_page,
+                          fake_pte(source_phys, JE_VM_PERM_RX));
+    assert(ops.read_user_pte(ops.context, idx, JE_VM_GUARD_OFFSET, &guard_phys,
+                             &permission, &present) == JE_OK);
+    assert(present != 0 && guard_phys == source_phys);
+    assert(je_vm_audit(&vm, idx) == JE_ERR_INVALID);
+
+    je_vm_fake_poke_upper(idx, 1, guard_page, 0u);
+    assert(ops.read_user_pte(ops.context, idx, JE_VM_GUARD_OFFSET, &guard_phys,
+                             &permission, &present) == JE_OK);
+    assert(present == 0);
+    assert(je_vm_audit(&vm, idx) == JE_OK);
+}
+
+static void test_audit_rejects_incomplete_mapping(void)
+{
+    const uint64_t source_offset = 0u;
+    const uint32_t source_page = (uint32_t)(source_offset / JE_PAGE_SIZE);
+    uint32_t idx = build_auditable_process();
+    const uint64_t original = existing_pte(idx, source_offset);
+    uint64_t physical;
+    je_vm_perm permission;
+    int present;
+
+    je_vm_fake_poke_upper(idx, 1, source_page, 0u);
+    assert(ops.read_user_pte(ops.context, idx, source_offset, &physical,
+                             &permission, &present) == JE_OK);
+    assert(present == 0);
+    assert(je_vm_audit(&vm, idx) == JE_ERR_INVALID);
+
+    je_vm_fake_poke_upper(idx, 1, source_page, original);
+    assert(ops.read_user_pte(ops.context, idx, source_offset, &physical,
+                             &permission, &present) == JE_OK);
+    assert(present != 0 && permission == JE_VM_PERM_RX);
+    assert(je_vm_audit(&vm, idx) == JE_OK);
+}
+
+static void test_audit_rejects_upper_flags(void)
+{
+    uint32_t idx = build_auditable_process();
+    uint32_t flags;
+
+    assert(ops.read_upper(ops.context, idx, 3, 0u, &flags) == JE_OK);
+    assert(flags == 3u);
+    je_vm_fake_poke_upper(idx, 3, 0u, FAKE_PTE_P | FAKE_PTE_W | FAKE_PTE_U);
+    assert(ops.read_upper(ops.context, idx, 3, 0u, &flags) == JE_OK);
+    assert(flags == 7u);
+    assert(je_vm_audit(&vm, idx) == JE_ERR_INVALID);
+
+    je_vm_fake_poke_upper(idx, 3, 0u, FAKE_PTE_P | FAKE_PTE_W);
+    assert(ops.read_upper(ops.context, idx, 3, 0u, &flags) == JE_OK);
+    assert(flags == 3u);
+    assert(je_vm_audit(&vm, idx) == JE_OK);
+}
+
+static void test_audit_rejects_kind_permission_mismatch(void)
+{
+    const uint64_t source_offset = 0u;
+    const uint32_t source_page = (uint32_t)(source_offset / JE_PAGE_SIZE);
+    uint32_t idx = build_auditable_process();
+    uint64_t physical;
+    uint64_t original = existing_pte(idx, source_offset);
+    je_vm_perm permission;
+    int present;
+
+    assert(ops.read_user_pte(ops.context, idx, source_offset, &physical,
+                             &permission, &present) == JE_OK);
+    assert(present != 0 && permission == JE_VM_PERM_RX);
+    je_vm_fake_poke_upper(idx, 1, source_page,
+                          fake_pte(physical, JE_VM_PERM_RW_NX));
+    assert(ops.read_user_pte(ops.context, idx, source_offset, &physical,
+                             &permission, &present) == JE_OK);
+    assert(present != 0 && permission == JE_VM_PERM_RW_NX);
+    assert(je_vm_audit(&vm, idx) == JE_ERR_INVALID);
+
+    je_vm_fake_poke_upper(idx, 1, source_page, original);
+    assert(ops.read_user_pte(ops.context, idx, source_offset, &physical,
+                             &permission, &present) == JE_OK);
+    assert(present != 0 && permission == JE_VM_PERM_RX);
+    assert(je_vm_audit(&vm, idx) == JE_OK);
+}
+
+static void test_audit_rejects_unowned_frame(void)
+{
+    const uint64_t source_offset = 0u;
+    const uint32_t source_page = (uint32_t)(source_offset / JE_PAGE_SIZE);
+    uint32_t idx;
+    uint32_t other;
+    uint32_t table_extent;
+    uint64_t table_phys;
+    uint64_t physical;
+    uint64_t original;
+    je_vm_perm permission;
+    int present;
+
+    build_two_auditable_processes(&idx, &other);
+    table_extent = find_extent(&vm.procs[idx], JE_VM_TABLE,
+                               (size_t)JE_VM_TABLE_PAGES);
+    assert(ops.extent_frame_phys(ops.context, idx, table_extent, 0u,
+                                 &table_phys) == JE_OK);
+    original = existing_pte(idx, source_offset);
+    je_vm_fake_poke_upper(idx, 1, source_page,
+                          fake_pte(table_phys, JE_VM_PERM_RX));
+    assert(ops.read_user_pte(ops.context, idx, source_offset, &physical,
+                             &permission, &present) == JE_OK);
+    assert(present != 0 && physical == table_phys);
+    assert(je_vm_audit(&vm, idx) == JE_ERR_INVALID);
+
+    je_vm_fake_poke_upper(idx, 1, source_page, original);
+    assert(ops.read_user_pte(ops.context, idx, source_offset, &physical,
+                             &permission, &present) == JE_OK);
+    assert(present != 0 && permission == JE_VM_PERM_RX);
+    assert(je_vm_audit(&vm, idx) == JE_OK);
+    assert(je_vm_audit(&vm, other) == JE_OK);
+}
+
+static void test_audit_rejects_distinct_root_collision(void)
+{
+    uint32_t first;
+    uint32_t second;
+
+    build_two_auditable_processes(&first, &second);
+    assert(vm.procs[first].root != vm.procs[second].root);
+    const uint32_t saved_root = vm.procs[second].root;
+    vm.procs[second].root = vm.procs[first].root;
+    assert(vm.procs[second].root == vm.procs[first].root);
+    assert(je_vm_audit(&vm, first) == JE_ERR_INVALID);
+
+    vm.procs[second].root = saved_root;
+    assert(vm.procs[second].root == saved_root);
+    assert(je_vm_audit(&vm, first) == JE_OK);
+    assert(je_vm_audit(&vm, second) == JE_OK);
+}
+
+static void test_audit_rejects_cross_process_frame_sharing(void)
+{
+    uint32_t first;
+    uint32_t second;
+    uint32_t first_extent;
+    uint32_t second_extent;
+    uint64_t first_phys;
+    uint64_t second_phys;
+    uint64_t restored_phys;
+
+    build_two_auditable_processes(&first, &second);
+    first_extent = find_extent(&vm.procs[first], JE_VM_USER_CODE, 1u);
+    second_extent = find_extent(&vm.procs[second], JE_VM_USER_CODE, 1u);
+    assert(ops.extent_frame_phys(ops.context, first, first_extent, 0u,
+                                 &first_phys) == JE_OK);
+    assert(ops.extent_frame_phys(ops.context, second, second_extent, 0u,
+                                 &second_phys) == JE_OK);
+    assert(first_phys != second_phys);
+
+    je_vm_fake_poke_extent_phys(second, second_extent, first_phys);
+    assert(ops.extent_frame_phys(ops.context, second, second_extent, 0u,
+                                 &restored_phys) == JE_OK);
+    assert(restored_phys == first_phys);
+    assert(je_vm_audit(&vm, first) == JE_ERR_INVALID);
+
+    je_vm_fake_poke_extent_phys(second, second_extent, second_phys);
+    assert(ops.extent_frame_phys(ops.context, second, second_extent, 0u,
+                                 &restored_phys) == JE_OK);
+    assert(restored_phys == second_phys);
+    assert(je_vm_audit(&vm, first) == JE_OK);
+    assert(je_vm_audit(&vm, second) == JE_OK);
+}
+
+/* The hosted reader rejects W+X before je_vm_audit reaches its raw-permission
+ * branch, so that class is fake-unreachable. Descriptor-level illegal
+ * permissions remain covered by test_image_validation above. This suite has no
+ * spawn fixture; the audit gate itself is therefore the reachable rollback
+ * assertion here, while spawn_undo is covered by the spawn-path tests. */
+
 int main(void)
 {
     test_image_validation();
@@ -942,5 +1251,14 @@ int main(void)
     test_build_quota_admits();
     test_build_quota_independent();
     test_build_quota_rollback();
+    test_audit_rejects_alias();
+    test_audit_rejects_one_to_one_alias();
+    test_audit_rejects_guard_mapping();
+    test_audit_rejects_incomplete_mapping();
+    test_audit_rejects_upper_flags();
+    test_audit_rejects_kind_permission_mismatch();
+    test_audit_rejects_unowned_frame();
+    test_audit_rejects_distinct_root_collision();
+    test_audit_rejects_cross_process_frame_sharing();
     puts("vm: PASS (validation, admission at P, audit + stale-upper rejection, permissions, zeroing, rollback, teardown, death-hook, P-way isolation, handle quota)");
 }

@@ -97,7 +97,7 @@ je_ep_status je_endpoint_kern_create(je_vm *vm, uint32_t index,
      * teardown hook AND the IRQ critical-section pair — not just the hook, so a
      * partially-wired vm cannot mint without the A3-1 critical section. */
     if (!je_endpoint_kern_is_wired(vm))
-        return JE_EP_CORRUPT;
+        return JE_EP_UNWIRED;
     kep_init_once();
     je_handle_table *t = &vm->procs[index].htable;
     je_proc_id creator = JE_PROC_ID_NONE;
@@ -106,10 +106,17 @@ je_ep_status je_endpoint_kern_create(je_vm *vm, uint32_t index,
     je_vm *caller_vm = (je_vm *)0;
     uint32_t caller_index = 0u;
     if (je_sched_current_user(&caller_vm, &caller_index) == JE_OK) {
+        /* F07: a caller-identity mismatch (wrong vm/index, or an UNREGISTERED
+         * user thread whose proc_id.gen is 0) is a USER-REACHABLE rejection, not
+         * an internal invariant break — je_thread_create_user_start permits a
+         * runnable thread with proc_id==NONE, which could invoke ENDPOINT_CREATE
+         * and hit this. Return DENIED (a returnable authority rejection) rather
+         * than JE_EP_CORRUPT, which the syscall glue now fail-stops. Only a
+         * genuinely impossible internal state uses CORRUPT. */
         if (caller_vm != vm || caller_index != index
             || je_sched_current_proc_id(&creator) != JE_OK
             || creator.gen == 0u)
-            return JE_EP_CORRUPT;
+            return JE_EP_DENIED;
     }
     je_ep_status status = je_endpoint_channel_create_by(
         &g_kep, creator, t, JE_EP_RIGHTS_ALL, t, JE_EP_RIGHTS_ALL, out0, out1);
@@ -124,7 +131,7 @@ je_ep_status je_endpoint_kern_dup(je_vm *vm, uint32_t index, je_handle src,
 {
     if (out) *out = 0u;
     if (!vm || index >= JE_VM_MAX_PROCESSES || !out) return JE_EP_BADINDEX;
-    if (!je_endpoint_kern_is_wired(vm)) return JE_EP_CORRUPT;
+    if (!je_endpoint_kern_is_wired(vm)) return JE_EP_UNWIRED;
     kep_init_once();
     return je_endpoint_handle_dup(&g_kep, &vm->procs[index].htable, src, rights, out);
 }
@@ -335,7 +342,7 @@ je_ep_status je_endpoint_kern_seed(je_vm *vm, uint32_t idxA, uint32_t idxB,
         || idxA == idxB || !outA || !outB) return JE_EP_BADINDEX;
     /* A5-4: both VMs must be hooked so the seeded ends are on a reclaiming death
      * path (the raw channel_create bypasses op-10's A3-2 hook check). */
-    if (!je_endpoint_kern_is_wired(vm)) return JE_EP_CORRUPT;
+    if (!je_endpoint_kern_is_wired(vm)) return JE_EP_UNWIRED;
     kep_init_once();
     return je_endpoint_channel_create(&g_kep, &vm->procs[idxA].htable,
                                       JE_EP_RIGHTS_ALL,

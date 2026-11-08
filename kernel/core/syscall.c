@@ -187,6 +187,32 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
     }
 }
 
+/*
+ * Fix-gate F10 (defensive; not a proven overflow): the KERNEL staging capacity
+ * handed to the endpoint peek for a recv. Both recv paths stage into a fixed
+ * `uint8_t staging[JE_EP_MSG_MAX]`, but the peek's `cap` argument is the stated
+ * capacity of THAT kernel buffer. Passing the raw user RDX would let the user
+ * claim a kernel buffer larger than it is; today that is harmless only because
+ * the peek copies `mlen` bytes and `mlen` (a uint8_t) is bounded to
+ * JE_EP_MSG_MAX at enqueue. This clamp removes the dependency on that remote
+ * invariant: the callee can never be told the staging buffer is bigger than
+ * `staging_size`.
+ *
+ * Contract: pure, any context. Returns min(user_cap, staging_size).
+ * User-visible semantics are unchanged: the peek returns SHORT_BUFFER iff
+ * cap < mlen, and mlen <= JE_EP_MSG_MAX == staging_size, so for
+ * user_cap > staging_size both the raw and the clamped value are >= mlen
+ * (no SHORT_BUFFER either way), and for user_cap <= staging_size the value is
+ * passed through unchanged. The copy-out to the user still copies exactly mlen
+ * bytes into the user's buffer. Linkage is external (no header) only so the
+ * hosted test_syscall can check it; it is not part of any ABI.
+ */
+size_t je_syscall_recv_staging_cap(uint64_t user_cap, size_t staging_size);
+size_t je_syscall_recv_staging_cap(uint64_t user_cap, size_t staging_size)
+{
+    return user_cap > (uint64_t)staging_size ? staging_size : (size_t)user_cap;
+}
+
 #ifndef JE_SYSCALL_HOSTED_TEST
 /* M3b: SELF is the only object kind so far — a kernel-minted, immortal,
  * resource-free process-identity capability (ADR 0008). It is granted the
@@ -413,7 +439,13 @@ static je_abi_status ep_status_to_abi(je_ep_status s)
     case JE_EP_EMPTY:       return JE_ABI_H_EMPTY;
     case JE_EP_WAITERS_BUSY: return JE_ABI_H_EMPTY; /* A6-4: occupied slot -> non-blocking EMPTY */
     case JE_EP_INVALID:     return JE_ABI_INVALID;
-    case JE_EP_CORRUPT:     return JE_ABI_UNSUPPORTED; /* unwired vm / invariant */
+    case JE_EP_UNWIRED:     return JE_ABI_UNSUPPORTED; /* expected: vm not wired */
+    case JE_EP_CORRUPT:
+        /* F07: an INTERNAL invariant break (dangling/stale end record, lease or
+         * enum-drift mismatch). Unreachable from a well-formed user handle, so
+         * this is kernel corruption, not a user error — fail-stop instead of
+         * handing JE_ABI_UNSUPPORTED back to ring 3. _Noreturn. */
+        syscall_invariant("JeiOS fatal: endpoint internal corruption\r\n");
     }
     return JE_ABI_INVALID;
 }
@@ -454,7 +486,8 @@ static void je_syscall_finish_blocked_recv(je_trap_frame *f, je_ep_channel *rec,
     je_ep_capdesc caps[JE_ABI_MSG_CAPS_MAX];
     size_t mlen = 0u; uint8_t mcaps = 0u;
     je_ep_recv_lease lease;
-    je_ep_status s = je_endpoint_kern_recv_peek_owned(rec, side, staging, (size_t)cap,
+    je_ep_status s = je_endpoint_kern_recv_peek_owned(rec, side, staging,
+                                                      je_syscall_recv_staging_cap(cap, sizeof staging),
                                                       &mlen, (uint8_t)hcap, caps, &mcaps,
                                                       &lease);
     if (s == JE_EP_SHORT_BUFFER) {
@@ -1088,7 +1121,8 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         size_t mlen = 0u; uint8_t mcaps = 0u;
         je_ep_recv_lease lease;
         je_ep_status s = je_endpoint_kern_recv_peek_caps(vm, index, h, staging,
-                                                         (size_t)cap, &mlen,
+                                                         je_syscall_recv_staging_cap(cap, sizeof staging),
+                                                         &mlen,
                                                          (uint8_t)hcap, caps, &mcaps,
                                                          &lease);
         if (s == JE_EP_SHORT_BUFFER) {

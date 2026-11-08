@@ -123,8 +123,17 @@ typedef enum {
     JE_EP_WAITERS_BUSY, /* M3c A6-4: the end's single waiter slot is occupied; the
                          * glue maps this to a non-blocking EMPTY (never parks,
                          * never a new ABI status). */
-    JE_EP_CORRUPT       /* an object pointer that is not a valid pool end
-                         * (should be impossible; fail closed, never deref) */
+    JE_EP_UNWIRED,      /* F07: an EXPECTED configuration condition — the vm has no
+                         * endpoint-kernel teardown table wired yet (create/dup/seed
+                         * before wiring). A normal, user-returnable status; NOT an
+                         * invariant break. Kept distinct from JE_EP_CORRUPT so the
+                         * glue can return this but fail-stop on CORRUPT. */
+    JE_EP_CORRUPT       /* an INTERNAL invariant break: an object pointer that is not
+                         * a valid pool end, a dangling/stale end record, a lease or
+                         * enum-drift mismatch. Unreachable from a well-formed user
+                         * handle (the table confirms a LIVE gen-matching ENDPOINT
+                         * slot first). The glue routes this to the fail-stop path,
+                         * never back to ring 3. Fail closed; never deref. */
 } je_ep_status;
 
 /* A queued capability descriptor (ADR 0009 A5): a direct reference to a

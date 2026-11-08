@@ -269,9 +269,44 @@ static void test_proc_kill_decode(void)
     assert(dec(JE_SYS_PROC_KILL, 0x00010000,0x40002000,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN && st==JE_ABI_INVALID && res==0);
 }
 
+/* Fix-gate F10: the recv kernel-staging capacity clamp (pure helper; the recv
+ * dispatch itself has no hosted seam and stays QEMU-covered). Independent
+ * oracle: min() written out by hand. The user-facing SHORT_BUFFER predicate
+ * (cap < mlen, mlen <= JE_EP_MSG_MAX) is evaluated on raw vs clamped cap for
+ * every reachable mlen to prove the clamp cannot change the user-visible result. */
+size_t je_syscall_recv_staging_cap(uint64_t user_cap, size_t staging_size);
+static void test_recv_staging_cap(void)
+{
+    const size_t S = JE_EP_MSG_MAX;
+    const uint64_t caps[] = {
+        0u, 1u, (uint64_t)S - 1u, (uint64_t)S, (uint64_t)S + 1u, 255u, 256u,
+        UINT64_C(0x100000000), UINT64_C(0x7fffffffffffffff), UINT64_MAX
+    };
+    for (size_t i = 0; i < sizeof caps / sizeof caps[0]; ++i) {
+        uint64_t c = caps[i];
+        size_t got = je_syscall_recv_staging_cap(c, S);
+        size_t want = c <= (uint64_t)S ? (size_t)c : S;
+        assert(got == want);
+        assert(got <= S);
+        for (size_t mlen = 0; mlen <= S; ++mlen) {
+            int raw_short = c < (uint64_t)mlen;
+            int clamped_short = got < mlen;
+            assert(raw_short == clamped_short);
+        }
+    }
+    /* A user cap above the staging size never reaches the callee. */
+    assert(je_syscall_recv_staging_cap(UINT64_MAX, S) == S);
+    assert(je_syscall_recv_staging_cap((uint64_t)S + 1u, S) == S);
+    /* A legitimate cap passes through bit-for-bit. */
+    assert(je_syscall_recv_staging_cap(17u, S) == 17u);
+    assert(je_syscall_recv_staging_cap(0u, S) == 0u);
+}
+
 int main(void)
 {
     je_abi_status st; uint64_t res;
+
+    test_recv_staging_cap();
 
     /* abi_query(version) -> OK, RDX = version. */
     assert(dec(JE_SYS_ABI_QUERY, JE_ABI_QUERY_VERSION,0,0,0,0,0,&st,&res)==JE_SYSCALL_RETURN);

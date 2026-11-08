@@ -12,7 +12,7 @@
  *     (the A3-1 critical section) from the arch IRQ primitives. Call exactly once
  *     per je_vm before it becomes runnable; the fields are immutable thereafter.
  *   - je_endpoint_kern_create(vm, &h0, &h1): the ONLY endpoint creation path for
- *     a process table. It refuses (JE_EP_CORRUPT) unless `vm` has the teardown
+ *     a process table. It refuses (JE_EP_UNWIRED) unless `vm` has the teardown
  *     hook installed, so "an endpoint lives in a ring-3 table ⇒ that vm's
  *     je_vm_destroy walks it" holds by construction (A3-2). Used by the
  *     endpoint_create syscall AND the main.c self-tests, so neither can skip the
@@ -29,7 +29,7 @@
 void je_endpoint_kern_install(je_vm *vm);
 
 /* Mint a channel's two ends into `vm`'s current-process table. Returns JE_EP_OK
- * and the two handles, or an error (incl. JE_EP_CORRUPT if `vm` is unwired). */
+ * and the two handles, or an error (incl. JE_EP_UNWIRED if `vm` is unwired). */
 je_ep_status je_endpoint_kern_create(je_vm *vm, uint32_t index,
                                      je_handle *out0, je_handle *out1);
 

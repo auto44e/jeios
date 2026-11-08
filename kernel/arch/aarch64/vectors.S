@@ -263,9 +263,13 @@ je_arm_irq_common:
     .extern je_arm_canary_heartbeat
     .extern je_arm_irq_tick_count
     .extern je_arm_canary_fail_reg
+    .extern je_arm_timer_stalled
+    .extern je_arm_canary_deadline
 
 /* (b) extra live ticks the rotating-scratch x29/x30 phase waits for. */
 #define JE_ARM_CANARY_HI_TICKS 3
+/* The C side arms a CNTPCT deadline from the configured timer interval before
+ * each phase; this keeps the bound independent of guest instruction throughput. */
 
 .macro CANARY_CHECK reg, num
     adrp    x30, je_arm_canary_patterns
@@ -286,6 +290,13 @@ je_arm_canary_loop:
     stp     x25, x26, [sp, #48]
     stp     x27, x28, [sp, #64]
     stp     x29, x30, [sp, #80]
+    /* [112] is the last observed tick and [120] is the bounded no-progress
+     * iteration count. They are outside the caller-save area above. */
+    adrp    x29, je_arm_irq_tick_count
+    add     x29, x29, #:lo12:je_arm_irq_tick_count
+    ldr     x30, [x29]
+    str     x30, [sp, #112]
+    str     xzr, [sp, #120]
 
     /* Each pattern is 0xc0de000000000000 + register number. */
     movz    x0,  #0xc0de, lsl #48
@@ -407,16 +418,28 @@ je_arm_canary_loop:
     add     x29, x29, #:lo12:je_arm_canary_patterns
     ldr     x29, [x29, #(29 * 8)]
 
-    /* Stop after four successful timer ticks (N >= 3); x29/x30 are scratch
-     * only while the already-checked canary values are saved on the stack. */
+    /* Stop after four successful timer ticks (N >= 3). If the count does not
+     * advance before the C-provided CNTPCT deadline, identify the stalled
+     * timer internally instead of relying on the external smoke timeout. */
     stp     x29, x30, [sp, #104]
     adrp    x29, je_arm_irq_tick_count
     add     x29, x29, #:lo12:je_arm_irq_tick_count
     ldr     x30, [x29]
     cmp     x30, #4
     b.hs    .Lcanary_done
+    isb
+    mrs     x30, CNTPCT_EL0
+    adrp    x29, je_arm_canary_deadline
+    add     x29, x29, #:lo12:je_arm_canary_deadline
+    ldr     x29, [x29]
+    cmp     x30, x29
+    b.hs    .Lcanary_timer_stalled
     ldp     x29, x30, [sp, #104]
     b       .Lcanary_loop
+
+.Lcanary_timer_stalled:
+    bl      je_arm_timer_stalled
+    b       .Lcanary_timer_stalled
 
 .Lcanary_done:
     /* Mask I FIRST so no further IRQ can land during the final verification,
@@ -520,84 +543,277 @@ je_arm_canary_loop:
     ret
 
 /* ---- (b) Rotating-scratch canary for x29 and x30 (ADR 0012 D8, owner a+b).
- * The primary loop above cannot check x29/x30 (they are ITS scratch/LR), so a
- * SECOND phase checks exactly those two, using x0-x2 — which the primary loop
- * already proved survive an IRQ return — as the scratch/address temporaries.
- * It seeds x29,x30 with their canary patterns, unmasks I, and spins until the
- * tick count advances by JE_ARM_CANARY_HI_TICKS more ticks, checking x29,x30
- * every iteration; a mismatch stores the reg number and halts the proof. A
- * final I-masked re-check closes the last-tick race. On entry the primary loop
- * has returned, so x0-x28 are caller-restored; we only clobber x0-x2 (scratch),
- * x29, x30 here and restore the frame's x29/x30 (LR) at the end. ---- */
+ * The secondary phase uses x0-x2 as scratch, but snapshots their expected
+ * values before doing so and re-checks ALL of x0-x30 on every iteration. It
+ * also seeds x19-x28 with their canary patterns for this phase, preserving the
+ * caller values in the frame below. Thus a late low-register corruption during
+ * the high-register interval is diagnosed rather than hidden by scratch use.
+ * A final I-masked full check closes the last-tick race. */
     .globl  je_arm_canary_hi_loop
 je_arm_canary_hi_loop:
-    sub     sp, sp, #32
-    stp     x29, x30, [sp, #0]          /* save real FP/LR to restore + return */
-    str     x19, [sp, #16]              /* x19 scratch for the deadline base */
+    /* [0..16] save this phase's expected canaries for scratch registers x0-x2.
+     * [32..120] preserve the caller's callee-saved x19-x30.
+     * [128..136] preserve the live x29/x30 while reading tick state.
+     * [144] is the starting/last tick. */
+    sub     sp, sp, #160
+    stp     x19, x20, [sp, #32]
+    stp     x21, x22, [sp, #48]
+    stp     x23, x24, [sp, #64]
+    stp     x25, x26, [sp, #80]
+    stp     x27, x28, [sp, #96]
+    stp     x29, x30, [sp, #112]
 
     /* Record the starting tick count; we require +JE_ARM_CANARY_HI_TICKS. */
     adrp    x0, je_arm_irq_tick_count
     add     x0, x0, #:lo12:je_arm_irq_tick_count
-    ldr     x19, [x0]
+    ldr     x1, [x0]
+    str     x1, [sp, #24]
+    str     x1, [sp, #144]
 
-    /* Seed x29,x30 with their canary patterns (indices 29,30). */
+    /* Seed the complete x0-x30 set for this phase. The C call between the
+     * primary and secondary functions is allowed to clobber x0-x18, so the
+     * secondary proof must establish its own expected values rather than
+     * inheriting them from the earlier function. */
     adrp    x0, je_arm_canary_patterns
     add     x0, x0, #:lo12:je_arm_canary_patterns
+    ldr     x1, [x0, #(1 * 8)]
+    ldr     x2, [x0, #(2 * 8)]
+    ldr     x3, [x0, #(3 * 8)]
+    ldr     x4, [x0, #(4 * 8)]
+    ldr     x5, [x0, #(5 * 8)]
+    ldr     x6, [x0, #(6 * 8)]
+    ldr     x7, [x0, #(7 * 8)]
+    ldr     x8, [x0, #(8 * 8)]
+    ldr     x9, [x0, #(9 * 8)]
+    ldr     x10, [x0, #(10 * 8)]
+    ldr     x11, [x0, #(11 * 8)]
+    ldr     x12, [x0, #(12 * 8)]
+    ldr     x13, [x0, #(13 * 8)]
+    ldr     x14, [x0, #(14 * 8)]
+    ldr     x15, [x0, #(15 * 8)]
+    ldr     x16, [x0, #(16 * 8)]
+    ldr     x17, [x0, #(17 * 8)]
+    ldr     x18, [x0, #(18 * 8)]
+    ldr     x19, [x0, #(19 * 8)]
+    ldr     x20, [x0, #(20 * 8)]
+    ldr     x21, [x0, #(21 * 8)]
+    ldr     x22, [x0, #(22 * 8)]
+    ldr     x23, [x0, #(23 * 8)]
+    ldr     x24, [x0, #(24 * 8)]
+    ldr     x25, [x0, #(25 * 8)]
+    ldr     x26, [x0, #(26 * 8)]
+    ldr     x27, [x0, #(27 * 8)]
+    ldr     x28, [x0, #(28 * 8)]
     ldr     x29, [x0, #(29 * 8)]
     ldr     x30, [x0, #(30 * 8)]
+    ldr     x0, [x0, #(0 * 8)]
+    stp     x0, x1, [sp, #0]
+    str     x2, [sp, #16]
 
     msr     daifclr, #2                 /* unmask IRQ (I only) */
 .Lcanary_hi_loop:
-    /* Check x29 against pattern[29] using x0,x1 as scratch. */
+    /* A deliberately patched NOP at this label is the native late-low
+     * corruption profile. It executes after the timer interval has begun and
+     * immediately before the complete low/high check. */
+    .globl  je_arm_canary_late_low_site
+je_arm_canary_late_low_site:
+    nop
+
+    /* Check x0-x2 before using any of them as scratch. x30 is the temporary;
+     * restore its canary before the full x3-x30 pass below. */
+    ldr     x30, [sp, #0]
+    cmp     x0, x30
+    b.ne    .Lcanary_hi_fail_0
+    ldr     x30, [sp, #8]
+    cmp     x1, x30
+    b.ne    .Lcanary_hi_fail_1
+    ldr     x30, [sp, #16]
+    cmp     x2, x30
+    b.ne    .Lcanary_hi_fail_2
+
+    /* x0 is now a scratch address for the immutable pattern table. */
     adrp    x0, je_arm_canary_patterns
     add     x0, x0, #:lo12:je_arm_canary_patterns
-    ldr     x1, [x0, #(29 * 8)]
-    cmp     x29, x1
-    b.ne    .Lcanary_hi_fail_29
-    ldr     x1, [x0, #(30 * 8)]
-    cmp     x30, x1
-    b.ne    .Lcanary_hi_fail_30
+    ldr     x30, [x0, #(30 * 8)]
+.macro HI_CANARY_CHECK reg, num
+    ldr     x1, [x0, #(\num * 8)]
+    cmp     x\reg, x1
+    b.ne    .Lcanary_hi_fail_\num
+.endm
+    HI_CANARY_CHECK 3, 3
+    HI_CANARY_CHECK 4, 4
+    HI_CANARY_CHECK 5, 5
+    HI_CANARY_CHECK 6, 6
+    HI_CANARY_CHECK 7, 7
+    HI_CANARY_CHECK 8, 8
+    HI_CANARY_CHECK 9, 9
+    HI_CANARY_CHECK 10, 10
+    HI_CANARY_CHECK 11, 11
+    HI_CANARY_CHECK 12, 12
+    HI_CANARY_CHECK 13, 13
+    HI_CANARY_CHECK 14, 14
+    HI_CANARY_CHECK 15, 15
+    HI_CANARY_CHECK 16, 16
+    HI_CANARY_CHECK 17, 17
+    HI_CANARY_CHECK 18, 18
+    HI_CANARY_CHECK 19, 19
+    HI_CANARY_CHECK 20, 20
+    HI_CANARY_CHECK 21, 21
+    HI_CANARY_CHECK 22, 22
+    HI_CANARY_CHECK 23, 23
+    HI_CANARY_CHECK 24, 24
+    HI_CANARY_CHECK 25, 25
+    HI_CANARY_CHECK 26, 26
+    HI_CANARY_CHECK 27, 27
+    HI_CANARY_CHECK 28, 28
+    /* Patch point for the native late-high corruption profile. */
+    .globl  je_arm_canary_late_high_site
+je_arm_canary_late_high_site:
+    nop
+    HI_CANARY_CHECK 29, 29
+    HI_CANARY_CHECK 30, 30
+
     /* Bump the heartbeat so the --timer-test oracle sees progress here too. */
     adrp    x0, je_arm_canary_heartbeat
     add     x0, x0, #:lo12:je_arm_canary_heartbeat
     ldr     x1, [x0]
     add     x1, x1, #1
     str     x1, [x0]
-    /* Exit after +JE_ARM_CANARY_HI_TICKS ticks. */
-    adrp    x0, je_arm_irq_tick_count
-    add     x0, x0, #:lo12:je_arm_irq_tick_count
-    ldr     x1, [x0]
-    sub     x1, x1, x19
-    cmp     x1, #JE_ARM_CANARY_HI_TICKS
-    b.lo    .Lcanary_hi_loop
 
-    msr     daifset, #2                 /* mask I: final race-free re-check */
+    /* Exit after +JE_ARM_CANARY_HI_TICKS ticks, or fail internally if the
+     * counter does not advance before the C-provided CNTPCT deadline. */
+    stp     x29, x30, [sp, #128]
+    adrp    x29, je_arm_irq_tick_count
+    add     x29, x29, #:lo12:je_arm_irq_tick_count
+    ldr     x30, [x29]
+    ldr     x29, [sp, #144]
+    cmp     x30, x29
+    b.hi    .Lcanary_hi_tick_advanced
+    isb
+    mrs     x30, CNTPCT_EL0
+    adrp    x29, je_arm_canary_deadline
+    add     x29, x29, #:lo12:je_arm_canary_deadline
+    ldr     x29, [x29]
+    cmp     x30, x29
+    b.hs    .Lcanary_hi_timer_stalled
+    ldp     x29, x30, [sp, #128]
+    b       .Lcanary_hi_restore_low
+
+.Lcanary_hi_tick_advanced:
+    str     x30, [sp, #144]
+    ldr     x29, [sp, #24]
+    sub     x1, x30, x29
+    cmp     x1, #JE_ARM_CANARY_HI_TICKS
+    b.lo    .Lcanary_hi_restore_live
+
+    msr     daifset, #2                 /* final race-free full re-check */
+    ldp     x29, x30, [sp, #128]
+    ldr     x0, [sp, #0]
+    ldr     x1, [sp, #8]
+    ldr     x2, [sp, #16]
+    ldr     x30, [sp, #0]
+    cmp     x0, x30
+    b.ne    .Lcanary_hi_fail_0
+    ldr     x30, [sp, #8]
+    cmp     x1, x30
+    b.ne    .Lcanary_hi_fail_1
+    ldr     x30, [sp, #16]
+    cmp     x2, x30
+    b.ne    .Lcanary_hi_fail_2
     adrp    x0, je_arm_canary_patterns
     add     x0, x0, #:lo12:je_arm_canary_patterns
-    ldr     x1, [x0, #(29 * 8)]
-    cmp     x29, x1
-    b.ne    .Lcanary_hi_fail_29
-    ldr     x1, [x0, #(30 * 8)]
-    cmp     x30, x1
-    b.ne    .Lcanary_hi_fail_30
-    mov     w0, #0                       /* 0 = OK */
+    ldr     x30, [x0, #(30 * 8)]
+    HI_CANARY_CHECK 3, 3
+    HI_CANARY_CHECK 4, 4
+    HI_CANARY_CHECK 5, 5
+    HI_CANARY_CHECK 6, 6
+    HI_CANARY_CHECK 7, 7
+    HI_CANARY_CHECK 8, 8
+    HI_CANARY_CHECK 9, 9
+    HI_CANARY_CHECK 10, 10
+    HI_CANARY_CHECK 11, 11
+    HI_CANARY_CHECK 12, 12
+    HI_CANARY_CHECK 13, 13
+    HI_CANARY_CHECK 14, 14
+    HI_CANARY_CHECK 15, 15
+    HI_CANARY_CHECK 16, 16
+    HI_CANARY_CHECK 17, 17
+    HI_CANARY_CHECK 18, 18
+    HI_CANARY_CHECK 19, 19
+    HI_CANARY_CHECK 20, 20
+    HI_CANARY_CHECK 21, 21
+    HI_CANARY_CHECK 22, 22
+    HI_CANARY_CHECK 23, 23
+    HI_CANARY_CHECK 24, 24
+    HI_CANARY_CHECK 25, 25
+    HI_CANARY_CHECK 26, 26
+    HI_CANARY_CHECK 27, 27
+    HI_CANARY_CHECK 28, 28
+    HI_CANARY_CHECK 29, 29
+    HI_CANARY_CHECK 30, 30
     b       .Lcanary_hi_done
 
-.Lcanary_hi_fail_29:
-    msr     daifset, #2
-    mov     w0, #29
+.Lcanary_hi_restore_live:
+    ldp     x29, x30, [sp, #128]
+.Lcanary_hi_restore_low:
+    ldr     x0, [sp, #0]
+    ldr     x1, [sp, #8]
+    ldr     x2, [sp, #16]
+    b       .Lcanary_hi_loop
+
+.Lcanary_hi_timer_stalled:
+    bl      je_arm_timer_stalled
+    b       .Lcanary_hi_timer_stalled
+
+.macro HI_FAIL num
+.Lcanary_hi_fail_\num:
+    mov     w0, #\num
     b       .Lcanary_hi_store
-.Lcanary_hi_fail_30:
-    msr     daifset, #2
-    mov     w0, #30
+.endm
+    HI_FAIL 0
+    HI_FAIL 1
+    HI_FAIL 2
+    HI_FAIL 3
+    HI_FAIL 4
+    HI_FAIL 5
+    HI_FAIL 6
+    HI_FAIL 7
+    HI_FAIL 8
+    HI_FAIL 9
+    HI_FAIL 10
+    HI_FAIL 11
+    HI_FAIL 12
+    HI_FAIL 13
+    HI_FAIL 14
+    HI_FAIL 15
+    HI_FAIL 16
+    HI_FAIL 17
+    HI_FAIL 18
+    HI_FAIL 19
+    HI_FAIL 20
+    HI_FAIL 21
+    HI_FAIL 22
+    HI_FAIL 23
+    HI_FAIL 24
+    HI_FAIL 25
+    HI_FAIL 26
+    HI_FAIL 27
+    HI_FAIL 28
+    HI_FAIL 29
+    HI_FAIL 30
 .Lcanary_hi_store:
     adrp    x1, je_arm_canary_fail_reg
     add     x1, x1, #:lo12:je_arm_canary_fail_reg
     str     x0, [x1]
+    msr     daifset, #2
 .Lcanary_hi_done:
-    ldp     x29, x30, [sp, #0]
-    ldr     x19, [sp, #16]
-    add     sp, sp, #32
+    ldp     x19, x20, [sp, #32]
+    ldp     x21, x22, [sp, #48]
+    ldp     x23, x24, [sp, #64]
+    ldp     x25, x26, [sp, #80]
+    ldp     x27, x28, [sp, #96]
+    ldp     x29, x30, [sp, #112]
+    add     sp, sp, #160
     ret
 
 

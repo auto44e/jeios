@@ -132,6 +132,27 @@ je_status je_arch_page_restore(uintptr_t address)
     return JE_OK;
 }
 
+/* F08 fakes for je_thread_create_user_start. NX is reported present (ADR 0007
+ * D2 precondition). je_arch_page_guard RECORDS every call and always succeeds:
+ * it deliberately does NOT model "guarding an already-guarded page fails", so
+ * the only thing that can stop a duplicate create in this harness is the
+ * explicit F08 (vm,index) scan — not the incidental downstream failure the scan
+ * replaced. */
+static unsigned g_page_guard_calls;
+static uintptr_t g_page_guard_addr[JE_THREAD_MAX];
+
+int je_arch_has_nx(void)
+{
+    return 1;
+}
+
+je_status je_arch_page_guard(uintptr_t address)
+{
+    unsigned n = g_page_guard_calls++;
+    if (n < JE_THREAD_MAX) g_page_guard_addr[n] = address;
+    return JE_OK;
+}
+
 static je_proc_pool g_pool;
 
 je_status je_vm_destroy_owned(je_vm *vm, uint32_t index, je_proc_id owner)
@@ -188,6 +209,8 @@ static void reset_fixture(void)
     g_page_restore_fail_call = 0u;
     g_page_restore_fail_status = JE_OK;
     memset(g_page_restore_addr, 0, sizeof g_page_restore_addr);
+    g_page_guard_calls = 0u;
+    memset(g_page_guard_addr, 0, sizeof g_page_guard_addr);
     g_destroy_calls = 0u;
     g_destroy_status = JE_OK;
     memset(g_destroy, 0, sizeof g_destroy);
@@ -628,6 +651,131 @@ static void test_reap_post_drop_fail_stop(void)
           "the inconsistent record is not silently transitioned");
 }
 
+/* ---- F08: one user thread per (vm, index) ------------------------------------
+ * je_thread_create_user_start must EXPLICITLY reject a second THREAD_USER for a
+ * (vm, index) that already has one, BEFORE any side effect: no second slot, no
+ * second guard of the (shared) held kstack, no page_restore of the first
+ * thread's live guard page, no re-synthesized frame, no proc_link attempt.
+ * The fake page_guard never fails (see above), so without the scan a duplicate
+ * create on an UNREGISTERED process returns JE_OK with a second slot, and on a
+ * REGISTERED one guards the kstack twice and then page_restore()s the FIRST
+ * thread's guard page on the je_proc_link failure — the latter returns the same
+ * JE_ERR_INVALID code, which is why every case asserts state, not just status. */
+#define F08_KSTACK_BYTES ((size_t)JE_VM_KSTACK_PAGES * 4096u)
+static _Alignas(4096) uint8_t g_f08_kstack[3][F08_KSTACK_BYTES];
+static je_vm g_vm2;
+
+static void f08_ready(je_vm *vm, uint32_t index, unsigned buf)
+{
+    je_vm_process *p = &vm->procs[index];
+    p->state = JE_VM_READY;
+    p->held_kstack = JE_VM_KSTACK_PAGES;
+    p->root = (uint32_t)SLOT_ROOT(index + 1u);
+    p->entry = 0x100u;
+    p->kstack_physical = (uint64_t)(uintptr_t)g_f08_kstack[buf];
+}
+
+static unsigned used_slots(void)
+{
+    unsigned n = 0u;
+    for (unsigned i = 1u; i < JE_THREAD_MAX; ++i)
+        if (threads[i].state != EMPTY) ++n;
+    return n;
+}
+
+/* Snapshot covering the scheduler/proc/registry state AND the held kstack
+ * bytes (the synthesized first frame) the duplicate must not rewrite. */
+static uint8_t g_f08_kstack_before[F08_KSTACK_BYTES];
+
+static void check_duplicate_refused(je_vm *vm, uint32_t index, unsigned buf,
+                                    uint32_t first_slot, const char *what)
+{
+    snapshot();
+    memcpy(g_f08_kstack_before, g_f08_kstack[buf], F08_KSTACK_BYTES);
+    unsigned guards = g_page_guard_calls, restores = g_page_restore_calls;
+    unsigned used = used_slots();
+    uint32_t out = UINT32_MAX;
+
+    je_status s = je_thread_create_user_start(vm, index, (const je_user_startup *)0, &out);
+    CHECK(s == JE_ERR_INVALID, what);
+    CHECK(out == UINT32_MAX, "a refused duplicate create does not write out_slot");
+    CHECK(used_slots() == used, "a refused duplicate create consumes no thread slot");
+    CHECK(g_page_guard_calls == guards,
+          "a refused duplicate create does not re-guard the held kstack");
+    CHECK(g_page_restore_calls == restores,
+          "a refused duplicate create never un-guards the first thread's kstack");
+    CHECK(unchanged_since_snapshot(),
+          "a refused duplicate create leaves threads/proc pool/registry unchanged");
+    CHECK(memcmp(g_f08_kstack_before, g_f08_kstack[buf], F08_KSTACK_BYTES) == 0,
+          "a refused duplicate create does not rewrite the first thread's frame");
+    CHECK(threads[first_slot].kind == THREAD_USER && threads[first_slot].state == READY
+          && threads[first_slot].vm == vm && threads[first_slot].vm_index == index,
+          "the first thread for (vm,index) is untouched");
+}
+
+static void test_create_user_one_thread_per_process(void)
+{
+    reset_fixture();
+
+    /* (A) REGISTERED process: the first create links the PROCESS record. */
+    f08_ready(&g_vm, 2u, 0u);
+    je_proc_id id = JE_PROC_ID_NONE;
+    CHECK(je_proc_alloc(&g_pool, 0u, false, &id) == JE_OK, "F08 process allocation");
+    CHECK(je_sched_register_process(&g_vm, 2u, id) == JE_OK, "F08 process registration");
+    uint32_t s1 = UINT32_MAX;
+    CHECK(je_thread_create_user_start(&g_vm, 2u, (const je_user_startup *)0, &s1) == JE_OK,
+          "first user thread for (vm,2) is created");
+    CHECK(s1 != UINT32_MAX && s1 >= 1u && s1 < JE_THREAD_MAX, "first create reports a slot");
+    if (s1 == UINT32_MAX || s1 == 0u || s1 >= JE_THREAD_MAX) return;
+    uintptr_t kbase0 = (uintptr_t)g_f08_kstack[0];
+    CHECK(threads[s1].kind == THREAD_USER && threads[s1].state == READY
+          && threads[s1].vm == &g_vm && threads[s1].vm_index == 2u
+          && same_id(threads[s1].proc_id, id)
+          && threads[s1].rsp0_top == (uint64_t)kbase0 + F08_KSTACK_BYTES,
+          "first thread records (vm, index, PROCESS id, RSP0 top)");
+    CHECK(g_page_guard_calls == 1u && g_page_guard_addr[0] == kbase0,
+          "first create guards the held kstack base exactly once");
+    CHECK(g_pool.rec[id.index].run_linked && g_pool.rec[id.index].thread_slot == s1
+          && g_pool.rec[id.index].vm_index == 2u,
+          "first create links the PROCESS record to its slot");
+    CHECK(used_slots() == 1u, "exactly one user slot is in use");
+
+    check_duplicate_refused(&g_vm, 2u, 0u, s1,
+                            "second create for a REGISTERED (vm,2) is JE_ERR_INVALID");
+    CHECK(g_pool.rec[id.index].run_linked && g_pool.rec[id.index].thread_slot == s1,
+          "the PROCESS run link still names the first slot");
+
+    /* (B) UNREGISTERED process (no proc_link to fail downstream): without the
+     * scan a duplicate would return JE_OK with a second slot. */
+    f08_ready(&g_vm, 3u, 1u);
+    uint32_t s2 = UINT32_MAX;
+    CHECK(je_thread_create_user_start(&g_vm, 3u, (const je_user_startup *)0, &s2) == JE_OK,
+          "a DIFFERENT index (vm,3) still creates: the check is identity-scoped");
+    CHECK(s2 != UINT32_MAX && s2 != s1 && s2 >= 1u && s2 < JE_THREAD_MAX,
+          "the (vm,3) thread gets its own slot");
+    if (s2 == UINT32_MAX || s2 == 0u || s2 >= JE_THREAD_MAX) return;
+    CHECK(threads[s2].vm == &g_vm && threads[s2].vm_index == 3u
+          && threads[s2].proc_id.gen == 0u,
+          "the unregistered (vm,3) thread carries no PROCESS id");
+    CHECK(g_page_guard_calls == 2u && g_page_guard_addr[1] == (uintptr_t)g_f08_kstack[1],
+          "the (vm,3) create guards its own kstack");
+    check_duplicate_refused(&g_vm, 3u, 1u, s2,
+                            "second create for an UNREGISTERED (vm,3) is JE_ERR_INVALID");
+
+    /* (C) Same index, DIFFERENT vm: the identity is the (vm,index) pair, not
+     * the index alone. (Unregistered: the registry is per-index.) */
+    f08_ready(&g_vm2, 2u, 2u);
+    uint32_t s3 = UINT32_MAX;
+    CHECK(je_thread_create_user_start(&g_vm2, 2u, (const je_user_startup *)0, &s3) == JE_OK,
+          "same index on a DIFFERENT vm still creates");
+    CHECK(s3 != UINT32_MAX && s3 != s1 && s3 != s2, "the (vm2,2) thread gets its own slot");
+    CHECK(used_slots() == 3u, "three distinct (vm,index) identities -> three slots");
+    CHECK(threads[s1].vm == &g_vm && threads[s1].vm_index == 2u
+          && same_id(threads[s1].proc_id, id),
+          "the first (vm,2) thread is still untouched after the other creates");
+    memset(&g_vm2, 0, sizeof g_vm2);
+}
+
 int main(void)
 {
     test_live_and_spare();
@@ -641,6 +789,7 @@ int main(void)
     test_reap_partial_progress();
     test_reap_success_counts();
     test_reap_post_drop_fail_stop();
+    test_create_user_one_thread_per_process();
     if (g_failures != 0u) {
         fprintf(stderr, "test_sched_killall: FAIL (%u of %u checks)\n",
                 g_failures, g_checks);

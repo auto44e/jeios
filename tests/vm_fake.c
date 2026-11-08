@@ -64,6 +64,9 @@ void je_vm_fake_init(je_vm_ops *ops, je_pages *pages);
 void je_vm_fake_fail_at(unsigned n);
 size_t je_vm_fake_fallible_count(void);
 const unsigned char *je_vm_fake_peek(je_vm_ref frame);
+void je_vm_fake_poke_alias(je_vm_ref ref, je_vm_alias al);
+void je_vm_fake_poke_extent_phys(uint32_t process, uint32_t extent,
+                                 uint64_t phys);
 
 #define E_P  UINT64_C(0x1)
 #define E_W  UINT64_C(0x2)
@@ -513,6 +516,33 @@ const unsigned char *je_vm_fake_peek(je_vm_ref frame)
 {
     const fake_frame *f = frame_of(&g, frame, NULL);
     return f ? (const unsigned char *)f->page : NULL;
+}
+
+/* Test-only: change the identity alias state without changing the user PTE. */
+void je_vm_fake_poke_alias(je_vm_ref ref, je_vm_alias al)
+{
+    fake_frame *f = frame_of(&g, ref, NULL);
+
+    if (!f || (al != JE_VM_ALIAS_RW && al != JE_VM_ALIAS_RO_NX)) {
+        fprintf(stderr, "vm_fake: poke_alias out of range\n");
+        abort();
+    }
+    f->alias = al;
+}
+
+/* Test-only: make an extent report a different physical base. The backing
+ * allocation and page-table leaves are intentionally unchanged so audit tests
+ * can model a cross-process physical-frame collision and restore it exactly. */
+void je_vm_fake_poke_extent_phys(uint32_t process, uint32_t extent,
+                                 uint64_t phys)
+{
+    fake_extent *e = extent_of(&g, process, extent);
+
+    if (!e || (phys % (uint64_t)JE_PAGE_SIZE) != 0u) {
+        fprintf(stderr, "vm_fake: poke_extent_phys out of range\n");
+        abort();
+    }
+    e->physical = phys;
 }
 
 /* Test-only: force a raw entry into a process's upper paging table, to simulate a
