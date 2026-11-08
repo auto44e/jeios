@@ -6,7 +6,6 @@
  * DAIF.I masked while the GIC is configured and while the PR-2a proof polls the
  * pending state.  The MMIO pages are mapped as Device-nGnRnE by main.c.
  */
-#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
