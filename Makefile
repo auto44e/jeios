@@ -6,6 +6,8 @@ PYTHON ?= python3
 GRUB_PC_DIR ?= /usr/lib/grub/i386-pc
 TEST_MODE ?= 0
 BUILD := build/$(TEST_MODE)
+IMAGE_REG_CASES := ok span_equal span_inverted len_mismatch report_missing
+IMAGE_REG_TESTS := $(patsubst %,$(BUILD)/test_image_registry_%,$(IMAGE_REG_CASES))
 WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
 CPPFLAGS := -Iinclude -DJE_TEST_MODE=$(TEST_MODE)
 # Dev-only fixup-injection path is compiled ONLY in the dedicated test mode 11,
@@ -79,7 +81,7 @@ $(BUILD)/kernel/core/image.o: kernel/core/image.c $(USER_GENERATED) $(USER_GENER
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_paging_bits $(BUILD)/test_gic_bits $(BUILD)/test_vm $(BUILD)/test_usercopy $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_device
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_paging_bits $(BUILD)/test_gic_bits $(BUILD)/test_vm $(BUILD)/test_usercopy $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_device $(IMAGE_REG_TESTS)
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
@@ -100,6 +102,7 @@ test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_ph
 	./$(BUILD)/test_image
 	./$(BUILD)/test_sched_killall
 	./$(BUILD)/test_device
+	for t in $(IMAGE_REG_TESTS); do ./$$t || exit 1; done
 check: all test
 	$(PYTHON) tools/check_elf.py $(BUILD)/jeios.elf
 	$(PYTHON) tools/mkimage.py --name c_hello --elf $(USER_IMAGE) --verify
@@ -230,6 +233,14 @@ $(BUILD)/test_image: tests/test_image.c $(USER_GENERATED) kernel/core/vm.c kerne
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all \
 	  -DJE_TEST_IMAGE_C='"$(abspath $(USER_GENERATED))"' -DJE_TEST_IMAGE_NAME=c_hello \
 	  tests/test_image.c kernel/core/vm.c kernel/core/handle.c -o $@
+
+# Fix-gate F10: hosted built-in image registry (kernel/core/image.c) linked with
+# the real validator and FAKE linker symbols. image.c's inputs are const link-time
+# symbols, so each failure case is its own link of the same TU (-DJE_REG_CASE_<c>).
+$(BUILD)/test_image_registry_%: tests/test_image_registry.c kernel/core/image.c kernel/core/vm.c kernel/core/handle.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -DJE_REG_CASE_$* -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  tests/test_image_registry.c kernel/core/image.c kernel/core/vm.c kernel/core/handle.c -o $@
 
 # ADR 0010 D12: hosted coverage uses the production scheduler and PROCESS pool.
 # Private scheduler state is exposed only by the test TU; section GC discards

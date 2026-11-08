@@ -10,7 +10,9 @@
       "build": "build/0/test_physmem_arm",
       "run": "build/0/test_physmem_arm",
       "killer": "test_physmem_arm: out-of-window / window-crossing free rejection",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -22,7 +24,9 @@
       "build": "build/0/test_physmem",
       "run": "build/0/test_physmem",
       "killer": "test_physmem: init state[] vs independent byte-level reference; exhaustion excludes reserved frames",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -34,7 +38,9 @@
       "build": "build/0/test_handle",
       "run": "build/0/test_handle",
       "killer": "test_handle: lookup with insufficient rights is DENIED",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -46,7 +52,9 @@
       "build": "build/0/test_handle",
       "run": "build/0/test_handle",
       "killer": "test_handle: duplicate requesting a superset of rights is DENIED",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -58,7 +66,9 @@
       "build": "build/0/test_vm",
       "run": "build/0/test_vm",
       "killer": "test_vm: overlapping-segment descriptor is rejected",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -70,7 +80,9 @@
       "build": "build/0/test_fdt",
       "run": "build/0/test_fdt",
       "killer": "test_fdt: bad-magic blob is rejected (JE_FDT_BAD_MAGIC)",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -82,7 +94,9 @@
       "build": "build/0/test_sched_killall",
       "run": "build/0/test_sched_killall",
       "killer": "test_sched_killall: test_reap_drop_failure (page_restore -> JE_ERR_IO returns exactly -6; slot/PROCESS still DYING; no destroy)",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -94,7 +108,9 @@
       "build": "build/0/test_sched_killall",
       "run": "build/0/test_sched_killall",
       "killer": "test_sched_killall: test_reap_if_enabled_fail_stop (IF=1 -> abort_scheduler caught via longjmp; no destroy; slot still DYING)",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -106,7 +122,9 @@
       "build": "build/0/test_sched_killall",
       "run": "build/0/test_sched_killall",
       "killer": "test_sched_killall: test_reap_active_cr3 (root == active CR3 -> -5, no page_restore/destroy, slot unchanged) and test_reap_partial_progress",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -118,7 +136,9 @@
       "build": "build/0/test_sched_killall",
       "run": "build/0/test_sched_killall",
       "killer": "test_sched_killall: test_reap_active_rsp0 (rsp0_top == active TSS.RSP0 -> -5, no page_restore/destroy/waiter release, slot/PROCESS/registry unchanged)",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -130,7 +150,9 @@
       "build": "build/0/test_sched_killall",
       "run": "build/0/test_sched_killall",
       "killer": "test_sched_killall: test_reap_partial_progress, test_reap_success_counts and the reaping sub-case of test_reap_active_cr3/rsp0, whose DYING slots use vm_index 8-slot (slot!=vm_index): exact destroy (vm, vm_index, owner) args and per-vm_index registry checks",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -141,8 +163,10 @@
       "replace": "    if (0 && (kptr == NULL)) return JE_ABI_INVALID;",
       "build": "build/0/test_usercopy",
       "run": "build/0/test_usercopy",
-      "killer": "test_usercopy: case C — NULL kernel buffer is invalid without scheduler or run side effects",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "killer": "test_usercopy: case C \u2014 NULL kernel buffer is invalid without scheduler or run side effects",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -153,8 +177,10 @@
       "replace": "    if (0 && g_scope.active) return JE_ABI_INVALID;   /* no nesting; outer scope intact */",
       "build": "build/0/test_usercopy",
       "run": "build/0/test_usercopy",
-      "killer": "test_usercopy: case I — nested copy is invalid and the outer fixup scope remains active",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "killer": "test_usercopy: case I \u2014 nested copy is invalid and the outer fixup scope remains active",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -165,11 +191,98 @@
       "replace": "            if (0 && (perm != JE_VM_PERM_RW_NX)) return 0;  /* only RW/NX is writable */",
       "build": "build/0/test_usercopy",
       "run": "build/0/test_usercopy",
-      "killer": "test_usercopy: case F — writes to RX and R/NX pages are rejected",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "killer": "test_usercopy: case F \u2014 writes to RX and R/NX pages are rejected",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
-
+    {
+      "id": "IMAGE-REGISTRY-PUBLISH-GATE",
+      "invariant": "je_builtin_images_init publishes the registry (count/get) only after EVERY entry validates: a length mismatch on the last entry, after all earlier entries were staged, leaves nothing published and a retry still fails (fix-gate F10)",
+      "file": "kernel/core/image.c",
+      "find": "    if (je_vm_image_validate(&image->desc, image->blob_len) != JE_OK)\n        return JE_ERR_INVALID;\n    builtin_images_ready = true;",
+      "replace": "    if (0 && (je_vm_image_validate(&image->desc, image->blob_len) != JE_OK))\n        return JE_ERR_INVALID;\n    builtin_images_ready = true;",
+      "build": "build/0/test_image_registry_len_mismatch",
+      "run": "build/0/test_image_registry_len_mismatch",
+      "killer": "test_image_registry_len_mismatch: broker-client blob_len 1 byte short of source_size -> JE_ERR_INVALID, count 0, get NULL, retry still INVALID",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
+    },
+    {
+      "id": "IMAGE-SUPERVISOR-REPORT",
+      "invariant": "the supervisor built-in image is rejected unless exactly one RW non-X segment holds the fixed service report (Stage 2 report hook; fix-gate F10)",
+      "file": "kernel/core/image.c",
+      "find": "        || !report_vaddr_in_rw_segment(&image->desc))",
+      "replace": "        || (0 && !report_vaddr_in_rw_segment(&image->desc)))",
+      "build": "build/0/test_image_registry_report_missing",
+      "run": "build/0/test_image_registry_report_missing",
+      "killer": "test_image_registry_report_missing: code-only supervisor descriptor (vm_image_validate OK) -> JE_ERR_INVALID, nothing published",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
+    },
+    {
+      "id": "IMAGE-SPAN-GUARD",
+      "invariant": "je_builtin_images_init rejects an empty or inverted spawn-child linker span (uintptr_t compare; fix-gate F10)",
+      "file": "kernel/core/image.c",
+      "find": "    if (e <= s) return JE_ERR_INVALID;",
+      "replace": "    if (0 && (e <= s)) return JE_ERR_INVALID;",
+      "build": "build/0/test_image_registry_span_equal",
+      "run": "build/0/test_image_registry_span_equal",
+      "killer": "test_image_registry_span_equal (end == start -> JE_ERR_INVALID, nothing published); test_image_registry_span_inverted checks end < start but cannot be named here (one run per entry)",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "equivalent": true,
+      "equivalent_reason": "Defense-in-depth guard, observationally subsumed today by je_vm_image_validate on the synthesized spawn-child descriptor: e == s gives source_size 0 so entry_offset 0 lies in no RX source byte (entry check fails); e < s wraps length past memory_size (source_size > memory_size fails). Either way init returns JE_ERR_INVALID and publishes nothing, so no hosted test can distinguish the deletion (verified 2026-11-08: span_equal and span_inverted both PASS under this mutant). Declared EQUIVALENT as a tripwire: if the validator or the synthesized descriptor changes so the guard becomes load-bearing, this killer FAILS under the mutant and the runner reports SURVIVED-as-declared-equivalent; then drop equivalent and keep it as a normal KILL anchor.",
+      "enabled": true
+    },
+    {
+      "id": "RECV-STAGING-CLAMP",
+      "invariant": "the recv kernel staging capacity handed to the endpoint peek is min(user cap, sizeof staging): a user cap never states a kernel buffer larger than JE_EP_MSG_MAX (fix-gate F10, defensive)",
+      "file": "kernel/core/syscall.c",
+      "find": "    return user_cap > (uint64_t)staging_size ? staging_size : (size_t)user_cap;",
+      "replace": "    return (0 && (user_cap > (uint64_t)staging_size)) ? staging_size : (size_t)user_cap;",
+      "build": "build/0/test_syscall",
+      "run": "build/0/test_syscall",
+      "killer": "test_syscall: test_recv_staging_cap (caps > JE_EP_MSG_MAX incl. UINT64_MAX clamp to JE_EP_MSG_MAX; helper only, the two dispatch call sites are QEMU-covered)",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
+    },
+    {
+      "id": "F08-ONE-THREAD",
+      "invariant": "je_thread_create_user_start explicitly rejects a second THREAD_USER for a (vm,index) that already has one, BEFORE allocating a slot, re-guarding the held kstack, rewriting its frame, or (on a proc_link failure) page_restore-ing the first thread's guard page (fix-gate F08)",
+      "file": "kernel/core/sched.c",
+      "find": "        if (threads[t].kind == THREAD_USER && threads[t].vm == vm &&\n            threads[t].vm_index == index)\n            return JE_ERR_INVALID;",
+      "replace": "        if (0 && (threads[t].kind == THREAD_USER && threads[t].vm == vm &&\n            threads[t].vm_index == index))\n            return JE_ERR_INVALID;",
+      "build": "build/0/test_sched_killall",
+      "run": "build/0/test_sched_killall",
+      "killer": "test_sched_killall: test_create_user_one_thread_per_process (duplicate create on a REGISTERED and an UNREGISTERED (vm,index) -> JE_ERR_INVALID with no slot consumed, no second page_guard, no page_restore, threads/proc/registry/kstack bytes unchanged; different index and different vm still create)",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
+    },
+    {
+      "id": "EP-RESOLVE-PRECEDENCE",
+      "invariant": "je_endpoint_resolve returns the handle table's BADINDEX/STALE/WRONGTYPE verdict BEFORE object_to_end runs, so no malformed, not-live or wrong-type user handle reaches the INTERNAL JE_EP_CORRUPT that the F07 syscall glue routes to fail-stop (fix-gate F07; the glue routing itself is not hosted)",
+      "file": "kernel/core/endpoint.c",
+      "find": "    if (s != JE_HANDLE_OK) return hstat(s);\n    return object_to_end(pool, obj, out_rec, out_side);",
+      "replace": "    if (0 && (s != JE_HANDLE_OK)) return hstat(s);\n    return object_to_end(pool, obj, out_rec, out_side);",
+      "build": "build/0/test_endpoint",
+      "run": "build/0/test_endpoint",
+      "killer": "test_endpoint: test_f07_resolve_precedence (zero/out-of-capacity -> BADINDEX, wrong-gen/closed -> STALE, SELF incl. SELF bound to a real end -> WRONGTYPE, each never CORRUPT/UNWIRED and with no out-param or accounting change). NOTE: in main() order the FIRST abort under this mutant is the pre-existing section 2 STALE double-close assertion; test_f07_resolve_precedence was separately verified (scratch copy, called first) to kill it on its own",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
+    },
     {
       "id": "GAP-VM-AUDIT-ONE-TO-ONE",
       "invariant": "je_vm_audit rejects a page table where two arena offsets map the same physical frame (no user-visible aliasing of a single frame)",
@@ -178,10 +291,11 @@
       "replace": "            if (0 && (seen_phys[k] == phys)) return JE_ERR_INVALID;",
       "build": "build/0/test_vm",
       "run": "build/0/test_vm",
-      "killer": "GAP: no hosted negative test pokes a one-to-one violation into vm_fake (peer audit: SURVIVES). Add a poke-based negative test, then enable.",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
-      "enabled": false,
-      "gap": true
+      "killer": "test_vm: test_audit_rejects_one_to_one_alias replaces an existing present leaf with a same-extent frame and restores it",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
     },
     {
       "id": "GAP-EP-WAIT-INFLIGHT",
@@ -192,7 +306,9 @@
       "build": "build/0/test_endpoint",
       "run": "build/0/test_endpoint",
       "killer": "GAP: peer audit's probe dropped the inflight ref and the mutant SURVIVED (close both handles while a thread is parked -> record freed under the sleeper). Add the killer test, pin the exact find-string, then enable.",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": false,
       "gap": true
     },
@@ -200,25 +316,28 @@
       "id": "GAP-DEV-DISPATCH-OWNER",
       "invariant": "je_device_apply_dispatch grants ring-3 port I/O only to the device's owner (identity, not merely active)",
       "file": "kernel/core/device.c",
-      "find": "GAP-PLACEHOLDER-apply_dispatch-owner-identity",
-      "replace": "",
+      "find": "        allow = d && d->owner.index == id.index && d->owner.gen == id.gen",
+      "replace": "        allow = d && (1 || (d->owner.index == id.index && d->owner.gen == id.gen))",
       "build": "build/0/test_device",
       "run": "build/0/test_device",
-      "killer": "GAP: je_device_apply_dispatch has no hosted test (peer audit: DISPATCH-ANY-USER SURVIVES). Add owner / non-owner / post-revoke / closed-handle cases, pin the find-string, then enable.",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
-      "enabled": false,
-      "gap": true
+      "killer": "test_device: test_dispatch_authority owner/non-owner/gen-zero/kernel/revoked/inactive dispatch checks",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
     },
     {
       "id": "ARM-AUDIT-FOREIGN-SIBLING",
-      "invariant": "the AArch64 audit's phase-1 structural walk rejects a valid table descriptor whose child frame is not a ledger member (FOREIGN) — including a late, off-path sibling like root[511] — so no unvalidated table frame is ever accepted or later read",
+      "invariant": "the AArch64 audit's phase-1 structural walk rejects a valid table descriptor whose child frame is not a ledger member (FOREIGN) \u2014 including a late, off-path sibling like root[511] \u2014 so no unvalidated table frame is ever accepted or later read",
       "file": "kernel/arch/aarch64/paging.c",
       "find": "return audit_reject(JE_ARM_AUDIT_REJECT_FOREIGN);",
       "replace": "continue;",
       "build": "build/0/test_paging_bits",
       "run": "build/0/test_paging_bits",
       "killer": "test_paging_bits test_structural_tampers case 1: root[511] / L2[200] -> mmap(PROT_NONE) page and root[511] -> in-window non-ledger frame must be INVALID with reason FOREIGN (and exactly 512 reads for root[511]); under the mutant the foreign entry is silently skipped and the audit returns JE_OK. Replaces the disabled GAP-ARM-AUDIT-FOREIGN-SIBLING marker (fix-gate F04). Written as a `continue` substitution, not `if (0 && ...)`: disabling the table_ordinal() call would leave child_ordinal uninitialized (a -Werror build failure = BLOCKED, or UB).",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -230,7 +349,9 @@
       "build": "build/0/test_paging_bits",
       "run": "build/0/test_paging_bits",
       "killer": "test_paging_bits test_structural_tampers cases 3-5: root[300]->root, L2[100]->L1, L1[5]->root, root[7]==root[0] must reject with reason REVISIT; under the mutant the walk re-enqueues until the work-list bound (COUNT) or over-counts visits (UNREACHED), so the exact-reason assertion fails",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -242,19 +363,23 @@
       "build": "build/0/test_paging_bits",
       "run": "build/0/test_paging_bits",
       "killer": "test_paging_bits test_structural_tampers case 6: table_count 0 / MAX+1 / SIZE_MAX must reject with reason COUNT and zero descriptor reads; under the mutant 0 falls through to ROOT and MAX+1/SIZE_MAX index table_pa[] and hit LEDGER, failing the exact-reason assertion",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
       "id": "ARM-AUDIT-STAMP-CLEAR",
-      "invariant": "je_arm_mmu_audit revokes the enable eligibility stamp (je_arm_last_audited) unconditionally on entry (C4), so ANY failed audit call — a failed re-audit of a previously-passing context, or even audit(NULL) — forbids je_arm_mmu_enable",
+      "invariant": "je_arm_mmu_audit revokes the enable eligibility stamp (je_arm_last_audited) unconditionally on entry (C4), so ANY failed audit call \u2014 a failed re-audit of a previously-passing context, or even audit(NULL) \u2014 forbids je_arm_mmu_enable",
       "file": "kernel/arch/aarch64/paging.c",
       "find": "    je_arm_last_audited = NULL;\n    je_arm_mmu_last_audit_leaves = 0u;",
       "replace": "    je_arm_mmu_last_audit_leaves = 0u;",
       "build": "build/0/test_paging_bits",
       "run": "build/0/test_paging_bits",
       "killer": "test_paging_bits struct_rejects (every structural case: OK audit, tamper, INVALID audit, then je_arm_mmu_enable must be JE_ERR_INVALID with the asm leaf never called) and test_enable_gating (OK audit, then audit(NULL) == INVALID/PRECONDITION, then enable must be INVALID with leaf_rec.calls == 0); under the mutant the stale stamp lets enable succeed. Find re-pinned after C4 made the clear unconditional (the old conditional find no longer exists).",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -266,7 +391,9 @@
       "build": "build/0/test_paging_bits",
       "run": "build/0/test_paging_bits",
       "killer": "test_paging_bits test_structural_tampers case 8a (orphan just past table_end must be LEDGER with 0 reads; mutant -> UNREACHED) and case 8d (table_pa[5] / table_pa[0] moved to a PROT_NONE frame BASE+32*PG outside the window, no descriptor changed, must be LEDGER with 0 reads; mutant -> FOREIGN / ROOT)",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     },
     {
@@ -278,7 +405,9 @@
       "build": "build/0/test_paging_bits",
       "run": "build/0/test_paging_bits",
       "killer": "test_paging_bits test_structural_tampers case 8e: a LATER RW data leaf (RODATA_HI) retargeted to the earlier text frame, and a LATER RX text leaf retargeted to the earlier table frame (BASE), must reject with reason ALIAS; under the mutant the earlier valid leaf passes and the tampered later leaf is rejected as LEAF (va != physical), failing the exact-reason assertion",
-      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
       "enabled": true
     }
   ]
