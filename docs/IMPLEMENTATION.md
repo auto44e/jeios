@@ -2,6 +2,36 @@
 
 Current checkpoint and work order: [STATUS.md](STATUS.md). Dated status and next-task statements below are historical when superseded by that checkpoint.
 
+## ADR 0014 lifecycle extraction — observed 2026-11-08T20:00:36Z
+
+Repository `/tmp/wt-adr14-extract`, branch `wip/adr0014-extract`, baseline
+commit `9c356e80e2be1503f7c1a0bcaadf9752c4cb8ad2` plus the implementation
+worktree changes. State: **implemented / tested locally / planned (owner review,
+remote CI and independent human qualification) / not blocked**. This is
+AI-assisted evidence, not human or release qualification.
+
+| Area | Current status | Evidence |
+| --- | --- | --- |
+| Neutral lifecycle link-time port | Implemented | `kernel/core/lifecycle.c` and `include/jeios/lifecycle.h`; x86 kernel link includes `lifecycle.o` |
+| Registry ownership and access | Implemented | Registry storage/writers moved; scheduler reads use `je_lc_*` accessors |
+| Dying/reap/kill extraction | Implemented | Ordered `je_lc_on_dying`, process-record `je_lc_kill_check`, and `je_lc_reaped`; run-queue/architecture gates remain in `sched.c` |
+| Regression and mutation gates | Tested locally | `make check`; `make mutants`: 31 killed / 1 equivalent / 0 survived / 0 blocked / 1 skipped |
+| Neutral-module boundary | Tested locally | Forbidden-token grep empty; `nm -u build/0/kernel/core/lifecycle.o` lists only proc/VM/device/endpoint dependencies |
+| Qualification | Planned | Owner review, remote CI, ARM lifecycle binding and independent human review remain open |
+
+The six `sched.c` mutant anchors remain byte-identical and discoverable:
+`REAPER-SIGN`, `REAPER-IF-CHECK`, `REAPER-CR3-GUARD`, `REAPER-RSP0-GUARD`,
+`REAPER-VM-INDEX`, and `F08-ONE-THREAD`. `tests/test_sched_killall.c` changed
+only by including `kernel/core/lifecycle.c` under its existing white-box
+`#define static` binding. `tests/test_lifecycle_order.c` remains unchanged and
+passes its 50-check ordering characterization.
+
+Not enforced by this extraction: ARM user lifecycle/reaping, ARM
+VM-owned-stack handoff, SMP, dynamic loading, general fault isolation,
+arbitrary hardware support, remote CI, and independent human qualification.
+The ARM VM-owned user-stack reaping rule and the reaper slot-cache cross-check
+remain MP3 entry criteria under ADR 0014.
+
 ## MP2 Stream C second-fix refresh — observed 2026-11-08T13:56:53+00:00
 
 Repository `/tmp/wt-mp2-cfix`, branch `wip/mp2-cfix`. The implementation and

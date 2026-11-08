@@ -1,5 +1,122 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## ADR 0014 lifecycle extraction — observed 2026-11-08T20:00:36Z
+
+Repository `/tmp/wt-adr14-extract`, branch `wip/adr0014-extract`, exact
+implementation baseline inspected at
+`9c356e80e2be1503f7c1a0bcaadf9752c4cb8ad2` with the extraction worktree
+changes. State: **implemented / tested locally / planned (owner review, remote
+CI and independent human qualification) / not blocked**. This is AI-assisted
+evidence, not human or release qualification. No push, PR publication,
+reviewer assignment or release was performed. The pre-existing untracked
+`EXTRACT-BRIEF.md` was not modified.
+
+### Implemented
+
+- Added `kernel/core/lifecycle.c` and `include/jeios/lifecycle.h` as the
+  neutral link-time port. The module owns `process_pool`, `registered_vm[]`,
+  and `registered_proc[]`, their four existing `je_sched_*` registry APIs,
+  read accessors, waiter-release wrapper, ordered dying prefix, process-record
+  kill decision, and destroy/`on_reaped` pair.
+- Added `lifecycle.c` to the x86 kernel `SOURCES` and to both affected hosted
+  target prerequisites. `test_sched_killall` includes it exactly once under
+  its existing `#define static`; the unchanged lifecycle-order test uses the
+  test-only scheduler include binding so it does not link a second copy.
+- Kept `threads[]`, `current`, `ready`, the complete reaper loop, all six
+  reaper/F08 mutant anchors (REAPER-SIGN, REAPER-IF-CHECK, REAPER-CR3-GUARD,
+  REAPER-RSP0-GUARD, REAPER-VM-INDEX, F08-ONE-THREAD — verified present exactly
+  once and still KILLED), kill and kill-all run-state/frame gates, death
+  record writes, initial frame synthesis, and every architecture-specific
+  scheduler operation in `sched.c`.
+- Added the ADR 0014 D3 neutral conformance suite `tests/test_proc_lifecycle.c`
+  (links `lifecycle.c` as its own TU + real `proc.c`, no `JE_SCHED_HOSTED_TEST`),
+  pinning the dying ORDER, the record-LIVE-at-device-hooks ordering, failure
+  propagation, the legacy (gen==0) release-only path, the fault/non-fault split,
+  the registry writers, `je_lc_kill_check`, and `je_lc_reaped`. Added two
+  neutral-module mutants (LC-ONDYING-FAIL-PROPAGATE, LC-ONDYING-ORDER-DEVHOOK),
+  each killed by that suite. Added `tools/check_lifecycle_boundary.sh`, run by
+  `make check`: it strips comments then rejects any x86/run-queue token in
+  `lifecycle.[ch]` code, and compiles `lifecycle.c` with the aarch64 freestanding
+  flags (`-Werror -Wconversion -Wshadow`) to prove arch-neutrality.
+
+### Decision and logic
+
+The approved link-time-port boundary was used instead of a runtime per-slot
+operations table. The white-box test directly accesses the registry storage,
+and the six enabled `sched.c` mutants require exact text in the reaper/F08
+regions. Moving those regions or mirroring them behind a new authority would
+either block the mutants or make the tests observe a non-authoritative copy.
+The registry is therefore single-owned by `lifecycle.c`; the
+`threads[].{vm,vm_index,proc_id}` values remain the scheduler's synchronized
+slot cache required by the frozen white-box and run-queue paths.
+
+`je_lc_on_dying` preserves the observable sequence by performing waiter release
+first, then the fault-only/device death hooks under the original
+`JE_SCHED_HOSTED_TEST` conditional, then `je_proc_on_dying`. It returns the
+process status; `mark_dying` retains the existing fail-stop policy and only
+then publishes wait/run/death fields. `je_lc_reaped` preserves
+destroy-before-`je_proc_on_reaped` and returns either failure so the unchanged
+reaper calls `abort_scheduler`. `je_lc_kill_check` contains only the D8
+PROCESS-record decisions; the caller's IF check, slot/kind/state/frame gate,
+frame snapshot, and `mark_dying` remain in `sched.c`.
+
+The neutral header does not include `sched.h` and the neutral source has no
+architecture frame, register, interrupt, halt, or run-queue references. The
+ARM user-stack ownership fix and reaper slot-cache cross-check are not
+implemented here; they remain the ADR 0014 MP3 entry criteria because the ARM
+user path does not yet exist and changing its tested scheduler path would
+expand this surgical port.
+
+### Verification actually run
+
+```text
+make build/0/test_sched_killall build/0/test_lifecycle_order build/0/kernel/core/lifecycle.o
+./build/0/test_sched_killall
+test_sched_killall: PASS (259 checks)
+./build/0/test_lifecycle_order
+test_lifecycle_order: PASS (50 checks)
+make check
+make mutants
+git diff -U0 tests/test_sched_killall.c
+nm -u build/0/kernel/core/lifecycle.o
+grep -n -E 'je_trap_frame|cr3|tss|rsp0|rflags|int[[:space:]]+0x80|int[[:space:]]+0x81|hlt|<<[[:space:]]*9' kernel/core/lifecycle.c include/jeios/lifecycle.h
+git diff --check
+```
+
+Observed results (lead-run on the integrated head, gcc 13.3, QEMU 8.2.2):
+
+- `make check` passed, including the full hosted suite (test_sched_killall 259,
+  test_lifecycle_order 50, test_proc_lifecycle 59), kernel ELF/image checks, and
+  the new lifecycle boundary check.
+- `make mutants` reported `33 killed, 1 equivalent, 0 SURVIVED, 0 BLOCKED,
+  1 skipped`; all six scheduler anchors killed, plus the two new neutral-module
+  mutants.
+- `make smoke` (default) PASS; `make integration` (modes 1-15) PASS with serial
+  markers identical to the pre-extraction baseline after masking volatile
+  numbers (allocator free-page counts and cycle counters shift only because
+  `lifecycle.c` is a new linked object; no marker kind or PASS/OK text changed);
+  `make check TEST_MODE=1` and `TEST_MODE=2` PASS.
+- The `test_sched_killall.c` diff contains exactly one added include line.
+- The lifecycle boundary check passed (no x86 tokens in code; `lifecycle.c`
+  compiles clean under the aarch64 freestanding flags).
+
+`make smoke`/`make integration`/`JE_TEST_MODE` WERE rerun (ADR 0014 part 3
+requires it, and `lifecycle.c` is a new kernel source in `SOURCES`, so the boot
+image does change in size/layout). An earlier draft of this handoff claimed they
+were skipped for "no boot image change"; that was incorrect and is corrected here.
+
+### Planned / blocked / not enforced
+
+Planned: owner/peer review, remote CI reproduction, and the later ARM
+neutral/conformance binding. Not blocked for this x86 link-time port. Not
+enforced: ARM user lifecycle/reaping, VM-owned ARM stack non-freeing,
+slot-cache cross-check during ARM reaping, SMP, dynamic loading, arbitrary
+hardware support, remote CI and independent human qualification.
+
+Next bounded task: review this committed extraction against ADR 0014, then
+begin MP3 only after the ARM stack-ownership and reaper-cache criteria are
+implemented and independently tested.
+
 ## Current status — 2026-11-08T13:56:53+00:00
 
 Repository `/tmp/wt-mp2-cfix`, branch `wip/mp2-cfix`. The implementation and

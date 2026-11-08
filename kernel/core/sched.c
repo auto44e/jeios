@@ -55,10 +55,12 @@ typedef struct {
  * BAD_RETURN: a user frame failed je_uframe_check (invalid return state). */
 typedef enum { DEATH_FAULT = 0, DEATH_EXIT = 1, DEATH_BAD_RETURN = 2,
                DEATH_KILLED = 3 } death_reason;
+/* je_lc_on_dying classifies a FAULT death by comparing `reason` to
+ * JE_ABI_DEATH_FAULT; pin the private enum to that ABI value so a renumber here
+ * cannot silently desync the neutral module's fault-note branch. */
+_Static_assert((uint32_t)DEATH_FAULT == JE_ABI_DEATH_FAULT,
+               "DEATH_FAULT must equal JE_ABI_DEATH_FAULT (je_lc_on_dying contract)");
 static thread threads[JE_THREAD_MAX];
-static je_proc_pool *process_pool;
-static je_vm *registered_vm[JE_VM_MAX_PROCESSES];
-static je_proc_id registered_proc[JE_VM_MAX_PROCESSES];
 static unsigned current;
 static bool ready;
 static uint64_t preemptions;
@@ -68,35 +70,6 @@ volatile uint64_t je_timer_ticks;
 static void sched_ticks_set(uint64_t ticks)
 {
     je_timer_ticks = ticks;
-}
-
-void je_sched_set_proc_pool(je_proc_pool *pool)
-{
-    process_pool = pool;
-    for (uint32_t i = 0u; i < JE_VM_MAX_PROCESSES; ++i) {
-        registered_vm[i] = (je_vm *)0;
-        registered_proc[i] = JE_PROC_ID_NONE;
-    }
-}
-
-je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id)
-{
-    if (!process_pool || !vm || index >= JE_VM_MAX_PROCESSES
-        || !je_proc_valid(process_pool, id)
-        || (registered_vm[index] != (je_vm *)0 && registered_vm[index] != vm))
-        return JE_ERR_INVALID;
-    registered_vm[index] = vm;
-    registered_proc[index] = id;
-    return JE_OK;
-}
-
-je_status je_sched_unregister_process(je_vm *vm, uint32_t index)
-{
-    if (!vm || index >= JE_VM_MAX_PROCESSES) return JE_ERR_INVALID;
-    if (registered_vm[index] != vm) return JE_OK;
-    registered_vm[index] = (je_vm *)0;
-    registered_proc[index] = JE_PROC_ID_NONE;
-    return JE_OK;
 }
 
 bool je_sched_has_process(je_vm *vm, uint32_t index)
@@ -116,11 +89,6 @@ je_status je_sched_current_proc_id(je_proc_id *out)
         return JE_ERR_INVALID;
     *out = threads[current].proc_id;
     return JE_OK;
-}
-
-je_proc_pool *je_sched_proc_pool(void)
-{
-    return process_pool;
 }
 
 static _Noreturn void abort_scheduler(void)
@@ -230,10 +198,10 @@ je_status je_thread_create_user_start(je_vm *vm, uint32_t index,
     threads[slot].vm = vm;
     threads[slot].vm_index = index;
     threads[slot].proc_id = JE_PROC_ID_NONE;
-    if (registered_vm[index] == vm && registered_proc[index].gen != 0u) {
-        threads[slot].proc_id = registered_proc[index];
+    if (je_lc_registered_vm(index) == vm && je_lc_registered_proc(index).gen != 0u) {
+        threads[slot].proc_id = je_lc_registered_proc(index);
         uint64_t flags = je_arch_irq_save();
-        je_status link = je_proc_link(process_pool, threads[slot].proc_id, slot, index);
+        je_status link = je_proc_link(je_lc_proc_pool(), threads[slot].proc_id, slot, index);
         je_arch_irq_restore(flags);
         if (link != JE_OK) {
             (void)je_arch_page_restore((uintptr_t)kbase);
@@ -256,23 +224,9 @@ je_status je_thread_create_user(je_vm *vm, uint32_t index)
 static void mark_dying(unsigned slot, death_reason reason, uint64_t code,
                        uint64_t vec, uint64_t err, uint64_t rip, uint64_t cs, uint64_t cr2)
 {
-    /* M3c A6-CLARIFY-2: release any blocking-recv waiter/reservation this thread
-     * holds BEFORE its slot is torn down, via the single idempotent release owner
-     * (keyed on the thread slot = waiter_id). Safe no-op if the thread held none.
-     * This is the one site that RELEASES; the reaper only asserts it is clear. */
-    (void)je_endpoint_kern_waiter_release_by_id((uint32_t)slot);
-#ifndef JE_SCHED_HOSTED_TEST
-    if (threads[slot].proc_id.gen != 0u)
-    {
-        if (reason == DEATH_FAULT)
-            je_device_note_fault_after_admin_revoke(
-                je_kernel_device(), threads[slot].proc_id, vec);
-        je_device_on_process_dying(je_kernel_device(), threads[slot].proc_id);
-    }
-#endif
-    if (threads[slot].proc_id.gen != 0u
-        && je_proc_on_dying(process_pool, threads[slot].proc_id,
-                            (uint32_t)reason, code) != JE_OK)
+    je_status lifecycle = je_lc_on_dying((uint32_t)slot, threads[slot].proc_id,
+                                         (uint32_t)reason, code, vec);
+    if (lifecycle != JE_OK)
         abort_scheduler();
     threads[slot].wait_pending=false;
     threads[slot].state=DYING;
@@ -579,7 +533,7 @@ je_status je_sched_drop_user(je_vm *vm, uint32_t index)
              * DYING thread whose waiter mark_dying already released — idempotent),
              * release its waiter/reservation before wiping the slot, so the record
              * doesn't leak and a reused slot can't inherit a stale waiter. */
-            (void)je_endpoint_kern_waiter_release_by_id((uint32_t)i);
+            je_lc_release_waiter((uint32_t)i);
             if (threads[i].rsp0_top) { /* restore the kstack guard before the process frees the run */
                 uint64_t kbase=threads[i].rsp0_top-(uint64_t)STACK_PAGES*4096u;
                 je_status s=je_arch_page_restore((uintptr_t)kbase);
@@ -621,11 +575,8 @@ int je_sched_reap_dead(void)
         je_proc_id proc_id = threads[i].proc_id;
         je_status s=je_sched_drop_user(vm, idx); /* restores the kstack guard, clears the slot */
         if (s!=JE_OK) return -(int)s;
-        s=je_vm_destroy_owned(vm, idx, proc_id); /* frees the held kstack run + page tables */
+        s=je_lc_reaped(vm, idx, proc_id); /* frees the held kstack run + page tables */
         if (s!=JE_OK) abort_scheduler();
-        if (proc_id.gen != 0u
-            && je_proc_on_reaped(process_pool, proc_id) != JE_OK)
-            abort_scheduler();
         ++reaped;
     }
     return reaped;
@@ -691,12 +642,14 @@ je_status je_sched_current_user(je_vm **vm, uint32_t *index)
 }
 je_status je_sched_find_process(je_proc_id id, je_vm **vm, uint32_t *index)
 {
-    if (!process_pool || id.gen == 0u || !je_proc_valid(process_pool, id))
+    if (!je_lc_proc_pool() || id.gen == 0u || !je_proc_valid(je_lc_proc_pool(), id))
         return JE_ERR_INVALID;
     for (uint32_t i = 0u; i < JE_VM_MAX_PROCESSES; ++i) {
-        if (registered_vm[i] && registered_proc[i].index == id.index
-            && registered_proc[i].gen == id.gen) {
-            if (vm) *vm = registered_vm[i];
+        je_vm *registered = je_lc_registered_vm(i);
+        je_proc_id registered_id = je_lc_registered_proc(i);
+        if (registered && registered_id.index == id.index
+            && registered_id.gen == id.gen) {
+            if (vm) *vm = registered;
             if (index) *index = i;
             return JE_OK;
         }
@@ -729,43 +682,21 @@ je_status je_sched_kill(je_proc_id victim)
     uint64_t flags = je_arch_irq_save();
     if ((flags & (UINT64_C(1) << 9)) != 0u) abort_scheduler(); /* IF must be 0 */
 
-    uint32_t victim_state = JE_PROC_FREE;
-    uint32_t victim_reason = 0u;
-    uint64_t victim_code = 0u;
-    if (!process_pool
-        || je_proc_status(process_pool, victim, &victim_state, &victim_reason,
-                          &victim_code) != JE_OK) {
-        je_arch_irq_restore(flags);
-        return JE_ERR_INVALID;
-    }
-
     je_proc_id caller = JE_PROC_ID_NONE;
     if (je_sched_current_proc_id(&caller) != JE_OK) {
         je_arch_irq_restore(flags);
         return JE_ERR_INVALID;
     }
-    if (caller.index == victim.index && caller.gen == victim.gen) {
-        je_arch_irq_restore(flags);
-        return JE_ERR_INVALID;
-    }
-    if (victim_state == JE_PROC_DYING || victim_state == JE_PROC_DEAD) {
-        je_arch_irq_restore(flags);
-        return JE_OK;
-    }
-    if (victim_state != JE_PROC_LIVE) {
-        je_arch_irq_restore(flags);
-        return JE_ERR_INVALID;
-    }
-    if (je_proc_is_supervisor(process_pool, victim)) {
-        je_arch_irq_restore(flags);
-        return JE_ERR_INVALID;
-    }
-
     uint32_t slot = 0u;
     uint32_t vm_index = 0u;
-    if (je_proc_run_link(process_pool, victim, &slot, &vm_index) != JE_OK) {
+    je_lc_kill_result check = je_lc_kill_check(victim, caller, &slot, &vm_index);
+    if (check == JE_LC_KILL_INVALID) {
         je_arch_irq_restore(flags);
         return JE_ERR_INVALID;
+    }
+    if (check == JE_LC_KILL_ALREADY) {
+        je_arch_irq_restore(flags);
+        return JE_OK;
     }
     if (slot == 0u || slot >= JE_THREAD_MAX
         || vm_index >= JE_VM_MAX_PROCESSES
@@ -815,8 +746,8 @@ je_status je_sched_kill_all_user(je_proc_id spare, uint32_t *killed)
 
         uint32_t linked_slot = 0u;
         uint32_t linked_vm_index = 0u;
-        if (!process_pool
-            || je_proc_run_link(process_pool, t->proc_id, &linked_slot,
+        if (!je_lc_proc_pool()
+            || je_proc_run_link(je_lc_proc_pool(), t->proc_id, &linked_slot,
                                 &linked_vm_index) != JE_OK
             || linked_slot != i || linked_vm_index != t->vm_index)
             goto invariant;
@@ -824,7 +755,7 @@ je_status je_sched_kill_all_user(je_proc_id spare, uint32_t *killed)
         uint32_t proc_state = JE_PROC_FREE;
         uint32_t proc_reason = 0u;
         uint64_t proc_code = 0u;
-        if (je_proc_status(process_pool, t->proc_id, &proc_state,
+        if (je_proc_status(je_lc_proc_pool(), t->proc_id, &proc_state,
                            &proc_reason, &proc_code) != JE_OK)
             goto invariant;
 

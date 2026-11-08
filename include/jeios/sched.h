@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <jeios/trap.h>
 #include <jeios/status.h>
+#include <jeios/lifecycle.h>
 #include <jeios/vm.h>
 #include <jeios/endpoint.h>   /* je_ep_channel, for the blocking-recv waiter API */
 /* ADR 0010 D2: T = 1 idle + 7 M2 workers + P user threads. Was 8. */
@@ -15,11 +16,10 @@ _Static_assert(JE_THREAD_MAX >= 1u + JE_M2_WORKERS + JE_VM_MAX_PROCESSES, "ADR 0
  * TSS.RSP0). Init/create/reap require interrupts disabled. Sleep/yield serialize
  * internally. No SIMD, user credentials, SMP, priorities or cancellation.
  * Reaped non-running slots are reused with their contents reinitialized. */
-void je_sched_set_proc_pool(je_proc_pool *pool);
-je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id);
-je_status je_sched_unregister_process(je_vm *vm, uint32_t index);
+/* Registry / lifecycle-owner API (je_sched_set_proc_pool, register_process,
+ * unregister_process, proc_pool) is declared in <jeios/lifecycle.h>, included
+ * above; it is defined in kernel/core/lifecycle.c (ADR 0014). */
 bool je_sched_has_process(je_vm *vm, uint32_t index);
-je_proc_pool *je_sched_proc_pool(void);
 void je_sched_init(void);
 je_status je_thread_create(void (*entry)(void *),void *argument);
 /* M3a #4 step 3: create a ring-3 thread for a READY vm process (see vm.h). The
