@@ -377,6 +377,12 @@ def run_manifest(mutants, only_ids, timeout, jobs):
             results.append((mid, SKIPPED, "disabled"))
             print(f"[SKIP ] {mid}")
             continue
+        need = m.get("skip_if_no_cmd")
+        if need is not None and shutil.which(need) is None:
+            results.append((mid, SKIPPED, f"{need} absent"))
+            print(f"[SKIP ] {mid}: {need} not installed (cross-toolchain "
+                  f"required; verified where it is present)")
+            continue
         status, detail = apply_one(m, timeout=timeout, jobs=jobs)
         results.append((mid, status, detail))
         tag = {KILLED: "KILL ", SURVIVED: "SURV ", BLOCKED: "BLOCK",

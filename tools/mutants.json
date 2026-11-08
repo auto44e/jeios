@@ -508,7 +508,8 @@
         "ARM_REQUIRE": "1",
         "ARM_SMOKE_TIMEOUT": "60"
       },
-      "enabled": true
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
     },
     {
       "id": "ARM-USER-WRONG-ROOT-P2",
@@ -524,7 +525,8 @@
         "ARM_REQUIRE": "1",
         "ARM_SMOKE_TIMEOUT": "60"
       },
-      "enabled": true
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
     },
     {
       "id": "ARM-USER-STRAY-ARENA-L1-ENTRY",
@@ -540,7 +542,8 @@
         "ARM_REQUIRE": "1",
         "ARM_SMOKE_TIMEOUT": "60"
       },
-      "enabled": true
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
     },
     {
       "id": "ARM-USER-GUARD-PAGE-SHIFT",
@@ -556,7 +559,8 @@
         "ARM_REQUIRE": "1",
         "ARM_SMOKE_TIMEOUT": "60"
       },
-      "enabled": true
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
     },
     {
       "id": "ARM-USER-UNMAPPED-KERNEL-PROBE",
@@ -572,7 +576,8 @@
         "ARM_REQUIRE": "1",
         "ARM_SMOKE_TIMEOUT": "60"
       },
-      "enabled": true
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
     },
     {
       "id": "ARM-USER-NO-ASIDE1IS-TLBI",
@@ -588,7 +593,8 @@
         "ARM_REQUIRE": "1",
         "ARM_SMOKE_TIMEOUT": "60"
       },
-      "enabled": true
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
     },
     {
       "id": "ARM-USER-NO-ASID-IN-TTBR0",
@@ -604,7 +610,8 @@
         "ARM_REQUIRE": "1",
         "ARM_SMOKE_TIMEOUT": "60"
       },
-      "enabled": true
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
     },
     {
       "id": "ARM-USER-MAP-USER-CODE-FRAME-RW",
@@ -620,7 +627,8 @@
         "ARM_REQUIRE": "1",
         "ARM_SMOKE_TIMEOUT": "60"
       },
-      "enabled": true
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
     }
   ]
 }
