@@ -409,6 +409,62 @@
         "ASAN_OPTIONS": "detect_leaks=0"
       },
       "enabled": true
+    },
+    {
+      "id": "RR-PICK-FAIRNESS",
+      "invariant": "the round-robin cursor advances to the selected READY slot, so a second READY worker is selected after the first instead of repeatedly selecting the first slot",
+      "file": "kernel/core/sched_rr.c",
+      "find": "        uint32_t candidate = t->cursor + offset;",
+      "replace": "        uint32_t candidate = offset;",
+      "build": "build/0/test_sched_rr",
+      "run": "build/0/test_sched_rr",
+      "killer": "test_sched_rr: test_rr_order cycles idle -> A -> B -> A -> B",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
+    },
+    {
+      "id": "RR-ZOMBIE-EXCLUDE",
+      "invariant": "je_rr_pick excludes ZOMBIE slots from the READY candidate set",
+      "file": "kernel/core/sched_rr.c",
+      "find": "        if (candidate != 0u &&\n            t->slots[candidate].state == JE_RR_READY) {",
+      "replace": "        if (candidate != 0u &&\n            (t->slots[candidate].state == JE_RR_READY ||\n             t->slots[candidate].state == JE_RR_ZOMBIE)) {",
+      "build": "build/0/test_sched_rr",
+      "run": "build/0/test_sched_rr",
+      "killer": "test_sched_rr: test_zombie_exclusion exits A before the first pick and requires B, never A",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
+    },
+    {
+      "id": "RR-FRAMECHECK",
+      "invariant": "je_rr_switch must reject a frame-check failure before dispatch and must never return an unvalidated resume frame",
+      "file": "kernel/core/sched_rr.c",
+      "find": "    status = t->hooks->frame_check(next_ctx, next_ctx->frame,\n                                   next_ctx->phase);\n    if (status != JE_OK) {",
+      "replace": "    status = JE_OK;\n    if (0 && (status != JE_OK)) {",
+      "build": "build/0/test_sched_rr",
+      "run": "build/0/test_sched_rr",
+      "killer": "test_sched_rr: test_frame_check_rejection rejects out-of-bounds and swapped fake frames with no returned frame",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
+    },
+    {
+      "id": "RR-WAS-RUNNING",
+      "invariant": "je_rr_switch changes the previous context to READY only when it was RUNNING, never resurrecting a SLEEPING or ZOMBIE context",
+      "file": "kernel/core/sched_rr.c",
+      "find": "    if (prev_was_running) prev_ctx->state = JE_RR_READY;",
+      "replace": "    if (1) prev_ctx->state = JE_RR_READY;",
+      "build": "build/0/test_sched_rr",
+      "run": "build/0/test_sched_rr",
+      "killer": "test_sched_rr: test_resurrect_guard keeps exited A ZOMBIE and sleeping B SLEEPING after switches/tick",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
     }
   ]
 }
