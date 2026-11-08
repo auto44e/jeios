@@ -28,6 +28,23 @@ real-hardware coverage: QEMU runs in TCG mode (no KVM in CI containers), exactly
 as the existing CI does, and the standing "no physical-board qualification"
 boundary is unchanged.
 
+## First-time Docker setup
+
+Install Docker, then add yourself to the `docker` group so the daemon is usable
+without `sudo`:
+
+```sh
+sudo usermod -aG docker "$USER"
+```
+
+This group change does **not** apply to shells that were already open — **log out
+and back in, or reboot**, before continuing. Verify:
+
+```sh
+id | tr ' ' '\n' | grep docker   # should print: docker
+docker info                      # should work with no sudo
+```
+
 ## Build it
 
 From the repo root:

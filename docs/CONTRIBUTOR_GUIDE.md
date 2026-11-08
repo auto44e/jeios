@@ -110,6 +110,63 @@ follow-up. Never label an unrun check PASS. A draft PR can request help; complet
 and merge still depend on the applicable gate/reviewer disposition. Local results
 do not waive remote checks, and remote results do not fabricate local coverage.
 
+## Reproducible runs in a container (recommended, optional)
+
+The repository ships a pinned builder image and a task runner under `.docker/`
+(see [.docker/README.md](../.docker/README.md)). It gives you the same toolchain
+CI uses — gcc, the aarch64 cross-toolchain and QEMU 8.2 — without installing them
+on your host, and runs each task on a clean copy of the tree so a stale local
+`build/` cannot mask a result. It is the easiest way to produce the local
+CI-style evidence a PR needs.
+
+```sh
+.docker/ci-run.sh check          # make check, isolated clean copy
+.docker/ci-run.sh mutants        # the critical-mutant assurance harness
+.docker/ci-run.sh soak 50        # repeat check+mutants to hunt flakes
+.docker/ci-run.sh --in-tree shell # a shell in the image, your worktree mounted
+```
+
+First-time Docker setup needs a **log out / log back in (or a reboot)** after
+`sudo usermod -aG docker "$USER"` before `docker` works without `sudo` — a group
+change does not apply to shells that were already open. Verify with
+`id | tr ' ' '\n' | grep docker` and `docker info`. If Docker is unavailable,
+run the `make` targets directly on your host instead and say so in the PR; the
+container is a convenience, not a required gate.
+
+Honest scope: the container pins the **software** toolchain and the emulator, and
+QEMU runs in TCG mode (no KVM). It is reproducible-enough for consistent toolchain
+and local/CI parity, but it is **not** real-hardware coverage and not a bit-for-bit
+clean-build guarantee (the base image is digest-pinned; the apt packages are
+recorded, not version-pinned). Physical-board qualification remains a separate
+gate. Record the image's recorded toolchain (`docker run --rm jeios-builder cat
+/etc/jeios-toolchain`) alongside your results when a run matters.
+
+### Using AI coding agents (any number, even one)
+
+If you work with an AI coding assistant, it can carry much of this loop, and the
+container makes that safe. A useful pattern even with a single agent:
+
+- Let the agent **run the task in a container and read the (large) log** rather
+  than pasting thousands of lines into the conversation: it runs
+  `.docker/ci-run.sh mutants`, then reads the captured log file and reports the
+  short verdict (survivors, seeds, a hang vs a crash). The container is the blast
+  radius; the agent interprets, you decide.
+- For heavier or parallel work (long soak/fuzz sweeps, cross-arch builds) an agent
+  may drive its **own disposable container** and tear it down afterwards. Keep it
+  contained: a throwaway `docker run --rm` box, `--network none` unless the task
+  needs the network, run as your UID, **never** mount the Docker socket or
+  credentials into it, and build on a container-private copy — never let an agent
+  write your working tree or push on your behalf.
+- Whatever an agent reports is **execution evidence, not qualification**: re-run
+  the real gate yourself (or have a second agent of a different lineage review the
+  diff) before you rely on it. An AI-assisted review is not the independent human
+  review the critical profile requires. This mirrors the project's multi-agent
+  norms in [AGENTS.md](../AGENTS.md); they apply to a single agent too.
+
+This whole subsection is a recommendation to make local verification easier and
+safer, not a new required gate. The verification matrix above is what a PR must
+satisfy, by whatever means.
+
 ## Result data required in PRs
 
 Use the PR template and include a compact evidence table, not only “tests pass.”
