@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * ADR 0010 D5 built-in image table (kernel only). PROC_SPAWN's image_id indexes this
  * table. Each entry is a checked je_vm_image v1 descriptor (ADR 0007 D8; no ELF in the
@@ -54,10 +55,18 @@ extern const je_vm_image   je_img_broker_client_desc;
 extern const unsigned char je_img_uart_driver_blob[];
 extern const unsigned long je_img_uart_driver_len;
 extern const je_vm_image   je_img_uart_driver_desc;
+extern const unsigned char je_img_uart_service_blob[];
+extern const unsigned long je_img_uart_service_len;
+extern const je_vm_image   je_img_uart_service_desc;
+extern const unsigned char je_img_uart_client_blob[];
+extern const unsigned long je_img_uart_client_len;
+extern const je_vm_image   je_img_uart_client_desc;
 
 je_status je_builtin_images_init(void);
 /* NULL for an unknown id, or before init. */
 const je_builtin_image *je_builtin_image_get(uint32_t image_id);
 uint32_t                je_builtin_image_count(void);
+
+extern const char je_c_hello_blob_sha256[];
 
 #endif /* JEIOS_IMAGE_H */

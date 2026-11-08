@@ -108,6 +108,17 @@ void je_arch_cpu_policy_init(void)
     cr4 &= ~((uintptr_t)1 << 10);  /* OSXMMEXCPT */
     cr4 &= ~((uintptr_t)1 << 18);  /* OSXSAVE */
     cr4 &= ~((uintptr_t)1 << 16);  /* FSGSBASE: no user FS/GS-base API (ADR D6 no-TLS) */
+    /* F06/ADR 0007 D3: the x86 VM backend's vb_flush() is a deliberate no-op
+     * ("single BSP, CR3 reload flushes"). That is correct ONLY while user
+     * mappings are never global and no PCID is in use, so a CR3 reload on
+     * address-space switch flushes all relevant translations. Enforce the
+     * precondition here instead of assuming it: clear CR4.PGE (global pages) and
+     * CR4.PCIDE (process-context IDs). If PCID/global pages are ever introduced,
+     * vb_flush must become a real scoped invalidation (ADR 0014 / a future ADR),
+     * and these clears will make that omission fail fast rather than silently
+     * leave stale user translations. je_arch_cpu_policy_cr4() reads this back. */
+    cr4 &= ~((uintptr_t)1 << 7);   /* PGE: no global pages (vb_flush no-op precond) */
+    cr4 &= ~((uintptr_t)1 << 17);  /* PCIDE: no PCID (vb_flush no-op precond) */
     __asm__ volatile("mov %0,%%cr4" : : "r"(cr4) : "memory");
     /* Normalize data selectors for the no-TLS profile (ADR 0007 D6): IRETQ to
      * CPL3 loads SS from the frame but leaves DS/ES/FS/GS at their current

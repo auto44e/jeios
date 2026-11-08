@@ -101,8 +101,6 @@ je_ep_status je_endpoint_kern_create(je_vm *vm, uint32_t index,
     kep_init_once();
     je_handle_table *t = &vm->procs[index].htable;
     je_proc_id creator = JE_PROC_ID_NONE;
-    extern je_status je_sched_current_proc_id(je_proc_id *out);
-    extern je_status je_sched_current_user(je_vm **out_vm, uint32_t *out_index);
     je_vm *caller_vm = (je_vm *)0;
     uint32_t caller_index = 0u;
     if (je_sched_current_user(&caller_vm, &caller_index) == JE_OK) {

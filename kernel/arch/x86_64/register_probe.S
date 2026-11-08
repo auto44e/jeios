@@ -2,6 +2,9 @@
 /* GPR preservation stress: busy until PIT tick 64, no cooperative yield. */
 .section .text,"ax"
 .global je_arch_register_probe
+# je_timer_ticks is intentionally global only for this diagnostic's
+# RIP-relative read. C code uses je_sched_ticks(); volatile does not provide
+# synchronization, and the scheduler is single-CPU.
 je_arch_register_probe:
     pushq %rbx
     pushq %rbp

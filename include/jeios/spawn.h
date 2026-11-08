@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * ADR 0010 D5 journaled spawn (kernel only). Called from the PROC_SPAWN syscall glue
  * with IF=0, after the decode checks and after the grants are copied into kernel
@@ -34,6 +35,8 @@
 #include <stdint.h>
 #include <jeios/abi.h>
 #include <jeios/handle.h>
+#include <jeios/proc.h>
+#include <jeios/status.h>
 #include <jeios/vm.h>
 
 je_abi_status je_proc_spawn(je_vm *vm, uint32_t caller_idx, je_handle launcher,
@@ -53,5 +56,35 @@ void je_spawn_failpoint_set(uint32_t step, uint32_t grant_index);
 /* Number of times the failpoint has fired since it was last armed (kernel-internal;
  * lets fixtures prove a failpoint did or did NOT fire, e.g. validation order). */
 uint32_t je_spawn_failpoint_fired(void);
+
+/*
+ * Post-commit spawn observer seam (fix-gate F13 part 1).
+ *
+ * je_proc_spawn calls the registered observer exactly once per successful spawn,
+ * AFTER the journal has committed (child published, PROCESS handle minted, *out
+ * set) and before returning JE_ABI_OK. It is never called on any failure or
+ * rollback path, so an observer can never see an identity that was undone.
+ *
+ * Caller context: syscall path, IF=0, on the spawning CPU. The observer runs
+ * inside that context and therefore MUST:
+ *   - be infallible from the core's perspective: it must return, must not halt
+ *     or panic, and has no way to fail or roll back the spawn (the return type is
+ *     void on purpose: the spawn has already committed);
+ *   - be observation only: it must not mutate kernel state the core depends on
+ *     (records, VMs, handle tables, scheduler, pools). It may only update its own
+ *     private bookkeeping; an observer that detects a violation of ITS invariant
+ *     records that fact and reports it later from its own context;
+ *   - not block, not allocate, and not re-enter spawn.
+ *
+ * The core default is NO observer: production spawn calls nothing. A test harness
+ * may register one with je_spawn_set_commit_observer. Registration contract:
+ * call it from kernel init context only while no user thread exists (so no spawn
+ * can race the store); a non-NULL observer can be registered once. Re-registering
+ * the same observer is JE_OK (idempotent); NULL or a different observer once one
+ * is set is refused (JE_ERR_INVALID / JE_ERR_BUSY) and leaves the current one in
+ * place. There is no unregister: nothing in the kernel needs it.
+ */
+typedef void (*je_spawn_commit_observer)(je_proc_id id, uint32_t image_id);
+je_status je_spawn_set_commit_observer(je_spawn_commit_observer observer);
 
 #endif /* JEIOS_SPAWN_H */

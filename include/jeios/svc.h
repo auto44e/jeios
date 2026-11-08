@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * ADR 0010 D7/D11: service-protocol constants shared by the kernel fixtures, the
  * supervisor and ring-3 services. Ring-3 safe: includes only <stdint.h>. This is a v0

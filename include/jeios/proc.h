@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /*
  * PROCESS records (ADR 0010 D4 / D-DEV). Pure and hostable: caller-supplied pool
  * storage, no global state, no scheduler or vm dependency. The kernel owns one static

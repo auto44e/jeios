@@ -197,3 +197,21 @@ QEMU TCG models no real interrupt latency or caches — timing is a lower bound,
 a precision/fairness claim. Two DDI0487 points to confirm in-code with citations:
 WFI waking on a PSTATE.I-masked IRQ, and the `daifclr`+`isb` point at which a
 pending IRQ is taken. AI-assisted review is not independent human qualification.
+
+## Amendment (2026-11-06): migration trigger for the "migrate later" flex
+
+Fix-gate F13 requires the trigger-less flex above ("migrate `sched.c` onto
+`sched_rr.c` (later)") to name a concrete trigger. That migration is now governed
+by **ADR 0014 (pre-MP3 process-lifecycle ownership)**, which records:
+
+- a bounded **lifecycle-only** extraction (not a run-queue rewrite) with a single
+  ownership boundary, as a **pre-MP3 blocker**, owner-gated and not yet
+  authorized; and
+- an explicit **migration trigger**: the x86 `sched.c` run queue migrates onto
+  `sched_rr.c` only when **either** the next scheduler *feature* lands that would
+  otherwise be implemented twice (cooperative yield, priorities, SMP readiness)
+  **or** a **cross-arch scheduler parity claim** is made.
+
+This amends only the Flex line's open-endedness; D1 (x86 `sched.c` untouched this
+PR) and all other ADR 0013 decisions are unchanged. The migration itself remains
+a further owner-approved ADR. See `docs/adr/0014-pre-mp3-process-lifecycle-ownership.md`.

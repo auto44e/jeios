@@ -4,30 +4,31 @@
 /*
  * M3c sub-PR 2 (ADR 0009 D-SEQ step 2): the endpoint/channel LIFECYCLE core —
  * the first DESTROYABLE, refcounted kernel object. Standalone and hostable like
- * handle.c: it includes ONLY <jeios/handle.h> plus the standard headers (no
- * vm.h, sched.h, or abi.h), allocates nothing itself (the caller supplies the
- * pool), and has zero global state — so `make check` unit-tests destruction,
- * the split refcount, and REFOVERFLOW with no kernel state.
+ * handle.c: it has no vm.h, sched.h, or abi.h dependency, allocates nothing
+ * itself (the caller supplies the pool), and has zero global state — so
+ * `make check` unit-tests destruction, the split refcount, and REFOVERFLOW with
+ * no kernel state.
  *
- * SCOPE OF THIS PR (frozen by ADR 0009):
+ * CURRENT PURE-LAYER SCOPE (frozen by ADR 0009 and its later M3c steps):
  *   - the channel pool, the channel record (both ends in one record), the SPLIT
  *     refcount (handle_refs vs inflight_refs), retain/release, destruction on
  *     last reference, and the endpoint-aware alloc/dup/close SEAM over the pure
  *     handle table.
- *   - CREATE IS KERNEL-ONLY: je_endpoint_channel_create() is a direct in-kernel
- *     entry used by the hosted test (and, later, the kernel self-test). There is
- *     NO ring-3 endpoint_create syscall in this PR, by design — it ships WITH the
- *     owner-signed process-death release-walk PR (ADR 0009 D-OWNER-2), so a user
- *     process can never die holding an endpoint before teardown can reclaim it.
- *   - NOT here: messages (data IPC), transfer, waits. inflight_refs exists and is
- *     tested directly, but nothing in this PR queues a cap or registers a waiter.
+ *   - CREATE IS PURE-LAYER/KERNEL-ONLY: je_endpoint_channel_create() is the
+ *     direct pure entry used by hosted tests and kernel fixtures. The
+ *     endpoint_kern bridge owns process-table creation and the syscall glue
+ *     provides the typed ring-3 route.
+ *   - This header also owns non-blocking byte IPC, capability transfer, and
+ *     blocking-recv waiter primitives. They remain pure/hostable; the kernel
+ *     bridge supplies ownership, user-copy and scheduler integration.
  *
  * TABLE PURITY (frozen virtue, ADR 0009 D2/D3). The handle table stays fully
  * object-agnostic: it only ever reads/writes the opaque `object` pointer and
  * NEVER dereferences it. All retain/release lives HERE. That makes one invariant
  * load-bearing:
  *
- *   >> PRECONDITION (discharged by the create-syscall PR, NOT this one):
+ *   >> PRECONDITION (enforced by the typed syscall dispatch and endpoint_kern
+ *   >> bridge):
  *   >> an ENDPOINT-typed handle slot is created and closed ONLY through this
  *   >> layer (je_endpoint_handle_* / je_endpoint_channel_*). A raw
  *   >> je_handle_alloc() of an ENDPOINT-typed slot (which takes NO ref), a raw
@@ -36,12 +37,11 @@
  *   >> from the real slot count. A raw CLOSE under-drops (leaks: fail-safe); a
  *   >> raw ALLOC over-counts so a later endpoint-close drops a ref the slot never
  *   >> took, which CAN free a still-named record early (a use-after-free — NOT
- *   >> fail-safe). THIS PR keeps both impossible by minting endpoints ONLY into
- *   >> kernel-local tables, never into a process's own vm->procs[i].htable. The
- *   >> create-syscall PR MUST add a TYPED alloc+close dispatch (endpoint slots
- *   >> are only ever created/closed through this layer) before any endpoint can
- *   >> live in a process table. "Callers remember to use the wrapper" is NOT an
- *   >> acceptable invariant and is why create stays kernel-only until then.
+ *   >> fail-safe). The pure layer does not enforce this invariant itself: the
+ *   >> endpoint_kern bridge mints process-table endpoints through the typed
+ *   >> endpoint path, and syscall close dispatch routes endpoint slots through
+ *   >> the endpoint-aware close. Raw allocation/close remains forbidden for
+ *   >> ENDPOINT-typed slots.
  */
 #include <jeios/handle.h>
 #include <jeios/proc.h>
@@ -66,7 +66,7 @@
 #define JE_EP_PROCESS_OBJ_TYPE 3u
 /* JE_BROKER_MAX and its D11 bound assert now live in <jeios/svc.h>. */
 #define JE_EP_QUEUE_DEPTH   4u    /* messages per end inbound queue */
-#define JE_EP_MAX_WAITERS   2u    /* waiters per end (unused this PR) */
+#define JE_EP_MAX_WAITERS   2u    /* ref-budget bound: one waiter per end */
 /* M3c step 5: max payload BYTES per message (a policy bound, newly chosen here —
  * ADR 0009 said the message max is pinned in an M3c PR; the lifecycle PR did not,
  * so this is it). <= 255 so a per-slot length fits a uint8_t. */
@@ -87,15 +87,15 @@
 
 /* ENDPOINT object type tag carried in a handle slot. Type 0 is reserved; SELF is
  * 1 (handle.h). This is the table-side copy (endpoint.c has no ABI include); the
- * syscall glue _Static_asserts it equals the ABI's endpoint object type when the
- * ring-3 ops land. MUST differ from JE_HANDLE_OBJ_SELF. */
+ * syscall glue _Static_asserts it equals the ABI's endpoint object type. MUST
+ * differ from JE_HANDLE_OBJ_SELF. */
 #define JE_ENDPOINT_OBJ_TYPE 2u
 _Static_assert(JE_ENDPOINT_OBJ_TYPE != JE_HANDLE_OBJ_SELF,
                "endpoint type must differ from SELF");
 
 /* Endpoint rights — table-side copies of the ABI bits (abi.h JE_ABI_RIGHT_*),
- * kept here so endpoint.c has no ABI dependency. The glue pins these equal to
- * the ABI constants. INSPECT is shared with SELF (0x1). */
+ * kept here so endpoint.c has no ABI dependency. The syscall glue pins these
+ * equal to the ABI constants. INSPECT is shared with SELF (0x1). */
 #define JE_EP_RIGHT_INSPECT  0x1u
 #define JE_EP_RIGHT_SEND     0x2u
 #define JE_EP_RIGHT_RECV     0x4u
@@ -103,9 +103,9 @@ _Static_assert(JE_ENDPOINT_OBJ_TYPE != JE_HANDLE_OBJ_SELF,
 #define JE_EP_RIGHTS_ALL (JE_EP_RIGHT_INSPECT | JE_EP_RIGHT_SEND \
                           | JE_EP_RIGHT_RECV | JE_EP_RIGHT_TRANSFER)
 
-/* Status. Distinct enum (no ABI coupling); the glue maps these to je_abi_status
- * names (JE_ABI_H_* + JE_ABI_H_REFOVERFLOW) at the syscall boundary in a later
- * PR, exactly as handle.c's je_handle_status does. */
+/* Status. Distinct enum (no ABI coupling); syscall.c maps these to je_abi_status
+ * names (JE_ABI_H_* + JE_ABI_H_REFOVERFLOW), exactly as handle.c's
+ * je_handle_status does. */
 typedef enum {
     JE_EP_OK = 0,
     JE_EP_BADINDEX,     /* handle/arg malformed, or not an endpoint handle */
@@ -197,7 +197,8 @@ typedef enum {
 } je_ep_end_state;
 
 /* One end of a channel. `inbound` holds messages sent by the PEER and waiting for
- * THIS end's try_recv (Model A). Waiter storage is reserved for step 6. */
+ * THIS end's try_recv (Model A). The waiter slot is used by the blocking-recv
+ * bridge and permits at most one waiter per end. */
 typedef struct {
     je_ep_end_state state;
     uint16_t        handle_refs;    /* LIVE handle slots naming this end */
@@ -210,12 +211,10 @@ typedef struct {
 /* A channel record: both ends in one allocation, so a peer pointer is always to
  * the same record and can never dangle (ADR 0009 D2). `generation` is INTERNAL
  * double-free / stale-pool-index defence, bumped on free, never exposed to ring
- * 3 (handles bind &end[i], not a pool index), per ADR 0009 D-OWNER-1. NOTE: this
- * lifecycle PR bumps it but does not yet READ it — the borrowed-pointer rule
- * (ADR 0009 D3) keeps stale (rec,side) pairs out of the only refcount APIs that
- * take a raw record, so there is nothing to detour yet. The queue/wait PR that
- * first holds such a pair across a possible free MUST carry+check this
- * generation; until then it is reserved structure, honestly unused. */
+ * 3 (handles bind &end[i], not a pool index), per ADR 0009 D-OWNER-1. Leases
+ * and queued capability descriptors carry and validate this generation before
+ * acting on a borrowed (record, side) pair, so a freed-and-reused record fails
+ * closed instead of being consumed as the old object. */
 typedef struct {
     bool     allocated;      /* record is in use */
     uint32_t generation;     /* bumped on free; internal only */
@@ -237,7 +236,7 @@ typedef struct {
  * ADR 0010 D-DEV charging. */
 void je_endpoint_pool_init(je_endpoint_pool *pool);
 
-/* ---- Create (KERNEL-ONLY; no ring-3 route exists in this PR). ------------- */
+/* ---- Pure-layer create (the ring-3 route is in endpoint_kern/syscall glue). */
 /* Transactionally create a channel and mint one handle to EACH end into the two
  * supplied tables (t0 for end 0, t1 for end 1 — may be the same table). Each
  * minted handle takes a handle_ref. On ANY failure the whole operation unwinds:
@@ -302,8 +301,8 @@ je_ep_status je_endpoint_handle_dup(je_endpoint_pool *pool, je_handle_table *t,
                                     je_handle src, uint32_t new_rights,
                                     je_handle *out);
 
-/* ---- Direct (non-handle) inflight ref API — for the queue/wait PRs, tested
- * directly here. retain_inflight fails REFOVERFLOW past JE_EP_REF_MAX (acquires
+/* ---- Direct (non-handle) inflight ref API — used by the queue/wait paths and
+ * tested directly here. retain_inflight fails REFOVERFLOW past JE_EP_REF_MAX (acquires
  * nothing); release_inflight on the last ref may free the record under the same
  * both-ends-zero rule as close. These take a resolved end obtained from a handle
  * via je_endpoint_resolve (never a raw user pointer). ----------------------- */
@@ -318,7 +317,8 @@ je_ep_status je_endpoint_release_inflight(je_endpoint_pool *pool,
 /* ---- Non-blocking data IPC (M3c step 4, ADR 0009 D6, data-only per D9) ------
  * All pure/hostable: they move KERNEL bytes only (the glue does copy_from/to_user
  * around them, honoring D6's copy-then-enqueue / peek-copy-then-dequeue ordering).
- * A message is bytes only — no capabilities until step 5. */
+ * A message is bytes only in these data-only forms; capability-bearing forms
+ * are declared below. */
 
 /* try_send PREFLIGHT: the read-only half of send — resolve the handle (needs
  * SEND), check self-end state and peer-inbound capacity — WITHOUT touching user

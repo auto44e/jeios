@@ -13,8 +13,13 @@ _Static_assert(JE_THREAD_MAX >= 1u + JE_M2_WORKERS + JE_VM_MAX_PROCESSES, "ADR 0
 /* Single CPU. Bootstrap slot 0 is the idle/monitor task; other slots are kernel
  * threads or (M3a #4) ring-3 user threads bound to a vm process (own CR3 +
  * TSS.RSP0). Init/create/reap require interrupts disabled. Sleep/yield serialize
- * internally. No SIMD, user credentials, SMP, priorities, cancellation or
- * dynamic slot reuse. */
+ * internally. No SIMD, user credentials, SMP, priorities or cancellation.
+ * Reaped non-running slots are reused with their contents reinitialized. */
+void je_sched_set_proc_pool(je_proc_pool *pool);
+je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id);
+je_status je_sched_unregister_process(je_vm *vm, uint32_t index);
+bool je_sched_has_process(je_vm *vm, uint32_t index);
+je_proc_pool *je_sched_proc_pool(void);
 void je_sched_init(void);
 je_status je_thread_create(void (*entry)(void *),void *argument);
 /* M3a #4 step 3: create a ring-3 thread for a READY vm process (see vm.h). The
@@ -116,7 +121,13 @@ uint64_t je_sched_ticks(void);
 uint64_t je_sched_preemptions(void);
 uint64_t je_sched_user_cpl3_dispatches(void);
 uint64_t je_sched_min_dispatches(void);
-extern volatile uint64_t je_timer_ticks;
+/* C code reads the tick count through je_sched_ticks(). The backing symbol
+ * remains global and volatile only because the AMD64 register_probe.S diagnostic
+ * reads it with a RIP-relative load; that assembly access is not a
+ * synchronization primitive. The scheduler is single-CPU, so this accessor and
+ * the timer update run with the existing interrupt-disabled invariant. */
+void je_kernel_idle_step(void);
+unsigned je_sched_user_thread_count(void);
 int je_arch_register_probe(void);
 #endif
 

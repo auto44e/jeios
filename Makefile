@@ -112,6 +112,11 @@ check: all test
 	@! grep -qE '^[[:space:]]*#[[:space:]]*include.*(status|handle)\.h' include/jeios/abi.h
 	@echo "Dev-inject isolation: the fixup-injection path must be absent from the default kernel"
 	@! nm $(BUILD)/jeios.elf | grep -qiE 'copy_fixup_inject|user_inject'
+	@echo "Spawn seam (F13): core spawn.o must not import any symbol defined by the harness main.o"
+	@nm -u $(BUILD)/kernel/core/spawn.o | awk '{print $$NF}' | sort -u > $(BUILD)/spawn_undef.txt
+	@nm --defined-only $(BUILD)/kernel/core/main.o | awk 'NF==3 && $$2 ~ /[A-Z]/ {print $$3}' | sort -u > $(BUILD)/main_def.txt
+	@test -s $(BUILD)/spawn_undef.txt && test -s $(BUILD)/main_def.txt
+	@! comm -12 $(BUILD)/spawn_undef.txt $(BUILD)/main_def.txt | grep .
 # Critical-mutant assurance (issue #18/#19, "curl-style" local CI). For each named
 # critical mutant, tools/mutants.py applies a precise reversible source transform
 # that BREAKS one security/correctness invariant, rebuilds the one hosted test that

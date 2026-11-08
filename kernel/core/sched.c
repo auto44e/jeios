@@ -65,6 +65,11 @@ static uint64_t preemptions;
 static uint64_t user_cpl3_dispatches; /* M3a #4 step 3: times a THREAD_USER frame (cs&3==3) was seen */
 volatile uint64_t je_timer_ticks;
 
+static void sched_ticks_set(uint64_t ticks)
+{
+    je_timer_ticks = ticks;
+}
+
 void je_sched_set_proc_pool(je_proc_pool *pool)
 {
     process_pool = pool;
@@ -335,12 +340,14 @@ je_trap_frame *je_sched_interrupt(je_trap_frame *f,bool timer)
     }
     threads[current].frame=f;
     if (timer) {
-        if (je_timer_ticks==UINT64_MAX) abort_scheduler();
-        ++je_timer_ticks;
-        je_device_timer(je_kernel_device(), je_timer_ticks);
+        uint64_t ticks = je_sched_ticks();
+        if (ticks == UINT64_MAX) abort_scheduler();
+        sched_ticks_set(ticks + 1u);
+        je_device_timer(je_kernel_device(), je_sched_ticks());
     }
+    uint64_t ticks = je_sched_ticks();
     for (unsigned i=1;i<JE_THREAD_MAX;++i)
-        if (threads[i].state==SLEEPING && threads[i].wake<=je_timer_ticks) threads[i].state=READY;
+        if (threads[i].state==SLEEPING && threads[i].wake<=ticks) threads[i].state=READY;
     /* M3c D7/A6: on a timer tick, stamp TIMED_OUT on any blocked-IPC waiter whose
      * absolute deadline has elapsed, through the SINGLE endpoint arbitrate CAS
      * (first-critical-section-wins: if a sender/close already stamped it WOKEN/
@@ -349,7 +356,7 @@ je_trap_frame *je_sched_interrupt(je_trap_frame *f,bool timer)
     if (timer)
         for (unsigned i=1;i<JE_THREAD_MAX;++i)
             if (threads[i].state==BLOCKED_IPC && threads[i].wait_deadline!=0u &&
-                threads[i].wait_deadline<=je_timer_ticks) {
+                threads[i].wait_deadline<=ticks) {
                 uint32_t id=0u;
                 je_ep_arb_result r=je_endpoint_wait_arbitrate(threads[i].wait_rec,
                                                               threads[i].wait_side,
@@ -515,11 +522,12 @@ je_trap_frame *je_sched_return_to_user(je_trap_frame *f)
 je_status je_thread_sleep(uint64_t duration)
 {
     uint64_t flags=je_arch_irq_save();
-    if (!ready || current==0 || duration>UINT64_MAX-je_timer_ticks) {
+    uint64_t ticks = je_sched_ticks();
+    if (!ready || current==0 || duration>UINT64_MAX-ticks) {
         je_arch_irq_restore(flags);return current==0 ? JE_ERR_DENIED : JE_ERR_INVALID;
     }
     if (duration) {
-        threads[current].wake=je_timer_ticks+duration;
+        threads[current].wake=ticks+duration;
         threads[current].state=SLEEPING;
     }
     __asm__ volatile("int $0x81":::"memory");

@@ -4,7 +4,10 @@
 /* M3a #5 step (a): v0 syscall dispatcher (see kernel/core/syscall.c). */
 #include <stdint.h>
 #include <jeios/abi.h>
+#include <jeios/handle.h>
+#include <jeios/status.h>
 #include <jeios/trap.h>
+#include <jeios/vm.h>
 
 /* What the pure decoder decided the kernel glue should do. */
 typedef enum {
@@ -45,5 +48,12 @@ je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],
 /* Kernel glue: dispatch a user-origin int 0x80 trap frame; returns the frame to
  * iretq to (the caller, or a live successor for yield/exit). */
 je_trap_frame *je_syscall_dispatch(je_trap_frame *frame);
+
+/* Kernel-only helpers shared by the syscall glue and spawn/self-test paths.
+ * They are not ring-3 ABI entry points. */
+_Noreturn void syscall_invariant(const char *message);
+je_status je_process_handle_mint(je_vm *vm, uint32_t index, je_proc_id id,
+                                 uint32_t rights, je_handle *out,
+                                 je_handle_status *out_alloc_status);
 
 #endif
