@@ -10,6 +10,15 @@ void je_arch_console_write(const char *text);
 _Noreturn void je_arch_halt(void);
 uint64_t je_arch_irq_save(void);
 void je_arch_irq_restore(uint64_t flags);
+/* True iff maskable interrupts are currently enabled (x86: RFLAGS.IF set). Used
+ * by scheduler code to ENFORCE an interrupts-off precondition at a trust
+ * boundary (not to toggle state); a hosted test overrides it to exercise the
+ * precondition without privileged flag manipulation. CONTRACT: every port MUST
+ * provide a real strong definition that reports the true hardware state. A weak
+ * or hardcoded-false stub is forbidden — it would let an IF-on misuse slip past
+ * the reaper's fail-stop. The hosted override must default to interrupts-off and
+ * only the dedicated IF-precondition test may report enabled. */
+bool je_arch_irqs_enabled(void);
 void je_arch_timer_init(void);
 void je_arch_timer_eoi(void);
 void je_arch_irq3_mask(void);

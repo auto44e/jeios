@@ -62,6 +62,12 @@ void je_arch_irq_restore(uint64_t flags)
 {
     if (flags & (UINT64_C(1)<<9)) __asm__ volatile("sti":::"memory");
 }
+bool je_arch_irqs_enabled(void)
+{
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0":"=r"(flags)::"memory");
+    return (flags & (UINT64_C(1)<<9)) != 0u;   /* RFLAGS.IF */
+}
 static void io_wait(void) { out8(0x80,0); }
 void je_arch_timer_init(void)
 {

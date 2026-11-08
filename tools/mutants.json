@@ -73,6 +73,66 @@
       "env": {"ASAN_OPTIONS": "detect_leaks=0"},
       "enabled": true
     },
+    {
+      "id": "REAPER-SIGN",
+      "invariant": "je_sched_reap_dead reports a je_sched_drop_user failure as a NEGATIVE je_status, so the idle loop's `< 0` fail-stop guard fires instead of the error being miscounted as reaped slots (fix-gate F03)",
+      "file": "kernel/core/sched.c",
+      "find": "if (s!=JE_OK) return -(int)s;",
+      "replace": "if (s!=JE_OK) return (int)s;",
+      "build": "build/0/test_sched_killall",
+      "run": "build/0/test_sched_killall",
+      "killer": "test_sched_killall: test_reap_drop_failure (page_restore -> JE_ERR_IO returns exactly -6; slot/PROCESS still DYING; no destroy)",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "REAPER-IF-CHECK",
+      "invariant": "je_sched_reap_dead with interrupts enabled is a fail-stop misuse: the liveness guards and destroy must be atomic vs a timer dispatch (fix-gate F03)",
+      "file": "kernel/core/sched.c",
+      "find": "if (je_arch_irqs_enabled()) abort_scheduler();",
+      "replace": "if (0 && je_arch_irqs_enabled()) abort_scheduler();",
+      "build": "build/0/test_sched_killall",
+      "run": "build/0/test_sched_killall",
+      "killer": "test_sched_killall: test_reap_if_enabled_fail_stop (IF=1 -> abort_scheduler caught via longjmp; no destroy; slot still DYING)",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "REAPER-CR3-GUARD",
+      "invariant": "je_sched_reap_dead never reaps a DYING slot whose address space is still the active CR3 (fix-gate F03)",
+      "file": "kernel/core/sched.c",
+      "find": "if (threads[i].root==active_cr3) return -(int)JE_ERR_BUSY;",
+      "replace": "if (0 && threads[i].root==active_cr3) return -(int)JE_ERR_BUSY;",
+      "build": "build/0/test_sched_killall",
+      "run": "build/0/test_sched_killall",
+      "killer": "test_sched_killall: test_reap_active_cr3 (root == active CR3 -> -5, no page_restore/destroy, slot unchanged) and test_reap_partial_progress",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "REAPER-RSP0-GUARD",
+      "invariant": "je_sched_reap_dead never reaps a DYING slot whose kernel stack is still the live TSS.RSP0 (fix-gate F03)",
+      "file": "kernel/core/sched.c",
+      "find": "if (threads[i].rsp0_top==active_rsp0) return -(int)JE_ERR_BUSY;",
+      "replace": "if (0 && threads[i].rsp0_top==active_rsp0) return -(int)JE_ERR_BUSY;",
+      "build": "build/0/test_sched_killall",
+      "run": "build/0/test_sched_killall",
+      "killer": "test_sched_killall: test_reap_active_rsp0 (rsp0_top == active TSS.RSP0 -> -5, no page_restore/destroy/waiter release, slot/PROCESS/registry unchanged)",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "REAPER-VM-INDEX",
+      "invariant": "je_sched_reap_dead tears down the slot's RECORDED vm_index (threads[i].vm_index), not the loop slot number (fix-gate F03)",
+      "file": "kernel/core/sched.c",
+      "find": "je_vm *vm=threads[i].vm; uint32_t idx=threads[i].vm_index;",
+      "replace": "je_vm *vm=threads[i].vm; uint32_t idx=i;",
+      "build": "build/0/test_sched_killall",
+      "run": "build/0/test_sched_killall",
+      "killer": "test_sched_killall: test_reap_partial_progress, test_reap_success_counts and the reaping sub-case of test_reap_active_cr3/rsp0, whose DYING slots use vm_index 8-slot (slot!=vm_index): exact destroy (vm, vm_index, owner) args and per-vm_index registry checks",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
 
     {
       "id": "GAP-VM-AUDIT-ONE-TO-ONE",
