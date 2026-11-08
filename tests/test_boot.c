@@ -23,10 +23,36 @@ static size_t fixture(unsigned char *b)
 }
 static je_status parse(const unsigned char *b,size_t n,je_boot_context *c)
 { return je_boot_parse(b,n,0x300000,0x100000,0x110000,c); }
+
+static size_t reservation_exhaustion_fixture(unsigned char *b)
+{
+    const size_t module_count = (size_t)JE_BOOT_RESERVED_MAX - 3u + 1u;
+    const size_t total = 8u + 88u + module_count * 24u + 8u;
+    memset(b,0,1024);
+    w32(b,(uint32_t)total);
+    w32(b+8,6); w32(b+12,88); w32(b+16,24);
+    w64(b+24,0); w64(b+32,0x9f000); w32(b+40,1);
+    w64(b+48,0x9f000); w64(b+56,0x61000); w32(b+64,2);
+    w64(b+72,0x100000); w64(b+80,0xf00000); w32(b+88,1);
+    size_t offset = 96u;
+    for (size_t i=0; i<module_count; ++i) {
+        uint32_t begin = 0x300000u + (uint32_t)i * 0x1000u;
+        w32(b+offset,3); w32(b+offset+4,24);
+        w32(b+offset+8,begin); w32(b+offset+12,begin+0x1000u);
+        offset += 24u;
+    }
+    w32(b+offset,0); w32(b+offset+4,8);
+    return total;
+}
+
 int main(void)
 {
     unsigned char b[256];je_boot_context c;
     size_t n=fixture(b);
+    /* The three fixed reservations are all accepted on a normal fixture.
+     * Initial-reservation exhaustion has no public seam because draft starts
+     * with count zero; the RESERVED_MAX capacity path is exercised below by
+     * the module reservation extension. */
     assert(parse(b,n,&c)==JE_OK && c.valid && c.map_count==3 && c.reserved_count==4);
     assert(je_boot_ram_page(&c,0x100000));
     assert(!je_boot_free_page(&c,0x100000));
@@ -61,6 +87,13 @@ int main(void)
     assert(je_boot_parse(b,n,0x300000,0,0x110000,&c)==JE_ERR_INVALID);
     assert(parse(NULL,0,&c)==JE_ERR_INVALID);
     assert(parse(b,n,NULL)==JE_ERR_INVALID);
+    {
+        unsigned char exhausted[1024];
+        size_t exhausted_n = reservation_exhaustion_fixture(exhausted);
+        assert(je_boot_parse(exhausted,exhausted_n,0x300000,
+                             0x100000,0x110000,&c) == JE_ERR_NOMEM);
+        assert(!c.valid);
+    }
     /* Deterministic mutation corpus under ASan/UBSan: parser must stay bounded.
      * On accepted inputs, retained state is internally bounded and reservation
      * predicates must never expose the kernel image or any low-memory page. */

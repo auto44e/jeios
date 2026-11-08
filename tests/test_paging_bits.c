@@ -23,7 +23,18 @@
  *
  * Order matters: the single permanent context (je_arm_mmu_context) cannot be
  * torn down, so negative builds run first (they must leave it invalid and the
- * allocator unchanged), then one good build, then audit tampering, then enable.
+ * allocator unchanged), then one good build, then audit tampering (leaf, then
+ * structural), then enable.
+ *
+ * Structural tampers (fix-gate F04): the audit's ledger/root/count live in the
+ * OPAQUE struct je_arm_mmu (paging.h exposes no layout). The test pokes them
+ * through `struct mmu_mirror`, a field-for-field copy of paging.c's struct whose
+ * layout is VERIFIED at runtime against known post-build values (every field the
+ * test writes, plus the fields after frame_flags[], are checked) before any
+ * poke. If paging.c's layout drifts, check_mirror() fails loudly rather than
+ * poking the wrong bytes. Foreign table targets are mmap(PROT_NONE) pages, so a
+ * stray dereference by the audit faults DETERMINISTICALLY (SIGSEGV), with or
+ * without ASan.
  */
 #define _GNU_SOURCE
 #undef NDEBUG
@@ -379,8 +390,297 @@ static void test_good_build_and_audit(void)
     assert(failures_seen == 23);
 }
 
+/* ---- Structural tampers (fix-gate F04). ---- */
+
+/* Field-for-field mirror of paging.c's struct je_arm_mmu (layout verified by
+ * check_mirror before use). MIRROR_MAX_TABLES mirrors JE_ARM_MAX_TABLES; the
+ * COUNT boundary case (128 -> not COUNT, 129 -> COUNT) independently pins it. */
+#define MIRROR_MAX_TABLES 128u
+#define MIRROR_EXTERNAL_FRAMES 64u
+struct mmu_mirror {
+    bool valid;
+    uint64_t root_pa;
+    uint64_t table_pa[MIRROR_MAX_TABLES];
+    size_t table_count;
+    uint64_t table_start;
+    uint64_t table_end;
+    uint64_t image_start;
+    uint64_t image_end;
+    je_pages *pages;
+    uint8_t frame_flags[JE_PAGE_COUNT];
+    uint64_t external_pa[MIRROR_EXTERNAL_FRAMES];
+    uint8_t external_flags[MIRROR_EXTERNAL_FRAMES];
+    size_t external_count;
+};
+
+static struct mmu_mirror *mirror(void)
+{
+    return (struct mmu_mirror *)(void *)&je_arm_mmu_context;
+}
+
+static void check_mirror(size_t tables)
+{
+    const struct mmu_mirror *m = mirror();
+    assert(m->valid);
+    assert(m->root_pa == je_arm_mmu_root(&je_arm_mmu_context));
+    assert(m->root_pa == JE_PHYSICAL_BASE);
+    assert(m->table_count == tables);
+    for (size_t i = 0; i < tables; ++i)
+        assert(m->table_pa[i] == JE_PHYSICAL_BASE + i * PG);
+    for (size_t i = tables; i < MIRROR_MAX_TABLES; ++i)
+        assert(m->table_pa[i] == 0u);
+    assert(m->table_start == JE_PHYSICAL_BASE);
+    assert(m->table_end == JE_PHYSICAL_BASE + tables * PG);
+    assert(m->image_start == (uint64_t)(uintptr_t)_text);
+    assert(m->image_end == (uint64_t)(uintptr_t)_end);
+    assert(m->pages == &pages);
+    /* Fields AFTER the JE_PAGE_COUNT-sized frame_flags[]: only the UART is
+     * outside the allocator window. */
+    assert(m->external_count == 1u);
+    assert(m->external_pa[0] == UART);
+}
+
+static int structural_seen;
+
+/* A good audit: OK, reject reason NONE, and the enable stamp is set (so the
+ * following reject proves REVOCATION, not "never granted"). */
+static void struct_ok(void)
+{
+    AUDIT_OK();
+    assert(je_arm_mmu_last_audit_reject == JE_ARM_AUDIT_REJECT_NONE);
+    assert(je_arm_mmu_last_audit_leaves == UINT64_C(0x53));
+}
+
+/* (a) audit INVALID, (b) the EXACT expected reason, (c) enable refused and the
+ * asm leaf never reached. Returns the descriptor-read count of the failed audit
+ * so a caller can bound it. */
+static uint64_t struct_rejects(je_arm_mmu_audit_reject want, const char *what)
+{
+    const int calls = leaf_rec.calls;
+    assert(je_arm_mmu_audit(&je_arm_mmu_context, good, NGOOD) == JE_ERR_INVALID);
+    if (je_arm_mmu_last_audit_reject != want) {
+        fprintf(stderr, "test_paging_bits: FAIL %s: reject reason %d, want %d\n",
+                what, (int)je_arm_mmu_last_audit_reject, (int)want);
+        assert(0 && "wrong audit reject reason");
+    }
+    assert(je_arm_mmu_last_audit_leaves == 0u);
+    assert(je_arm_mmu_enable(&je_arm_mmu_context) == JE_ERR_INVALID);
+    assert(leaf_rec.calls == calls);
+    ++structural_seen;
+    return je_arm_mmu_last_audit_reads;
+}
+
+/* Replace one 64-bit word (descriptor, root_pa or ledger entry) with `value`,
+ * require the exact reject, restore, require OK again. */
+static uint64_t struct_tamper(uint64_t *slot, uint64_t value,
+                              je_arm_mmu_audit_reject want, const char *what)
+{
+    struct_ok();
+    const uint64_t saved = *slot;
+    assert(value != saved);
+    *slot = value;
+    const uint64_t reads = struct_rejects(want, what);
+    *slot = saved;
+    struct_ok();
+    return reads;
+}
+
+static void count_tamper(size_t value, je_arm_mmu_audit_reject want,
+                         const char *what)
+{
+    struct_ok();
+    size_t *slot = &mirror()->table_count;
+    const size_t saved = *slot;
+    *slot = value;
+    const uint64_t reads = struct_rejects(want, what);
+    *slot = saved;
+    if (want == JE_ARM_AUDIT_REJECT_COUNT || want == JE_ARM_AUDIT_REJECT_LEDGER)
+        assert(reads == 0u);   /* phase 0: rejected before ANY table read */
+    struct_ok();
+}
+
+static void test_structural_tampers(void)
+{
+    const size_t tables = 6;
+    check_mirror(tables);
+    struct mmu_mirror *m = mirror();
+    const uint64_t root = m->root_pa;
+    uint64_t *l0 = (uint64_t *)(uintptr_t)root;
+    const uint64_t l1_pa = l0[0] & D_OA_MASK;
+    uint64_t *l1 = (uint64_t *)(uintptr_t)l1_pa;
+    const uint64_t l2k_pa = l1[1] & D_OA_MASK;     /* L2 for 1 GiB @0x40000000 */
+    uint64_t *l2k = (uint64_t *)(uintptr_t)l2k_pa;
+    /* Unused slots chosen below are really unused in the good build. */
+    assert(l0[7] == 0u && l0[300] == 0u && l0[511] == 0u);
+    assert(l1[5] == 0u && l2k[100] == 0u && l2k[200] == 0u);
+    assert(FIELD(TEXT_LO, 21, 9) == 0u && (l2k[0] & 3u) == 3u);
+
+    /* Deterministic-fault foreign frame: any dereference is a SIGSEGV. */
+    void *pn = mmap(NULL, (size_t)PG, PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(pn != MAP_FAILED);
+    const uint64_t foreign = (uint64_t)(uintptr_t)pn;
+    assert((foreign & ~D_OA_MASK) == 0u);          /* encodable as an OA */
+    assert(foreign < JE_PHYSICAL_BASE || foreign >= JE_PHYSICAL_BASE + JE_PHYSICAL_SPAN);
+
+    /* 1. FOREIGN late sibling: root[511] is OFF every descent path. Phase 1
+     *    reads exactly the root's 512 entries and rejects before reading ANY
+     *    child (the BFS has enqueued but not read L1). */
+    uint64_t reads = struct_tamper(&l0[511], foreign | D_VALID_PAGE,
+                                   JE_ARM_AUDIT_REJECT_FOREIGN,
+                                   "foreign late sibling root[511] (PROT_NONE)");
+    assert(reads == 512u);
+    /*    Same at a deeper level (L2 sibling of the kernel L3), and with a
+     *    readable in-window frame that is simply not in the ledger. */
+    struct_tamper(&l2k[200], foreign | D_VALID_PAGE, JE_ARM_AUDIT_REJECT_FOREIGN,
+                  "foreign L2 sibling (PROT_NONE)");
+    struct_tamper(&l0[511], (JE_PHYSICAL_BASE + 10 * PG) | D_VALID_PAGE,
+                  JE_ARM_AUDIT_REJECT_FOREIGN, "in-window non-ledger child");
+
+    /* 2. Root not a ledger member (PROT_NONE): ROOT, before any table read. */
+    reads = struct_tamper(&m->root_pa, foreign, JE_ARM_AUDIT_REJECT_ROOT,
+                          "root_pa -> PROT_NONE non-member");
+    assert(reads == 0u);
+
+    /* 3. Self-cycle: root[300] -> root. */
+    struct_tamper(&l0[300], root | D_VALID_PAGE, JE_ARM_AUDIT_REJECT_REVISIT,
+                  "self-cycle root[300] -> root");
+    /* 4. Ancestor cycles: L2 -> its L1 parent; L1 -> the root. */
+    struct_tamper(&l2k[100], l1_pa | D_VALID_PAGE, JE_ARM_AUDIT_REJECT_REVISIT,
+                  "ancestor cycle L2[100] -> L1");
+    struct_tamper(&l1[5], root | D_VALID_PAGE, JE_ARM_AUDIT_REJECT_REVISIT,
+                  "ancestor cycle L1[5] -> root");
+    /* 5. Shared child: root[7] -> the same L1 as root[0]. */
+    struct_tamper(&l0[7], l1_pa | D_VALID_PAGE, JE_ARM_AUDIT_REJECT_REVISIT,
+                  "shared child root[7] == root[0]");
+
+    /* 6. Bad count. The huge value must be rejected before table_pa[] is
+     *    indexed (reads == 0, no fault). 128 is the inclusive bound: it passes
+     *    the COUNT check and fails the ledger (zero entry) instead. */
+    count_tamper(0u, JE_ARM_AUDIT_REJECT_COUNT, "table_count 0");
+    count_tamper(MIRROR_MAX_TABLES + 1u, JE_ARM_AUDIT_REJECT_COUNT,
+                 "table_count MAX+1");
+    count_tamper(SIZE_MAX, JE_ARM_AUDIT_REJECT_COUNT, "table_count SIZE_MAX");
+    count_tamper(MIRROR_MAX_TABLES, JE_ARM_AUDIT_REJECT_LEDGER,
+                 "table_count == MAX (boundary: ledger, not count)");
+
+    /* 7. Ledger: duplicate, zero, misaligned, beyond the 44-bit PA. */
+    reads = struct_tamper(&m->table_pa[5], m->table_pa[1],
+                          JE_ARM_AUDIT_REJECT_LEDGER, "duplicate ledger entry");
+    assert(reads == 0u);
+    struct_tamper(&m->table_pa[3], 0u, JE_ARM_AUDIT_REJECT_LEDGER,
+                  "zero ledger entry");
+    struct_tamper(&m->table_pa[3], m->table_pa[3] + 8u,
+                  JE_ARM_AUDIT_REJECT_LEDGER, "misaligned ledger entry");
+    struct_tamper(&m->table_pa[3], UINT64_C(1) << 44,
+                  JE_ARM_AUDIT_REJECT_LEDGER, "ledger entry beyond 44-bit PA");
+
+    /* 8. Orphan ledger frames. The window is EXACTLY the 6 contiguous table
+     *    frames [BASE, BASE+6*PG), so there is no spare in-window frame:
+     *    (a) an orphan just past table_end is OUT of the window -> phase 0
+     *        LEDGER (C2), before any table read;
+     *    (b) the same orphan with table_end widened to cover it passes phase 0
+     *        and no descriptor points at it -> phase 1 UNREACHED;
+     *    (c) a detached subtree (L1[0] -> UART L2+L3 cut off) is UNREACHED in
+     *        phase 1, before the leaf checks would notice the missing UART. */
+    struct_ok();
+    assert(m->table_pa[tables] == 0u);
+    m->table_pa[tables] = JE_PHYSICAL_BASE + tables * PG;
+    m->table_count = tables + 1u;
+    reads = struct_rejects(JE_ARM_AUDIT_REJECT_LEDGER,
+                           "orphan ledger frame outside [table_start,table_end)");
+    assert(reads == 0u);
+    const uint64_t saved_end = m->table_end;
+    m->table_end = JE_PHYSICAL_BASE + (tables + 1u) * PG;
+    struct_rejects(JE_ARM_AUDIT_REJECT_UNREACHED,
+                   "in-window orphan ledger frame (widened window)");
+    m->table_end = saved_end;
+    m->table_count = tables;
+    m->table_pa[tables] = 0u;
+    struct_ok();
+    struct_tamper(&l1[0], 0u, JE_ARM_AUDIT_REJECT_UNREACHED,
+                  "detached UART subtree");
+
+    /* 8d. Coupled ledger tamper (C2): move a real ledger entry to an aligned,
+     *     unique, below-2^44 frame OUTSIDE the table window WITHOUT changing
+     *     any descriptor. The frame is made PROT_NONE so a dereference would
+     *     fault; phase 0 must reject LEDGER with zero reads. (Without the
+     *     window check the walk would hit the now-unlisted old frame and say
+     *     FOREIGN/ROOT instead.) */
+    const uint64_t outside = JE_PHYSICAL_BASE + 32u * PG;
+    assert(outside >= m->table_end && outside < (UINT64_C(1) << 44));
+    for (size_t i = 0; i < tables; ++i) assert(m->table_pa[i] != outside);
+    assert(mprotect((void *)(uintptr_t)outside, (size_t)PG, PROT_NONE) == 0);
+    reads = struct_tamper(&m->table_pa[5], outside, JE_ARM_AUDIT_REJECT_LEDGER,
+                          "ledger entry moved outside the table window");
+    assert(reads == 0u);
+    reads = struct_tamper(&m->table_pa[0], outside, JE_ARM_AUDIT_REJECT_LEDGER,
+                          "root ledger entry moved outside the table window");
+    assert(reads == 0u);
+    assert(mprotect((void *)(uintptr_t)outside, (size_t)PG,
+                    PROT_READ | PROT_WRITE) == 0);
+
+    /* 8e. Cross-leaf W^X alias (reaches audit_alias_scan). Every leaf is
+     *     identity-checked, so an alias needs a NON-identity leaf B; phase 2
+     *     only rejects B as LEAF when it reaches B. The alias scan for an
+     *     EARLIER valid leaf A looks ahead at every L3 entry, so if B sits
+     *     after A in walk order the scan fires first -> ALIAS. (A tamper on
+     *     the earlier leaf is caught as LEAF — why older alias tampers never
+     *     reached the scan.) Both disjuncts of the scan predicate:
+     *     (i)  A = text (exec) @TEXT_LO; later RW data leaf B -> TEXT_LO.
+     *     (ii) A = table frame leaf (RW) @BASE; later text leaf B -> BASE. */
+    uint64_t *a_text = l3_slot(root, TEXT_LO);
+    uint64_t *b_data = l3_slot(root, RODATA_HI);
+    uint64_t *a_tbl = l3_slot(root, JE_PHYSICAL_BASE);
+    assert(a_text && b_data && a_tbl && a_tbl < a_text && a_text < b_data);
+    assert(*b_data == spec_leaf(RODATA_HI, JE_MAP_RW));
+    assert(*a_text == spec_leaf(TEXT_LO, JE_MAP_TEXT));
+    assert(*a_tbl == spec_leaf(JE_PHYSICAL_BASE, JE_MAP_RW));
+    struct_tamper(b_data, (*b_data & ~D_OA_MASK) | TEXT_LO,
+                  JE_ARM_AUDIT_REJECT_ALIAS,
+                  "later RW leaf aliases earlier text frame");
+    struct_tamper(a_text, (*a_text & ~D_OA_MASK) | JE_PHYSICAL_BASE,
+                  JE_ARM_AUDIT_REJECT_ALIAS,
+                  "later RX leaf aliases earlier table frame");
+    /*     Control: the same alias with the tampered leaf FIRST in walk order
+     *     is caught by the identity check (LEAF), not the scan. */
+    struct_tamper(a_text, (*a_text & ~D_OA_MASK) | RODATA_HI,
+                  JE_ARM_AUDIT_REJECT_LEAF,
+                  "earlier RX leaf aliases later RW frame (identity first)");
+
+    /* 9. Malformed table descriptors. */
+    struct_tamper(&l1[1], l1[1] & ~B(1), JE_ARM_AUDIT_REJECT_MALFORMED,
+                  "L1 table entry as a block");
+    struct_tamper(&l0[0], l0[0] & ~B(1), JE_ARM_AUDIT_REJECT_MALFORMED,
+                  "root entry as a block");
+    const unsigned hier[] = { 59, 60, 61, 62, 63 };  /* PXN/UXN/AP[2]/NSTable */
+    for (size_t i = 0; i < sizeof(hier) / sizeof(hier[0]); ++i)
+        struct_tamper(&l1[1], l1[1] | B(hier[i]), JE_ARM_AUDIT_REJECT_MALFORMED,
+                      "hierarchical restriction bit on L1 table entry");
+    /*    Encoding is checked before membership: a block-encoded foreign entry
+     *    is MALFORMED, still never dereferenced. */
+    struct_tamper(&l0[511], foreign | UINT64_C(1) /* valid, bit1=0: block */,
+                  JE_ARM_AUDIT_REJECT_MALFORMED, "block-encoded foreign root[511]");
+
+    /* A leaf tamper is classified LEAF (phase 2), not as a structural reason. */
+    struct_tamper(l3_slot(root, TEXT_LO), *l3_slot(root, TEXT_LO) & ~D_AP(3),
+                  JE_ARM_AUDIT_REJECT_LEAF, "text W+X (leaf reason)");
+
+    check_mirror(tables);
+    assert(munmap(pn, (size_t)PG) == 0);
+    assert(structural_seen == 33);
+}
+
 static void test_enable_gating(void)
 {
+    /* C4: ANY audit call — even a NULL-context precondition failure that
+     * names no context — revokes the prior enable grant. */
+    AUDIT_OK();
+    assert(je_arm_mmu_audit(NULL, good, NGOOD) == JE_ERR_INVALID);
+    assert(je_arm_mmu_last_audit_reject == JE_ARM_AUDIT_REJECT_PRECONDITION);
+    assert(je_arm_mmu_enable(&je_arm_mmu_context) == JE_ERR_INVALID);
+    assert(leaf_rec.calls == 0);
+
     /* A failed audit revokes the enable permission. */
     uint64_t *text = l3_slot(je_arm_mmu_root(&je_arm_mmu_context), TEXT_LO);
     uint64_t saved = *text;
@@ -425,9 +725,11 @@ int main(void)
     test_encoder();
     test_bad_builds();
     test_good_build_and_audit();
+    test_structural_tampers();
     test_enable_gating();
     printf("test_paging_bits: PASS (constants, %u-class encoder vs DDI0487 "
-           "spec, %d audit tamper rejections, build rollback, enable gating)\n",
-           (unsigned)JE_MAP_CLASS_COUNT, failures_seen);
+           "spec, %d audit tamper rejections, %d structural rejections with "
+           "exact reason, build rollback, enable gating)\n",
+           (unsigned)JE_MAP_CLASS_COUNT, failures_seen, structural_seen);
     return 0;
 }

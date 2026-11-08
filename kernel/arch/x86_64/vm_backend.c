@@ -170,6 +170,7 @@ static je_status vb_install_pte(void *ctx, je_vm_ref frame, uint64_t varena_off)
     uint64_t *vpt = phys_ptr(frame_phys(te, 3));
     uint64_t idx = (varena_off >> 12) & 511;
     if (vpt[idx] & PTE_P) return JE_ERR_INVALID;         /* no double-install */
+    if (e->kind == JE_VM_USER_DATA && !s->nx) return JE_ERR_UNSUPPORTED;
     uint64_t leaf = frame_phys(e, frame.page) | PTE_P | PTE_U;
     if (e->kind == JE_VM_USER_DATA) leaf |= PTE_W;       /* RW/NX */
     if (e->kind != JE_VM_USER_CODE) leaf |= s->nx;       /* NX unless executable */
@@ -191,6 +192,15 @@ static je_status vb_demote_alias(void *ctx, je_vm_ref frame)
 
 static void vb_panic(void *ctx, const char *why);
 
+static void vb_assert_inactive_root(vb_state *s, uint32_t process)
+{
+    vb_proc *p = &s->procs[process];
+    if (p->used && p->root_phys && je_arch_cr3_read() == p->root_phys) {
+        vb_panic(s, "teardown active root");
+        return;
+    }
+}
+
 static void vb_unmap(void *ctx, je_vm_ref frame) { (void)ctx; (void)frame; /* map had no side effects */ }
 
 static void vb_clear_pte(void *ctx, uint32_t process, uint64_t varena_off)
@@ -198,6 +208,7 @@ static void vb_clear_pte(void *ctx, uint32_t process, uint64_t varena_off)
     vb_state *s = ctx;
     if (process >= JE_VM_MAX_PROCESSES || varena_off >= JE_VM_ARENA_SIZE || (varena_off & 4095))
         { vb_panic(ctx, "clear_pte range"); return; }
+    vb_assert_inactive_root(s, process);
     vb_proc *p = &s->procs[process];
     if (!p->used) { vb_panic(ctx, "clear_pte proc"); return; }
     vb_extent *te = ext_of(s, process, p->table_extent);
@@ -263,6 +274,12 @@ static void vb_free_extent(void *ctx, uint32_t process, uint32_t extent)
     vb_state *s = ctx;
     vb_extent *e = ext_of(s, process, extent);
     if (!e) { vb_panic(ctx, "free_extent id"); return; }
+    /* In normal unwind this is the first operation that frees a frame. Check
+     * the root before scrubbing or returning any extent to the allocator. The
+     * clear_pte check above covers the usual PTE-bearing path; this boundary
+     * also covers a process with no installed leaves. Keep vb_drop_tables'
+     * later check as a second belt-and-suspenders assertion. */
+    vb_assert_inactive_root(s, process);
     vb_scrub_frames(ctx, e->phys, e->pages);   /* zero on free: no stale bytes survive reuse */
     if (je_pages_free(s->pages, e->phys, e->pages) != JE_OK) vb_panic(ctx, "free_extent pages");
     e->used = 0;

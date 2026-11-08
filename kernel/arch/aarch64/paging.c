@@ -40,6 +40,7 @@ extern void *memset(void *destination, int value, size_t count);
 #define JE_ARM_DESC_TABLE_PXN (UINT64_C(1) << 59)
 #define JE_ARM_DESC_TABLE_UXN (UINT64_C(1) << 60)
 #define JE_ARM_DESC_TABLE_NS (UINT64_C(1) << 63)
+#define JE_ARM_PA_LIMIT    (UINT64_C(1) << 44)   /* IPS = 44-bit PA (ADR D3) */
 
 #define JE_ARM_MAP_EXEC UINT8_C(1)
 #define JE_ARM_MAP_WRITE UINT8_C(2)
@@ -120,6 +121,8 @@ struct je_arm_mmu {
  * layout through the frozen header. */
 je_arm_mmu je_arm_mmu_context;
 uint64_t je_arm_mmu_last_audit_leaves;
+je_arm_mmu_audit_reject je_arm_mmu_last_audit_reject;
+uint64_t je_arm_mmu_last_audit_reads;
 static const je_arm_mmu *je_arm_last_audited;
 static const je_arm_mmu *je_arm_enabled_context;
 
@@ -226,12 +229,25 @@ static bool record_frame_flags(je_arm_mmu *mmu, uint64_t physical,
     return true;
 }
 
-static bool table_frame(const je_arm_mmu *mmu, uint64_t physical)
+static bool table_ordinal(const je_arm_mmu *mmu, uint64_t physical,
+                          size_t *ordinal)
 {
+    if (!mmu || !ordinal || mmu->table_count == 0u ||
+        mmu->table_count > JE_ARM_MAX_TABLES)
+        return false;
     for (size_t i = 0u; i < mmu->table_count; ++i) {
-        if (mmu->table_pa[i] == physical) return true;
+        if (mmu->table_pa[i] == physical) {
+            *ordinal = i;
+            return true;
+        }
     }
     return false;
+}
+
+static bool table_frame(const je_arm_mmu *mmu, uint64_t physical)
+{
+    size_t ordinal;
+    return table_ordinal(mmu, physical, &ordinal);
 }
 
 static uint64_t leaf_descriptor(uint64_t physical, je_map_class cls)
@@ -407,7 +423,6 @@ je_status je_arm_mmu_build(je_arm_mmu *mmu, je_pages *pages,
 #define JE_ARM_LEAF_RODATA UINT64_C(0x0060000000000783)
 #define JE_ARM_LEAF_RW     UINT64_C(0x0060000000000703)
 #define JE_ARM_LEAF_DEVICE UINT64_C(0x0060000000000407)
-#define JE_ARM_PA_LIMIT    (UINT64_C(1) << 44)   /* IPS = 44-bit PA (ADR D3) */
 
 static bool class_descriptor_matches(uint64_t descriptor, je_map_class cls)
 {
@@ -447,26 +462,32 @@ static const je_map_region *region_for_va(const je_map_region *regions,
     return match;
 }
 
-static bool audit_alias_scan(const je_arm_mmu *mmu, uint64_t table_pa,
-                             unsigned level, uint64_t target_pa,
+typedef struct {
+    size_t ordinal;
+    unsigned level;
+    uint64_t virtual_base;
+} je_arm_audit_table;
+
+static bool audit_alias_scan(const je_arm_mmu *mmu,
+                             const je_arm_audit_table *work,
+                             size_t work_count, uint64_t target_pa,
                              bool target_exec, bool target_write)
 {
-    const uint64_t *table = (const uint64_t *)(uintptr_t)table_pa;
-    for (size_t i = 0u; i < JE_ARM_PT_ENTRIES; ++i) {
-        uint64_t descriptor = table[i];
-        if ((descriptor & JE_ARM_DESC_VALID) == 0u) continue;
-        if (level < 3u) {
-            if ((descriptor & UINT64_C(3)) != JE_ARM_DESC_TABLE ||
-                (descriptor & (JE_ARM_DESC_TABLE_AP_MASK |
-                               JE_ARM_DESC_TABLE_PXN |
-                               JE_ARM_DESC_TABLE_UXN |
-                               JE_ARM_DESC_TABLE_NS)) != 0u) {
-                return true;
-            }
-            if (audit_alias_scan(mmu, descriptor & JE_ARM_DESC_ADDR_MASK,
-                                 level + 1u, target_pa, target_exec,
-                                 target_write)) return true;
-        } else {
+    /*
+     * Phase 1 has proved every work item is a unique ledger member and every
+     * level-3 item is reachable. This scan therefore never follows a raw
+     * descriptor pointer. It is deliberately conservative: for each leaf,
+     * it reads at most 512 entries in each recorded level-3 table, or
+     * <= leaves * 512 * (#L3 tables) descriptor reads overall.
+     */
+    for (size_t table_index = 0u; table_index < work_count; ++table_index) {
+        if (work[table_index].level != 3u) continue;
+        const uint64_t *table =
+            table_pointer(mmu->table_pa[work[table_index].ordinal]);
+        for (size_t i = 0u; i < JE_ARM_PT_ENTRIES; ++i) {
+            ++je_arm_mmu_last_audit_reads;
+            uint64_t descriptor = table[i];
+            if ((descriptor & JE_ARM_DESC_VALID) == 0u) continue;
             uint64_t physical = descriptor & JE_ARM_DESC_ADDR_MASK;
             bool executable = (descriptor & JE_ARM_DESC_PXN) == 0u;
             bool writable = ((descriptor >> JE_ARM_DESC_AP_SHIFT) &
@@ -479,87 +500,170 @@ static bool audit_alias_scan(const je_arm_mmu *mmu, uint64_t table_pa,
     return false;
 }
 
-static je_status audit_table(const je_arm_mmu *mmu, uint64_t table_pa,
-                             unsigned level, uint64_t virtual_base,
-                             const je_map_region *regions, size_t n,
-                             size_t *leaf_count, size_t *table_leaf_count)
+static je_status audit_reject(je_arm_mmu_audit_reject reason)
 {
-    const uint64_t *table = (const uint64_t *)(uintptr_t)table_pa;
-    unsigned shift = level_shift(level);
-    for (size_t i = 0u; i < JE_ARM_PT_ENTRIES; ++i) {
-        uint64_t descriptor = table[i];
-        if ((descriptor & JE_ARM_DESC_VALID) == 0u) continue;
-        uint64_t va = virtual_base | ((uint64_t)i << shift);
-        if (level < 3u) {
-            if ((descriptor & UINT64_C(3)) != JE_ARM_DESC_TABLE ||
-                (descriptor & (JE_ARM_DESC_TABLE_AP_MASK |
-                               JE_ARM_DESC_TABLE_PXN |
-                               JE_ARM_DESC_TABLE_UXN |
-                               JE_ARM_DESC_TABLE_NS)) != 0u)
-                return JE_ERR_INVALID;
-            /* The next-level table MUST be one of the builder's own table
-             * frames (ADR 0011 D4). Without this a table descriptor redirected
-             * into a .data/region frame would pass the audit, and post-enable
-             * ordinary writes to that frame would rewrite live translations and
-             * reopen W^X AFTER the audit. Requiring membership in table_pa (and
-             * region_for_va() below rejects region overlap for leaves) closes
-             * it; combined with the table_leaves==table_count tie every table is
-             * accounted for. */
-            if (!table_frame(mmu, descriptor & JE_ARM_DESC_ADDR_MASK))
-                return JE_ERR_INVALID;
-            je_status status = audit_table(mmu,
-                                           descriptor & JE_ARM_DESC_ADDR_MASK,
-                                           level + 1u, va, regions, n,
-                                           leaf_count, table_leaf_count);
-            if (status != JE_OK) return status;
-            continue;
-        }
-
-        ++*leaf_count;
-        if ((descriptor & JE_ARM_DESC_AF) == 0u ||
-            ((descriptor >> JE_ARM_DESC_AP_SHIFT) & UINT64_C(1)) != 0u)
-            return JE_ERR_INVALID;
-        uint64_t physical = descriptor & JE_ARM_DESC_ADDR_MASK;
-        const je_map_region *region = region_for_va(regions, n, va);
-        je_map_class expected;
-        if (region != NULL) {
-            expected = region->cls;
-            /* Identity contract (ADR 0011 D2): every region leaf maps VA==PA.
-             * A region leaf whose output frame differs from its VA is not an
-             * identity mapping and is rejected (table frames are checked for
-             * VA==PA in the else branch below). */
-            if (va != physical) return JE_ERR_INVALID;
-        } else if (va == physical && table_frame(mmu, physical)) {
-            expected = JE_MAP_RW;
-            ++*table_leaf_count;
-        } else {
-            return JE_ERR_INVALID;
-        }
-        if (!class_descriptor_matches(descriptor, expected))
-            return JE_ERR_INVALID;
-        bool executable = (descriptor & JE_ARM_DESC_PXN) == 0u;
-        bool writable = ((descriptor >> JE_ARM_DESC_AP_SHIFT) &
-                         UINT64_C(3)) == 0u;
-        if (executable && writable) return JE_ERR_INVALID;
-        if (audit_alias_scan(mmu, mmu->root_pa, 0u, physical,
-                             executable, writable))
-            return JE_ERR_INVALID;
-    }
-    return JE_OK;
+    je_arm_mmu_last_audit_reject = reason;
+    return JE_ERR_INVALID;
 }
 
 je_status je_arm_mmu_audit(const je_arm_mmu *mmu,
                            const je_map_region *regions, size_t n)
 {
+    /*
+     * The table memory, ledger, and regions are immutable during this audit:
+     * one CPU, pre-enable, and no DMA. The verdict assumes that contract.
+     * Phase 2 only reads recorded level-3 ordinals, so it never follows a
+     * descriptor pointer even if table contents change after Phase 1.
+     */
+    /* Any audit attempt invalidates a prior enable grant, regardless of which
+     * context or arguments the caller supplies. Only the full-success path
+     * below may publish a new eligibility stamp. */
+    je_arm_last_audited = NULL;
+    je_arm_mmu_last_audit_leaves = 0u;
+    je_arm_mmu_last_audit_reads = 0u;
+    je_arm_mmu_last_audit_reject = JE_ARM_AUDIT_REJECT_NONE;
+
     if (!mmu || !mmu->valid || je_arm_enabled_context == mmu ||
-        validate_regions(regions, n) != JE_OK) return JE_ERR_INVALID;
-    if (je_arm_last_audited == mmu) je_arm_last_audited = NULL;
+        validate_regions(regions, n) != JE_OK)
+        return audit_reject(JE_ARM_AUDIT_REJECT_PRECONDITION);
+
+    /*
+     * Phase 0 validates the complete ledger before any table page is
+     * dereferenced. In particular, bound table_count before indexing the
+     * fixed-size table_pa[] array, then reject zero, misaligned, out-of-range,
+     * or duplicate physical frames.
+     */
+    if (mmu->table_count == 0u || mmu->table_count > JE_ARM_MAX_TABLES)
+        return audit_reject(JE_ARM_AUDIT_REJECT_COUNT);
+    if (mmu->table_start >= mmu->table_end ||
+        (mmu->table_start & (JE_PAGE_SIZE - 1u)) != 0u ||
+        (mmu->table_end & (JE_PAGE_SIZE - 1u)) != 0u ||
+        mmu->table_end > JE_ARM_PA_LIMIT)
+        return audit_reject(JE_ARM_AUDIT_REJECT_LEDGER);
+    for (size_t i = 0u; i < mmu->table_count; ++i) {
+        uint64_t physical = mmu->table_pa[i];
+        if (physical == 0u || (physical & (JE_PAGE_SIZE - 1u)) != 0u ||
+            physical >= JE_ARM_PA_LIMIT ||
+            physical < mmu->table_start || physical >= mmu->table_end)
+            return audit_reject(JE_ARM_AUDIT_REJECT_LEDGER);
+        for (size_t j = 0u; j < i; ++j) {
+            if (mmu->table_pa[j] == physical)
+                return audit_reject(JE_ARM_AUDIT_REJECT_LEDGER);
+        }
+    }
+
+    size_t root_ordinal;
+    if (!table_ordinal(mmu, mmu->root_pa, &root_ordinal))
+        return audit_reject(JE_ARM_AUDIT_REJECT_ROOT);
+
+    /*
+     * Phase 1 is an explicit bounded structural walk. A table is marked and
+     * enqueued before its page is read; every later table dereference uses an
+     * ordinal that came from the validated ledger.
+     */
+    uint64_t visited[(JE_ARM_MAX_TABLES + 63u) / 64u] = { 0u };
+    je_arm_audit_table work[JE_ARM_MAX_TABLES];
+    size_t visited_count = 1u;
+    size_t work_count = 1u;
+    size_t work_head = 0u;
+    visited[root_ordinal / 64u] |=
+        UINT64_C(1) << (root_ordinal % 64u);
+    work[0] = (je_arm_audit_table){ root_ordinal, 0u, 0u };
+
+    while (work_head < work_count) {
+        je_arm_audit_table current = work[work_head];
+        ++work_head;
+        const uint64_t *table =
+            table_pointer(mmu->table_pa[current.ordinal]);
+        unsigned shift = level_shift(current.level);
+        for (size_t i = 0u; i < JE_ARM_PT_ENTRIES; ++i) {
+            ++je_arm_mmu_last_audit_reads;
+            uint64_t descriptor = table[i];
+            if ((descriptor & JE_ARM_DESC_VALID) == 0u) continue;
+            if (current.level >= 3u) continue;
+            if ((descriptor & UINT64_C(3)) != JE_ARM_DESC_TABLE ||
+                (descriptor & (JE_ARM_DESC_TABLE_AP_MASK |
+                               JE_ARM_DESC_TABLE_PXN |
+                               JE_ARM_DESC_TABLE_UXN |
+                               JE_ARM_DESC_TABLE_NS)) != 0u)
+                return audit_reject(JE_ARM_AUDIT_REJECT_MALFORMED);
+
+            size_t child_ordinal;
+            uint64_t child_pa = descriptor & JE_ARM_DESC_ADDR_MASK;
+            if (!table_ordinal(mmu, child_pa, &child_ordinal))
+                return audit_reject(JE_ARM_AUDIT_REJECT_FOREIGN);
+            size_t child_word = child_ordinal / 64u;
+            uint64_t child_bit = UINT64_C(1) << (child_ordinal % 64u);
+            if ((visited[child_word] & child_bit) != 0u)
+                return audit_reject(JE_ARM_AUDIT_REJECT_REVISIT);
+            if (work_count >= JE_ARM_MAX_TABLES)
+                return audit_reject(JE_ARM_AUDIT_REJECT_COUNT);
+            visited[child_word] |= child_bit;
+            ++visited_count;
+            work[work_count] = (je_arm_audit_table){
+                child_ordinal,
+                current.level + 1u,
+                current.virtual_base | ((uint64_t)i << shift)
+            };
+            ++work_count;
+        }
+    }
+    if (visited_count != mmu->table_count)
+        return audit_reject(JE_ARM_AUDIT_REJECT_UNREACHED);
+
+    /*
+     * Phase 2 checks leaves only in the validated work-list. This retains the
+     * existing independent literals, identity mapping, W^X, and table-leaf
+     * cardinality checks without dereferencing a raw child descriptor.
+     */
     size_t leaves = 0u;
     size_t table_leaves = 0u;
-    je_status status = audit_table(mmu, mmu->root_pa, 0u, 0u, regions, n,
-                                   &leaves, &table_leaves);
-    if (status != JE_OK || table_leaves != mmu->table_count)
-        return JE_ERR_INVALID;
+    for (size_t work_index = 0u; work_index < work_count; ++work_index) {
+        je_arm_audit_table current = work[work_index];
+        if (current.level != 3u) continue;
+        const uint64_t *table =
+            table_pointer(mmu->table_pa[current.ordinal]);
+        unsigned shift = level_shift(current.level);
+        for (size_t i = 0u; i < JE_ARM_PT_ENTRIES; ++i) {
+            ++je_arm_mmu_last_audit_reads;
+            uint64_t descriptor = table[i];
+            if ((descriptor & JE_ARM_DESC_VALID) == 0u) continue;
+            ++leaves;
+            uint64_t va = current.virtual_base | ((uint64_t)i << shift);
+            if ((descriptor & JE_ARM_DESC_AF) == 0u ||
+                ((descriptor >> JE_ARM_DESC_AP_SHIFT) & UINT64_C(1)) != 0u)
+                return audit_reject(JE_ARM_AUDIT_REJECT_LEAF);
+            uint64_t physical = descriptor & JE_ARM_DESC_ADDR_MASK;
+            const je_map_region *region = region_for_va(regions, n, va);
+            je_map_class expected;
+            if (region != NULL) {
+                expected = region->cls;
+                /* Identity contract (ADR 0011 D2): every region leaf maps VA==PA.
+                 * A region leaf whose output frame differs from its VA is not an
+                 * identity mapping and is rejected (table frames are checked for
+                 * VA==PA in the else branch below). */
+                if (va != physical)
+                    return audit_reject(JE_ARM_AUDIT_REJECT_LEAF);
+            } else if (va == physical && table_frame(mmu, physical)) {
+                expected = JE_MAP_RW;
+                ++table_leaves;
+            } else {
+                return audit_reject(JE_ARM_AUDIT_REJECT_LEAF);
+            }
+            if (!class_descriptor_matches(descriptor, expected))
+                return audit_reject(JE_ARM_AUDIT_REJECT_LEAF);
+            bool executable = (descriptor & JE_ARM_DESC_PXN) == 0u;
+            bool writable = ((descriptor >> JE_ARM_DESC_AP_SHIFT) &
+                             UINT64_C(3)) == 0u;
+            if (executable && writable)
+                return audit_reject(JE_ARM_AUDIT_REJECT_LEAF);
+            if (audit_alias_scan(mmu, work, work_count, physical,
+                                 executable, writable))
+                return audit_reject(JE_ARM_AUDIT_REJECT_ALIAS);
+        }
+    }
+    if (table_leaves != mmu->table_count)
+        return audit_reject(JE_ARM_AUDIT_REJECT_LEAF);
     je_arm_mmu_last_audit_leaves = (uint64_t)leaves;
     je_arm_last_audited = mmu;
     return JE_OK;

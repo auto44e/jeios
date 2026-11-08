@@ -133,6 +133,42 @@
       "env": {"ASAN_OPTIONS": "detect_leaks=0"},
       "enabled": true
     },
+    {
+      "id": "UCOPY-NULL-KPTR",
+      "invariant": "a nonzero-length user copy rejects a NULL kernel buffer before scheduler and copy-run side effects",
+      "file": "kernel/core/usercopy.c",
+      "find": "    if (kptr == NULL) return JE_ABI_INVALID;",
+      "replace": "    if (0 && (kptr == NULL)) return JE_ABI_INVALID;",
+      "build": "build/0/test_usercopy",
+      "run": "build/0/test_usercopy",
+      "killer": "test_usercopy: case C — NULL kernel buffer is invalid without scheduler or run side effects",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "UCOPY-NONNEST",
+      "invariant": "a validated copy refuses nesting while preserving the active outer copy scope",
+      "file": "kernel/core/usercopy.c",
+      "find": "    if (g_scope.active) return JE_ABI_INVALID;   /* no nesting; outer scope intact */",
+      "replace": "    if (0 && g_scope.active) return JE_ABI_INVALID;   /* no nesting; outer scope intact */",
+      "build": "build/0/test_usercopy",
+      "run": "build/0/test_usercopy",
+      "killer": "test_usercopy: case I — nested copy is invalid and the outer fixup scope remains active",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "UCOPY-WRITE-PERM",
+      "invariant": "a copy to user requires every covered page to have JE_VM_PERM_RW_NX",
+      "file": "kernel/core/usercopy.c",
+      "find": "            if (perm != JE_VM_PERM_RW_NX) return 0;  /* only RW/NX is writable */",
+      "replace": "            if (0 && (perm != JE_VM_PERM_RW_NX)) return 0;  /* only RW/NX is writable */",
+      "build": "build/0/test_usercopy",
+      "run": "build/0/test_usercopy",
+      "killer": "test_usercopy: case F — writes to RX and R/NX pages are rejected",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
 
     {
       "id": "GAP-VM-AUDIT-ONE-TO-ONE",
@@ -174,17 +210,76 @@
       "gap": true
     },
     {
-      "id": "GAP-ARM-AUDIT-FOREIGN-SIBLING",
-      "invariant": "the AArch64 page-table audit validates EVERY child table address (root membership + alignment) BEFORE dereferencing it, including in audit_alias_scan — a foreign/unvalidated sibling pointer is rejected, not followed",
+      "id": "ARM-AUDIT-FOREIGN-SIBLING",
+      "invariant": "the AArch64 audit's phase-1 structural walk rejects a valid table descriptor whose child frame is not a ledger member (FOREIGN) — including a late, off-path sibling like root[511] — so no unvalidated table frame is ever accepted or later read",
       "file": "kernel/arch/aarch64/paging.c",
-      "find": "GAP-PLACEHOLDER-audit-validate-before-deref",
-      "replace": "",
+      "find": "return audit_reject(JE_ARM_AUDIT_REJECT_FOREIGN);",
+      "replace": "continue;",
       "build": "build/0/test_paging_bits",
       "run": "build/0/test_paging_bits",
-      "killer": "GAP: CORRECTED per fix-gate F04. The earlier 'infinite recursion on a cycle' claim is WRONG — both walkers bound at level<3 and a root self-cycle already returns JE_ERR_INVALID. The REAL confirmed defect: audit_alias_scan (paging.c:456, reached via the recursive call at 466 from audit_table at 544) dereferences a child table address WITHOUT the root-membership check audit_table applies, so an otherwise-valid earlier leaf triggers an alias scan into an unvalidated later sibling (e.g. root[511]=0x30000000|3) -> ASan SEGV. Fix: a complete bounded structural pass that validates every table pointer before any alias/permission dereference; the foreign-sibling fixture must return INVALID, not crash. Add the hosted negative test, pin the find-string, then enable. OWNER-GATED (ARM paging, tested path).",
+      "killer": "test_paging_bits test_structural_tampers case 1: root[511] / L2[200] -> mmap(PROT_NONE) page and root[511] -> in-window non-ledger frame must be INVALID with reason FOREIGN (and exactly 512 reads for root[511]); under the mutant the foreign entry is silently skipped and the audit returns JE_OK. Replaces the disabled GAP-ARM-AUDIT-FOREIGN-SIBLING marker (fix-gate F04). Written as a `continue` substitution, not `if (0 && ...)`: disabling the table_ordinal() call would leave child_ordinal uninitialized (a -Werror build failure = BLOCKED, or UB).",
       "env": {"ASAN_OPTIONS": "detect_leaks=0"},
-      "enabled": false,
-      "gap": true
+      "enabled": true
+    },
+    {
+      "id": "ARM-AUDIT-REVISIT",
+      "invariant": "the AArch64 audit's phase-1 visited bitmap rejects any table reached twice (self-cycle, ancestor cycle, shared/repeated child) with reason REVISIT",
+      "file": "kernel/arch/aarch64/paging.c",
+      "find": "if ((visited[child_word] & child_bit) != 0u)",
+      "replace": "if (0 && ((visited[child_word] & child_bit) != 0u))",
+      "build": "build/0/test_paging_bits",
+      "run": "build/0/test_paging_bits",
+      "killer": "test_paging_bits test_structural_tampers cases 3-5: root[300]->root, L2[100]->L1, L1[5]->root, root[7]==root[0] must reject with reason REVISIT; under the mutant the walk re-enqueues until the work-list bound (COUNT) or over-counts visits (UNREACHED), so the exact-reason assertion fails",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "ARM-AUDIT-COUNT",
+      "invariant": "the AArch64 audit's phase 0 bounds table_count to [1, JE_ARM_MAX_TABLES] BEFORE indexing table_pa[] (no over-read on a corrupt count)",
+      "file": "kernel/arch/aarch64/paging.c",
+      "find": "if (mmu->table_count == 0u || mmu->table_count > JE_ARM_MAX_TABLES)",
+      "replace": "if (0 && (mmu->table_count == 0u || mmu->table_count > JE_ARM_MAX_TABLES))",
+      "build": "build/0/test_paging_bits",
+      "run": "build/0/test_paging_bits",
+      "killer": "test_paging_bits test_structural_tampers case 6: table_count 0 / MAX+1 / SIZE_MAX must reject with reason COUNT and zero descriptor reads; under the mutant 0 falls through to ROOT and MAX+1/SIZE_MAX index table_pa[] and hit LEDGER, failing the exact-reason assertion",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "ARM-AUDIT-STAMP-CLEAR",
+      "invariant": "je_arm_mmu_audit revokes the enable eligibility stamp (je_arm_last_audited) unconditionally on entry (C4), so ANY failed audit call — a failed re-audit of a previously-passing context, or even audit(NULL) — forbids je_arm_mmu_enable",
+      "file": "kernel/arch/aarch64/paging.c",
+      "find": "    je_arm_last_audited = NULL;\n    je_arm_mmu_last_audit_leaves = 0u;",
+      "replace": "    je_arm_mmu_last_audit_leaves = 0u;",
+      "build": "build/0/test_paging_bits",
+      "run": "build/0/test_paging_bits",
+      "killer": "test_paging_bits struct_rejects (every structural case: OK audit, tamper, INVALID audit, then je_arm_mmu_enable must be JE_ERR_INVALID with the asm leaf never called) and test_enable_gating (OK audit, then audit(NULL) == INVALID/PRECONDITION, then enable must be INVALID with leaf_rec.calls == 0); under the mutant the stale stamp lets enable succeed. Find re-pinned after C4 made the clear unconditional (the old conditional find no longer exists).",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "ARM-AUDIT-LEDGER-WINDOW",
+      "invariant": "the AArch64 audit's phase 0 rejects (LEDGER) any ledger table_pa[i] outside [table_start, table_end) BEFORE any table dereference (C2), so a coupled ledger tamper that moves an entry to an aligned, unique, below-2^44 foreign frame is never walked",
+      "file": "kernel/arch/aarch64/paging.c",
+      "find": "physical < mmu->table_start || physical >= mmu->table_end)",
+      "replace": "0)",
+      "build": "build/0/test_paging_bits",
+      "run": "build/0/test_paging_bits",
+      "killer": "test_paging_bits test_structural_tampers case 8a (orphan just past table_end must be LEDGER with 0 reads; mutant -> UNREACHED) and case 8d (table_pa[5] / table_pa[0] moved to a PROT_NONE frame BASE+32*PG outside the window, no descriptor changed, must be LEDGER with 0 reads; mutant -> FOREIGN / ROOT)",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
+    },
+    {
+      "id": "ARM-AUDIT-ALIAS",
+      "invariant": "the AArch64 audit's phase-2 alias scan rejects (ALIAS) a physical frame reachable via both an executable and a writable leaf, checked when the FIRST (valid, identity) leaf of the pair is reached. NOTE: under the identity (VA==PA) contract any cross-leaf alias also implies a non-identity leaf, so without the scan the audit still returns JE_ERR_INVALID (reason LEAF) when it reaches the second leaf; this mutant is killed by the exact-reason assertion, i.e. it proves the scan is reachable and classifies correctly, NOT that it is the sole barrier to an accepted alias",
+      "file": "kernel/arch/aarch64/paging.c",
+      "find": "if (audit_alias_scan(mmu, work, work_count, physical,",
+      "replace": "if (0 && audit_alias_scan(mmu, work, work_count, physical,",
+      "build": "build/0/test_paging_bits",
+      "run": "build/0/test_paging_bits",
+      "killer": "test_paging_bits test_structural_tampers case 8e: a LATER RW data leaf (RODATA_HI) retargeted to the earlier text frame, and a LATER RX text leaf retargeted to the earlier table frame (BASE), must reject with reason ALIAS; under the mutant the earlier valid leaf passes and the tampered later leaf is rejected as LEAF (va != physical), failing the exact-reason assertion",
+      "env": {"ASAN_OPTIONS": "detect_leaks=0"},
+      "enabled": true
     }
   ]
 }

@@ -201,13 +201,16 @@ def _snapshot(dest):
     written. Implemented as `git archive` over a transient tree object built
     from the current index + worktree, falling back to a tracked-file copy.
     """
-    # Stage a transient tree that reflects the working tree's tracked content
-    # without disturbing the caller's index: use a private index file.
+    # Stage a transient tree that reflects the working tree's content without
+    # disturbing the caller's index: use a private index file. `git add -A`
+    # (not -u) so NEW files the PR adds (e.g. a new test) are captured too, not
+    # only modifications to already-tracked files. .gitignore still excludes
+    # build/ and other ignored output, so the snapshot stays clean.
     tmp_index = os.path.join(dest, ".jeios_mut_index")
     env = dict(os.environ, GIT_INDEX_FILE=tmp_index)
     try:
         for cmd in (["git", "read-tree", "HEAD"],
-                    ["git", "add", "-u"]):
+                    ["git", "add", "-A"]):
             r = subprocess.run(cmd, cwd=ROOT, env=env, timeout=120,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if r.returncode != 0:

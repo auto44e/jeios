@@ -79,7 +79,7 @@ $(BUILD)/kernel/core/image.o: kernel/core/image.c $(USER_GENERATED) $(USER_GENER
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_paging_bits $(BUILD)/test_gic_bits $(BUILD)/test_vm $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_device
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_paging_bits $(BUILD)/test_gic_bits $(BUILD)/test_vm $(BUILD)/test_usercopy $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_device
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
@@ -88,6 +88,7 @@ test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_ph
 	./$(BUILD)/test_paging_bits
 	./$(BUILD)/test_gic_bits
 	./$(BUILD)/test_vm
+	./$(BUILD)/test_usercopy
 	./$(BUILD)/test_uframe
 	./$(BUILD)/test_syscall
 	./$(BUILD)/test_handle
@@ -173,6 +174,10 @@ $(BUILD)/test_gic_bits: tests/test_gic_bits.c kernel/arch/aarch64/gic.c kernel/a
 $(BUILD)/test_vm: tests/test_vm.c tests/vm_fake.c kernel/core/vm.c kernel/core/alloc.c kernel/core/boot.c kernel/core/handle.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_vm.c tests/vm_fake.c kernel/core/vm.c kernel/core/alloc.c kernel/core/boot.c kernel/core/handle.c -o $@
+
+$(BUILD)/test_usercopy: tests/test_usercopy.c kernel/core/usercopy.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all tests/test_usercopy.c kernel/core/usercopy.c -o $@
 
 $(BUILD)/test_uframe: tests/test_uframe.c kernel/core/uframe.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
