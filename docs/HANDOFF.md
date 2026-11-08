@@ -1,5 +1,258 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Current status — 2026-11-08T13:56:53+00:00
+
+Repository `/tmp/wt-mp2-cfix`, branch `wip/mp2-cfix`. The implementation and
+verification were inspected at exact commit
+`531f70ee872d6fb9fc61028711b35bb98d8a89cc`; this final documentation-only
+amend is its descendant. State:
+**implemented / tested locally / planned (owner review, remote CI, physical
+ARM and independent human qualification) / not blocked**. This is
+AI-assisted evidence, not human or release qualification. The demonstrated
+support tier is QEMU-only. No push, PR publication, reviewer assignment,
+release, or remote-CI result was created or observed. The user-provided
+`RE-REVIEW-FINDINGS.md` and `REVIEW-FINDINGS.md` remain untracked and were
+not modified.
+
+This refresh supersedes the 13:01 status below and records the second-pass
+re-review fixes:
+
+- The test-only phase-1 ELR rule now admits the canary/NZCV assembly, worker
+  entry/trampoline, idle preparation, and exit regions. The idle and exit
+  assembly call sites mask I before their C calls, and `je_arm_sched_exited`
+  is published only after `je_rr_exit`; this closes the three injected
+  unmasked-window false-FATAL cases.
+- Phase-B canary addressing uses already-verified low registers for its
+  stack/table indexes and bases. The high-restore mutant remains test-only:
+  it omits the pair restore and poisons x26 from restored x0, making the
+  named `canary reg=26` result deterministic. The production `vectors.o`
+  is byte-identical to the 8009df0 pre-fix checkpoint.
+- `drop-consume-on-resume` is documented and detected at the actual
+  cookie-zeroed-by-IRQ-saver check. A new `replay-stale-frame` mutant saves
+  an old nonzero frame copy and replays it at the same address; its named
+  detector is the resume-path frame-generation comparison.
+- `monitor_wait` now reads the readiness deadline before idle is requested
+  and emits `FATAL sched proof readiness deadline` if readiness never
+  completes. The no-tick path also runs sleeping-state validation.
+- Phase-A and phase-B labels end at their final comparisons; the static
+  canary-phase array is marked `used`; redundant nested test guards were
+  removed; test-only console diagnostics are explicitly separated from the
+  production IRQ-switch contract.
+
+Observed commands and results:
+
+```text
+make aarch64                                      PASS; Image 36873 bytes
+make aarch64 ARM_SCHED_TEST=1                    PASS; Image 53264 bytes
+make smoke-aarch64 ARM_SCHED_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60
+                                                   PASS; normal proof/guard halt
+make check                                        PASS
+git diff --check                                  PASS
+python3 -m py_compile tools/smoke_arm.py         PASS
+```
+
+The final normal scheduler smoke used QEMU 8.2.2 (`virt-8.2`, `cortex-a72`,
+one CPU, 256 MiB), GCC 13.3.0, and image SHA-256
+`375d1a00170f24f91c356b9fb076ea0dafb52d82a4de9fe90fc359b0a3e297f`.
+It observed idle interval `16->24` with four slot-0 ticks and worker 1
+resuming; slots 1 and 2 each had starts/resumes/phase-A/phase-B/canary/
+NZCV/verified-resume evidence; the oracle observed
+`dispatched=32 = preemptions 12 + nonpreempt_switch_ins 20`; and the guard
+translation fault ended in the expected terminal halt.
+
+The required 13-mutant loop was run with
+`ARM_SMOKE_TIMEOUT=25`. Every run emitted `MUTATION FIRED`, ended at its
+named detector, emitted no final guard PASS, and intentionally returned
+make rc 2:
+
+| mutation | observed detector |
+| --- | --- |
+| `drop-mov-sp` | `FATAL sched observed_running` |
+| `pick-skips-b` | `FATAL sched proof ready-bound slot=2` |
+| `rebuild-fake-frame` | `FATAL sched proof frame validation slot=1` |
+| `unconditional-cur-ready` | `FATAL sched proof dispatches_after_exit slot=1` |
+| `wfi-i-masked` | `FATAL sched proof exit DAIF.I slot=1` |
+| `corrupt-spsr-nzcv` | `FATAL sched canary reg=32` |
+| `spsr-i` | `FATAL sched proof frame validation slot=1` |
+| `early-fake-swap` | `FATAL sched proof frame validation slot=0` |
+| `live-pointer-swap` | `FATAL sched proof frame validation slot=4` |
+| `live-content-swap` | `FATAL sched canary reg=26` |
+| `drop-high-reg-restore` | `FATAL sched canary reg=26` |
+| `drop-consume-on-resume` | `FATAL sched frame cookie zeroed by IRQ saver` |
+| `replay-stale-frame` | `FATAL sched proof frame generation slot=1` |
+
+The deterministic high-register check was repeated ten times:
+all ten runs returned rc 2 and all ten ended at `FATAL sched canary reg=26`;
+none hit the former data-abort/guard-mismatch outcome.
+
+Required empirical re-confirmations were run in disposable scratch copies:
+
+- Trampoline, idle-call, and exit-call timing delays each completed the
+  normal QEMU proof without a false FATAL.
+- Forcing `all_proof_ready()` to remain false produced
+  `FATAL sched proof readiness deadline slot=4`, with smoke rc 2, rather than
+  an external timeout.
+- Removing only the resume-path generation comparison from the replay
+  scratch image let `replay-stale-frame` emit its FIRED marker and reach a
+  normal scheduler/guard PASS, proving that comparison is load-bearing.
+
+The production seam check compared `build/aarch64/vectors.o` with a fresh
+build of checkpoint `8009df0c36aabee92ed223d26c8429671cc4ecf5`:
+both SHA-256 values were
+`3e9ce000c688cf72ebf55c95e097d477ecdc7ff0a2a2015e5f313894a27c1b7d`.
+The only source delta in `vectors.S` is under the test-mutant conditional.
+
+Known limitations intentionally left open:
+
+- C: `wfi-i-masked` deliberately clears I inside the test-only C mutant; it
+  does not model dropping the later assembly `msr daifclr` before WFI, which
+  would hang without a named detector.
+- F: the pre-existing ready-bound oracle can become unsound if a sentinel
+  runs for more than one tick because its limit is stale.
+- SF4: killed and surviving mutants both exit 1 through `make` rc 2; there is
+  no hosted `check_sched_test` test yet.
+
+Not enforced: SMP safety, arbitrary ARM hardware, driver/application ABI
+coverage, userspace context switching, dynamic loading or fault isolation,
+remote CI, physical ARM, and independent human qualification. The existing
+linker RWX LOAD warning remains and is not a security qualification.
+
+Next bounded task: owner/peer review of this committed second-pass diff.
+Pass criteria are the exact command results above, preservation of the
+production vectors object and frozen scheduler contracts, and explicit
+classification of the C/F/SF4 limitations. No ARM hardware or general
+kernel-readiness claim follows from this QEMU-only evidence.
+
+## Current status — 2026-11-08T13:01:48+00:00
+
+Repository `/tmp/wt-mp2-cfix`, branch `wip/mp2-cfix`, exact commit
+`8009df0c36aabee92ed223d26c8429671cc4ecf5`. State:
+**implemented / tested locally / planned (owner review, remote CI, physical
+ARM and independent human qualification) / not blocked**. AI-assisted only;
+QEMU-only support tier. No PR, push, release, reviewer assignment, or remote
+CI result was created/observed. User-provided `REVIEW-FINDINGS.md` remains
+untracked and was not modified.
+
+Implemented files:
+
+- `kernel/arch/aarch64/sched_arm.c`: no-op ARM idle hook with slot-0 fallback,
+  frame-generation comparison and consume-on-resume proof, strict phase/ELR
+  checks, D3/D7 fail-closed checks, phase-A/phase-B live-register canary,
+  all-sleep idle proof, terminal wait placement, and real mutation detectors.
+- `kernel/arch/aarch64/vectors.S`: test-only `drop-high-reg-restore` guard
+  around the existing high-register restore.
+- `mk/aarch64.mk`, `tools/smoke_arm.py`: twelve mutation profiles, counters
+  for both live phases, idle marker validation, and named detector checking.
+- `docs/IMPLEMENTATION.md`, this file, and
+  `docs/audit/evidence/2026-11-mp2-sched.md`: current status/evidence refresh.
+
+Observed:
+
+- `make aarch64`: PASS.
+- `make aarch64 ARM_SCHED_TEST=1`: PASS.
+- `make smoke-aarch64 ARM_SCHED_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60`:
+  PASS; idle `all_sleep=1`, interval `16->24`, four slot-0 ticks, worker 1
+  resumed; oracle `dispatched=32 = preemptions 12 + nonpreempt 20`; guard
+  fault PASS and terminal halt.
+- Exact twelve-mutant loop: all twelve emitted FIRED, ended at their named
+  detector, emitted no final guard PASS, and intentionally returned make rc 2.
+- `make check`: PASS.
+- `git diff --check` and `python3 -m py_compile tools/smoke_arm.py`: PASS.
+
+The four detector-deletion experiments were run only in disposable scratch
+copies: wfi real-check deleted -> normal PASS; unconditional exited[] check
+deleted -> timeout/no named detector; corrupt NZCV branches deleted -> normal
+PASS; READY-bound fatal deleted -> normal PASS. This is evidence that those
+four checks are load-bearing. No independent human qualification is claimed.
+
+Next bounded task: owner/peer review of commit `8009df0`, then reproduce the
+same commands in remote CI if requested. Pass criteria are preservation of
+the frozen vector/ADR 0013 contracts, the normal idle/counter/guard evidence,
+and all twelve named mutation results. Do not advance an ARM hardware or
+userspace readiness claim from this QEMU-only result.
+
+## Historical 2026-11-08T12:19:50Z — MP2 ADR 0013 ARM switch seam, superseded
+
+Repository `/tmp/wt-mp2-switch`, branch `wip/mp2-switch`, exact inspected
+commit `6dd9e59` plus the uncommitted worktree diff. State:
+**implemented / tested locally / planned (owner review, remote CI, physical
+ARM and independent human qualification) / not blocked**. This is
+AI-assisted evidence, not a hardened/release qualification. No commit or push
+was made.
+
+Files changed: `kernel/arch/aarch64/vectors.S`, `main.c`, `trapframe.h`,
+new `sched_arm.c`, `mk/aarch64.mk`, `tools/smoke_arm.py`, and this
+documentation. `sched_rr.c`, ARM paging sources, and x86 sources were not
+touched. The exact asm edit is in `vectors.S`: after `bl je_arm_irq`, `tst
+x0,#0xf; b.ne je_arm_double_fault; mov sp,x0`, then the existing guard-clear,
+selected-frame ELR/SPSR/GPR restore, `add sp,#JE_TF_SIZE`, and `eret`; no
+`daifclr` is executed before `eret`.
+
+The C seam records the current IRQ frame, writes a slot/generation cookie,
+ticks/picks/switches through `je_rr_switch`, runs the same frame validator as
+the early hook as the final gate, consumes `next->frame`, and returns only
+the exact validated local pointer. Validation covers non-NULL/alignment,
+overflow-safe owned-stack bounds and mapped state, exact recorded pointer,
+consume-on-resume state, `sp`, EL1h policy SPSR with NZCV masked, and ELR
+inside linked text or the trampoline. Stack allocation maps only the top four
+pages of each five-page run and leaves the lowest guard page unmapped.
+
+Observed proof counters from
+`make smoke-aarch64 ARM_SCHED_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60`:
+
+```text
+slot=1 starts=1 dispatched_to=4 resumed=3 observed_running=3
+       preempted_in_canary=3 verified_resumes=3 interleave=4
+       nzcv_window_preempts=2 dispatches_after_exit=0
+slot=2 starts=1 dispatched_to=4 resumed=3 observed_running=3
+       preempted_in_canary=3 verified_resumes=3 interleave=4
+       nzcv_window_preempts=2 dispatches_after_exit=0
+slot=3 starts=1 dispatched_to=8 resumed=7
+slot=4 starts=1 dispatched_to=8 resumed=7
+oracle: dispatched=24 preemptions=8 nonpreempt_switch_ins=16 ready_bound=1
+guard: target=0x40007000, expected translation fault, FAR==guard,
+       monitor-masked I preserved in guard SPSR, PASS
+```
+
+Mutation battery, each run emitted `MUTATION FIRED`, the named FATAL, no
+PASS, and intentionally returned a nonzero smoke status:
+
+```text
+drop-mov-sp          -> FATAL sched observed_running
+pick-skips-b         -> FATAL sched proof preempted_in_canary slot=2
+rebuild-fake-frame   -> FATAL sched starts==1
+unconditional-cur-ready -> FATAL sched proof dispatches_after_exit slot=1
+wfi-i-masked         -> FATAL sched proof exit DAIF.I slot=1
+corrupt-spsr-nzcv    -> FATAL sched proof nzcv-window slot=1
+spsr-i                -> FATAL sched proof frame validation slot=1
+early-fake-swap      -> FATAL sched trampoline arg!=current
+live-pointer-swap    -> FATAL sched proof frame validation slot=4
+live-content-swap    -> FATAL sched canary reg=32
+```
+
+Verification actually run:
+
+- `make aarch64` and `make aarch64 ARM_SCHED_TEST=1`: PASS.
+- `make check`: PASS, including hosted scheduler, allocator, MMU/GIC and
+  image/ELF checks.
+- `python3 -m py_compile tools/smoke_arm.py` and
+  `python3 tools/test_smoke_arm_timer.py`: PASS.
+- Existing ARM smoke matrix: default, `ARM_TIMER_TEST=1`,
+  `ARM_VECTOR_TEST=1`, `ARM_DTB_BAD=1`, `ARM_BSS_CHECK=1`, and
+  `ARM_MMU_FAULT=text|data|rodata|guard`: all PASS with `ARM_REQUIRE=1`.
+
+Not enforced yet: SMP safety, arbitrary hardware/driver support, userspace
+context switching, dynamic loading/fault isolation, remote CI, physical ARM,
+and independent human qualification. The linker still reports its existing
+RWX LOAD warning. The scheduler proof is a QEMU support-tier result, not a
+claim for all ARM hardware.
+
+Next bounded task: owner/peer review of this isolated diff and a reviewable
+commit/PR. Pass criteria: preserve the frozen vector/ADR 0013 contracts,
+reproduce the normal counter table and all smoke profiles, and retain one
+named detector/no-PASS result for every mutation. Do not advance the next
+ARM userspace/lifecycle gate from this QEMU-only evidence.
+
 ## JTerminal future roadmap — 2026-11-06T10:31:01-05:00
 
 Inspected core main `a82352f405b8e4c4cb9336fdf847514ea9435734` (PR #94 merged), in isolated

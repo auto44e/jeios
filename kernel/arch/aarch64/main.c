@@ -30,6 +30,10 @@
 #include "physmem.h"
 #include "trapframe.h"
 
+#ifdef JE_ARM_SCHED_TEST
+bool je_arm_sched_guard_fault_check(const je_arm_trapframe *tf, uint64_t ec);
+#endif
+
 /* MP1 reentrancy guard (vectors.S): 0 outside a handler, 1 inside. A nested
  * synchronous fault (fault while handling) trips je_arm_double_fault. Plain byte,
  * single CPU, no atomics (ADR 0002: no exclusives pre-MMU). In .data so it is a
@@ -358,6 +362,13 @@ _Noreturn void je_arm_exception(je_arm_trapframe *tf)
 #ifdef JE_ARM_MMU_FAULT
     mmu_fault_check(tf, ec);
 #endif
+#ifdef JE_ARM_SCHED_TEST
+    if (je_arm_sched_guard_fault_check(tf, ec)) {
+        console_write("JeiOS/aarch64: sched guard PASS (thread guard translation fault; FAR==guard; ELR==store site)\r\n");
+    } else {
+        console_write("JeiOS/aarch64: FATAL sched guard mismatch\r\n");
+    }
+#endif
     console_write("JeiOS/aarch64: exception handled; halted\r\n");
     for (;;) __asm__ volatile("wfe");
 }
@@ -421,6 +432,18 @@ extern uint64_t je_arm_mmu_last_audit_leaves;
 extern uint8_t _text[], _end[];   /* IMAGE extent [_text, _end), linker.ld */
 extern uint8_t __text_end[], __rodata_end[], __data_end[];
 extern uint8_t __stack_guard[], __stack_bottom[];
+
+je_pages *je_arm_scheduler_pages(void)
+{
+    return &je_arm_pages;
+}
+
+void je_arm_sched_init(void);
+void *je_arm_sched_irq(je_arm_trapframe *tf);
+void *je_arm_sched_no_tick(je_arm_trapframe *tf);
+#ifdef JE_ARM_SCHED_TEST
+_Noreturn void je_arm_sched_test(void);
+#endif
 
 static inline uint64_t read_id_aa64mmfr0_el1(void)
 {
@@ -1069,7 +1092,7 @@ static void timer_poll_proof(void)
  * masked by exception entry. This path performs no allocation, blocking,
  * console I/O or unmasking. The assembly saver owns the transient guard and
  * restores ELR/SPSR/GPRs after this function returns. */
-void je_arm_irq(const je_arm_trapframe *tf)
+void *je_arm_irq(je_arm_trapframe *tf)
 {
     /* Sample at handler entry, before ACK/EOI can change interrupt status. */
     const uint64_t isr = je_arm_read_isr_el1();
@@ -1098,6 +1121,7 @@ void je_arm_irq(const je_arm_trapframe *tf)
             evidence->heartbeat = 0u;
 #endif
         }
+        return je_arm_sched_irq(tf);
     } else if (status == JE_ERR_BUSY) {
         /* A timer line that re-pended benignly was acknowledged and EOIRed by
          * gic.c but did not produce a tick. Retain the last wakeup evidence
@@ -1116,6 +1140,7 @@ void je_arm_irq(const je_arm_trapframe *tf)
         je_arm_irq_last_busy_wakeup.heartbeat = 0u;
 #endif
         ++je_arm_irq_busy_wakeups;
+        return je_arm_sched_no_tick(tf);
     } else if (status != JE_OK) {
         /* status == JE_ERR_INVALID: an UNEXPECTED non-spurious INTID. Only
          * INTID 30 is ever enabled (je_gic_init), so this is a hard invariant
@@ -1129,6 +1154,7 @@ void je_arm_irq(const je_arm_trapframe *tf)
         console_write("\r\n");
         halt();
     }
+    return je_arm_sched_no_tick(tf);
 }
 
 #ifdef JE_ARM_TIMER_TEST
@@ -1425,7 +1451,11 @@ _Noreturn void je_arm_main(void)
     dtb_intake();
     physmem_bringup();
     mmu_bringup();
+    je_arm_sched_init();
     gic_timer_bringup();
+#ifdef JE_ARM_SCHED_TEST
+    je_arm_sched_test();
+#endif
 #ifdef JE_ARM_TIMER_TEST
     /* gic_timer_bringup has configured and armed the source; vectors were
      * installed before DTB/MMU/GIC work above. The canary loop performs the

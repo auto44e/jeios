@@ -1,5 +1,29 @@
 # Current ecosystem status
 
+Observed 2026-11-08T12:40Z (MP2 ADR 0013 scheduler). Branch `feat/mp2-sched` atop
+core main `18cfce6` (= merge of fix-gate PR #100). State: **ADR 0013 implemented /
+tested locally (host + QEMU) / planned (owner review, remote CI, physical ARM,
+independent human qualification) / not blocked.** PR to main is pending; this is
+not yet merged runtime and remote CI is not yet observed.
+
+MP2 is now functionally complete: D1 round-robin policy (`kernel/core/sched_rr.c`,
+arch-neutral; x86 `sched.c` untouched per D1), D4 ARM runtime MMU map/unmap with
+guarded per-thread stacks, and D2/D3/D5/D6/D7 the AArch64 switch seam + QEMU proof
+(`kernel/arch/aarch64/sched_arm.c`, the `vectors.S` returning-IRQ edit). Local
+verification at this branch: `make check`, `make integration`, `make aarch64`
+(normal + `ARM_SCHED_TEST=1`), the 9-profile ARM smoke matrix, the scheduler proof
+smoke (counter table + guard-page fault; `dispatched=24 = 8 preemptions + 16
+nonpreempt switch-ins`), the 10-mutation battery (each FIRED + killed by its named
+detector, no PASS), `make mutants` (31 killed / 1 equivalent / 0 survived / 0
+blocked / 1 skipped, incl. the 4 RR-* policy mutants), and runner `--selftest`.
+Evidence: [`audit/evidence/2026-11-mp2-sched.md`](audit/evidence/2026-11-mp2-sched.md).
+AI-assisted implementation and cross-lineage review, not independent human
+qualification. The pre-MP3 ADR 0014 lifecycle-ownership blocker is unchanged.
+
+---
+
+## Historical checkpoint (2026-11-06, fix-gate closure)
+
 Observed 2026-11-06 (fix-gate closure). Core main at the merge of fix-gate PRs
 #94 (F01/F02), #97 (F03), #98 (F04–F06), #99 (F07–F11), and the F12–F14 PR that
 adds this closure. Mobile main `9221701ab2d5333978a294f54574ee384f4216e3` (pin

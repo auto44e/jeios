@@ -219,8 +219,19 @@ je_arm_irq_common:
     mov     x0, sp
     bl      je_arm_irq
 
-    /* C returned without changing the saved context. Clear the guard before
-     * restoring registers; the following eret is the successful return point. */
+    /*
+     * C returns the exact, fully validated frame to resume.  Keep the old
+     * frame live until the alignment fail-safe has passed: a bad return must
+     * never redirect SP to an unchecked address.  x0 is not touched by the
+     * guard clear, so it remains the selected frame pointer.
+     */
+    tst     x0, #0xf
+    b.ne    je_arm_double_fault
+#ifndef JE_ARM_SCHED_MUTANT_DROP_MOV_SP
+    mov     sp, x0
+#endif
+
+    /* Clear the transient guard before restoring the selected context. */
     adrp    x17, je_arm_in_handler
     add     x17, x17, #:lo12:je_arm_in_handler
     strb    wzr, [x17]
@@ -231,9 +242,12 @@ je_arm_irq_common:
     msr     ELR_EL1, x0
     msr     SPSR_EL1, x1
 
-    /* Restore every GPR from the frozen frame. The original interrupted SP is
-     * deliberately NOT loaded from tf->sp: the frame is unwound from the known
-     * current SP so a corrupted field cannot redirect the exception stack. */
+    /*
+     * Restore every GPR from the selected frozen frame.  tf->sp is validated
+     * by C but is deliberately not loaded here: add sp,#JE_TF_SIZE lands at
+     * the selected context's saved interrupted SP (stack_top for a fresh
+     * frame, or the interrupted SP for a preempted frame).
+     */
     ldp     x0,  x1,  [sp, #(JE_TF_GPR + 0)]
     ldp     x2,  x3,  [sp, #(JE_TF_GPR + 16)]
     ldp     x4,  x5,  [sp, #(JE_TF_GPR + 32)]
@@ -247,7 +261,16 @@ je_arm_irq_common:
     ldp     x20, x21, [sp, #(JE_TF_GPR + 160)]
     ldp     x22, x23, [sp, #(JE_TF_GPR + 176)]
     ldp     x24, x25, [sp, #(JE_TF_GPR + 192)]
+#ifndef JE_ARM_SCHED_MUTANT_DROP_HIGH_REG_RESTORE
     ldp     x26, x27, [sp, #(JE_TF_GPR + 208)]
+#else
+    /*
+     * Test mutant only: omit the pair restore and poison x26 with the
+     * already-restored low-register value.  This keeps the negative profile
+     * deterministic while preserving the production hand-off byte-for-byte.
+     */
+    mov     x26, x0
+#endif
     ldp     x28, x29, [sp, #(JE_TF_GPR + 224)]
     ldr     x30,      [sp, #(JE_TF_GPR + 240)]
     add     sp, sp, #JE_TF_SIZE
