@@ -1,12 +1,18 @@
 # ADR 0015: MP3a — AArch64 EL0 userspace boundary and the SVC syscall ABI
 
-Status: **proposed / owner-gated** (2026-11-08). MP3a is the ARM analogue of the
-x86 M3a boundary (ADR 0007): the first EL0 (ring-3) user/kernel boundary on
-aarch64 — per-process address spaces, a validated EL0 entry/return, and a bounded
-SVC syscall ABI. This ADR freezes the three contract decisions that MP3a needs and
-that change previously-tested ARM code (the MP2 MMU audit, the frozen trap frame,
-the EL1h scheduler validator) and so require owner sign-off before any code. It
-reuses the x86 security *shape* of ADR 0007 (D3 ownership/alias/no-W+X, D6
+Status: **accepted** (owner-approved 2026-11-08; proposed earlier the same day).
+The owner approved all three decisions and all 7 owner-gated items, with flex
+latitude on the specific values (arena VA, the exact EL0 leaf literals, the table
+cap, the audit-rule wording), and directed that **once MP3 is entirely complete the
+planning agent audits the result and adjusts if needed** — so the figures below are
+the implementation starting point, not an immutable freeze, and a later
+planning-agent audit may revise them without reopening the decision shape (D1
+shared-TTBR0 / defer-relink, D2 SVC register ABI, D3 one frozen frame). MP3a is the
+ARM analogue of the x86 M3a boundary (ADR 0007): the first EL0 (ring-3) user/kernel
+boundary on aarch64 — per-process address spaces, a validated EL0 entry/return, and
+a bounded SVC syscall ABI. It changes previously-tested ARM code (the MP2 MMU audit,
+the frozen trap frame, the EL1h scheduler validator) under that approval. It reuses
+the x86 security *shape* of ADR 0007 (D3 ownership/alias/no-W+X, D6
 validate-on-every-return, D8/D10 ABI) on ARM mechanisms. Reviewed baseline:
 `main` 0a4762f (post-MP2 scheduler + ADR 0014 lifecycle extraction).
 
