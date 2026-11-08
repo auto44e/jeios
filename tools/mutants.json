@@ -465,6 +465,34 @@
         "ASAN_OPTIONS": "detect_leaks=0"
       },
       "enabled": true
+    },
+    {
+      "id": "LC-ONDYING-FAIL-PROPAGATE",
+      "invariant": "je_lc_on_dying must propagate a je_proc_on_dying failure (not swallow it) so the run-queue caller fail-stops instead of publishing an inconsistent dying slot (ADR 0014)",
+      "file": "kernel/core/lifecycle.c",
+      "find": "    return je_proc_on_dying(process_pool, proc_id, reason, code);",
+      "replace": "    (void)je_proc_on_dying(process_pool, proc_id, reason, code); return JE_OK;",
+      "build": "build/0/test_proc_lifecycle",
+      "run": "build/0/test_proc_lifecycle",
+      "killer": "test_proc_lifecycle: test_on_dying_failure_propagates asserts an invalid reason makes je_lc_on_dying return non-OK",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
+    },
+    {
+      "id": "LC-ONDYING-ORDER-DEVHOOK",
+      "invariant": "je_lc_on_dying must run the device dying hook while the PROCESS record is still LIVE, before je_proc_on_dying transitions it (ordering pinned by the neutral conformance suite; ADR 0014)",
+      "file": "kernel/core/lifecycle.c",
+      "find": "    je_device_on_process_dying(je_kernel_device(), proc_id);\n#endif\n    return je_proc_on_dying(process_pool, proc_id, reason, code);",
+      "replace": "#endif\n    je_status r = je_proc_on_dying(process_pool, proc_id, reason, code);\n#ifndef JE_SCHED_HOSTED_TEST\n    je_device_on_process_dying(je_kernel_device(), proc_id);\n#endif\n    return r;",
+      "build": "build/0/test_proc_lifecycle",
+      "run": "build/0/test_proc_lifecycle",
+      "killer": "test_proc_lifecycle: test_on_dying_fault asserts the record is LIVE when the device-dying hook runs",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
     }
   ]
 }

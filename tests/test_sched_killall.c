@@ -28,6 +28,7 @@
 
 #define static
 #include "../kernel/core/sched.c"
+#include "../kernel/core/lifecycle.c"
 #undef static
 
 static unsigned g_checks;

@@ -18,7 +18,7 @@ CPPFLAGS += -DJE_DEV_COPY_INJECT
 endif
 CFLAGS := -std=c11 -O2 -g $(WARN) -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -m64 -march=x86-64 -mno-red-zone -mgeneral-regs-only
 CORE := kernel/core/status.c kernel/core/features.c kernel/core/module.c kernel/core/boot.c kernel/core/alloc.c
-SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/handle.c kernel/core/endpoint.c kernel/core/endpoint_kern.c kernel/core/device.c kernel/core/proc.c kernel/core/image.c kernel/core/spawn.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
+SOURCES := $(CORE) kernel/core/kheap.c kernel/core/sched.c kernel/core/lifecycle.c kernel/core/memory.c kernel/core/vm.c kernel/core/uframe.c kernel/core/syscall.c kernel/core/usercopy.c kernel/core/handle.c kernel/core/endpoint.c kernel/core/endpoint_kern.c kernel/core/device.c kernel/core/proc.c kernel/core/image.c kernel/core/spawn.c kernel/core/main.c kernel/arch/x86_64/platform.c kernel/arch/x86_64/trap.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/vm_backend.c
 USER_WARN := -Wall -Wextra -Werror -Wconversion -Wshadow -Wstrict-prototypes
 USER_CFLAGS := -std=c11 -O2 $(USER_WARN) -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -m64 -march=x86-64 -mcmodel=small -mno-red-zone -mgeneral-regs-only -fno-tree-loop-distribute-patterns -DJE_TEST_MODE=$(TEST_MODE) -Iuser/include -Iinclude
 USER_LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 -z noexecstack -Wl,--build-id=none
@@ -81,7 +81,7 @@ $(BUILD)/kernel/core/image.o: kernel/core/image.c $(USER_GENERATED) $(USER_GENER
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_paging_bits $(BUILD)/test_gic_bits $(BUILD)/test_vm $(BUILD)/test_usercopy $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_lifecycle_order $(BUILD)/test_sched_rr $(BUILD)/test_device $(IMAGE_REG_TESTS)
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_paging_bits $(BUILD)/test_gic_bits $(BUILD)/test_vm $(BUILD)/test_usercopy $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_lifecycle_order $(BUILD)/test_proc_lifecycle $(BUILD)/test_sched_rr $(BUILD)/test_device $(IMAGE_REG_TESTS)
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
@@ -102,6 +102,7 @@ test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_ph
 	./$(BUILD)/test_image
 	./$(BUILD)/test_sched_killall
 	./$(BUILD)/test_lifecycle_order
+	./$(BUILD)/test_proc_lifecycle
 	./$(BUILD)/test_sched_rr
 	./$(BUILD)/test_device
 	for t in $(IMAGE_REG_TESTS); do ./$$t || exit 1; done
@@ -119,6 +120,8 @@ check: all test
 	@nm --defined-only $(BUILD)/kernel/core/main.o | awk 'NF==3 && $$2 ~ /[A-Z]/ {print $$3}' | sort -u > $(BUILD)/main_def.txt
 	@test -s $(BUILD)/spawn_undef.txt && test -s $(BUILD)/main_def.txt
 	@! comm -12 $(BUILD)/spawn_undef.txt $(BUILD)/main_def.txt | grep .
+	@echo "Lifecycle boundary (ADR 0014): neutral module has no x86 tokens and compiles arch-neutral"
+	@sh tools/check_lifecycle_boundary.sh
 # Critical-mutant assurance (issue #18/#19, "curl-style" local CI). For each named
 # critical mutant, tools/mutants.py applies a precise reversible source transform
 # that BREAKS one security/correctness invariant, rebuilds the one hosted test that
@@ -252,7 +255,7 @@ $(BUILD)/test_image_registry_%: tests/test_image_registry.c kernel/core/image.c 
 # ADR 0010 D12: hosted coverage uses the production scheduler and PROCESS pool.
 # Private scheduler state is exposed only by the test TU; section GC discards
 # unrelated architecture-dependent scheduler entry points.
-$(BUILD)/test_sched_killall: tests/test_sched_killall.c kernel/core/sched.c kernel/core/proc.c $(wildcard include/jeios/*.h)
+$(BUILD)/test_sched_killall: tests/test_sched_killall.c kernel/core/sched.c kernel/core/lifecycle.c kernel/core/proc.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -ffunction-sections -fdata-sections \
 	  -fsanitize=address,undefined -fno-sanitize-recover=all \
@@ -263,11 +266,19 @@ $(BUILD)/test_sched_killall: tests/test_sched_killall.c kernel/core/sched.c kern
 # BEFORE the extraction so it can be proven to preserve the sequence. Compiled
 # WITHOUT JE_SCHED_HOSTED_TEST so the device-death hooks are present and
 # observable. Links the real proc.c.
-$(BUILD)/test_lifecycle_order: tests/test_lifecycle_order.c kernel/core/sched.c kernel/core/proc.c $(wildcard include/jeios/*.h)
+$(BUILD)/test_lifecycle_order: tests/test_lifecycle_order.c kernel/core/sched.c kernel/core/lifecycle.c kernel/core/proc.c $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -ffunction-sections -fdata-sections \
 	  -fsanitize=address,undefined -fno-sanitize-recover=all \
 	  tests/test_lifecycle_order.c kernel/core/proc.c -Wl,--gc-sections -o $@
+
+# ADR 0014 D3: neutral conformance suite. Links lifecycle.c as its own TU (not
+# #included) + the real proc.c, with recording fakes, WITHOUT JE_SCHED_HOSTED_TEST
+# so the device hooks inside je_lc_on_dying are observed.
+$(BUILD)/test_proc_lifecycle: tests/test_proc_lifecycle.c kernel/core/lifecycle.c kernel/core/proc.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  tests/test_proc_lifecycle.c kernel/core/lifecycle.c kernel/core/proc.c -o $@
 
 # ADR 0013 D1: pure arch-neutral scheduler policy with fake frames and hooks.
 $(BUILD)/test_sched_rr: tests/test_sched_rr.c kernel/core/sched_rr.c $(wildcard include/jeios/*.h)
