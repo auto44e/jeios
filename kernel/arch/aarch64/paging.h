@@ -52,6 +52,25 @@ typedef struct {
     je_map_class cls;
 } je_map_region;
 
+typedef enum {
+    JE_ARM_AUDIT_REJECT_NONE = 0,
+    JE_ARM_AUDIT_REJECT_LEDGER,
+    JE_ARM_AUDIT_REJECT_COUNT,
+    JE_ARM_AUDIT_REJECT_ROOT,
+    JE_ARM_AUDIT_REJECT_MALFORMED,
+    JE_ARM_AUDIT_REJECT_FOREIGN,
+    JE_ARM_AUDIT_REJECT_REVISIT,
+    JE_ARM_AUDIT_REJECT_UNREACHED,
+    JE_ARM_AUDIT_REJECT_LEAF,
+    JE_ARM_AUDIT_REJECT_ALIAS,
+    JE_ARM_AUDIT_REJECT_PRECONDITION
+} je_arm_mmu_audit_reject;
+
+/* Last pre-enable audit diagnostics. These are observability state only; the
+ * enable gate remains je_arm_last_audited in paging.c. */
+extern je_arm_mmu_audit_reject je_arm_mmu_last_audit_reject;
+extern uint64_t je_arm_mmu_last_audit_reads;
+
 /*
  * Opaque MMU bring-up context. Holds the root table physical address and a
  * handle to the allocator the builder draws table frames from. Lives in the

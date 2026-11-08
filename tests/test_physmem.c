@@ -183,6 +183,24 @@ static void test_predicate(void)
     assert(!pf(&s1, R0 + R0SZ - P));
     assert(pf(&s1, R0 + R0SZ - 2u * P));
 
+    /* Wrapping RAM ranges fail closed in range_contains_page: the high page is
+     * not considered contained even though the wrapping arithmetic would make
+     * a naive end comparison appear to accept it. */
+    je_boot_ctx wrap_ram = c;
+    wrap_ram.ram[0] = (je_range){UINT64_MAX - 3u * P, 4u * P};
+    assert(!pf(&wrap_ram, wrap_ram.ram[0].base));
+
+    /* The same checked range-end contract is used by range_intersects_page:
+     * a wrapping reservation covers its high-side page, so that page is not
+     * released even when it is otherwise in RAM. */
+    je_boot_ctx wrap_rsv;
+    memset(&wrap_rsv, 0, sizeof wrap_rsv);
+    wrap_rsv.ram_count = 1u;
+    wrap_rsv.ram[0] = (je_range){UINT64_MAX - 3u * P, P};
+    wrap_rsv.rsv_count = 1u;
+    wrap_rsv.rsv[0] = (je_range){UINT64_MAX - 3u * P, 4u * P};
+    assert(!pf(&wrap_rsv, wrap_rsv.ram[0].base));
+
     /* Three RAM ranges with gaps; probe pages in the LAST range (catches a
      * short RAM loop bound). */
     je_boot_ctx m;

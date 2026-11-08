@@ -28,9 +28,12 @@ je_status je_boot_parse(const void *data, size_t accessible, uint64_t physical,
         return JE_ERR_INVALID;
     je_boot_context draft = {0};
     draft.boot_bytes = total;
-    (void)reserve(&draft,0,0x100000);
-    (void)reserve(&draft,kernel_begin,kernel_end);
-    (void)reserve(&draft,physical,physical+total);
+    je_status s = reserve(&draft,0,0x100000);
+    if (s != JE_OK) return s;
+    s = reserve(&draft,kernel_begin,kernel_end);
+    if (s != JE_OK) return s;
+    s = reserve(&draft,physical,physical+total);
+    if (s != JE_OK) return s;
     bool found_map = false, found_end = false;
     for (size_t offset = 8; offset < total;) {
         if (total-offset < 8) return JE_ERR_INVALID;
@@ -67,7 +70,7 @@ je_status je_boot_parse(const void *data, size_t accessible, uint64_t physical,
             bool terminated = false;
             for (size_t j=16;j<size;++j) if (p[offset+j]==0) { terminated=true;break; }
             if (!terminated) return JE_ERR_INVALID;
-            je_status s = reserve(&draft,u32(p+offset+8),u32(p+offset+12));
+            s = reserve(&draft,u32(p+offset+8),u32(p+offset+12));
             if (s != JE_OK) return s;
         }
         offset += step;

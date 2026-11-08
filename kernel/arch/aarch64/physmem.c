@@ -1,15 +1,36 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "physmem.h"
 
+static bool checked_range_end(je_range range, uint64_t *out_end)
+{
+    if (!out_end || range.size > UINT64_MAX-range.base) return false;
+    *out_end = range.base + range.size;
+    return true;
+}
+
+static bool checked_page_end(uint64_t phys, uint64_t *out_end)
+{
+    if (!out_end || phys > UINT64_MAX-JE_PAGE_SIZE) return false;
+    *out_end = phys + JE_PAGE_SIZE;
+    return true;
+}
+
 static bool range_contains_page(je_range range, uint64_t phys)
 {
-    uint64_t page_end = phys + JE_PAGE_SIZE;
-    return range.base <= phys && page_end <= range.base + range.size;
+    uint64_t page_end, range_end;
+    if (!checked_page_end(phys, &page_end) ||
+        !checked_range_end(range, &range_end)) return false;
+    return range.base <= phys && page_end <= range_end;
 }
 
 static bool range_intersects_page(je_range range, uint64_t phys)
 {
-    uint64_t page_end = phys + JE_PAGE_SIZE;
+    uint64_t page_end, range_end;
+    /* A page whose own end wraps past 2^64 cannot be proven disjoint from a
+     * reserved range, so fail SAFE (report it as intersecting/reserved) rather
+     * than as free. je_arm_page_free rejects such a phys upstream, so this is
+     * unreachable live, but the predicate is documented total and safe-to-reuse. */
+    if (!checked_page_end(phys, &page_end)) return true;
     /* A range whose base+size wraps past 2^64 would make the half-open end
      * compare below the base and the intersection test fail OPEN (reporting a
      * reserved page as free). The FDT parser already rejects overflowing ranges
@@ -17,9 +38,8 @@ static bool range_intersects_page(je_range range, uint64_t phys)
      * unreachable in the live boot; but the predicate is documented as total and
      * safe to reuse, so treat an overflowing reserved range as covering
      * everything from its base up (fail SAFE). */
-    if (range.size > UINT64_MAX - range.base)
+    if (!checked_range_end(range, &range_end))
         return phys >= range.base || page_end > range.base;
-    uint64_t range_end = range.base + range.size;
     return phys < range_end && range.base < page_end;
 }
 

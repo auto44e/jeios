@@ -8,7 +8,12 @@
 
 /* Copy between kernel storage and a user arena span. Prevalidate presence +
  * permission for every page, copy through the approved assembly site, and
- * recover a not-present fault there to JE_ABI_INVALID. Zero length is OK and
+ * recover a not-present fault there to JE_ABI_INVALID. A nonzero-length call
+ * rejects a NULL kernel buffer before scheduler/scope access. The caller must
+ * not nest copies while another copy scope is active; a nested call is
+ * rejected and leaves the outer scope intact. The copy assumes interrupts are
+ * disabled and no scheduling occurs for its duration on the single CPU; this
+ * contract does not promise SMP or per-CPU behavior. Zero length is OK and
  * touches neither pointer. No user pointer is retained. */
 je_abi_status je_copy_from_user(void *kdst, uint64_t usrc, uint64_t len);
 je_abi_status je_copy_to_user(uint64_t udst, const void *ksrc, uint64_t len);

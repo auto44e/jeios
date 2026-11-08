@@ -42,8 +42,9 @@ typedef enum { COPY_NONE = 0, COPY_FROM_USER = 1, COPY_TO_USER = 2 } copy_dir;
 
 /* The single active copy scope. One copy runs at a time (single CPU, interrupts
  * disabled, no scheduling during a copy — ADR D10), so a single record suffices.
- * `owner` pins it to the process whose span it describes. Cleared on EVERY exit
- * path (success, validation failure, fault recovery). */
+ * `owner` pins it to the process whose span it describes. The scope is set only
+ * after full validation and is cleared only on the post-run path; validation
+ * failures return before it is set. */
 static struct copy_scope {
     int       active;
     copy_dir  dir;
@@ -99,11 +100,13 @@ static int span_pages_ok(je_vm *vm, uint32_t index, uint64_t addr, uint64_t len,
 static je_abi_status copy_core(copy_dir dir, void *kptr, uint64_t uaddr, uint64_t len)
 {
     if (len == 0) return JE_ABI_OK;          /* touches neither pointer */
+    if (kptr == NULL) return JE_ABI_INVALID;
     je_vm *vm; uint32_t index;
     if (je_sched_current_user(&vm, &index) != JE_OK || !vm || !vm->ops) return JE_ABI_INVALID;
     if (!span_structure_ok(uaddr, len)) return JE_ABI_INVALID;
     int need_write = (dir == COPY_TO_USER);
     if (!span_pages_ok(vm, index, uaddr, len, need_write)) return JE_ABI_INVALID;
+    if (g_scope.active) return JE_ABI_INVALID;   /* no nesting; outer scope intact */
 
     g_scope.active = 1; g_scope.dir = dir;
     g_scope.user_lo = uaddr; g_scope.user_hi = uaddr + len;

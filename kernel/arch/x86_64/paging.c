@@ -8,6 +8,34 @@ static uint64_t pd[512] __attribute__((aligned(4096)));
 static uint64_t pt[512][512] __attribute__((aligned(4096)));
 static int active;
 static uint64_t nx;
+/* A restore is valid only for a page whose exact leaf was cleared by guard.
+ * This bitmap is the ownership record; a zero leaf alone also describes a
+ * never-mapped hole. */
+#define JE_GUARDED_PAGE_COUNT (JE_PHYSICAL_LIMIT / JE_PAGE_SIZE)
+#define JE_GUARDED_WORD_COUNT ((JE_GUARDED_PAGE_COUNT + 63u) / 64u)
+static uint64_t guarded_pages[JE_GUARDED_WORD_COUNT];
+
+static size_t guarded_bit(uintptr_t a)
+{ return (size_t)(a / (uintptr_t)JE_PAGE_SIZE); }
+
+static bool page_was_guarded(uintptr_t a)
+{
+    size_t bit = guarded_bit(a);
+    return (guarded_pages[bit / 64u] & (UINT64_C(1) << (bit % 64u))) != 0;
+}
+
+static void mark_page_guarded(uintptr_t a)
+{
+    size_t bit = guarded_bit(a);
+    guarded_pages[bit / 64u] |= UINT64_C(1) << (bit % 64u);
+}
+
+static void clear_page_guarded(uintptr_t a)
+{
+    size_t bit = guarded_bit(a);
+    guarded_pages[bit / 64u] &= ~(UINT64_C(1) << (bit % 64u));
+}
+
 static void map_pages(uint64_t begin, uint64_t end)
 {
     if (begin < 0x100000) begin = 0x100000;
@@ -20,6 +48,9 @@ static void map_pages(uint64_t begin, uint64_t end)
 je_status je_arch_paging_init(const je_boot_context *ctx)
 {
     if (!ctx || !ctx->valid || active) return JE_ERR_INVALID;
+    if (ctx->map_count > JE_BOOT_MAP_MAX) return JE_ERR_INVALID;
+    for (size_t i=0;i<ctx->map_count;++i)
+        if (ctx->map[i].length > UINT64_MAX-ctx->map[i].base) return JE_ERR_INVALID;
     nx = je_arch_has_nx() ? UINT64_C(1)<<63 : 0;
     pml4[0]=(uintptr_t)pdpt|3; pdpt[0]=(uintptr_t)pd|3;
     for (size_t i=0;i<512;++i) pd[i]=(uintptr_t)pt[i]|3;
@@ -64,6 +95,7 @@ je_status je_arch_page_guard(uintptr_t a)
     uint64_t leaf = pt[a>>21][(a>>12)&511] & ~UINT64_C(0x60);
     if (leaf != ((uint64_t)a|3|nx)) return JE_ERR_INVALID;
     pt[a>>21][(a>>12)&511]=0;
+    mark_page_guarded(a);
     __asm__ volatile("invlpg (%0)"::"r"(a):"memory");
     return JE_OK;
 }
@@ -72,8 +104,10 @@ je_status je_arch_page_restore(uintptr_t a)
 {
     if (!active || (a&4095) || a>=JE_PHYSICAL_LIMIT || a<0x100000 ||
         (a>=(uintptr_t)__kernel_start && a<(uintptr_t)__kernel_end)) return JE_ERR_INVALID;
+    if (!page_was_guarded(a)) return JE_ERR_INVALID;
     if (pt[a>>21][(a>>12)&511]) return JE_ERR_INVALID;
     pt[a>>21][(a>>12)&511]=(uint64_t)a|3|nx;
+    clear_page_guarded(a);
     __asm__ volatile("invlpg (%0)"::"r"(a):"memory");
     return JE_OK;
 }
