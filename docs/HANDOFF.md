@@ -1,5 +1,129 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Current status — MP3a-1 adversarial fix pass — observed 2026-11-08T23:29:54Z
+
+Repository `/tmp/wt-mp3a1`, branch `wip/mp3a1`, exact inspected base commit
+`8cb1f3d1d0fd9ede667db1014cdd86729a7ae510` (the implementation commit; this status refresh is a
+documentation-only descendant). State: **implemented / tested locally /
+planned (owner review,
+remote CI, physical ARM and independent human qualification) / not blocked**.
+This is AI-assisted evidence, not human or release qualification. Support tier:
+**QEMU 8.2.2 only**. No push, PR publication, reviewer assignment or release
+was performed. `MP3A1-BRIEF.md` is pre-existing, untracked, and untouched.
+
+### Implemented
+
+Files changed: `kernel/core/vm.c`,
+`kernel/arch/aarch64/{main.c,paging.c,paging.h,sched_arm.c,vm_backend.c}`,
+`tools/{smoke_arm.py,mutants.json,run_arm_user_test.py}`, this handoff, and
+`docs/IMPLEMENTATION.md`. Existing review briefs and debate attachments were
+preserved and not added.
+
+The ARM backend now builds per-process TTBR0 roots that copy the decorated
+kernel L0 entries and add a private arena branch at VA
+`0x0000100000000000`. The three EL0 leaf classes are exact and audited:
+code `0x0020000000000fc3` (EL0 RX), rodata `0x0060000000000fc3` (EL0 R), and
+data `0x0060000000000f43` (EL0 RW). Kernel leaves remain AP[1]==0. The
+separate per-process audit additionally rejects valid arena L1/L2 upper entries,
+a mapped guard, shifted stack leaves, and foreign/out-of-window process-table
+pointers before dereference. The pre-enable kernel audit and kernel map were
+not changed semantically.
+
+The EL1 proof uses `AT S1E0R/W`; it does not execute at EL0 and does not add
+SVC or a user trapframe. TTBR0 install is wired for user ASID 1 and kernel
+ASID 0 with `ASIDE1IS; DSB ISH; ISB`, operand recording, TTBR0 readback, and
+an ELF instruction check. The dead `je_arm_sched_bind_user_root` seam was
+removed; MP3a-2 must add root ownership and unbind on slot free/reuse before
+dispatch can install process roots. SP_EL1 installation is deferred to MP3a-2
+because changing it in this C seam would invalidate the active EL1 stack
+context.
+
+USER_CODE and USER_RODATA publication now enters the paging.c W^X ledger and
+clear-PTE removes the ledger entry; the in-proof RW alias returns
+`JE_ERR_DENIED`. USER_DATA remains RW and UXN without a W^X entry. The user
+oracle prints and ELF-checks probe VAs, requires level-3 permission faults
+`0x...081f` for kernel/device/write-denial probes, and checks TTBR0 root+ASID.
+The table cap is 256 and the user profile prebuilds L3 paths for the 256 MiB
+managed RAM window. Its pre-enable audit evidence was
+`cycles=0x000000000051df1f reads=0x0000000001081800`. The cycle value is a
+QEMU CNTVCT execution-counter sample, not a wall-clock qualification; reads
+are the stable descriptor-input count.
+
+### Verification
+
+Exact commands and observed results:
+
+```text
+make aarch64                                  PASS
+make aarch64 ARM_USER_TEST=1                  PASS
+make smoke-aarch64 ARM_USER_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60
+                                               PASS
+make smoke-aarch64 ARM_REQUIRE=1              PASS
+make smoke-aarch64 ARM_SCHED_TEST=1 ARM_REQUIRE=1
+                                               PASS
+make smoke-aarch64 ARM_MMU_FAULT=text ARM_REQUIRE=1
+                                               PASS
+make check                                    PASS
+make mutants                                  PASS
+git diff --check                              PASS
+python3 -m py_compile tools/smoke_arm.py tools/run_arm_user_test.py
+                                               PASS
+```
+
+The user-test oracle independently checked the following observed values:
+
+```text
+P1 root 0x0000000040105000, P2 root 0x0000000040115000
+TTBR0: 0x0001000040105000 / 0x0001000040115000 (ASID 1)
+kernel AT S1E0R/W: PAR 0x000000000000081f / 0x000000000000081f (fault)
+UART/GICD AT S1E0R: 0x000000000000081f / 0x000000000000081f (fault)
+P1 code R/W:       PAR 0xff00000040109b80 / 0x000000000000081f
+P1 data W:         PAR 0xff0000004010bb80
+P1 rodata R/W:     PAR 0xff0000004010ab80 / 0x000000000000081f
+P2 data R:         PAR 0xff0000004011bb80
+W^X alias:          code-pa=0x0000000040109000 status=DENIED
+same-VA data PA:   0x4010b000 != 0x4011b000
+ASIDE1IS operand:  0x0001000000000000 for both installs
+audit marker:      user-test audit PASS
+terminal:          user-test PASS reviewed-tlb=not-observed
+```
+
+All requested ARM profiles and x86 `make check` passed locally. The full
+hosted check passed the unchanged paging-bit suite and all existing kernel
+tests. The current user Image SHA-256 is
+`3494a76dcdd3fb79b850964976dcc537025605224e3264dbd7224e7a2c74b0e5`.
+
+B1 scratch re-injections were negative as required: stray arena L1[1] and L2[1]
+each built with `build_rc=0` and stopped with `smoke_rc=2`,
+`FATAL user-test audit-p1`; the shifted-stack/guard injection did the same.
+
+`make mutants` reported `41 killed, 1 equivalent, 0 SURVIVED, 0 BLOCKED,
+1 skipped`. The eight new ARM mutants were all killed:
+skip-decorate-kernel-L0, wrong-root-for-p2, stray-arena-L1-entry,
+guard-page-shift, unmapped-kernel-probe, no-ASIDE1IS-TLBI,
+no-ASID-in-TTBR0, and map-user-code-frame-RW. The pre-existing enabled set
+remained `33 killed, 1 equivalent, 0 SURVIVED, 0 BLOCKED` before these
+additions.
+
+### Planned / blocked / not enforced
+
+Planned: owner review, remote CI, physical ARM reproduction, and independent
+human qualification. Not blocked. MP3a-2 is the next bounded task: add
+MMU-on mappings/cache maintenance for process tables and user frames, clear-PTE
+and TLBI lifecycle, root ownership/unbind on slot reuse, then install the
+process kstack in the safe EL0-return seam and add the user trapframe/entry.
+SVC remains outside this slice. EL0 execution, SVC, SP_EL1 handoff,
+MMU-on user-table teardown, cache/TLB staleness, SMP, dynamic loading,
+arbitrary hardware, remote CI, and independent human qualification are not
+claimed here.
+
+The TLBI/barrier order and cache maintenance are reviewed, not observed as
+hardware cache/TLB behavior under QEMU TCG. The backend intentionally fails
+closed rather than silently performing its MMU-off identity-pointer lifecycle
+after enable. The observed facts are the AT S1E0 fault/success results, exact
+PAR physical addresses, root/ASID readback, W^X refusal, root separation, and
+audit markers.
+
 ## ADR 0014 lifecycle extraction — observed 2026-11-08T20:00:36Z
 
 Repository `/tmp/wt-adr14-extract`, branch `wip/adr0014-extract`, exact

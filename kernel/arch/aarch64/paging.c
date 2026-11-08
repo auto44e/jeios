@@ -33,6 +33,7 @@
 #define JE_ARM_DESC_AP_SHIFT 6u
 #define JE_ARM_DESC_SH_SHIFT 8u
 #define JE_ARM_DESC_AF (UINT64_C(1) << 10)
+#define JE_ARM_DESC_NG (UINT64_C(1) << 11)
 #define JE_ARM_DESC_PXN (UINT64_C(1) << 53)
 #define JE_ARM_DESC_UXN (UINT64_C(1) << 54)
 #define JE_ARM_DESC_TABLE_AP_MASK (UINT64_C(3) << 61)
@@ -50,8 +51,13 @@
  * participates in the W^X test, which only looks at EXEC|WRITE. */
 #define JE_ARM_MAP_PRESENT UINT8_C(4)
 #define JE_ARM_MAP_RUNTIME UINT8_C(8)
+#define JE_ARM_MAP_USER UINT8_C(16)
 #define JE_ARM_EXTERNAL_FRAMES 64u
-#define JE_ARM_MAX_TABLES 128u
+/* Flex starting point for MP3a-1: 128 x 2 MiB RAM slots need one L3 each;
+ * the kernel's upper tables and device/image branches bring the QEMU 256 MiB
+ * profile to roughly 135 tables. 256 leaves review headroom for those tables
+ * and for a future bounded RAM profile without changing the audit shape. */
+#define JE_ARM_MAX_TABLES 256u
 
 /* MAIR_EL1: index 0 is Normal WB RA/WA; index 1 is Device-nGnRnE. */
 #define JE_ARM_MAIR_ATTR_NORMAL UINT64_C(0xff)
@@ -157,12 +163,12 @@ static bool class_valid(je_map_class cls)
 
 static bool class_executable(je_map_class cls)
 {
-    return cls == JE_MAP_TEXT;
+    return cls == JE_MAP_TEXT || cls == JE_MAP_USER_CODE;
 }
 
 static bool class_writable(je_map_class cls)
 {
-    return cls == JE_MAP_RW || cls == JE_MAP_DEVICE;
+    return cls == JE_MAP_RW || cls == JE_MAP_DEVICE || cls == JE_MAP_USER_DATA;
 }
 
 static uint8_t class_flags(je_map_class cls)
@@ -258,6 +264,13 @@ static bool table_frame(const je_arm_mmu *mmu, uint64_t physical)
 
 static uint64_t leaf_descriptor(uint64_t physical, je_map_class cls)
 {
+    if (cls == JE_MAP_USER_CODE)
+        return (physical & JE_ARM_DESC_ADDR_MASK) | JE_ARM_USER_CODE_BITS;
+    if (cls == JE_MAP_USER_RODATA)
+        return (physical & JE_ARM_DESC_ADDR_MASK) | JE_ARM_USER_RODATA_BITS;
+    if (cls == JE_MAP_USER_DATA)
+        return (physical & JE_ARM_DESC_ADDR_MASK) | JE_ARM_USER_DATA_BITS;
+
     uint64_t descriptor = (physical & JE_ARM_DESC_ADDR_MASK) |
                           JE_ARM_DESC_TABLE |
                           JE_ARM_DESC_AF;
@@ -268,8 +281,12 @@ static uint64_t leaf_descriptor(uint64_t physical, je_map_class cls)
     if (cls == JE_MAP_TEXT || cls == JE_MAP_RODATA) {
         descriptor |= UINT64_C(2) << JE_ARM_DESC_AP_SHIFT;
     }
-    if (cls != JE_MAP_TEXT) descriptor |= JE_ARM_DESC_PXN;
-    descriptor |= JE_ARM_DESC_UXN;
+    if (cls != JE_MAP_TEXT)
+        descriptor |= JE_ARM_DESC_PXN;
+    /* Preserve the frozen kernel TEXT literal (UXN=1, AP[1]=0); only the
+     * new EL0 USER_CODE class clears UXN. */
+    if (cls != JE_MAP_USER_CODE)
+        descriptor |= JE_ARM_DESC_UXN;
     return descriptor;
 }
 
@@ -325,6 +342,33 @@ static je_status map_page(je_arm_mmu *mmu, je_pages *pages,
                             (uint8_t)(class_flags(cls) | JE_ARM_MAP_PRESENT)))
         return JE_ERR_INVALID;
     l3[leaf_index] = leaf_descriptor(physical, cls);
+    return JE_OK;
+}
+
+static je_status ensure_l3_for_va(je_arm_mmu *mmu, je_pages *pages,
+                                  uint64_t virtual_address)
+{
+    uint64_t table_pa = mmu->root_pa;
+    for (unsigned level = 0u; level < 3u; ++level) {
+        uint64_t *table = table_pointer(table_pa);
+        size_t index = va_index(virtual_address, level);
+        uint64_t descriptor = table[index];
+        if ((descriptor & JE_ARM_DESC_VALID) == 0u) {
+            uint64_t child_pa = 0u;
+            je_status status = alloc_table(mmu, pages, &child_pa);
+            if (status != JE_OK) return status;
+            table[index] = table_descriptor(child_pa);
+            descriptor = table[index];
+        } else if ((descriptor & UINT64_C(3)) != JE_ARM_DESC_TABLE) {
+            return JE_ERR_INVALID;
+        }
+        if ((descriptor & (JE_ARM_DESC_TABLE_AP_MASK |
+                           JE_ARM_DESC_TABLE_PXN |
+                           JE_ARM_DESC_TABLE_UXN |
+                           JE_ARM_DESC_TABLE_NS)) != 0u)
+            return JE_ERR_INVALID;
+        table_pa = descriptor & JE_ARM_DESC_ADDR_MASK;
+    }
     return JE_OK;
 }
 
@@ -408,6 +452,48 @@ je_status je_arm_mmu_build(je_arm_mmu *mmu, je_pages *pages,
     return JE_OK;
 }
 
+je_status je_arm_mmu_prebuild_ram_l3(je_arm_mmu *mmu)
+{
+    const uint64_t l3_span = UINT64_C(0x200000);
+    const uint64_t ram_base = JE_PHYSICAL_BASE;
+    const uint64_t ram_end = JE_PHYSICAL_LIMIT;
+    if (!mmu || !mmu->valid || je_arm_enabled_context == mmu ||
+        mmu->pages == NULL || (ram_base & (l3_span - 1u)) != 0u ||
+        (ram_end & (l3_span - 1u)) != 0u)
+        return JE_ERR_INVALID;
+
+    /* The user-test profile calls this once, before the fresh audit. */
+    je_arm_last_audited = NULL;
+    const size_t first_new_table = mmu->table_count;
+    for (uint64_t va = ram_base; va < ram_end; va += l3_span) {
+        je_status status = ensure_l3_for_va(mmu, mmu->pages, va);
+        if (status != JE_OK) return status;
+    }
+
+    /*
+     * Identity-map only the table frames just added. The queue can grow while
+     * a table frame's identity leaf creates a missing hierarchy, although the
+     * RAM L3 prebuild makes that growth bounded and normally unnecessary.
+     */
+    size_t mapped_tables = first_new_table;
+    while (mapped_tables < mmu->table_count) {
+        uint64_t table_pa = mmu->table_pa[mapped_tables];
+        je_status status = map_page(mmu, mmu->pages, table_pa, table_pa, JE_MAP_RW);
+        if (status != JE_OK) return status;
+        ++mapped_tables;
+    }
+
+    mmu->table_start = mmu->table_pa[0];
+    mmu->table_end = mmu->table_pa[0] + JE_PAGE_SIZE;
+    for (size_t i = 1u; i < mmu->table_count; ++i) {
+        if (mmu->table_pa[i] < mmu->table_start)
+            mmu->table_start = mmu->table_pa[i];
+        uint64_t end = mmu->table_pa[i] + JE_PAGE_SIZE;
+        if (end > mmu->table_end) mmu->table_end = end;
+    }
+    return JE_OK;
+}
+
 /*
  * Independent audit of a leaf descriptor against the class's REQUIRED exact
  * bit pattern (ADR 0011 D4). This does NOT call leaf_descriptor() (a builder
@@ -425,12 +511,21 @@ je_status je_arm_mmu_build(je_arm_mmu *mmu, je_pages *pages,
  *   RODATA AP=10 PXN=1 UXN=1 SH=11 Attr0 -> 0x0060000000000783
  *   RW     AP=00 PXN=1 UXN=1 SH=11 Attr0 -> 0x0060000000000703
  *   DEVICE AP=00 PXN=1 UXN=1 SH=00 Attr1 -> 0x0060000000000407
- */
+ *
+ * MP3a-1 EL0 classes use the same documented fields:
+ *   valid+page 0b11 | AttrIdx[4:2] | AP[7:6] | SH[9:8] | AF | nG |
+ *   PXN[53] | UXN[54].
+ *   USER_CODE   = 0x3 | (0<<2) | (0b11<<6) | (0b11<<8) | (1<<10) |
+ *                 (1<<11) | (1<<53) | (0<<54) = 0x0020000000000fc3
+ *   USER_RODATA = USER_CODE with UXN[54] set = 0x0060000000000fc3
+ *   USER_DATA   = AP=0b01 (EL1+EL0 RW), UXN=1, PXN=1, nG=1 =
+ *                 0x0060000000000f43.
+ * AP[1] is descriptor bit 6; all three EL0 classes set it. USER_CODE is the
+ * only EL0-executable class, and no class is both writable and executable. */
 #define JE_ARM_LEAF_TEXT   UINT64_C(0x0040000000000783)
 #define JE_ARM_LEAF_RODATA UINT64_C(0x0060000000000783)
 #define JE_ARM_LEAF_RW     UINT64_C(0x0060000000000703)
 #define JE_ARM_LEAF_DEVICE UINT64_C(0x0060000000000407)
-
 static bool class_descriptor_matches(uint64_t descriptor, je_map_class cls)
 {
     uint64_t oa = descriptor & JE_ARM_DESC_ADDR_MASK;
@@ -441,19 +536,33 @@ static bool class_descriptor_matches(uint64_t descriptor, je_map_class cls)
     case JE_MAP_RODATA: return bits == JE_ARM_LEAF_RODATA;
     case JE_MAP_RW:     return bits == JE_ARM_LEAF_RW;
     case JE_MAP_DEVICE: return bits == JE_ARM_LEAF_DEVICE;
+    case JE_MAP_USER_CODE: return bits == JE_ARM_USER_CODE_BITS;
+    case JE_MAP_USER_RODATA: return bits == JE_ARM_USER_RODATA_BITS;
+    case JE_MAP_USER_DATA: return bits == JE_ARM_USER_DATA_BITS;
     default:            return false;
     }
 }
 
-/* Cross-check the per-class literals against the builder's own encoder at build
- * of paging.c: if leaf_descriptor and these literals ever diverge for the
- * governed (non-address) bits, that is a bug in ONE of them — but since they are
- * written independently, a compile-time agreement here means the AUDIT's notion
- * of "correct" matches the BUILDER's intended output for a KNOWN-GOOD encoder,
- * while still catching a RUNTIME-tampered or mis-encoded leaf (the literals are
- * the source of truth the audit compares installed descriptors against). This is
- * a sanity tie, not a substitute for the independent hosted encoder test. */
+/* The user literals are shared with vm_backend.c through paging.h. The hosted
+ * encoder test remains independent of both the encoder and the audit. */
 _Static_assert((JE_ARM_LEAF_TEXT & 0x3u) == 0x3u, "leaf literal must be a valid page");
+_Static_assert(JE_ARM_USER_CODE_BITS == UINT64_C(0x0020000000000fc3),
+               "EL0 code literal is pinned by the documented bit layout");
+_Static_assert(JE_ARM_USER_RODATA_BITS == UINT64_C(0x0060000000000fc3),
+               "EL0 rodata literal is pinned by the documented bit layout");
+_Static_assert(JE_ARM_USER_DATA_BITS == UINT64_C(0x0060000000000f43),
+               "EL0 data literal is pinned by the documented bit layout");
+_Static_assert((JE_ARM_USER_CODE_BITS & (UINT64_C(1) << 6)) != 0u &&
+               (JE_ARM_USER_RODATA_BITS & (UINT64_C(1) << 6)) != 0u &&
+               (JE_ARM_USER_DATA_BITS & (UINT64_C(1) << 6)) != 0u,
+               "EL0 classes must set AP[1]");
+_Static_assert((JE_ARM_USER_CODE_BITS & (UINT64_C(1) << 54)) == 0u &&
+               (JE_ARM_USER_RODATA_BITS & (UINT64_C(1) << 54)) != 0u &&
+               (JE_ARM_USER_DATA_BITS & (UINT64_C(1) << 54)) != 0u,
+               "only USER_CODE is EL0 executable");
+_Static_assert((JE_ARM_USER_CODE_BITS & (UINT64_C(1) << 7)) != 0u &&
+               (JE_ARM_USER_DATA_BITS & (UINT64_C(1) << 7)) == 0u,
+               "EL0 AP encodings preserve RO versus RW");
 
 static const je_map_region *region_for_va(const je_map_region *regions,
                                           size_t n, uint64_t virtual_address)
@@ -657,8 +766,9 @@ je_status je_arm_mmu_audit(const je_arm_mmu *mmu,
             } else {
                 return audit_reject(JE_ARM_AUDIT_REJECT_LEAF);
             }
-            if (!class_descriptor_matches(descriptor, expected))
+            if (!class_descriptor_matches(descriptor, expected)) {
                 return audit_reject(JE_ARM_AUDIT_REJECT_LEAF);
+            }
             bool executable = (descriptor & JE_ARM_DESC_PXN) == 0u;
             bool writable = ((descriptor >> JE_ARM_DESC_AP_SHIFT) &
                              UINT64_C(3)) == 0u;
@@ -680,6 +790,8 @@ extern void je_arm_mmu_enable_leaf(uint64_t root_pa, uint64_t mair,
                                    uint64_t tcr, uint64_t range0_start,
                                    uint64_t range0_end, uint64_t range1_start,
                                    uint64_t range1_end, uint64_t sctlr_set);
+static bool in_window(uint64_t physical);
+static size_t window_index(uint64_t physical);
 
 je_status je_arm_mmu_enable(const je_arm_mmu *mmu)
 {
@@ -693,6 +805,44 @@ je_status je_arm_mmu_enable(const je_arm_mmu *mmu)
                            mmu->image_start, mmu->image_end,
                            JE_ARM_SCTLR_SET);
     je_arm_enabled_context = mmu;
+    return JE_OK;
+}
+
+bool je_arm_mmu_is_enabled(const je_arm_mmu *mmu)
+{
+    return mmu != NULL && je_arm_enabled_context == mmu;
+}
+
+je_status je_arm_mmu_publish_user_frame(je_arm_mmu *mmu, uint64_t physical,
+                                         je_map_class cls)
+{
+    if (!mmu || !mmu->valid || je_arm_mmu_is_enabled(mmu) ||
+        (cls != JE_MAP_USER_CODE && cls != JE_MAP_USER_RODATA) ||
+        !in_window(physical) || table_frame(mmu, physical))
+        return JE_ERR_INVALID;
+
+    const size_t index = window_index(physical);
+    if (mmu->frame_flags[index] != 0u)
+        return JE_ERR_DENIED;
+    mmu->frame_flags[index] = (uint8_t)(class_flags(cls) |
+                                        JE_ARM_MAP_PRESENT |
+                                        JE_ARM_MAP_USER);
+    return JE_OK;
+}
+
+je_status je_arm_mmu_unpublish_user_frame(je_arm_mmu *mmu,
+                                           uint64_t physical)
+{
+    if (!mmu || !mmu->valid || je_arm_mmu_is_enabled(mmu) ||
+        !in_window(physical))
+        return JE_ERR_INVALID;
+
+    const size_t index = window_index(physical);
+    const uint8_t flags = mmu->frame_flags[index];
+    if ((flags & JE_ARM_MAP_USER) == 0u ||
+        (flags & JE_ARM_MAP_RUNTIME) != 0u)
+        return JE_ERR_INVALID;
+    mmu->frame_flags[index] = 0u;
     return JE_OK;
 }
 
@@ -735,13 +885,14 @@ je_status je_arm_mmu_enable(const je_arm_mmu *mmu)
  * break-before-make step is needed. For unmap the ledger entry is cleared only
  * after the TLBI has completed (the translation is gone first).
  */
-#ifdef JE_ARM_PAGING_HOSTED_TEST
-/* Hosted-test seam: the x86 host cannot run TLBI, so the hosted build counts
- * each maintenance sequence and keeps its operand for tests/test_paging_bits.c.
- * Not part of the frozen paging.h contract. */
-uint64_t je_arm_tlbi_hosted_calls;
-uint64_t je_arm_tlbi_hosted_last_operand;
-#endif
+/*
+ * Shared observability seam. Hosted tests count the existing runtime-map TLBI
+ * maintenance, and MP3a-1 also records the ASIDE1IS operand on real ARM builds.
+ * QEMU TCG does not model stale-TLB behavior; the maintenance sequence is
+ * reviewed, not observed.
+ */
+volatile uint64_t je_arm_tlbi_hosted_calls;
+volatile uint64_t je_arm_tlbi_hosted_last_operand;
 
 /*
  * TLBI VALE1IS operand, Xt (Arm ARM DDI0487, "TLBI VALE1, TLBI VALE1IS, TLBI
@@ -982,6 +1133,23 @@ uint64_t je_arm_at_s1e1(uint64_t virtual_address, int write)
                          : "=r"(par) : "r"(virtual_address) : "memory");
     } else {
         __asm__ volatile("at s1e1r, %1\n\t"
+                         "isb\n\t"
+                         "mrs %0, par_el1"
+                         : "=r"(par) : "r"(virtual_address) : "memory");
+    }
+    return par;
+}
+
+uint64_t je_arm_at_s1e0(uint64_t virtual_address, int write)
+{
+    uint64_t par = 0u;
+    if (write != 0) {
+        __asm__ volatile("at s1e0w, %1\n\t"
+                         "isb\n\t"
+                         "mrs %0, par_el1"
+                         : "=r"(par) : "r"(virtual_address) : "memory");
+    } else {
+        __asm__ volatile("at s1e0r, %1\n\t"
                          "isb\n\t"
                          "mrs %0, par_el1"
                          : "=r"(par) : "r"(virtual_address) : "memory");

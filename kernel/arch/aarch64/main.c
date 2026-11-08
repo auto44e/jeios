@@ -25,6 +25,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <jeios/fdt.h>
+#ifdef JE_ARM_USER_TEST
+#include <jeios/vm.h>
+#endif
 #include "gic.h"
 #include "paging.h"
 #include "physmem.h"
@@ -432,6 +435,27 @@ extern uint64_t je_arm_mmu_last_audit_leaves;
 extern uint8_t _text[], _end[];   /* IMAGE extent [_text, _end), linker.ld */
 extern uint8_t __text_end[], __rodata_end[], __data_end[];
 extern uint8_t __stack_guard[], __stack_bottom[];
+#ifdef JE_ARM_USER_TEST
+extern void je_arm_sched_install_ttbr0(uint64_t root_pa, uint16_t asid);
+extern uint64_t je_arm_sched_read_ttbr0(void);
+extern je_status je_arch_vm_decorate_kernel_root(void);
+static je_vm je_arm_user_vm;
+static uint8_t je_arm_user_blob[3u * JE_PAGE_SIZE]
+    __attribute__((aligned(16)));
+static const je_vm_image je_arm_user_image = {
+    .version = JE_VM_IMAGE_VERSION,
+    .segment_count = 3u,
+    .entry_offset = 0u,
+    .reserved = 0u,
+    .segments = {
+        { 0u, JE_PAGE_SIZE, 0u, JE_PAGE_SIZE, JE_VM_R | JE_VM_X, 0u },
+        { JE_PAGE_SIZE, JE_PAGE_SIZE, JE_PAGE_SIZE, JE_PAGE_SIZE,
+          JE_VM_R, 0u },
+        { 2u * JE_PAGE_SIZE, JE_PAGE_SIZE, 2u * JE_PAGE_SIZE, JE_PAGE_SIZE,
+          JE_VM_R | JE_VM_W, 0u },
+    },
+};
+#endif
 
 je_pages *je_arm_scheduler_pages(void)
 {
@@ -832,6 +856,174 @@ static bool par_attr_is(uint64_t par, uint64_t attr)
            ((par >> 56) & UINT64_C(0xff)) == attr;
 }
 
+#ifdef JE_ARM_USER_TEST
+static bool par_permission_l3(uint64_t par)
+{
+    return (par & UINT64_C(0xfff)) == UINT64_C(0x81f);
+}
+
+static uint64_t je_arm_user_audit_cycles;
+static uint64_t je_arm_user_audit_reads;
+
+static _Noreturn void user_test_fatal(const char *reason)
+{
+    console_write("JeiOS/aarch64: FATAL user-test ");
+    console_write(reason);
+    console_write("\r\n");
+    halt();
+}
+
+static void user_test_prepare(void)
+{
+    for (size_t i = 0u; i < JE_PAGE_SIZE; ++i) {
+        je_arm_user_blob[i] = UINT8_C(0xa1);
+        je_arm_user_blob[JE_PAGE_SIZE + i] = UINT8_C(0xb2);
+        je_arm_user_blob[2u * JE_PAGE_SIZE + i] = UINT8_C(0xc3);
+    }
+
+    const je_vm_ops *ops = je_arch_vm_ops(&je_arm_pages, 1);
+    je_status status = je_vm_init(&je_arm_user_vm, ops, &je_arm_pages, 0u);
+    if (status != JE_OK) user_test_fatal("vm-init");
+
+    uint32_t p1 = UINT32_MAX;
+    uint32_t p2 = UINT32_MAX;
+    status = je_vm_build(&je_arm_user_vm, &je_arm_user_image,
+                         je_arm_user_blob, sizeof(je_arm_user_blob), 1, &p1);
+    if (status != JE_OK || p1 != 0u) user_test_fatal("build-p1");
+    status = je_vm_build(&je_arm_user_vm, &je_arm_user_image,
+                         je_arm_user_blob, sizeof(je_arm_user_blob), 1, &p2);
+    if (status != JE_OK || p2 != 1u) user_test_fatal("build-p2");
+
+    status = je_vm_audit(&je_arm_user_vm, p1);
+    if (status != JE_OK) user_test_fatal("audit-p1");
+    status = je_vm_audit(&je_arm_user_vm, p2);
+    if (status != JE_OK) user_test_fatal("audit-p2");
+}
+
+static void user_test_probe(const char *name, uint64_t va, int write,
+                            uint64_t *out_par)
+{
+    const uint64_t par = je_arm_at_s1e0(va, write);
+    console_write("JeiOS/aarch64: user-test ");
+    console_write(name);
+    console_write(" va=");
+    console_hex(va);
+    console_write(" par=");
+    console_hex(par);
+    console_write("\r\n");
+    if (out_par != NULL) *out_par = par;
+}
+
+static uint64_t user_test_install(const char *name, uint64_t root)
+{
+    je_arm_sched_install_ttbr0(root, 1u);
+    const uint64_t ttbr0 = je_arm_sched_read_ttbr0();
+    console_write("JeiOS/aarch64: user-test install ");
+    console_write(name);
+    console_write(" root=");
+    console_hex(root);
+    console_write(" ttbr0=");
+    console_hex(ttbr0);
+    console_write(" tlbi=");
+    console_hex(je_arm_tlbi_hosted_last_operand);
+    console_write("\r\n");
+    return ttbr0;
+}
+
+static _Noreturn void user_test_run(void)
+{
+    const uint64_t kernel_text = (uint64_t)(uintptr_t)_text;
+    const uint64_t kernel_data = (uint64_t)(uintptr_t)&je_arm_bss_probe;
+    const uint64_t code = JE_VM_ARENA_BASE;
+    const uint64_t rodata = JE_VM_ARENA_BASE + JE_PAGE_SIZE;
+    const uint64_t data = JE_VM_ARENA_BASE + 2u * JE_PAGE_SIZE;
+    const uint64_t p1_root = (uint64_t)je_arm_user_vm.procs[0].root;
+    const uint64_t p2_root = (uint64_t)je_arm_user_vm.procs[1].root;
+    uint64_t p1_kernel_read_par = 0u;
+    uint64_t p1_kernel_write_par = 0u;
+    uint64_t p1_code_read_par = 0u;
+    uint64_t p1_code_write_par = 0u;
+    uint64_t p1_data_par = 0u;
+    uint64_t p1_rodata_read_par = 0u;
+    uint64_t p1_rodata_write_par = 0u;
+    uint64_t p1_uart_par = 0u;
+    uint64_t p1_gicd_par = 0u;
+    uint64_t p2_data_par = 0u;
+    uint64_t p1_ttbr0;
+    uint64_t p2_ttbr0;
+    uint64_t p1_tlbi_operand;
+    uint64_t p2_tlbi_operand;
+
+    p1_ttbr0 = user_test_install("p1", p1_root);
+    p1_tlbi_operand = je_arm_tlbi_hosted_last_operand;
+    user_test_probe("p1 kernel-read", kernel_text, 0, &p1_kernel_read_par);
+    user_test_probe("p1 kernel-write", kernel_data, 1, &p1_kernel_write_par);
+    user_test_probe("p1 code-read", code, 0, &p1_code_read_par);
+    user_test_probe("p1 code-write", code, 1, &p1_code_write_par);
+    user_test_probe("p1 data-write", data, 1, &p1_data_par);
+    user_test_probe("p1 rodata-read", rodata, 0, &p1_rodata_read_par);
+    user_test_probe("p1 rodata-write", rodata, 1, &p1_rodata_write_par);
+    user_test_probe("p1 uart-read", PL011_BASE, 0, &p1_uart_par);
+    user_test_probe("p1 gicd-read", JE_GICD_BASE, 0, &p1_gicd_par);
+
+    const uint64_t code_pa = p1_code_read_par & UINT64_C(0x0000fffffffff000);
+    if (je_arm_mmu_map_page(&je_arm_mmu_context, code_pa, code_pa,
+                            JE_MAP_RW) != JE_ERR_DENIED) {
+        user_test_fatal("wx-ledger");
+    }
+    console_write("JeiOS/aarch64: user-test wx-refuse code-pa=");
+    console_hex(code_pa);
+    console_write(" status=DENIED\r\n");
+
+    p2_ttbr0 = user_test_install("p2", p2_root);
+    p2_tlbi_operand = je_arm_tlbi_hosted_last_operand;
+    user_test_probe("p2 data-read", data, 0, &p2_data_par);
+    console_write("JeiOS/aarch64: user-test isolate p1-par=");
+    console_hex(p1_data_par);
+    console_write(" p2-par=");
+    console_hex(p2_data_par);
+    console_write("\r\n");
+
+    const uint64_t root_mask = UINT64_C(0x0000fffffffff000);
+    if ((p1_ttbr0 & root_mask) != p1_root ||
+        (p2_ttbr0 & root_mask) != p2_root ||
+        ((p1_ttbr0 >> 48) & UINT64_C(0xff)) != 1u ||
+        ((p2_ttbr0 >> 48) & UINT64_C(0xff)) != 1u ||
+        !par_permission_l3(p1_kernel_read_par) ||
+        !par_permission_l3(p1_kernel_write_par) ||
+        !par_permission_l3(p1_uart_par) ||
+        !par_permission_l3(p1_gicd_par) ||
+        par_fault(p1_code_read_par) ||
+        !par_permission_l3(p1_code_write_par) ||
+        par_fault(p1_data_par) ||
+        par_fault(p1_rodata_read_par) ||
+        !par_permission_l3(p1_rodata_write_par) ||
+        par_fault(p2_data_par) ||
+        (p1_data_par & UINT64_C(0x0000fffffffff000)) ==
+            (p2_data_par & UINT64_C(0x0000fffffffff000))) {
+        user_test_fatal("probe-mismatch");
+    }
+
+    console_write("JeiOS/aarch64: user-test audit PASS\r\n");
+    console_write("JeiOS/aarch64: user-test tlbi p1 operand=");
+    console_hex(p1_tlbi_operand);
+    console_write("\r\n");
+    console_write("JeiOS/aarch64: user-test tlbi p2 operand=");
+    console_hex(p2_tlbi_operand);
+    console_write("\r\n");
+    /* The barrier/TLBI effects are reviewed, not observed under QEMU TCG. */
+    je_arm_sched_install_ttbr0(je_arm_mmu_root(&je_arm_mmu_context), 0u);
+    console_write("JeiOS/aarch64: user-test PASS reviewed-tlb=not-observed\r\n");
+    halt();
+}
+
+static void user_test_prepare_l3(void)
+{
+    const je_status status = je_arm_mmu_prebuild_ram_l3(&je_arm_mmu_context);
+    if (status != JE_OK) user_test_fatal("l3-prebuild");
+}
+#endif
+
 /*
  * Exact default-path marker order (complete lines; smoke_arm.py matches these):
  *   JeiOS/aarch64: mmu build root=<hex>
@@ -921,8 +1113,19 @@ static void mmu_bringup(void)
     console_hex(gicc);
     console_write("\r\n");
 
+#ifdef JE_ARM_USER_TEST
+    user_test_prepare_l3();
+#endif
+
+#ifdef JE_ARM_USER_TEST
+    const uint64_t audit_start = je_arm_read_cntpct();
+#endif
     status = je_arm_mmu_audit(&je_arm_mmu_context, regions,
                               sizeof(regions) / sizeof(regions[0]));
+#ifdef JE_ARM_USER_TEST
+    je_arm_user_audit_cycles = je_arm_read_cntpct() - audit_start;
+    je_arm_user_audit_reads = je_arm_mmu_last_audit_reads;
+#endif
     if (status != JE_OK) {
         console_write("JeiOS/aarch64: FATAL mmu audit status=");
         console_dec((uint64_t)status);
@@ -932,6 +1135,18 @@ static void mmu_bringup(void)
     console_write("JeiOS/aarch64: mmu audit ok leaves=");
     console_hex(je_arm_mmu_last_audit_leaves);
     console_write("\r\n");
+
+#ifdef JE_ARM_USER_TEST
+    /* MP3a-1 changes the kernel-root L0 attributes only after the frozen MP2
+     * audit. Do this once, explicitly, before any process root is built; a
+     * lazy decoration during link_tables would be a live table mutation. */
+    status = je_arch_vm_decorate_kernel_root();
+    if (status != JE_OK) {
+        console_write("JeiOS/aarch64: FATAL user-test kernel-decoration\r\n");
+        halt();
+    }
+    user_test_prepare();
+#endif
 
     status = je_arm_mmu_enable(&je_arm_mmu_context);
     if (status != JE_OK) {
@@ -992,6 +1207,20 @@ static void mmu_bringup(void)
         console_write("JeiOS/aarch64: FATAL mmu probe mismatch\r\n");
         halt();
     }
+
+#ifdef JE_ARM_USER_TEST
+    /*
+     * The user profile prebuilds an L3 path for every managed 2 MiB RAM slot,
+     * so this records the enlarged pre-enable audit input. CNTVCT is a
+     * coarse QEMU execution counter, not a wall-clock or hardware timing
+     * qualification; the exact descriptor-read count is the stable evidence.
+     */
+    console_write("JeiOS/aarch64: user-test pre-enable-audit cycles=");
+    console_hex(je_arm_user_audit_cycles);
+    console_write(" reads=");
+    console_hex(je_arm_user_audit_reads);
+    console_write("\r\n");
+#endif
 }
 
 static uint64_t je_arm_timer_freq;
@@ -1451,6 +1680,9 @@ _Noreturn void je_arm_main(void)
     dtb_intake();
     physmem_bringup();
     mmu_bringup();
+#ifdef JE_ARM_USER_TEST
+    user_test_run();
+#endif
     je_arm_sched_init();
     gic_timer_bringup();
 #ifdef JE_ARM_SCHED_TEST

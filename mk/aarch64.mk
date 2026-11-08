@@ -10,7 +10,7 @@ ARM_OBJCOPY := aarch64-linux-gnu-objcopy
 ARM_BUILD   := build/aarch64
 ARM_ARCH    := kernel/arch/aarch64
 
-# The seven test-build toggles below are MUTUALLY EXCLUSIVE: each selects its own
+# The eight test-build toggles below are MUTUALLY EXCLUSIVE: each selects its own
 # build dir, and with more than one set the last assignment would silently win
 # and reuse that dir for a different flag combination (stale objects / a smoke
 # run asserting the wrong markers). Refuse the combination outright.
@@ -18,6 +18,7 @@ ARM_ARCH    := kernel/arch/aarch64
 ARM_MMU_FAULT_SET := $(if $(strip $(ARM_MMU_FAULT)),1,)
 ARM_SCHED_MUTATION_SET := $(if $(strip $(ARM_SCHED_MUTATION)),1,)
 ARM_SCHED_TEST_SET := $(if $(filter 1,$(ARM_SCHED_TEST)),1,)
+ARM_USER_TEST_SET := $(if $(filter 1,$(ARM_USER_TEST)),1,)
 ifneq ($(ARM_SCHED_MUTATION_SET),)
 ifeq ($(ARM_SCHED_TEST),1)
 else
@@ -25,9 +26,9 @@ $(error ARM_SCHED_MUTATION requires ARM_SCHED_TEST=1)
 endif
 ARM_SCHED_TEST_SET := 1
 endif
-ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL) $(ARM_TIMER_TEST) $(ARM_SCHED_TEST_SET))),0)
-ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL) $(ARM_TIMER_TEST) $(ARM_SCHED_TEST_SET))),1)
-$(error ARM_BSS_CHECK, ARM_VECTOR_TEST, ARM_DTB_BAD, ARM_MMU_FAULT, ARM_TIMER_POLL, ARM_TIMER_TEST and ARM_SCHED_TEST are mutually exclusive; set at most one)
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL) $(ARM_TIMER_TEST) $(ARM_SCHED_TEST_SET) $(ARM_USER_TEST_SET))),0)
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL) $(ARM_TIMER_TEST) $(ARM_SCHED_TEST_SET) $(ARM_USER_TEST_SET))),1)
+$(error ARM_BSS_CHECK, ARM_VECTOR_TEST, ARM_DTB_BAD, ARM_MMU_FAULT, ARM_TIMER_POLL, ARM_TIMER_TEST, ARM_SCHED_TEST and ARM_USER_TEST are mutually exclusive; set at most one)
 endif
 endif
 
@@ -98,6 +99,11 @@ endif
 ifneq ($(ARM_SCHED_MUTATION_SET),)
 ARM_BUILD   := build/aarch64-schedtest-$(ARM_SCHED_MUTATION)
 endif
+# MP3a-1 EL1-only TTBR0/AT S1E0 proof. It builds two process roots and halts
+# after the serial oracle sees the complete permission/isolation proof.
+ifeq ($(ARM_USER_TEST),1)
+ARM_BUILD   := build/aarch64-usertest
+endif
 
 # Freestanding, no PIC/stack-protector, STRICT alignment (pre-MMU RAM is
 # Device-nGnRnE so unaligned accesses fault), and general-regs-only (a stray
@@ -139,6 +145,10 @@ ifeq ($(ARM_SCHED_TEST),1)
 ARM_CFLAGS  += -DJE_ARM_SCHED_TEST
 ARM_ASFLAGS += -DJE_ARM_SCHED_TEST
 endif
+ifeq ($(ARM_USER_TEST),1)
+ARM_CFLAGS  += -DJE_ARM_USER_TEST
+ARM_ASFLAGS += -DJE_ARM_USER_TEST
+endif
 ARM_SCHED_MUTATION_DEFINE_drop-mov-sp := JE_ARM_SCHED_MUTANT_DROP_MOV_SP
 ARM_SCHED_MUTATION_DEFINE_pick-skips-b := JE_ARM_SCHED_MUTANT_PICK_SKIP_B
 ARM_SCHED_MUTATION_DEFINE_rebuild-fake-frame := JE_ARM_SCHED_MUTANT_REBUILD_FAKE
@@ -164,7 +174,7 @@ ARM_CFLAGS  += -DJE_ARM_MMU_FAULT=$(ARM_MMU_FAULT_$(ARM_MMU_FAULT))
 ARM_ASFLAGS += -DJE_ARM_MMU_FAULT=$(ARM_MMU_FAULT_$(ARM_MMU_FAULT))
 endif
 
-ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/gic.o $(ARM_BUILD)/physmem.o $(ARM_BUILD)/paging.o $(ARM_BUILD)/paging_enable.o $(ARM_BUILD)/alloc.o $(ARM_BUILD)/bootctx.o $(ARM_BUILD)/memory.o $(ARM_BUILD)/vectors.o $(ARM_BUILD)/fdt.o $(ARM_BUILD)/sched_rr.o $(ARM_BUILD)/sched_arm.o
+ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/gic.o $(ARM_BUILD)/physmem.o $(ARM_BUILD)/paging.o $(ARM_BUILD)/paging_enable.o $(ARM_BUILD)/alloc.o $(ARM_BUILD)/bootctx.o $(ARM_BUILD)/memory.o $(ARM_BUILD)/vectors.o $(ARM_BUILD)/fdt.o $(ARM_BUILD)/sched_rr.o $(ARM_BUILD)/sched_arm.o $(ARM_BUILD)/vm.o $(ARM_BUILD)/handle.o $(ARM_BUILD)/vm_backend.o
 
 # Shared arch-neutral bounded DTB parser (issue #52), compiled with the ARM
 # freestanding/strict-align flags.
@@ -177,6 +187,18 @@ $(ARM_BUILD)/sched_rr.o: kernel/core/sched_rr.c include/jeios/sched_rr.h
 	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
 
 $(ARM_BUILD)/sched_arm.o: $(ARM_ARCH)/sched_arm.c $(ARM_ARCH)/paging.h $(ARM_ARCH)/trapframe.h include/jeios/sched_rr.h
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
+
+$(ARM_BUILD)/vm.o: kernel/core/vm.c include/jeios/vm.h $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
+
+$(ARM_BUILD)/handle.o: kernel/core/handle.c include/jeios/handle.h $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
+
+$(ARM_BUILD)/vm_backend.o: $(ARM_ARCH)/vm_backend.c $(ARM_ARCH)/paging.h include/jeios/vm.h $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
 
@@ -250,4 +272,4 @@ aarch64: $(ARM_BUILD)/Image
 # uses them).
 ARM_SMOKE_TIMEOUT ?= 15
 smoke-aarch64: $(ARM_BUILD)/Image
-	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_PHYSALLOC)),--phys-alloc,) $(if $(filter 1,$(ARM_TIMER_POLL)),--timer-poll,) $(if $(filter 1,$(ARM_TIMER_TEST)),--timer-test,) $(if $(filter 1,$(ARM_SCHED_TEST)),--sched-test,) $(if $(ARM_SCHED_MUTATION_SET),--sched-mutation $(ARM_SCHED_MUTATION),) $(if $(ARM_MMU_FAULT_SET),--mmu-fault $(ARM_MMU_FAULT_SMOKE_$(ARM_MMU_FAULT)),) $(if $(filter 1,$(ARM_REQUIRE)),--require,)
+	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_PHYSALLOC)),--phys-alloc,) $(if $(filter 1,$(ARM_TIMER_POLL)),--timer-poll,) $(if $(filter 1,$(ARM_TIMER_TEST)),--timer-test,) $(if $(filter 1,$(ARM_SCHED_TEST)),--sched-test,) $(if $(ARM_USER_TEST),--user-test,) $(if $(ARM_SCHED_MUTATION_SET),--sched-mutation $(ARM_SCHED_MUTATION),) $(if $(ARM_MMU_FAULT_SET),--mmu-fault $(ARM_MMU_FAULT_SMOKE_$(ARM_MMU_FAULT)),) $(if $(filter 1,$(ARM_REQUIRE)),--require,)

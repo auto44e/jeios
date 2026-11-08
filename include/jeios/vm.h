@@ -32,8 +32,14 @@
 #include <jeios/status.h>
 #include <jeios/handle.h>    /* M3b: per-process handle table storage */
 
-/* User arena is the half-open range [JE_VM_ARENA_BASE, +JE_VM_ARENA_SIZE). */
+/* User arena is the half-open range [JE_VM_ARENA_BASE, +JE_VM_ARENA_SIZE).
+ * ARM starts at 2^44 so the shared TTBR0 kernel identity map cannot collide
+ * with the arena; x86 keeps its existing ABI value. */
+#if defined(JE_ARCH_AARCH64)
+#define JE_VM_ARENA_BASE   UINT64_C(0x0000100000000000)
+#else
 #define JE_VM_ARENA_BASE   UINT64_C(0x40000000)
+#endif
 #define JE_VM_ARENA_SIZE   UINT64_C(0x00200000) /* 2 MiB */
 #define JE_VM_ARENA_PAGES  (JE_VM_ARENA_SIZE / JE_PAGE_SIZE) /* 512 */
 /* Stack is the top JE_VM_STACK_PAGES of the arena; one guard page sits below it.
@@ -316,6 +322,14 @@ je_status je_vm_destroy_owned(je_vm *vm, uint32_t index, je_proc_id owner);
  * frozen invariant holds for process `index`, including cross-process root/
  * extent disjointness. */
 je_status je_vm_audit(const je_vm *vm, uint32_t index);
+
+#if defined(JE_ARCH_AARCH64)
+/* ARM MP3a-1 replaces the x86-specific upper-level shape oracle with a
+ * per-process TTBR0 audit. The hook is kept outside je_vm_ops so the
+ * arch-neutral builder/journal remains unchanged and the x86 audit path is
+ * byte-for-byte the existing path. */
+je_status je_arch_vm_audit(const je_vm *vm, uint32_t index);
+#endif
 
 /* M3a #4: the real arch backend (kernel/arch/x86_64/vm_backend.c) implementing
  * the ops above against actual page tables. Returns a singleton ops vector bound
