@@ -580,26 +580,28 @@ je_status je_sched_drop_user(je_vm *vm, uint32_t index)
  * kstack guard and destroy its vm process (freeing the held run + tables). The
  * vm record stays READY until destroy (D5's DYING/REAPABLE are modeled in the
  * scheduler slot, not vm.c). Returns the number reaped, or a negative je_status
- * on an invariant violation. Single-CPU/PCID-off invariant: after one iretq away
+ * on an invariant violation. A negative result leaves the failing slot
+ * untouched, but earlier DYING slots may already have been reaped in this call;
+ * the error is FATAL and the caller must not retry, or it will spin on the
+ * slot that remains DYING. Single-CPU/PCID-off invariant: after one iretq away
  * from the dead task, nothing else runs on its kstack. */
 int je_sched_reap_dead(void)
 {
-    if (!ready || current!=0) return (int)JE_ERR_BUSY;
+    if (!ready || current!=0) return -(int)JE_ERR_BUSY;
     /* Must run with interrupts disabled: the three liveness guards below and the
      * destroy must be atomic vs a timer dispatch. Enforce it here rather than
      * trusting the caller (defense in depth). */
-    uint64_t rflags; __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
-    if (rflags & (UINT64_C(1)<<9)) abort_scheduler(); /* IF set -> misuse */
+    if (je_arch_irqs_enabled()) abort_scheduler(); /* IF set -> misuse */
     uint64_t active_cr3=je_arch_cr3_read(), active_rsp0=je_arch_tss_get_rsp0();
     int reaped=0;
     for (unsigned i=1;i<JE_THREAD_MAX;++i) if (threads[i].state==DYING) {
-        if (i==current) return (int)JE_ERR_BUSY;
-        if (threads[i].root==active_cr3) return (int)JE_ERR_BUSY;    /* still the live address space */
-        if (threads[i].rsp0_top==active_rsp0) return (int)JE_ERR_BUSY; /* still the live kernel stack */
+        if (i==current) return -(int)JE_ERR_BUSY;
+        if (threads[i].root==active_cr3) return -(int)JE_ERR_BUSY;    /* still the live address space */
+        if (threads[i].rsp0_top==active_rsp0) return -(int)JE_ERR_BUSY; /* still the live kernel stack */
         je_vm *vm=threads[i].vm; uint32_t idx=threads[i].vm_index;
         je_proc_id proc_id = threads[i].proc_id;
         je_status s=je_sched_drop_user(vm, idx); /* restores the kstack guard, clears the slot */
-        if (s!=JE_OK) return (int)s;
+        if (s!=JE_OK) return -(int)s;
         s=je_vm_destroy_owned(vm, idx, proc_id); /* frees the held kstack run + page tables */
         if (s!=JE_OK) abort_scheduler();
         if (proc_id.gen != 0u
