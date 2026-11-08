@@ -54,6 +54,10 @@ typedef struct {
     je_memory_range map[JE_BOOT_MAP_MAX];
     je_reservation reserved[JE_BOOT_RESERVED_MAX];
 } je_boot_context;
+
+/* Freestanding AMD64 boot.S transfers control here after long-mode setup. */
+_Noreturn void je_kernel_main(uint32_t magic, uintptr_t info);
+
 /* Input must already be accessible for `accessible` bytes; neither output nor
  * input may alias. No retained input pointers; output invalid on any failure.
  * Reject ambiguous overlapping maps, unsupported versions and fixed-capacity

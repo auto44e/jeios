@@ -26,12 +26,17 @@
 #include <jeios/vm.h>
 #include <jeios/handle.h>
 
+void je_endpoint_kern_set_proc_pool(je_proc_pool *procs);
+bool je_endpoint_kern_is_wired(const je_vm *vm);
+
 void je_endpoint_kern_install(je_vm *vm);
 
 /* Mint a channel's two ends into `vm`'s current-process table. Returns JE_EP_OK
  * and the two handles, or an error (incl. JE_EP_UNWIRED if `vm` is unwired). */
 je_ep_status je_endpoint_kern_create(je_vm *vm, uint32_t index,
                                      je_handle *out0, je_handle *out1);
+je_ep_status je_endpoint_kern_dup(je_vm *vm, uint32_t index, je_handle src,
+                                  uint32_t rights, je_handle *out);
 
 /* Typed close of handle `h` as an endpoint in `vm`'s process `index` table. */
 je_ep_status je_endpoint_kern_close(je_vm *vm, uint32_t index, je_handle h);

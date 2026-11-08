@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <jeios/spawn.h>
 
 #include <jeios/arch.h>
@@ -6,18 +7,7 @@
 #include <jeios/image.h>
 #include <jeios/proc.h>
 #include <jeios/sched.h>
-
-extern je_status je_sched_register_process(je_vm *vm, uint32_t index,
-                                            je_proc_id id);
-extern je_status je_sched_unregister_process(je_vm *vm, uint32_t index);
-extern je_status je_sched_drop_user(je_vm *vm, uint32_t index);
-extern je_status je_process_handle_mint(je_vm *vm, uint32_t index,
-                                        je_proc_id id, uint32_t rights,
-                                        je_handle *out,
-                                        je_handle_status *out_alloc_status);
-extern je_proc_pool *je_sched_proc_pool(void);
-extern _Noreturn void syscall_invariant(const char *message);
-extern void je_proc_record_image(je_proc_id id, uint32_t image_id);
+#include <jeios/syscall.h>
 
 typedef struct {
     uint32_t step;
@@ -26,6 +16,20 @@ typedef struct {
 
 static je_spawn_failpoint spawn_failpoint;
 static uint32_t spawn_failpoint_fires;
+/* F13: post-commit observer (spawn.h). NULL = core default: observe nothing, so
+ * production spawn no longer depends on a failable harness symbol. Written only
+ * by je_spawn_set_commit_observer from init context with no user thread live;
+ * read only by je_proc_spawn after commit. */
+static je_spawn_commit_observer spawn_commit_observer;
+
+je_status je_spawn_set_commit_observer(je_spawn_commit_observer observer)
+{
+    if (!observer) return JE_ERR_INVALID;
+    if (spawn_commit_observer && spawn_commit_observer != observer)
+        return JE_ERR_BUSY;
+    spawn_commit_observer = observer;
+    return JE_OK;
+}
 
 static je_abi_status spawn_finish(je_abi_status status)
 {
@@ -256,6 +260,9 @@ je_abi_status je_proc_spawn(je_vm *vm, uint32_t caller_idx, je_handle launcher,
         return spawn_finish(internal_status_to_abi(status));
     }
     *out = process_handle;
-    je_proc_record_image(id, image_id);
+    /* F13: post-commit observation only, via the registered observer (NULL in the
+     * default/production build). The observer is contractually infallible, so a
+     * committed spawn never halts here. */
+    if (spawn_commit_observer) spawn_commit_observer(id, image_id);
     return spawn_finish(JE_ABI_OK);
 }

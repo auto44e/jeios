@@ -1,41 +1,9 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 #include <jeios/image.h>
 #include <jeios/svc.h>
 
 extern unsigned char je_user_spawn_child_start[];
 extern unsigned char je_user_spawn_child_end[];
-extern const unsigned char je_img_c_hello_blob[];
-extern const unsigned long je_img_c_hello_len;
-extern const je_vm_image je_img_c_hello_desc;
-extern const unsigned char je_img_supervisor_blob[];
-extern const unsigned long je_img_supervisor_len;
-extern const je_vm_image je_img_supervisor_desc;
-extern const unsigned char je_img_restart_blob[];
-extern const unsigned long je_img_restart_len;
-extern const je_vm_image je_img_restart_desc;
-extern const unsigned char je_img_survivor_blob[];
-extern const unsigned long je_img_survivor_len;
-extern const je_vm_image je_img_survivor_desc;
-extern const unsigned char je_img_spoofer_blob[];
-extern const unsigned long je_img_spoofer_len;
-extern const je_vm_image je_img_spoofer_desc;
-extern const unsigned char je_img_crashloop_blob[];
-extern const unsigned long je_img_crashloop_len;
-extern const je_vm_image je_img_crashloop_desc;
-extern const unsigned char je_img_broker_service_blob[];
-extern const unsigned long je_img_broker_service_len;
-extern const je_vm_image je_img_broker_service_desc;
-extern const unsigned char je_img_broker_client_blob[];
-extern const unsigned long je_img_broker_client_len;
-extern const je_vm_image je_img_broker_client_desc;
-extern const unsigned char je_img_uart_driver_blob[];
-extern const unsigned long je_img_uart_driver_len;
-extern const je_vm_image je_img_uart_driver_desc;
-extern const unsigned char je_img_uart_service_blob[];
-extern const unsigned long je_img_uart_service_len;
-extern const je_vm_image je_img_uart_service_desc;
-extern const unsigned char je_img_uart_client_blob[];
-extern const unsigned long je_img_uart_client_len;
-extern const je_vm_image je_img_uart_client_desc;
 
 #ifndef JE_C_HELLO_BLOB_SHA256
 #define JE_C_HELLO_BLOB_SHA256 "unavailable"

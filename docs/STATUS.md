@@ -1,5 +1,35 @@
 # Current ecosystem status
 
+Observed 2026-11-06 (fix-gate closure). Core main at the merge of fix-gate PRs
+#94 (F01/F02), #97 (F03), #98 (F04–F06), #99 (F07–F11), and the F12–F14 PR that
+adds this closure. Mobile main `9221701ab2d5333978a294f54574ee384f4216e3` (pin
+unchanged).
+
+**The repair-first gate is CLOSED.** F01–F14 are dispositioned — confirmed defects
+repaired (reaper sign, ARM audit deref, usercopy NULL, endpoint-corruption
+fail-stop incl. a cross-review-caught DoS), security-boundary mutant killers
+enabled (27 killed / 1 equivalent / 0 survived / 0 blocked), owner-approved
+contract changes landed (F07 JE_EP_CORRUPT split, F08 one-thread-per-process), and
+the four deferred F06 decisions owner-dispositioned. See the
+[closure ledger](audit/2026-11-fix-gate-closure.md) for the per-row dispositions
+and exit-criteria status. Verified at the final head: x86 `make check` +
+`make integration`, ARM `make aarch64` + 11/11 smoke matrix, `make mutants`,
+runner `--selftest`. AI-assisted, not independent human qualification.
+
+**Pre-MP3 blocker:** the lifecycle-ownership extraction is recorded as
+[ADR 0014](adr/0014-pre-mp3-process-lifecycle-ownership.md) (proposed/owner-gated)
+with an explicit migration trigger; MP3 must not begin until the owner approves it
+(or waives it). With the gate closed, the roadmap (MP2 scheduler implementation,
+then MP3) may resume subject to that blocker and the standing owner gates.
+
+Tracked non-blocker follow-ups: `GAP-EP-WAIT-INFLIGHT` killer, x86 trap-routing
+hosted seam, the `(uint8_t)hcap` recv truncation, the recv shared-helper refactor,
+F13's main.c fixture split, device-observation-state split.
+
+---
+
+## Historical checkpoint (2026-11-06T02:10:28-05:00, pre-fix)
+
 Observed 2026-11-06T02:10:28-05:00. Core main `e4bd9c24d69de4fc6798d733b1f2e6398522748f`;
 mobile main `9221701ab2d5333978a294f54574ee384f4216e3` (pin unchanged).
 PRs #89/#90 add audit and mutation tooling/provenance; #91 adds accepted ADR 0013;

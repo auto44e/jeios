@@ -20,6 +20,9 @@ typedef struct {
     uint64_t last_unmask;
     uint64_t rearm_tick;
     uint32_t ack_gen;
+    /* Diagnostic observation state is intentionally inline. Production M4
+     * self-tests read it even in the normal kernel build, so moving it behind
+     * JE_TEST_MODE would change tested layout/diagnostic behavior. */
     uint64_t irq3_deliveries;
     uint64_t irq3_last_tick;
     uint32_t irq3_binding_deliveries;

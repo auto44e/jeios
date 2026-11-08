@@ -16,22 +16,12 @@
 #include <jeios/proc.h>
 #include <jeios/image.h>
 #include <jeios/spawn.h>
+#include <jeios/syscall.h>
 #include <jeios/svc.h>
 #include <jeios/broker_test.h>
 #include <jeios/device.h>
 #include <jeios/uart_test.h>
 
-extern void je_sched_set_proc_pool(je_proc_pool *pool);
-extern je_status je_sched_register_process(je_vm *vm, uint32_t index, je_proc_id id);
-extern je_status je_sched_unregister_process(je_vm *vm, uint32_t index);
-extern bool je_sched_has_process(je_vm *vm, uint32_t index);
-extern unsigned je_sched_user_thread_count(void);
-extern void je_kernel_idle_step(void);
-extern void je_endpoint_kern_set_proc_pool(je_proc_pool *pool);
-extern je_status je_process_handle_mint(je_vm *vm, uint32_t index, je_proc_id id,
-                                        uint32_t rights, je_handle *out,
-                                        je_handle_status *out_alloc_status);
-extern const char je_c_hello_blob_sha256[];
 static je_boot_context boot;
 static _Noreturn void fail(const char *message)
 {
@@ -62,6 +52,12 @@ typedef struct {
 } m4f_child_identity;
 static bool m4f_ledger_enabled;
 static bool m4f_unexpected_image;
+/* Set by the spawn commit observer when a committed spawn reports an identity
+ * that violates the ledger (gen 0, out of range, or a still-active slot). The
+ * observer must not halt inside the spawn syscall (spawn.h), so the harness
+ * fail-stops on this flag from its own context: m4f_monitor checks it on every
+ * iteration and vm_s3_build_builtin checks it right after its direct record. */
+static bool m4f_ledger_identity_bad;
 static m4f_child_identity m4f_children[JE_PROC_REC_MAX];
 static bool m4f_run_proc_slots[JE_PROC_REC_MAX];
 static uint32_t m4f_spawn_count[M4F_IMAGE_COUNT];
@@ -143,7 +139,8 @@ static void m4g_delivery_reset(void)
 /*
  * Called after the receive transaction has committed and the endpoint layer has
  * minted a received cap. Spawn grants are
- * deliberately ignored because je_proc_record_image() is published only after
+ * deliberately ignored because the spawn commit observer (m4f_record_image,
+ * registered via je_spawn_set_commit_observer) publishes the child only after
  * the spawn transaction commits. In mode 13, the only later SEND|RECV cap
  * deliveries into a broker client are the supervisor's broker grants.
  */
@@ -353,6 +350,7 @@ static void m4f_ledger_reset(void)
     m4f_spoofer_code = 0u;
     m4f_spoofer_ep_charge = UINT32_MAX;
     m4f_unexpected_image = false;
+    m4f_ledger_identity_bad = false;
     m4f_progress_serial = 0u;
     m4f_ledger_enabled = true;
     m4g_delivery_reset();
@@ -366,14 +364,25 @@ static void m4f_ledger_reset(void)
 #endif
 }
 
-/* Called only after a spawn is committed, so a failed journal never enters the
- * run ledger. It is intentionally inert before the M4f seed point. */
-void je_proc_record_image(je_proc_id id, uint32_t image_id)
+/* F13 compatibility declaration: spawn.c's image-ledger coupling remains
+ * intentionally unchanged in this cleanup. */
+void je_proc_record_image(je_proc_id id, uint32_t image_id);
+
+/* Harness implementation of the spawn.h post-commit observer, registered in
+ * m4f_seed_supervisor; also called directly by vm_s3_build_builtin for the
+ * kernel-seeded supervisor. Called only after a spawn is committed, so a failed
+ * journal never enters the run ledger. It is intentionally inert before the M4f
+ * seed point. Per the spawn.h contract it never halts: an identity violation is
+ * latched in m4f_ledger_identity_bad (the slot is left untouched) and the
+ * harness fail-stops on it via m4f_assert_ledger_identity. */
+static void m4f_record_image(je_proc_id id, uint32_t image_id)
 {
     if (!m4f_ledger_enabled) return;
     if (id.gen == 0u || id.index >= JE_PROC_REC_MAX
-        || m4f_children[id.index].active)
-        fail("JeiOS fatal: M4f child ledger identity\r\n");
+        || m4f_children[id.index].active) {
+        m4f_ledger_identity_bad = true;
+        return;
+    }
     m4f_children[id.index] = (m4f_child_identity){true, false, id, image_id,
                                                    0u, 0u, 0u, 0u, false};
     m4f_run_proc_slots[id.index] = true;
@@ -382,6 +391,14 @@ void je_proc_record_image(je_proc_id id, uint32_t image_id)
     else
         ++m4f_spawn_count[image_id];
     ++m4f_progress_serial;
+}
+
+/* Harness-context fail-stop for an identity violation latched by the observer.
+ * Same message as the pre-F13 in-spawn fail(), so failure evidence is unchanged. */
+static void m4f_assert_ledger_identity(void)
+{
+    if (m4f_ledger_identity_bad)
+        fail("JeiOS fatal: M4f child ledger identity\r\n");
 }
 _Static_assert((1u + JE_M2_WORKERS) * 2u == 16u,
                "M2 preemption floor remains the T=8 floor");
@@ -612,7 +629,8 @@ static uint32_t vm_s3_build_builtin(uint32_t image_id, uint32_t ep_limit,
         fail("JeiOS fatal: M4f supervisor registration\r\n");
     }
     vm_s3_proc_ids[index] = id;
-    je_proc_record_image(id, image_id);
+    m4f_record_image(id, image_id);
+    m4f_assert_ledger_identity();
     *out_id = id;
     je_arch_irq_restore(flags);
     return index;
@@ -621,6 +639,10 @@ static uint32_t vm_s3_build_builtin(uint32_t image_id, uint32_t ep_limit,
 static uint32_t m4f_seed_supervisor(je_proc_id *out_id)
 {
     m4f_ledger_reset();
+    /* No user thread exists here (pre-seed baseline is checked by the caller),
+     * so registering cannot race a spawn (spawn.h registration contract). */
+    if (je_spawn_set_commit_observer(m4f_record_image) != JE_OK)
+        fail("JeiOS fatal: M4f spawn observer registration\r\n");
     uint32_t index = vm_s3_build_builtin(
         JE_IMAGE_SUPERVISOR, JE_SVC_EP_LIMIT, true, out_id);
     je_handle launcher = 0u;
@@ -809,9 +831,8 @@ static bool svc_report_read(uint32_t vm_index, je_svc_report *out)
 }
 
 /* Write a 64-bit word into proc idx's arena at offset off (CPL0, its CR3).
- * (Currently unused — kept for a future ring-3 fixture that hands a seeded
- * handle to a stub.) First used by the M3c-s7 bootstrap fixture to inject each
- * process's seeded endpoint handle into its arena before the thread starts. */
+ * The M3c-s7 bootstrap and later M4 fixtures use this to inject seeded handles
+ * and bounded test observations before a thread starts. */
 static void vm_s3_scratch_write(uint32_t idx, uint64_t off, uint64_t val)
 {
     uint64_t flags=je_arch_irq_save();
@@ -1624,6 +1645,9 @@ static _Noreturn void m4f_monitor(const m4f_baseline *baseline,
     bool rollback_armed = false;
     for (;;) {
         uint64_t flags = je_arch_irq_save();
+        /* IF=0 until this iteration's restore: no spawn can commit between this
+         * check and the corroboration/teardown below. */
+        m4f_assert_ledger_identity();
         uint32_t state = JE_PROC_FREE;
         uint32_t reason = JE_DEATH_FAULT;
         uint64_t code = 0u;
@@ -1926,7 +1950,16 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
     if (je_arch_paging_init(&boot)!=JE_OK) fail("JeiOS fatal: paging setup\r\n");
     je_arch_console_write(je_arch_has_nx() ? "CPU: NX enforced\r\n" :
                                             "CPU: legacy profile, NX absent\r\n");
-    je_arch_console_write("M1: protected mappings and stack guards ready\r\n");
+    /* F06: make the degraded (no-NX) profile UNAMBIGUOUS. The "M1: protected
+     * mappings" prefix is retained (smoke.py / integration.py match it), but the
+     * suffix now states the actual guarantee: with NX, kernel W^X is enforced;
+     * without NX, kernel data/heap/stack are EXECUTABLE and user-VM creation is
+     * refused (ADR 0007 D2, enforced in je_vm_build_quota + sched.c), so this is
+     * a degraded profile, not a W^X claim. */
+    je_arch_console_write(je_arch_has_nx()
+        ? "M1: protected mappings and stack guards ready (W^X enforced)\r\n"
+        : "M1: protected mappings and stack guards ready (DEGRADED: NX absent, "
+          "kernel data/heap/stack executable, user VM refused)\r\n");
     /* M3a #4 step 3 (ADR 0007 D7): deny x87/MMX/SSE/AVX before any user thread
      * can exist, so hostile ring-3 FP/SIMD traps rather than executes/leaks. */
     je_arch_cpu_policy_init();
@@ -2631,7 +2664,7 @@ _Noreturn void je_kernel_main(uint32_t magic, uintptr_t info)
         /* --- M3c step 6 (ADR 0009 A6): blocking recv that TIMES OUT (end-to-end
          * through the real scheduler, ring 3). A single user thread calls
          * recv(h0, timeout) on an end nobody sends to -> it PARKS (BLOCKED_IPC);
-         * the timer naturally advances je_timer_ticks past the deadline; the ISR
+         * the timer naturally advances the scheduler tick count past the deadline; the ISR
          * stamps TIMED_OUT via the single arbitrate CAS and makes it READY; the
          * continuation prologue re-enters the recv and returns 14. Deterministic
          * with ONE ring-3 thread + the natural timer tick (no second spinning

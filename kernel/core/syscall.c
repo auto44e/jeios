@@ -25,9 +25,6 @@
 #include <jeios/arch.h>
 #include <jeios/spawn.h>
 #include <jeios/device.h>
-extern je_ep_status je_endpoint_kern_dup(je_vm *vm, uint32_t index, je_handle src,
-                                         uint32_t rights, je_handle *out);
-extern bool je_endpoint_kern_is_wired(const je_vm *vm);
 #if JE_TEST_MODE == 15
 extern void je_m4g_record_cap_delivery(je_vm *vm, uint32_t index,
                                        const je_ep_capdesc *descriptor);
@@ -324,7 +321,6 @@ static je_handle_table *current_htable(void)
 
 static je_proc_pool *process_pool(void)
 {
-    extern je_proc_pool *je_sched_proc_pool(void);
     return je_sched_proc_pool();
 }
 

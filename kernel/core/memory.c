@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Compiler-emitted freestanding runtime operations. No allocation or locking. */
-#include <stddef.h>
+#include <jeios/memory.h>
 void *memset(void *destination, int value, size_t count)
 {
     unsigned char *p=destination;

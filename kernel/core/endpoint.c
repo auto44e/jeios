@@ -236,7 +236,7 @@ static void release_handle(je_endpoint_pool *pool, je_ep_channel *rec, uint8_t s
     }
 }
 
-/* ---- inflight ref API (tested directly; used by queue/wait PRs) ----------- */
+/* ---- inflight ref API (tested directly; used by queue/wait paths) --------- */
 
 /* Is `rec` one of this pool's channel records? Uses uintptr_t comparison (not
  * relational pointer comparison, which is UB for a pointer outside the array)

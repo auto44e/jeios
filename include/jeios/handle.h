@@ -41,8 +41,10 @@ typedef uint32_t je_handle;          /* the ABI handle value (0 == invalid) */
 #define JE_HANDLE_GEN_MASK   ((1u << JE_HANDLE_GEN_BITS) - 1u)
 #define JE_HANDLE_GEN_MAX    JE_HANDLE_GEN_MASK      /* saturation point */
 
-/* Object type values carried in a slot. Type 0 is reserved/invalid (a zeroed
- * slot never reads as a valid type). JE_HANDLE_OBJ_SELF is the M3b identity
+/* Object type values carried in a slot. A zeroed slot has type 0, which the
+ * pure table permits as an opaque caller-supplied tag; the syscall dispatcher
+ * rejects type 0 and all other unregistered types before exposing a handle
+ * operation. JE_HANDLE_OBJ_SELF is the M3b identity
  * capability — the ONLY type that may be duplicated via je_handle_dup_self,
  * because it owns no external resource and is never destroyed. It MUST equal the
  * ABI's JE_ABI_OBJ_SELF; a syscall-layer _Static_assert pins the two together.

@@ -2536,3 +2536,40 @@ linked work queue. Multitouch/security-key PR #10 is merged into main at
 The previous M0 state is preserved in git history; this file describes the M1/M2
 implementation and subsequent documentation checkpoints. Do not infer future capabilities from design prose.
 
+
+
+## 2026-11-06 — repair-first fix-gate CLOSED (F01–F14)
+
+State: implemented/tested (AI-assisted, not independent human qualification).
+The current-code stabilization gate (`docs/audit/2026-11-fix-gate.md`) is closed.
+Dispositions and evidence are in the [closure ledger](audit/2026-11-fix-gate-closure.md);
+per-batch evidence under `docs/audit/evidence/2026-11-F0*.md`.
+
+- F01/F02 (PR #94): trustworthy mutation runner + builds.
+- F03 (PR #97): reaper sign fix + `je_arch_irqs_enabled` seam.
+- F04–F06 (PR #98): ARM audit two-pass deref safety; usercopy guards; F06
+  defensive subset. The 4 deferred F06 contract decisions are owner-dispositioned
+  in this PR (vb_flush: assert PCID/PGE-off at boot, keep no-op; zeroization:
+  keep distributed policy, documented; boot-block: don't tighten, documented;
+  no-NX console line: reworded unambiguously).
+- F07–F11 (PR #99): JE_EP_CORRUPT split (owner-approved; a cross-review-caught
+  user-reachable CORRUPT re-routed to DENIED); explicit one-thread-per-process
+  (owner-approved); vm-audit/device/image negative coverage; recv staging clamp;
+  ARM late-canary + stalled-timer proofs.
+- F12–F14 (this PR): warning sweep 49→0 (core); SPDX/comment/FDT/tick-global
+  cleanup; spawn decoupled from the failable harness ledger via a registered
+  no-op-default observer; **ADR 0014** records the pre-MP3 lifecycle-ownership
+  decision + migration trigger (owner-gated, deferred — a pre-MP3 blocker) and
+  amends ADR 0013's trigger-less flex; the closure ledger.
+
+Verified at the final head: x86 `make check` + `make integration`; ARM
+`make aarch64` + 11/11 smoke matrix (+ F11 injected profiles FAIL as required);
+`make mutants` 27 killed / 1 equivalent / 0 survived / 0 blocked / 1 skipped;
+`tools/mutants.py --selftest` OK; NX-present and no-NX smoke both pass.
+
+Next bounded task: with the gate closed, resume the roadmap — MP2 ARM scheduler
+implementation per ADR 0013 — but the **ADR 0014 pre-MP3 lifecycle extraction is
+an owner-gated blocker for MP3** (ARM userspace/IPC). Tracked non-blocker
+follow-ups: `GAP-EP-WAIT-INFLIGHT` killer, x86 trap-routing hosted seam, the
+`(uint8_t)hcap` recv truncation, the recv shared-helper refactor, F13's main.c
+fixture split, device-observation-state split. Mobile pin unchanged.

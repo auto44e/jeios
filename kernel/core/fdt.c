@@ -599,7 +599,6 @@ je_fdt_status je_fdt_parse(const uint8_t *blob, size_t len,
     if (out != NULL) fdt_zero_context(out);
     if (err_off != NULL) *err_off = 0u;
     if (out == NULL || err_off == NULL || blob == NULL) return JE_FDT_BAD_ARG;
-    fdt_zero_context(out);
     *err_off = 0u;
     blob_len = (uint64_t)len;
 

@@ -19,9 +19,8 @@
 #include <stdint.h>
 
 #include <jeios/alloc.h>
+#include <jeios/memory.h>
 #include "paging.h"
-
-extern void *memset(void *destination, int value, size_t count);
 
 #define JE_ARM_PAGE_SHIFT 12u
 #define JE_ARM_PT_ENTRIES 512u
