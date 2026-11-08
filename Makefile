@@ -81,7 +81,7 @@ $(BUILD)/kernel/core/image.o: kernel/core/image.c $(USER_GENERATED) $(USER_GENER
 $(BUILD)/test_core: tests/test_core.c $(CORE) $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -fsanitize=undefined -fno-sanitize-recover=all tests/test_core.c $(CORE) -o $@
-test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_paging_bits $(BUILD)/test_gic_bits $(BUILD)/test_vm $(BUILD)/test_usercopy $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_sched_rr $(BUILD)/test_device $(IMAGE_REG_TESTS)
+test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_physmem $(BUILD)/test_physmem_arm $(BUILD)/test_paging_bits $(BUILD)/test_gic_bits $(BUILD)/test_vm $(BUILD)/test_usercopy $(BUILD)/test_uframe $(BUILD)/test_syscall $(BUILD)/test_handle $(BUILD)/test_handle_rw $(BUILD)/test_endpoint $(BUILD)/test_proc $(BUILD)/test_proc_retire $(BUILD)/test_fdt $(BUILD)/test_image $(BUILD)/test_sched_killall $(BUILD)/test_lifecycle_order $(BUILD)/test_sched_rr $(BUILD)/test_device $(IMAGE_REG_TESTS)
 	./$(BUILD)/test_core
 	./$(BUILD)/test_boot
 	./$(BUILD)/test_alloc
@@ -101,6 +101,7 @@ test: $(BUILD)/test_core $(BUILD)/test_boot $(BUILD)/test_alloc $(BUILD)/test_ph
 	./$(BUILD)/test_fdt
 	./$(BUILD)/test_image
 	./$(BUILD)/test_sched_killall
+	./$(BUILD)/test_lifecycle_order
 	./$(BUILD)/test_sched_rr
 	./$(BUILD)/test_device
 	for t in $(IMAGE_REG_TESTS); do ./$$t || exit 1; done
@@ -256,6 +257,17 @@ $(BUILD)/test_sched_killall: tests/test_sched_killall.c kernel/core/sched.c kern
 	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -ffunction-sections -fdata-sections \
 	  -fsanitize=address,undefined -fno-sanitize-recover=all \
 	  -DJE_SCHED_HOSTED_TEST tests/test_sched_killall.c kernel/core/proc.c -Wl,--gc-sections -o $@
+
+# ADR 0014: characterization of the process-lifecycle side-effect ORDER inside
+# sched.c (release -> device hooks -> je_proc_on_dying -> DYING publish), written
+# BEFORE the extraction so it can be proven to preserve the sequence. Compiled
+# WITHOUT JE_SCHED_HOSTED_TEST so the device-death hooks are present and
+# observable. Links the real proc.c.
+$(BUILD)/test_lifecycle_order: tests/test_lifecycle_order.c kernel/core/sched.c kernel/core/proc.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -std=c11 -O1 -g $(WARN) -ffunction-sections -fdata-sections \
+	  -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  tests/test_lifecycle_order.c kernel/core/proc.c -Wl,--gc-sections -o $@
 
 # ADR 0013 D1: pure arch-neutral scheduler policy with fake frames and hooks.
 $(BUILD)/test_sched_rr: tests/test_sched_rr.c kernel/core/sched_rr.c $(wildcard include/jeios/*.h)
