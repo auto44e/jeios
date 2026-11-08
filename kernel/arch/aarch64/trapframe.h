@@ -66,8 +66,12 @@ _Static_assert((JE_TF_SIZE % 16) == 0, "arm trapframe 16-aligned");
 
 /* The common C exception handler (MP1: diagnose + halt; no recovery). */
 _Noreturn void je_arm_exception(je_arm_trapframe *tf);
-/* Returning IRQ handler (MP2 PR-2b): no allocation, I unmask, or console I/O. */
-void je_arm_irq(const je_arm_trapframe *tf);
+/*
+ * Returning IRQ handler (MP2 PR-2b + ADR 0013 D2): no allocation, I unmask,
+ * or console I/O.  The returned pointer is a C-validated frame selected by
+ * the ARM scheduler seam; the vector restore consumes it as the new SP.
+ */
+void *je_arm_irq(je_arm_trapframe *tf);
 #endif /* __ASSEMBLER__ */
 
 #endif /* JEIOS_AARCH64_TRAPFRAME_H */

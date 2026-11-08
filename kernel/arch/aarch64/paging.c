@@ -43,6 +43,13 @@
 
 #define JE_ARM_MAP_EXEC UINT8_C(1)
 #define JE_ARM_MAP_WRITE UINT8_C(2)
+/* Ledger bits beyond W/X (ADR 0013 D4). PRESENT: the frame has at least one
+ * leaf (set by every install, static or runtime; RODATA frames would otherwise
+ * read as 0 == "unmapped"). RUNTIME: the frame's single leaf was installed by
+ * je_arm_mmu_map_page after enable and may be removed by unmap. Neither bit
+ * participates in the W^X test, which only looks at EXEC|WRITE. */
+#define JE_ARM_MAP_PRESENT UINT8_C(4)
+#define JE_ARM_MAP_RUNTIME UINT8_C(8)
 #define JE_ARM_EXTERNAL_FRAMES 64u
 #define JE_ARM_MAX_TABLES 128u
 
@@ -314,7 +321,8 @@ static je_status map_page(je_arm_mmu *mmu, je_pages *pages,
     uint64_t *l3 = table_pointer(table_pa);
     size_t leaf_index = va_index(virtual_address, 3u);
     if ((l3[leaf_index] & JE_ARM_DESC_VALID) != 0u) return JE_ERR_INVALID;
-    if (!record_frame_flags(mmu, physical, class_flags(cls)))
+    if (!record_frame_flags(mmu, physical,
+                            (uint8_t)(class_flags(cls) | JE_ARM_MAP_PRESENT)))
         return JE_ERR_INVALID;
     l3[leaf_index] = leaf_descriptor(physical, cls);
     return JE_OK;
@@ -685,6 +693,281 @@ je_status je_arm_mmu_enable(const je_arm_mmu *mmu)
                            mmu->image_start, mmu->image_end,
                            JE_ARM_SCTLR_SET);
     je_arm_enabled_context = mmu;
+    return JE_OK;
+}
+
+/*
+ * ---- Runtime single-page map/unmap + guarded stacks (ADR 0013 D4) ----
+ *
+ * Contract in paging.h. Design notes the header does not carry:
+ *
+ * Missing tables (hazard a/b). The static build creates an L3 table only for a
+ * 2 MiB region that holds an image page, a device page or a table frame. On
+ * QEMU virt the first-fit allocator places the table frames at the bottom of
+ * RAM, so the L3 for [0x40000000, 0x40200000) exists and covers the free frames
+ * below the image; but nothing guarantees a later stack run lands in a region
+ * that already has an L3. Creating one here would (1) memset a frame that has
+ * no identity leaf yet -> translation fault with the MMU on, and (2) grow
+ * table_pa[]/table_start/table_end, which the audit ledger treats as frozen
+ * post-build. The runtime path therefore NEVER allocates a table: a missing
+ * L0..L2 descriptor is JE_ERR_UNSUPPORTED with nothing written, and every
+ * table it reads must be a build-time ledger member (each of which has its own
+ * RW identity leaf), so a corrupt descriptor pointing at an unmapped or
+ * foreign frame is JE_ERR_INVALID without being dereferenced.
+ *
+ * Ledger (hazard c). A runtime-mapped frame must have an EMPTY ledger entry
+ * before the map (no leaf anywhere), so it is singly mapped and its entry is
+ * set to class_flags | PRESENT | RUNTIME. unmap therefore owns the entry
+ * outright and resets it to 0, so a later map of the same frame in another
+ * class starts from a clean ledger (record_frame_flags only ORs, which would
+ * otherwise make a later RX use of the frame look like a W+X alias). Static
+ * leaves never carry RUNTIME, so unmap cannot remove kernel image, table or
+ * device mappings.
+ *
+ * W^X. Only JE_MAP_RW / JE_MAP_RODATA are accepted; the encoded descriptor is
+ * then compared against the audit's independent literal and its PXN and UXN
+ * bits are required to be set before the store. With the empty-ledger rule no
+ * other leaf (executable or not) can alias the frame.
+ *
+ * Ordering (hazard d). The leaf is written with one aligned 64-bit volatile
+ * store (single-copy atomic for the walker), then leaf_changed_sync() runs the
+ * barrier/TLBI sequence. Only invalid <-> valid transitions happen, so no
+ * break-before-make step is needed. For unmap the ledger entry is cleared only
+ * after the TLBI has completed (the translation is gone first).
+ */
+#ifdef JE_ARM_PAGING_HOSTED_TEST
+/* Hosted-test seam: the x86 host cannot run TLBI, so the hosted build counts
+ * each maintenance sequence and keeps its operand for tests/test_paging_bits.c.
+ * Not part of the frozen paging.h contract. */
+uint64_t je_arm_tlbi_hosted_calls;
+uint64_t je_arm_tlbi_hosted_last_operand;
+#endif
+
+/*
+ * TLBI VALE1IS operand, Xt (Arm ARM DDI0487, "TLBI VALE1, TLBI VALE1IS, TLBI
+ * VALE1ISNXS, TLBI VALE1NXS: TLB Invalidate by VA, Last level, EL1" in the A64
+ * system-instruction chapter, C5.5 in DDI0487 K.a):
+ *   Xt[63:48] ASID  = 0. Our leaves are global (nG=0) and global entries match
+ *                     regardless of ASID; the kernel runs with ASID 0 anyway.
+ *   Xt[47:44] TTL   = 0. "No information about the translation level" (the
+ *                     FEAT_TTL hint is optional and not used).
+ *   Xt[43:0]  VA[55:12]. va < 2^48, so this is va >> 12 in bits [35:0].
+ * Semantics: invalidate cached stage-1 EL1&0 translations for that VA that come
+ * from a LAST-level (leaf) entry, broadcast to the Inner Shareable domain. Upper
+ * level walk caches are not invalidated, which is correct because the runtime
+ * path never changes a table descriptor. The DSB ISHST before makes the
+ * descriptor store visible to table walks before the invalidate; DSB ISH after
+ * waits for the invalidate to complete; ISB makes later instructions use the
+ * new translation (DDI0487 D8 "TLB maintenance requirements" / "Ordering and
+ * completion of TLB maintenance instructions").
+ */
+static uint64_t tlbi_va_operand(uint64_t virtual_address)
+{
+    return (virtual_address >> JE_ARM_PAGE_SHIFT) &
+           ((UINT64_C(1) << 44) - 1u);
+}
+
+static void leaf_changed_sync(uint64_t virtual_address)
+{
+    const uint64_t operand = tlbi_va_operand(virtual_address);
+#ifdef JE_ARM_PAGING_HOSTED_TEST
+    ++je_arm_tlbi_hosted_calls;
+    je_arm_tlbi_hosted_last_operand = operand;
+#else
+    __asm__ volatile("dsb ishst\n\t"
+                     "tlbi vale1is, %0\n\t"
+                     "dsb ish\n\t"
+                     "isb"
+                     : : "r"(operand) : "memory");
+#endif
+}
+
+static bool runtime_context_ok(const je_arm_mmu *mmu)
+{
+    return mmu != NULL && mmu->valid && je_arm_enabled_context == mmu &&
+           mmu->root_pa != 0u;
+}
+
+static bool page_aligned(uint64_t address)
+{
+    return (address & (JE_PAGE_SIZE - 1u)) == 0u;
+}
+
+static bool in_window(uint64_t physical)
+{
+    return physical >= JE_PHYSICAL_BASE && physical < JE_PHYSICAL_LIMIT;
+}
+
+static bool in_image(const je_arm_mmu *mmu, uint64_t address)
+{
+    return address >= mmu->image_start && address < mmu->image_end;
+}
+
+static size_t window_index(uint64_t physical)
+{
+    return (size_t)((physical - JE_PHYSICAL_BASE) / JE_PAGE_SIZE);
+}
+
+/* Locate the L3 slot for `va` WITHOUT allocating. JE_ERR_UNSUPPORTED: an
+ * L0..L2 descriptor is invalid (no L3 table for this 2 MiB region).
+ * JE_ERR_INVALID: a block descriptor, or a table that is not a ledger member
+ * (never dereferenced). */
+static je_status runtime_leaf_slot(const je_arm_mmu *mmu,
+                                   uint64_t virtual_address, uint64_t **out_slot)
+{
+    *out_slot = NULL;
+    uint64_t table_pa = mmu->root_pa;
+    for (unsigned level = 0u; level < 3u; ++level) {
+        if (!table_frame(mmu, table_pa)) return JE_ERR_INVALID;
+        const uint64_t descriptor =
+            table_pointer(table_pa)[va_index(virtual_address, level)];
+        if ((descriptor & JE_ARM_DESC_VALID) == 0u) return JE_ERR_UNSUPPORTED;
+        if ((descriptor & UINT64_C(3)) != JE_ARM_DESC_TABLE)
+            return JE_ERR_INVALID;
+        table_pa = descriptor & JE_ARM_DESC_ADDR_MASK;
+    }
+    if (!table_frame(mmu, table_pa)) return JE_ERR_INVALID;
+    *out_slot = &table_pointer(table_pa)[va_index(virtual_address, 3u)];
+    return JE_OK;
+}
+
+/* Shared by unmap and the stack reap pre-check: the slot holds a valid page
+ * descriptor installed by the runtime path. Writes nothing. */
+static je_status runtime_leaf_owned(const je_arm_mmu *mmu,
+                                    uint64_t virtual_address,
+                                    uint64_t **out_slot, size_t *out_index)
+{
+    uint64_t *slot = NULL;
+    je_status status = runtime_leaf_slot(mmu, virtual_address, &slot);
+    if (status == JE_ERR_UNSUPPORTED) return JE_ERR_INVALID; /* no L3: invalid */
+    if (status != JE_OK) return status;
+    const uint64_t descriptor = *slot;
+    if ((descriptor & JE_ARM_DESC_VALID) == 0u) return JE_ERR_INVALID;
+    if ((descriptor & UINT64_C(3)) != JE_ARM_DESC_TABLE) /* L3 0b01: not a page */
+        return JE_ERR_INVALID;
+    const uint64_t physical = descriptor & JE_ARM_DESC_ADDR_MASK;
+    if (!in_window(physical)) return JE_ERR_DENIED;          /* static device */
+    const size_t index = window_index(physical);
+    if ((mmu->frame_flags[index] & JE_ARM_MAP_RUNTIME) == 0u)
+        return JE_ERR_DENIED;                                /* static leaf */
+    *out_slot = slot;
+    *out_index = index;
+    return JE_OK;
+}
+
+je_status je_arm_mmu_map_page(je_arm_mmu *mmu, uint64_t va, uint64_t pa,
+                              je_map_class cls)
+{
+    if (!runtime_context_ok(mmu) || !class_valid(cls) ||
+        !page_aligned(va) || !page_aligned(pa) || va >= JE_ARM_VA_LIMIT ||
+        !in_window(pa))
+        return JE_ERR_INVALID;
+    if (cls != JE_MAP_RW && cls != JE_MAP_RODATA) return JE_ERR_DENIED;
+    if (in_image(mmu, va) || in_image(mmu, pa)) return JE_ERR_DENIED;
+
+    const uint64_t descriptor = leaf_descriptor(pa, cls);
+    if (class_executable(cls) || !class_descriptor_matches(descriptor, cls) ||
+        (descriptor & JE_ARM_DESC_PXN) == 0u ||
+        (descriptor & JE_ARM_DESC_UXN) == 0u ||
+        (descriptor & JE_ARM_DESC_ADDR_MASK) != pa)
+        return JE_ERR_INVALID;
+
+    uint64_t *slot = NULL;
+    je_status status = runtime_leaf_slot(mmu, va, &slot);
+    if (status != JE_OK) return status;
+    if ((*slot & JE_ARM_DESC_VALID) != 0u) return JE_ERR_INVALID;
+
+    const size_t index = window_index(pa);
+    if (table_frame(mmu, pa) || mmu->frame_flags[index] != 0u)
+        return JE_ERR_DENIED;          /* frame already has a leaf somewhere */
+
+    mmu->frame_flags[index] = (uint8_t)(class_flags(cls) | JE_ARM_MAP_PRESENT |
+                                        JE_ARM_MAP_RUNTIME);
+    *(volatile uint64_t *)slot = descriptor;
+    leaf_changed_sync(va);
+    return JE_OK;
+}
+
+je_status je_arm_mmu_unmap_page(je_arm_mmu *mmu, uint64_t va)
+{
+    if (!runtime_context_ok(mmu) || !page_aligned(va) || va >= JE_ARM_VA_LIMIT)
+        return JE_ERR_INVALID;
+    uint64_t *slot = NULL;
+    size_t index = 0u;
+    je_status status = runtime_leaf_owned(mmu, va, &slot, &index);
+    if (status != JE_OK) return status;
+    *(volatile uint64_t *)slot = 0u;
+    leaf_changed_sync(va);
+    mmu->frame_flags[index] = 0u;      /* translation gone; frame unledgered */
+    return JE_OK;
+}
+
+static bool stack_run_valid(uint64_t run_base)
+{
+    const uint64_t span = (uint64_t)JE_ARM_STACK_RUN_PAGES * JE_PAGE_SIZE;
+    return page_aligned(run_base) && in_window(run_base) &&
+           run_base <= JE_PHYSICAL_LIMIT - span;
+}
+
+/* JE_OK iff the guard VA has no valid leaf (a missing L3 counts as unmapped). */
+static je_status stack_guard_unmapped(const je_arm_mmu *mmu, uint64_t guard)
+{
+    uint64_t *slot = NULL;
+    je_status status = runtime_leaf_slot(mmu, guard, &slot);
+    if (status == JE_ERR_UNSUPPORTED) return JE_OK;
+    if (status != JE_OK) return status;
+    return (*slot & JE_ARM_DESC_VALID) == 0u ? JE_OK : JE_ERR_INVALID;
+}
+
+je_status je_arm_mmu_stack_map(je_arm_mmu *mmu, uint64_t run_base,
+                               uint64_t *out_top)
+{
+    if (out_top == NULL) return JE_ERR_INVALID;
+    *out_top = 0u;
+    if (!runtime_context_ok(mmu) || !stack_run_valid(run_base))
+        return JE_ERR_INVALID;
+    je_status status = stack_guard_unmapped(mmu, run_base);
+    if (status != JE_OK) return status;
+    for (uint64_t k = 0u; k < JE_ARM_STACK_PAGES; ++k) {
+        const uint64_t va = run_base + (JE_ARM_STACK_GUARD_PAGES + k) * JE_PAGE_SIZE;
+        status = je_arm_mmu_map_page(mmu, va, va, JE_MAP_RW);
+        if (status == JE_OK) continue;
+        /* All-or-nothing: undo the pages this call mapped, newest first. A
+         * rollback failure is the more severe state, so it wins (as in
+         * rollback_build). */
+        while (k > 0u) {
+            --k;
+            const uint64_t undo_va =
+                run_base + (JE_ARM_STACK_GUARD_PAGES + k) * JE_PAGE_SIZE;
+            je_status undo = je_arm_mmu_unmap_page(mmu, undo_va);
+            if (undo != JE_OK) status = undo;
+        }
+        return status;
+    }
+    *out_top = run_base + (uint64_t)JE_ARM_STACK_RUN_PAGES * JE_PAGE_SIZE;
+    return JE_OK;
+}
+
+je_status je_arm_mmu_stack_unmap(je_arm_mmu *mmu, uint64_t run_base)
+{
+    if (!runtime_context_ok(mmu) || !stack_run_valid(run_base))
+        return JE_ERR_INVALID;
+    je_status status = stack_guard_unmapped(mmu, run_base);
+    if (status != JE_OK) return status;
+    /* Pre-check every stack leaf before changing any (no partial reap). */
+    for (uint64_t k = 0u; k < JE_ARM_STACK_PAGES; ++k) {
+        const uint64_t va = run_base + (JE_ARM_STACK_GUARD_PAGES + k) * JE_PAGE_SIZE;
+        uint64_t *slot = NULL;
+        size_t index = 0u;
+        status = runtime_leaf_owned(mmu, va, &slot, &index);
+        if (status != JE_OK) return status;
+        if ((*slot & JE_ARM_DESC_ADDR_MASK) != va) return JE_ERR_INVALID;
+    }
+    for (uint64_t k = 0u; k < JE_ARM_STACK_PAGES; ++k) {
+        const uint64_t va = run_base + (JE_ARM_STACK_GUARD_PAGES + k) * JE_PAGE_SIZE;
+        status = je_arm_mmu_unmap_page(mmu, va);
+        if (status != JE_OK) return status;   /* unreachable after pre-check */
+    }
     return JE_OK;
 }
 

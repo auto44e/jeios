@@ -374,7 +374,8 @@ def line_of(raw):
     return raw[:-1] if raw.endswith(b"\r") else raw
 
 
-def run_qemu(cmd, serial_path, term_line, early_stop, timeout):
+def run_qemu(cmd, serial_path, term_line, early_stop, timeout,
+             term_match=None):
     """Run QEMU, polling the serial FILE, bounded by `timeout` seconds overall
     (settle included). Returns (final_log, early, stderr): final_log is the
     WHOLE serial file re-read after QEMU has been terminated and reaped;
@@ -434,7 +435,8 @@ def run_qemu(cmd, serial_path, term_line, early_stop, timeout):
             # Only complete lines count; a line still being written (or a log
             # cut mid-line) can never satisfy the terminal marker.
             lines, _ = split_lines(read_serial())
-            if term_line in lines:
+            if ((term_match is not None and any(term_match(ln) for ln in lines))
+                    or (term_match is None and term_line in lines)):
                 seen = True
                 break
             if early_stop is not None and any(early_stop in ln for ln in lines):
@@ -1331,6 +1333,173 @@ def check_timer_test(lines, exp):
           f"no double fault")
 
 
+# ---- --sched-test (MP2 ADR 0013 D2/D3/D5/D6/D7) -----------------------------
+SCHED_WORKERS_RE = re.compile(
+    rb"JeiOS/aarch64: sched test workers=" + HEX16)
+SCHED_COUNTER_RE = re.compile(
+    rb"JeiOS/aarch64: sched counter slot=([0-9]+)"
+    rb" starts=([0-9]+) dispatched_to=([0-9]+) resumed=([0-9]+)"
+    rb" observed_running=([0-9]+) preempted_from=([0-9]+)"
+    rb" preempted_in_canary=([0-9]+)"
+    rb" phase_a_preempts=([0-9]+) phase_b_preempts=([0-9]+)"
+    rb" verified_resumes=([0-9]+)"
+    rb" interleave=([0-9]+) nzcv_window_preempts=([0-9]+)"
+    rb" dispatches_after_exit=([0-9]+)")
+SCHED_IDLE_RE = re.compile(
+    rb"JeiOS/aarch64: sched idle PASS all_sleep=([01])"
+    rb" start=([0-9]+) end=([0-9]+) idle_ticks=([0-9]+)"
+    rb" woke_slot=([0-9]+) worker_resumes=([0-9]+)")
+SCHED_ORACLE_RE = re.compile(
+    rb"JeiOS/aarch64: sched oracle dispatched=([0-9]+)"
+    rb" preemptions=([0-9]+) nonpreempt_switch_ins=([0-9]+)"
+    rb" ready_bound=([01])")
+SCHED_GUARD_TARGET_RE = re.compile(
+    rb"JeiOS/aarch64: sched guard target=" + H)
+SCHED_EXC_RE = re.compile(
+    rb"JeiOS/aarch64: EXCEPTION vector=" + re.escape(hx(4))
+    + rb" ec=" + H + rb" il=" + H + rb" iss=" + H)
+SCHED_GUARD_PASS = (
+    b"JeiOS/aarch64: sched guard PASS "
+    b"(thread guard translation fault; FAR==guard; ELR==store site)")
+
+
+def sched_markers():
+    return [
+        valued(b"JeiOS/aarch64: sched test workers=<hex>",
+               SCHED_WORKERS_RE.pattern),
+        exact(b"JeiOS/aarch64: MUTATION POINT REACHABLE"),
+        valued(b"JeiOS/aarch64: sched idle PASS ...",
+               SCHED_IDLE_RE.pattern),
+    ] + [
+        valued(b"JeiOS/aarch64: sched counter slot=<N> ...",
+               SCHED_COUNTER_RE.pattern)
+        for _ in range(4)
+    ] + [
+        valued(b"JeiOS/aarch64: sched oracle ...", SCHED_ORACLE_RE.pattern),
+        valued(b"JeiOS/aarch64: sched guard target=<hex>",
+               SCHED_GUARD_TARGET_RE.pattern),
+        valued(b"JeiOS/aarch64: guard exception vector=4 ec=0x25 ...",
+               SCHED_EXC_RE.pattern),
+        valued(b"JeiOS/aarch64: guard exception esr/elr/spsr",
+               EXC_ESR_RE.pattern),
+        valued(b"JeiOS/aarch64: guard exception far/vbar",
+               EXC_FAR_RE.pattern),
+        exact(SCHED_GUARD_PASS),
+        exact(TERM_EXC),
+    ]
+
+
+def check_sched_test(lines, syms):
+    """Verify the scheduler's ordered proof markers and independent counter
+    invariants. The counter table is evidence, not a kernel-authored verdict:
+    the arithmetic and guard-fault addresses are checked here."""
+    def first_match(regex):
+        for candidate in lines:
+            match = regex.fullmatch(candidate)
+            if match is not None:
+                return match
+        return None
+
+    counters = {}
+    for line in lines:
+        match = SCHED_COUNTER_RE.fullmatch(line)
+        if match is not None:
+            values = [int(value) for value in match.groups()]
+            slot = values[0]
+            if slot in counters:
+                fail(f"sched-test: duplicate counter slot {slot}")
+            counters[slot] = values[1:]
+    if sorted(counters) != [1, 2, 3, 4]:
+        fail(f"sched-test: counter slots {sorted(counters)} != [1, 2, 3, 4]")
+    for slot in (1, 2):
+        starts, dispatched, resumed, observed, _, in_canary, phase_a, phase_b, \
+            verified, interleave, nzcv, after_exit = counters[slot]
+        if starts != 1:
+            fail(f"sched-test: slot {slot} starts={starts}, want 1")
+        for name, value in (("dispatched_to", dispatched),
+                            ("resumed", resumed),
+                            ("observed_running", observed),
+                            ("preempted_in_canary", in_canary),
+                            ("phase_a_preempts", phase_a),
+                            ("phase_b_preempts", phase_b),
+                            ("verified_resumes", verified),
+                            ("interleave", interleave),
+                            ("nzcv_window_preempts", nzcv)):
+            if value < 1:
+                fail(f"sched-test: slot {slot} {name}={value}, want >=1")
+        if dispatched < 3:
+            fail(f"sched-test: slot {slot} dispatched_to={dispatched}, want >=3")
+        if after_exit != 0:
+            fail(f"sched-test: slot {slot} dispatches_after_exit={after_exit}")
+
+    idle = first_match(SCHED_IDLE_RE)
+    if idle is None:
+        fail("sched-test: missing all-sleep idle proof")
+    all_sleep, idle_start, idle_end, idle_ticks, woke_slot, worker_resumes = \
+        map(int, idle.groups())
+    if all_sleep != 1:
+        fail("sched-test: idle proof did not observe all workers sleeping")
+    if idle_end <= idle_start or idle_ticks < 1:
+        fail("sched-test: idle proof did not observe timer progress")
+    if not 1 <= woke_slot <= 2 or worker_resumes < 1:
+        fail("sched-test: idle proof did not observe a worker resume")
+
+    oracle = first_match(SCHED_ORACLE_RE)
+    if oracle is None:
+        fail("sched-test: missing scheduler arithmetic oracle")
+    dispatched, preemptions, nonpreempt, ready_bound = map(
+        int, oracle.groups())
+    if dispatched != preemptions + nonpreempt:
+        fail(f"sched-test: dispatched={dispatched} != preemptions "
+             f"{preemptions} + nonpreempt_switch_ins {nonpreempt}")
+    if ready_bound != 1:
+        fail("sched-test: READY bounded-wait oracle did not pass")
+
+    target_match = first_match(SCHED_GUARD_TARGET_RE)
+    if target_match is None:
+        fail("sched-test: missing guard target")
+    guard_target = int(target_match.group(1), 16)
+    if guard_target & (PHYS_PAGE - 1) or not PHYS_WINDOW[0] <= guard_target < PHYS_WINDOW[1]:
+        fail(f"sched-test: worker guard 0x{guard_target:x} is not a page in "
+             f"the allocator window")
+    if guard_target == syms[b"__stack_guard"]:
+        fail("sched-test: guard subtest used the boot guard, not a worker guard")
+
+    exc = first_match(SCHED_EXC_RE)
+    if exc is None or int(exc.group(1), 16) != 0x25 or \
+            int(exc.group(2), 16) != 1:
+        fail("sched-test: guard exception vector/EC/IL mismatch")
+    esr_line = first_match(EXC_ESR_RE)
+    if esr_line is None:
+        fail("sched-test: missing guard ESR line")
+    esr, elr, spsr = (int(group, 16) for group in esr_line.groups())
+    if (esr >> 26) & 0x3f != 0x25 or not (esr & (1 << 25)) or \
+            esr & 0x3f != FSC_TRANSLATION_L3 or not (esr & (1 << 6)):
+        fail(f"sched-test: ESR 0x{esr:x} is not DABT_CUR translation-L3 WnR")
+    if elr != syms[b"je_arm_sched_guard_store_site"]:
+        fail(f"sched-test: guard ELR 0x{elr:x} != store site "
+             f"0x{syms[b'je_arm_sched_guard_store_site']:x}")
+    # The monitor masks I before printing the final counters and firing the
+    # synchronous guard-store proof.  A synchronous exception preserves that
+    # I bit in SPSR_EL1; it is the one expected difference from a returning
+    # scheduler frame, whose validator requires I clear.
+    if (spsr & ~(0xf0000000 | 0x80)) != 0x345:
+        fail(f"sched-test: guard SPSR 0x{spsr:x} violates EL1h D/A/F policy")
+    far_line = first_match(EXC_FAR_RE)
+    if far_line is None or int(far_line.group(1), 16) != guard_target or \
+            int(far_line.group(2), 16) != syms[b"je_arm_vectors"]:
+        fail("sched-test: FAR/VBAR guard evidence mismatch")
+    if SCHED_GUARD_PASS not in lines or lines[-1] != TERM_EXC:
+        fail("sched-test: guard PASS/terminal markers are not final and ordered")
+    print(f"sched: counters slots 1..4 satisfy starts/resume/phase-A/phase-B/"
+          f"canary/NZCV "
+          f"requirements; dispatched={dispatched} == preemptions {preemptions} "
+          f"+ nonpreempt_switch_ins {nonpreempt}; READY bound passed; "
+          f"idle all-sleep interval {idle_start}->{idle_end} ticked "
+          f"{idle_ticks} time(s) and resumed worker {woke_slot}; "
+          f"worker guard 0x{guard_target:x} faulted at the registered store site")
+
+
 # ---- --mmu-fault (MP2 PR-1b deliberate W^X / guard faults) ------------------
 # name -> (target symbol, ESR EC, FSC, WnR, data-abort?, PAR_R spec, PAR_W spec,
 #          section-range symbols the target must lie in)
@@ -1680,6 +1849,18 @@ def main():
                     help="expect the ARM_TIMER_TEST returning-IRQ proof (4 ticks "
                          "via vector 5 interrupting the register-canary loop, "
                          "then the BRK #0xb2b2 negative control)")
+    ap.add_argument("--sched-test", action="store_true",
+                    help="expect the ARM_SCHED_TEST preemptive scheduler proof "
+                         "(counter table, READY oracle, and worker guard fault)")
+    ap.add_argument("--sched-mutation",
+                    choices=("drop-mov-sp", "pick-skips-b", "rebuild-fake-frame",
+                             "unconditional-cur-ready", "wfi-i-masked",
+                             "corrupt-spsr-nzcv", "spsr-i", "early-fake-swap",
+                             "live-pointer-swap", "live-content-swap",
+                             "drop-high-reg-restore", "drop-consume-on-resume",
+                             "replay-stale-frame"),
+                    help="expect this ARM_SCHED_TEST mutation to be caught by "
+                         "its named detector; the command exits nonzero")
     ap.add_argument("--late-corruption", choices=("low", "high"),
                     help="deliberately patch a timer-test Image copy at the "
                          "late low/high canary site; this profile must FAIL "
@@ -1721,6 +1902,13 @@ def main():
                             or args.phys_alloc):
         fail("--timer-test is only valid alone (its build excludes the other "
              "toggles)")
+    if args.sched_test and (args.dtb_bad or args.vector_test or args.mmu_fault
+                            or args.bss_verified or args.timer_poll
+                            or args.timer_test or args.phys_alloc):
+        fail("--sched-test is only valid alone (its build excludes the other "
+             "toggles)")
+    if args.sched_mutation is not None and not args.sched_test:
+        fail("--sched-mutation requires --sched-test")
     if (args.late_corruption is not None or args.stalled_timer) and not args.timer_test:
         fail("--late-corruption/--stalled-timer require --timer-test")
     if args.late_corruption is not None and args.stalled_timer:
@@ -1758,6 +1946,10 @@ def main():
         elf, args.image, args.late_corruption, args.stalled_timer)
     image_extent = resolve_image_extent(elf) if args.phys_alloc else None
     mmu_syms = None if args.dtb_bad else resolve_syms(elf, MMU_LAYOUT_SYMS, "mmu")
+    sched_syms = (resolve_syms(
+        elf, (b"je_arm_vectors", b"je_arm_sched_guard_store_site",
+              b"__stack_guard"),
+        "sched-test") if args.sched_test else None)
     fault_exp = (mmu_fault_expect(args.mmu_fault, elf, args.image, mmu_syms)
                  if args.mmu_fault else None)
     tt_exp = timer_test_expect(elf, boot_image) if args.timer_test else None
@@ -1795,6 +1987,8 @@ def main():
             markers += [valued(b"JeiOS/aarch64: irq timer PASS ticks=<hex>",
                                IRQ_PASS_RE.pattern),
                         exact(IRQ_BRK_TRIGGER), exact(IRQ_BRK_EXC), exact(TERM_EXC)]
+        elif args.sched_test:
+            markers += sched_markers()
         else:
             markers += [exact(TERM_DEFAULT)]
     # Every mode ends on a fixed (exact) line; that line is the terminal marker.
@@ -1804,7 +1998,8 @@ def main():
     # error path; in --dtb-bad the forbidden "validated" marker means the
     # injection was not rejected. The checks below then fail with a clear
     # message; this only shortens the wait, it never makes a run PASS.
-    early_stop = VALIDATED if args.dtb_bad else b"FATAL"
+    early_stop = (VALIDATED if args.dtb_bad
+                  else None if args.sched_mutation is not None else b"FATAL")
     if not args.dtb_bad:
         check_dtb_gic_timer(fx)   # static: pinned bases/INTID vs fixture DTB
 
@@ -1833,8 +2028,10 @@ def main():
     print("cmd:   " + " ".join(cmd))
 
     try:
-        out, early, err = run_qemu(cmd, serial_path, final_line, early_stop,
-                                   args.timeout)
+        out, early, err = run_qemu(
+            cmd, serial_path, final_line, early_stop, args.timeout,
+            (lambda line: b"FATAL" in line)
+            if args.sched_mutation is not None else None)
     finally:
         if boot_image != args.image:
             try:
@@ -1855,6 +2052,41 @@ def main():
     # Everything below judges the FINAL log (re-read after QEMU was killed)
     # and the final stderr. stderr first: a QEMU-level error voids the run.
     check_stderr(err)
+    if args.sched_mutation is not None:
+        lines, partial = split_lines(out)
+        if partial:
+            fail("scheduler mutation emitted an unterminated serial line")
+        mutation_line = (b"JeiOS/aarch64: MUTATION FIRED "
+                         + args.sched_mutation.encode())
+        if not lines or mutation_line not in lines:
+            fail(f"scheduler mutation {args.sched_mutation} did not emit "
+                 "its MUTATION FIRED marker")
+        expected = {
+            "drop-mov-sp": b"FATAL sched observed_running",
+            "pick-skips-b": b"FATAL sched proof ready-bound slot=2",
+            "rebuild-fake-frame": b"FATAL sched proof frame validation",
+            "unconditional-cur-ready": b"FATAL sched proof dispatches_after_exit",
+            "wfi-i-masked": b"FATAL sched proof exit DAIF.I",
+            "corrupt-spsr-nzcv": b"FATAL sched canary reg=32",
+            "spsr-i": b"FATAL sched proof frame validation",
+            "early-fake-swap": b"FATAL sched proof frame validation",
+            "live-pointer-swap": b"FATAL sched proof frame validation",
+            "live-content-swap": b"FATAL sched canary reg=",
+            "drop-high-reg-restore": b"FATAL sched canary reg=26",
+            "drop-consume-on-resume":
+                b"FATAL sched frame cookie zeroed by IRQ saver",
+            "replay-stale-frame": b"FATAL sched proof frame generation",
+        }[args.sched_mutation]
+        if not lines[-1].startswith(b"JeiOS/aarch64: " + expected):
+            fail(f"scheduler mutation {args.sched_mutation} ended with "
+                 f"{lines[-1]!r}, expected detector {expected!r}")
+        if any(b"PASS" in line and
+               not line.startswith(b"JeiOS/aarch64: sched idle PASS ")
+               for line in lines):
+            fail(f"scheduler mutation {args.sched_mutation} emitted a PASS")
+        print(f"QEMU aarch64 mutation: FAIL as expected "
+              f"{args.sched_mutation} -> {lines[-1].decode('ascii')}")
+        sys.exit(1)
     if args.late_corruption is not None or args.stalled_timer:
         lines, partial = split_lines(out)
         if partial:
@@ -1913,11 +2145,15 @@ def main():
             next_ok = lambda ln: MMU_FAULT_TEST_RE.fullmatch(ln) is not None
         elif args.timer_test:
             next_ok = lambda ln: ln == IRQ_CANARY_HI
+        elif args.sched_test:
+            next_ok = lambda ln: SCHED_WORKERS_RE.fullmatch(ln) is not None
         else:
             next_ok = lambda ln: ln == TERM_DEFAULT
         check_gic(lines, args.timer_poll, next_ok)
         if args.timer_test:
             check_timer_test(lines, tt_exp)
+        elif args.sched_test:
+            check_sched_test(lines, sched_syms)
         elif any(ln.startswith(IRQ_TICK_PREFIX) or DOUBLE_FAULT in ln for ln in lines):
             fail("irq/double-fault lines present without --timer-test (wrong build?)")
     if args.mmu_fault:
