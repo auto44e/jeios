@@ -341,6 +341,20 @@ static void test_good_build_and_audit(void)
     const uint64_t *l1 = (const uint64_t *)(uintptr_t)(l0[0] & D_OA_MASK);
     assert((l1[0] & ~D_OA_MASK) == 3u && (l1[1] & ~D_OA_MASK) == 3u);
 
+    /* ADR 0013 D4: the runtime map/unmap/stack API refuses a context that is
+     * built (and audited) but NOT enabled, and writes nothing. */
+    {
+        const uint64_t free_pa = JE_PHYSICAL_BASE + tables * PG;
+        uint64_t top = 99;
+        assert(je_arm_mmu_map_page(&je_arm_mmu_context, free_pa, free_pa,
+                                   JE_MAP_RW) == JE_ERR_INVALID);
+        assert(je_arm_mmu_unmap_page(&je_arm_mmu_context, TEXT_LO) == JE_ERR_INVALID);
+        assert(je_arm_mmu_stack_map(&je_arm_mmu_context, free_pa, &top) == JE_ERR_INVALID);
+        assert(top == 0u);
+        assert(*l3_slot(root, free_pa) == 0u);
+        assert(*l3_slot(root, TEXT_LO) == spec_leaf(TEXT_LO, JE_MAP_TEXT));
+    }
+
     AUDIT_OK();
     /* Same independent count the QEMU smoke oracle recomputes (0x53). */
     assert(je_arm_mmu_last_audit_leaves == region_pages + tables);
@@ -709,6 +723,275 @@ static void test_enable_gating(void)
     assert(leaf_rec.calls == 1);
 }
 
+/* ---- ADR 0013 D4: runtime single-page map/unmap + guarded stacks. ----
+ *
+ * Hosted, this proves ENCODING, BOUNDS and LEDGER logic only. Real TLB
+ * behaviour and the guard-page data abort are QEMU evidence (ARM_SCHED_TEST),
+ * not claimed here. The maintenance sequence is observed through the hosted
+ * seam (count + TLBI operand), never executed. */
+extern uint64_t je_arm_tlbi_hosted_calls;
+extern uint64_t je_arm_tlbi_hosted_last_operand;
+
+/* Independent DDI0487 TLBI VALE1IS Xt layout: [63:48] ASID=0, [47:44] TTL=0,
+ * [43:0] = VA[55:12]. */
+static uint64_t spec_tlbi_operand(uint64_t va)
+{
+    return FIELD(va, 12, 44);
+}
+
+/* The audit's RW literal (paging.c JE_ARM_LEAF_RW), re-stated here. */
+#define LEAF_RW_BITS UINT64_C(0x0060000000000703)
+/* Mirror of paging.c's ledger WRITE bit (JE_ARM_MAP_WRITE). */
+#define MIRROR_LEDGER_WRITE 2u
+
+static uint8_t ledger(uint64_t pa)
+{
+    return mirror()->frame_flags[(pa - JE_PHYSICAL_BASE) / PG];
+}
+
+/* Expect `call` to return `want` and to leave the TLBI count unchanged. */
+#define NO_SYNC(call, want) do { \
+        const uint64_t c0_ = je_arm_tlbi_hosted_calls; \
+        assert((call) == (want)); \
+        assert(je_arm_tlbi_hosted_calls == c0_); } while (0)
+
+static int runtime_checks;
+
+static void expect_synced(uint64_t c0, uint64_t n, uint64_t last_va)
+{
+    assert(je_arm_tlbi_hosted_calls == c0 + n);
+    assert(je_arm_tlbi_hosted_last_operand == spec_tlbi_operand(last_va));
+    ++runtime_checks;
+}
+
+static void test_runtime_map(void)
+{
+    je_arm_mmu *ctx = &je_arm_mmu_context;
+    const uint64_t root = je_arm_mmu_root(ctx);
+    const size_t tables = 6;
+    check_mirror(tables);
+    const size_t free_before = pages.free_count;
+
+    /* ---- Arguments / policy: refused, nothing written, no TLBI. ---- */
+    struct mmu_mirror other;
+    memset(&other, 0, sizeof(other));
+    uint64_t run = 0;
+    assert(je_pages_alloc(&pages, JE_ARM_STACK_RUN_PAGES, &run) == JE_OK);
+    assert(run == JE_PHYSICAL_BASE + tables * PG);   /* first-fit after tables */
+    const uint64_t p1 = run + PG;
+    NO_SYNC(je_arm_mmu_map_page(NULL, p1, p1, JE_MAP_RW), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_map_page((je_arm_mmu *)(void *)&other, p1, p1, JE_MAP_RW),
+            JE_ERR_INVALID);                         /* not the enabled context */
+    NO_SYNC(je_arm_mmu_map_page(ctx, p1 + 8, p1, JE_MAP_RW), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_map_page(ctx, p1, p1 + 8, JE_MAP_RW), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_map_page(ctx, UINT64_C(1) << 48, p1, JE_MAP_RW), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_map_page(ctx, p1, UART, JE_MAP_RW), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_map_page(ctx, p1, JE_PHYSICAL_LIMIT, JE_MAP_RW), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_map_page(ctx, p1, JE_PHYSICAL_BASE - PG, JE_MAP_RW), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_map_page(ctx, p1, p1, JE_MAP_CLASS_COUNT), JE_ERR_INVALID);
+    /* W^X / attribute policy: never an executable or Device runtime leaf. */
+    NO_SYNC(je_arm_mmu_map_page(ctx, p1, p1, JE_MAP_TEXT), JE_ERR_DENIED);
+    NO_SYNC(je_arm_mmu_map_page(ctx, p1, p1, JE_MAP_DEVICE), JE_ERR_DENIED);
+    /* VA inside the kernel image extent [_text,_end) (holds the boot guard). */
+    NO_SYNC(je_arm_mmu_map_page(ctx, (uint64_t)(uintptr_t)_text, p1, JE_MAP_RW),
+            JE_ERR_DENIED);
+    assert(*l3_slot(root, p1) == 0u && ledger(p1) == 0u);
+    runtime_checks += 14;
+
+    /* ---- Map one RW identity page: exact literal, L3 index, TLBI. ---- */
+    uint64_t c0 = je_arm_tlbi_hosted_calls;
+    assert(je_arm_mmu_map_page(ctx, p1, p1, JE_MAP_RW) == JE_OK);
+    expect_synced(c0, 1, p1);
+    uint64_t *s1 = l3_slot(root, p1);
+    assert(s1 && *s1 == spec_leaf(p1, JE_MAP_RW));
+    assert((*s1 & ~D_OA_MASK) == LEAF_RW_BITS && (*s1 & D_OA_MASK) == p1);
+    assert((*s1 & D_PXN) && (*s1 & D_UXN) && FIELD(*s1, 6, 2) == AP_EL1_RW);
+    /* L3 index: independently, the slot is entry VA[20:12] of the kernel L3. */
+    const uint64_t *l0 = (const uint64_t *)(uintptr_t)root;
+    const uint64_t *l1 = (const uint64_t *)(uintptr_t)(l0[FIELD(p1, 39, 9)] & D_OA_MASK);
+    const uint64_t *l2 = (const uint64_t *)(uintptr_t)(l1[FIELD(p1, 30, 9)] & D_OA_MASK);
+    const uint64_t *l3 = (const uint64_t *)(uintptr_t)(l2[FIELD(p1, 21, 9)] & D_OA_MASK);
+    assert((size_t)(s1 - l3) == (size_t)((p1 >> 12) & 0x1ffu));
+    assert((size_t)(s1 - l3) == 7u);                 /* 0x40007000 */
+    assert(ledger(p1) != 0u);
+    /* No table was created and the audit ledger is untouched. */
+    assert(mirror()->table_count == tables);
+    assert(mirror()->table_end == JE_PHYSICAL_BASE + tables * PG);
+
+    /* ---- Map rejections on a live page. ---- */
+    NO_SYNC(je_arm_mmu_map_page(ctx, p1, p1, JE_MAP_RW), JE_ERR_INVALID);   /* valid */
+    NO_SYNC(je_arm_mmu_map_page(ctx, p1, p1, JE_MAP_RODATA), JE_ERR_INVALID);
+    const uint64_t p2 = run + 2 * PG;
+    /* Second leaf for an already-mapped frame (alias) is refused. */
+    NO_SYNC(je_arm_mmu_map_page(ctx, p2, p1, JE_MAP_RODATA), JE_ERR_DENIED);
+    /* Frames owned by the static map: a table frame, a text frame, and a
+     * RODATA frame (W/X ledger bits 0; caught by the PRESENT bit). */
+    NO_SYNC(je_arm_mmu_map_page(ctx, p2, JE_PHYSICAL_BASE, JE_MAP_RW), JE_ERR_DENIED);
+    NO_SYNC(je_arm_mmu_map_page(ctx, p2, TEXT_LO, JE_MAP_RW), JE_ERR_DENIED);
+    NO_SYNC(je_arm_mmu_map_page(ctx, p2, TEXT_HI, JE_MAP_RODATA), JE_ERR_DENIED);
+    assert(*l3_slot(root, p2) == 0u);
+    runtime_checks += 6;
+
+    /* ---- Unmap: leaf back to 0, ledger cleared, TLBI. ---- */
+    c0 = je_arm_tlbi_hosted_calls;
+    assert(je_arm_mmu_unmap_page(ctx, p1) == JE_OK);
+    expect_synced(c0, 1, p1);
+    assert(*s1 == 0u && ledger(p1) == 0u);
+    NO_SYNC(je_arm_mmu_unmap_page(ctx, p1), JE_ERR_INVALID);                /* invalid */
+    /* Remap the SAME frame in another class: clean ledger, no stale WRITE. */
+    c0 = je_arm_tlbi_hosted_calls;
+    assert(je_arm_mmu_map_page(ctx, p1, p1, JE_MAP_RODATA) == JE_OK);
+    expect_synced(c0, 1, p1);
+    assert(*s1 == spec_leaf(p1, JE_MAP_RODATA));
+    assert(ledger(p1) != 0u && (ledger(p1) & MIRROR_LEDGER_WRITE) == 0u);
+    assert(je_arm_mmu_unmap_page(ctx, p1) == JE_OK && *s1 == 0u && ledger(p1) == 0u);
+    /* Non-identity map (API takes va and pa): leaf OA is pa; unmap clears pa's
+     * ledger entry. */
+    assert(je_arm_mmu_map_page(ctx, p2, p1, JE_MAP_RW) == JE_OK);
+    assert(*l3_slot(root, p2) == spec_leaf(p1, JE_MAP_RW) && ledger(p1) != 0u);
+    assert(ledger(p2) == 0u);
+    assert(je_arm_mmu_unmap_page(ctx, p2) == JE_OK);
+    assert(*l3_slot(root, p2) == 0u && ledger(p1) == 0u);
+    runtime_checks += 4;
+
+    /* ---- Unmap refuses static leaves and non-pages. ---- */
+    NO_SYNC(je_arm_mmu_unmap_page(ctx, TEXT_LO), JE_ERR_DENIED);
+    NO_SYNC(je_arm_mmu_unmap_page(ctx, TEXT_HI), JE_ERR_DENIED);
+    NO_SYNC(je_arm_mmu_unmap_page(ctx, JE_PHYSICAL_BASE), JE_ERR_DENIED);  /* table */
+    NO_SYNC(je_arm_mmu_unmap_page(ctx, UART), JE_ERR_DENIED);              /* device */
+    NO_SYNC(je_arm_mmu_unmap_page(ctx, GUARD), JE_ERR_INVALID);            /* unmapped */
+    NO_SYNC(je_arm_mmu_unmap_page(ctx, p1 + 8), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_unmap_page(NULL, p1), JE_ERR_INVALID);
+    assert(*l3_slot(root, TEXT_LO) == spec_leaf(TEXT_LO, JE_MAP_TEXT));
+    assert(*l3_slot(root, JE_PHYSICAL_BASE) == spec_leaf(JE_PHYSICAL_BASE, JE_MAP_RW));
+    assert(*l3_slot(root, UART) == spec_leaf(UART, JE_MAP_DEVICE));
+    /* An L3 entry with only bit 0 set (0b01: reserved, not a page). */
+    *s1 = p1 | 1u;
+    NO_SYNC(je_arm_mmu_unmap_page(ctx, p1), JE_ERR_INVALID);
+    assert(*s1 == (p1 | 1u));
+    *s1 = 0u;
+    runtime_checks += 8;
+
+    /* ---- Missing L3 (option a: reject, never create a table). ---- */
+    uint64_t *l2w = (uint64_t *)(uintptr_t)(l1[1] & D_OA_MASK);  /* L2 @0x40000000 */
+    const uint64_t next2m = JE_PHYSICAL_BASE + (UINT64_C(1) << 21);
+    assert(l2w[1] == 0u);
+    const uint64_t missing[] = {
+        next2m,                       /* L2[1] invalid: no L3 for this 2 MiB  */
+        UINT64_C(0x80000000),         /* L1[2] invalid: no L2                 */
+        UINT64_C(1) << 39,            /* L0[1] invalid: no L1                 */
+    };
+    for (size_t i = 0; i < sizeof(missing) / sizeof(missing[0]); ++i) {
+        NO_SYNC(je_arm_mmu_map_page(ctx, missing[i], next2m, JE_MAP_RW),
+                JE_ERR_UNSUPPORTED);
+        NO_SYNC(je_arm_mmu_unmap_page(ctx, missing[i]), JE_ERR_INVALID);
+        runtime_checks += 2;
+    }
+    assert(l2w[1] == 0u && l1[2] == 0u && l0[1] == 0u);
+    assert(mirror()->table_count == tables && pages.free_count == free_before - 5u);
+    assert(ledger(next2m) == 0u);
+    /* A corrupt L2 entry pointing at a PROT_NONE frame that is NOT a ledger
+     * member: refused without dereference (a deref would SIGSEGV). A valid
+     * block descriptor at L2 is refused as malformed. */
+    void *pn = mmap(NULL, (size_t)PG, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(pn != MAP_FAILED && ((uint64_t)(uintptr_t)pn & ~D_OA_MASK) == 0u);
+    l2w[1] = (uint64_t)(uintptr_t)pn | D_VALID_PAGE;
+    NO_SYNC(je_arm_mmu_map_page(ctx, next2m, next2m, JE_MAP_RW), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_unmap_page(ctx, next2m), JE_ERR_INVALID);
+    l2w[1] = next2m | 1u;
+    NO_SYNC(je_arm_mmu_map_page(ctx, next2m, next2m, JE_MAP_RW), JE_ERR_INVALID);
+    l2w[1] = 0u;
+    /* Same at an INTERMEDIATE level: L1[2] -> PROT_NONE "L2". The walk must
+     * check membership before reading the next table, not only at L3. */
+    uint64_t *l1w = (uint64_t *)(uintptr_t)l1;
+    l1w[2] = (uint64_t)(uintptr_t)pn | D_VALID_PAGE;
+    NO_SYNC(je_arm_mmu_map_page(ctx, UINT64_C(0x80000000), next2m, JE_MAP_RW),
+            JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_unmap_page(ctx, UINT64_C(0x80000000)), JE_ERR_INVALID);
+    l1w[2] = 0u;
+    assert(munmap(pn, (size_t)PG) == 0);
+    assert(ledger(next2m) == 0u);
+    runtime_checks += 5;
+
+    /* ---- Guarded stack over the 5-page run. ---- */
+    uint64_t top = 1;
+    NO_SYNC(je_arm_mmu_stack_map(ctx, run, NULL), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_stack_map(ctx, run + 8, &top), JE_ERR_INVALID);
+    assert(top == 0u);
+    NO_SYNC(je_arm_mmu_stack_map(ctx, UART, &top), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_stack_map(ctx, JE_PHYSICAL_LIMIT - 4 * PG, &top), JE_ERR_INVALID);
+    NO_SYNC(je_arm_mmu_stack_map(NULL, run, &top), JE_ERR_INVALID);
+    c0 = je_arm_tlbi_hosted_calls;
+    assert(je_arm_mmu_stack_map(ctx, run, &top) == JE_OK);
+    expect_synced(c0, 4, run + 4 * PG);
+    assert(top == run + 5 * PG && (top & 15u) == 0u);
+    assert(*l3_slot(root, run) == 0u && ledger(run) == 0u);     /* guard */
+    for (uint64_t k = 1; k < 5; ++k) {
+        assert(*l3_slot(root, run + k * PG) == spec_leaf(run + k * PG, JE_MAP_RW));
+        assert(ledger(run + k * PG) != 0u);
+    }
+    assert(*l3_slot(root, run + 5 * PG) == 0u);                 /* past the top */
+    /* A second map of a live stack fails on its first page; nothing changes. */
+    NO_SYNC(je_arm_mmu_stack_map(ctx, run, &top), JE_ERR_INVALID);
+    assert(top == 0u && *l3_slot(root, run) == 0u);
+    runtime_checks += 7;
+
+    /* Partial reap is refused as a whole: drop one stack page by hand. */
+    assert(je_arm_mmu_unmap_page(ctx, run + 4 * PG) == JE_OK);
+    NO_SYNC(je_arm_mmu_stack_unmap(ctx, run), JE_ERR_INVALID);
+    for (uint64_t k = 1; k < 4; ++k)
+        assert(*l3_slot(root, run + k * PG) == spec_leaf(run + k * PG, JE_MAP_RW));
+    assert(je_arm_mmu_map_page(ctx, run + 4 * PG, run + 4 * PG, JE_MAP_RW) == JE_OK);
+    /* A mapped guard is not a guard: reap refused. */
+    assert(je_arm_mmu_map_page(ctx, run, run, JE_MAP_RW) == JE_OK);
+    NO_SYNC(je_arm_mmu_stack_unmap(ctx, run), JE_ERR_INVALID);
+    assert(je_arm_mmu_unmap_page(ctx, run) == JE_OK);
+    /* Reap. */
+    c0 = je_arm_tlbi_hosted_calls;
+    assert(je_arm_mmu_stack_unmap(ctx, run) == JE_OK);
+    expect_synced(c0, 4, run + 4 * PG);
+    for (uint64_t k = 0; k < 5; ++k) {
+        assert(*l3_slot(root, run + k * PG) == 0u);
+        assert(ledger(run + k * PG) == 0u);
+    }
+    NO_SYNC(je_arm_mmu_stack_unmap(ctx, run), JE_ERR_INVALID);
+    runtime_checks += 3;
+
+    /* Rollback: page 3 of a second run is already mapped, so stack_map maps
+     * pages 1-2, fails on 3, and unmaps 1-2 again (2 maps + 2 unmaps). */
+    uint64_t run2 = 0;
+    assert(je_pages_alloc(&pages, JE_ARM_STACK_RUN_PAGES, &run2) == JE_OK);
+    assert(run2 == run + 5 * PG);
+    assert(je_arm_mmu_map_page(ctx, run2 + 3 * PG, run2 + 3 * PG, JE_MAP_RW) == JE_OK);
+    c0 = je_arm_tlbi_hosted_calls;
+    top = 1;
+    assert(je_arm_mmu_stack_map(ctx, run2, &top) == JE_ERR_INVALID);
+    expect_synced(c0, 4, run2 + PG);              /* last sync: undo of page 1 */
+    assert(top == 0u);
+    assert(*l3_slot(root, run2 + PG) == 0u && ledger(run2 + PG) == 0u);
+    assert(*l3_slot(root, run2 + 2 * PG) == 0u && ledger(run2 + 2 * PG) == 0u);
+    assert(*l3_slot(root, run2 + 3 * PG) == spec_leaf(run2 + 3 * PG, JE_MAP_RW));
+    assert(je_arm_mmu_unmap_page(ctx, run2 + 3 * PG) == JE_OK);
+    /* Mapped guard: stack_map refuses before mapping anything. */
+    assert(je_arm_mmu_map_page(ctx, run2, run2, JE_MAP_RW) == JE_OK);
+    NO_SYNC(je_arm_mmu_stack_map(ctx, run2, &top), JE_ERR_INVALID);
+    assert(*l3_slot(root, run2 + PG) == 0u);
+    assert(je_arm_mmu_unmap_page(ctx, run2) == JE_OK);
+    runtime_checks += 2;
+
+    /* Return both runs; the static map and its ledger are exactly as built. */
+    assert(je_pages_free(&pages, run, JE_ARM_STACK_RUN_PAGES) == JE_OK);
+    assert(je_pages_free(&pages, run2, JE_ARM_STACK_RUN_PAGES) == JE_OK);
+    assert(pages.free_count == free_before);
+    for (uint64_t pa = run; pa < run2 + 5 * PG; pa += PG)
+        assert(*l3_slot(root, pa) == 0u && ledger(pa) == 0u);
+    check_mirror(tables);
+    /* The pre-enable audit still refuses the enabled context (not weakened,
+     * not repurposed as a post-enable check). */
+    assert(je_arm_mmu_audit(ctx, good, NGOOD) == JE_ERR_INVALID);
+    assert(je_arm_mmu_last_audit_reject == JE_ARM_AUDIT_REJECT_PRECONDITION);
+}
+
 int main(void)
 {
     void *window = mmap((void *)(uintptr_t)JE_PHYSICAL_BASE,
@@ -727,9 +1010,12 @@ int main(void)
     test_good_build_and_audit();
     test_structural_tampers();
     test_enable_gating();
+    test_runtime_map();
     printf("test_paging_bits: PASS (constants, %u-class encoder vs DDI0487 "
            "spec, %d audit tamper rejections, %d structural rejections with "
-           "exact reason, build rollback, enable gating)\n",
-           (unsigned)JE_MAP_CLASS_COUNT, failures_seen, structural_seen);
+           "exact reason, build rollback, enable gating, %d runtime map/unmap/"
+           "guarded-stack checks)\n",
+           (unsigned)JE_MAP_CLASS_COUNT, failures_seen, structural_seen,
+           runtime_checks);
     return 0;
 }

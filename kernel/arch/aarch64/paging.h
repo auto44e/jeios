@@ -139,4 +139,86 @@ uint64_t je_arm_at_s1e1(uint64_t va, int write);
 /* Root-table physical address of a built context (for markers/evidence). */
 uint64_t je_arm_mmu_root(const je_arm_mmu *mmu);
 
+/*
+ * ---- Runtime single-page map/unmap (ADR 0013 D4; reviewed contract update) ----
+ *
+ * Caller context: EL1, AFTER a successful je_arm_mmu_enable(mmu) (the context
+ * must be the enabled one), single core, and the caller serializes every call
+ * (interrupts masked or the scheduler lock held). The ledger is unlocked.
+ *
+ * Each call edits exactly ONE 4 KiB level-3 leaf, and only between the two
+ * states INVALID <-> VALID (never valid -> different valid, so break-before-make
+ * never arises). After the store it runs, in this order:
+ *     DSB ISHST ; TLBI VALE1IS, (va >> 12) ; DSB ISH ; ISB
+ * (store visible to the Inner-Shareable walker; drop any last-level TLB entry
+ * for va at EL1; wait for completion; resync the instruction stream).
+ *
+ * NO TABLE CREATION: the runtime path never allocates a table. If any of the
+ * L0..L2 descriptors for `va` is invalid (the 2 MiB region has no L3 table) the
+ * call returns JE_ERR_UNSUPPORTED and writes nothing. Every table walked must
+ * be a member of the build-time table ledger (all of which are identity-mapped
+ * RW), so the walk never dereferences an unmapped or foreign table frame; a
+ * non-member or a block descriptor is JE_ERR_INVALID. table_count, the table
+ * window and the audit ledger are therefore unchanged by runtime maps.
+ *
+ * je_arm_mmu_map_page(mmu, va, pa, cls):
+ *   va, pa page-aligned; va < 2^48; pa inside the allocator window
+ *   [JE_PHYSICAL_BASE, JE_PHYSICAL_LIMIT); neither inside the kernel image
+ *   [_text,_end) (which contains the unmapped boot-stack guard). Stacks pass
+ *   va == pa (identity); the API takes both. cls must be non-executable and
+ *   Normal memory: JE_MAP_RW or JE_MAP_RODATA. JE_MAP_TEXT (would need I-cache
+ *   maintenance and a new W^X proof) and JE_MAP_DEVICE are JE_ERR_DENIED.
+ *   The frame must have NO existing leaf anywhere (its ledger entry is empty);
+ *   a frame already mapped by the static build (image, table frame) or by an
+ *   earlier runtime map is JE_ERR_DENIED, so every runtime frame is singly
+ *   mapped. The encoded leaf is re-checked against the audit's independent
+ *   per-class literal and must have PXN|UXN set before install.
+ *   Returns JE_ERR_INVALID for a bad argument, a context that is not the
+ *   enabled one, or an already-valid leaf at va.
+ *
+ * je_arm_mmu_unmap_page(mmu, va):
+ *   va page-aligned. Returns JE_ERR_INVALID if the leaf is already invalid or
+ *   is not a page descriptor; JE_ERR_DENIED if the leaf was installed by the
+ *   static build (only runtime-mapped leaves may be removed). On success the
+ *   leaf is zeroed AND the frame's ledger entry is cleared, so the frame can
+ *   later be remapped in a different class without a false W^X reject.
+ *
+ * Audit scope (BY DESIGN): je_arm_mmu_audit is a PRE-enable proof of the static
+ * map and refuses an enabled context. Runtime-mapped leaves exist only after
+ * enable and are outside that audit's scope; they are validated by the checks
+ * above at install time and by the post-enable guard-fault proof. The
+ * pre-enable audit is unchanged.
+ *
+ * Hardware note: tables are Normal WB and the walk is Inner-Shareable WBWA
+ * (TCR_EL1), so the walker is coherent with the data cache once the MMU is on;
+ * no DC maintenance of the table line is required. QEMU TCG does not model TLB
+ * staleness faithfully, so the barrier/TLBI sequence is REVIEWED, not observed.
+ */
+je_status je_arm_mmu_map_page(je_arm_mmu *mmu, uint64_t va, uint64_t pa,
+                              je_map_class cls);
+je_status je_arm_mmu_unmap_page(je_arm_mmu *mmu, uint64_t va);
+
+/*
+ * Guarded kernel stack (ADR 0013 D4) over a run of JE_ARM_STACK_RUN_PAGES
+ * contiguous frames from the page allocator starting at `run_base`:
+ *   [run_base, +1 page)            GUARD: left UNMAPPED (must be invalid now)
+ *   [run_base + 1 page, +4 pages)  stack: mapped JE_MAP_RW (RW, PXN, UXN), va==pa
+ * *out_top = run_base + JE_ARM_STACK_RUN_PAGES * 4096 (16-byte aligned initial
+ * SP; the stack grows down toward the guard, so overflow is a translation fault
+ * with FAR in the guard page). All-or-nothing: on any failure every stack page
+ * this call mapped is unmapped again and *out_top is 0. Errors are those of
+ * je_arm_mmu_map_page; a guard page whose leaf is valid is JE_ERR_INVALID.
+ *
+ * je_arm_mmu_stack_unmap is the reap path: pre-checks that the guard is still
+ * unmapped and all four stack leaves are valid runtime leaves, then unmaps all
+ * four (nothing is changed if any pre-check fails). Only after JE_OK may the
+ * caller return the run to the allocator. Same caller context as above.
+ */
+#define JE_ARM_STACK_GUARD_PAGES 1u
+#define JE_ARM_STACK_PAGES 4u
+#define JE_ARM_STACK_RUN_PAGES (JE_ARM_STACK_GUARD_PAGES + JE_ARM_STACK_PAGES)
+je_status je_arm_mmu_stack_map(je_arm_mmu *mmu, uint64_t run_base,
+                               uint64_t *out_top);
+je_status je_arm_mmu_stack_unmap(je_arm_mmu *mmu, uint64_t run_base);
+
 #endif /* JEIOS_AARCH64_PAGING_H */
