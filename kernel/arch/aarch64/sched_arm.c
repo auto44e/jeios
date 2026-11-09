@@ -52,6 +52,11 @@
 
 extern je_pages *je_arm_scheduler_pages(void);
 extern je_arm_mmu je_arm_mmu_context;
+#ifdef JE_ARM_EL0_TEST
+extern je_syscall_action je_arm_syscall_dispatch(
+    uint64_t op, const uint64_t args[6], je_abi_status *out_status,
+    uint64_t *out_result);
+#endif
 
 extern uint8_t _text[];
 extern uint8_t __text_end[];
@@ -704,6 +709,12 @@ static je_status arm_dispatch_install(je_rr_ctx *prev, je_rr_ctx *next)
             !arm_user_harden())
             return JE_ERR_DENIED;
         je_arm_sched_install_ttbr0(je_arm_user_root[next->slot], 1u);
+        /*
+         * Test-only poison is installed after hardening and root selection so
+         * the EL0 restore seam, rather than arm_user_harden(), is the proof
+         * boundary that must scrub TPIDR{,RO}_EL0.
+         */
+        je_arm_el0_test_poison_tpidr();
         return JE_OK;
     }
 #endif
@@ -784,6 +795,33 @@ je_status je_arm_sched_current_user(je_vm **out_vm, uint32_t *out_index,
     *out_index = je_arm_user_index[slot];
     *out_slot = slot;
     return JE_OK;
+}
+
+/*
+ * Arch-neutral current-user seam used by usercopy and future frame-neutral
+ * glue.  The ARM-internal helper keeps its slot result for scheduler proofs;
+ * this wrapper deliberately matches the x86 contract: NULL output pointers are
+ * accepted, but the scheduler must be ready and the resolved identity must be
+ * a real VM process index.
+ */
+je_status je_sched_current_user(je_vm **out_vm, uint32_t *out_index)
+{
+    je_vm *vm = NULL;
+    uint32_t index = UINT32_MAX;
+    uint32_t slot = UINT32_MAX;
+
+    if (!je_arm_rr_ready ||
+        je_arm_sched_current_user(&vm, &index, &slot) != JE_OK ||
+        vm == NULL || index >= JE_VM_MAX_PROCESSES)
+        return JE_ERR_INVALID;
+    if (out_vm) *out_vm = vm;
+    if (out_index) *out_index = index;
+    return JE_OK;
+}
+
+_Noreturn void je_arm_copy_live_root_fail(void)
+{
+    sched_fatal("copy live root");
 }
 
 uint32_t je_arm_el0_test_mode_rejection(uint32_t slot)
@@ -1095,12 +1133,7 @@ void *je_arm_el0_svc(je_arm_trapframe *tf)
         }
     } else
 #endif
-        action = je_syscall_decode(op, args, &abi_status, &result);
-    if (action != JE_SYSCALL_RETURN && action != JE_SYSCALL_YIELD &&
-        action != JE_SYSCALL_EXIT) {
-        abi_status = JE_ABI_UNSUPPORTED;
-        result = 0u;
-    }
+        action = je_arm_syscall_dispatch(op, args, &abi_status, &result);
     tf->gpr[0] = (uint64_t)abi_status;
     tf->gpr[1] = result;
     if (op == JE_ARM_EL0_PROOF_OP)

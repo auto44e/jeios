@@ -40,6 +40,38 @@ typedef enum {
 #endif
 } je_syscall_action;
 
+/* The decoder action numbers mirror the public ABI operation numbers. Keep the
+ * two enums tied at compile time so an arch-local SVC glue cannot silently
+ * dispatch the wrong operation after either enum is edited. */
+_Static_assert((unsigned)JE_SYSCALL_RETURN == (unsigned)JE_SYS_ABI_QUERY, "syscall abi_query");
+_Static_assert((unsigned)JE_SYSCALL_YIELD == (unsigned)JE_SYS_YIELD, "syscall yield");
+_Static_assert((unsigned)JE_SYSCALL_EXIT == (unsigned)JE_SYS_EXIT, "syscall exit");
+_Static_assert((unsigned)JE_SYSCALL_COPY_PROBE == (unsigned)JE_SYS_COPY_PROBE, "syscall copy_probe");
+_Static_assert((unsigned)JE_SYSCALL_HANDLE_SELF == (unsigned)JE_SYS_HANDLE_SELF, "syscall handle_self");
+_Static_assert((unsigned)JE_SYSCALL_HANDLE_CLOSE == (unsigned)JE_SYS_HANDLE_CLOSE, "syscall handle_close");
+_Static_assert((unsigned)JE_SYSCALL_HANDLE_QUERY == (unsigned)JE_SYS_HANDLE_QUERY, "syscall handle_query");
+_Static_assert((unsigned)JE_SYSCALL_HANDLE_RIGHTS == (unsigned)JE_SYS_HANDLE_RIGHTS,
+               "syscall handle_rights");
+_Static_assert((unsigned)JE_SYSCALL_HANDLE_DUP == (unsigned)JE_SYS_HANDLE_DUP, "syscall handle_dup");
+_Static_assert((unsigned)JE_SYSCALL_ENDPOINT_CREATE == (unsigned)JE_SYS_ENDPOINT_CREATE,
+               "syscall endpoint_create");
+_Static_assert((unsigned)JE_SYSCALL_TRY_SEND == (unsigned)JE_SYS_TRY_SEND, "syscall try_send");
+_Static_assert((unsigned)JE_SYSCALL_TRY_RECV == (unsigned)JE_SYS_TRY_RECV, "syscall try_recv");
+_Static_assert((unsigned)JE_SYSCALL_CLOCK_TICKS == (unsigned)JE_SYS_CLOCK_TICKS,
+               "syscall clock_ticks");
+_Static_assert((unsigned)JE_SYSCALL_PROC_SPAWN == (unsigned)JE_SYS_PROC_SPAWN, "syscall proc_spawn");
+_Static_assert((unsigned)JE_SYSCALL_PROC_STATUS == (unsigned)JE_SYS_PROC_STATUS,
+               "syscall proc_status");
+_Static_assert((unsigned)JE_SYSCALL_PROC_KILL == (unsigned)JE_SYS_PROC_KILL, "syscall proc_kill");
+_Static_assert((unsigned)JE_SYSCALL_DEV_ASSIGN == (unsigned)JE_SYS_DEV_ASSIGN, "syscall dev_assign");
+_Static_assert((unsigned)JE_SYSCALL_DEV_REVOKE == (unsigned)JE_SYS_DEV_REVOKE, "syscall dev_revoke");
+_Static_assert((unsigned)JE_SYSCALL_DEV_IRQ_ACK == (unsigned)JE_SYS_DEV_IRQ_ACK,
+               "syscall dev_irq_ack");
+#ifdef JE_DEV_COPY_INJECT
+_Static_assert((unsigned)JE_SYSCALL_COPY_FIXUP_INJECT == (unsigned)JE_SYS_COPY_FIXUP_INJECT,
+               "syscall copy_fixup_inject");
+#endif
+
 /* Pure: (op, six arg registers) -> action + ABI status + optional scalar result.
  * No kernel state; unit-tested on the host. */
 je_syscall_action je_syscall_decode(uint64_t op, const uint64_t args[6],

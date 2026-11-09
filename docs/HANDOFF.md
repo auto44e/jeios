@@ -1,5 +1,126 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Current status — MP3b fix pass — observed 2026-11-09T08:04:29Z
+
+Repository `/tmp/wt-mp3b`, branch `wip/mp3b`, exact inspected commit
+`5b338b7b89f787365ddff37f1969ae2d8416925d` (the exact inspected pre-fix-pass
+base; this working tree contains the fix pass). State: **implemented / tested
+locally / planned (owner review, remote CI, physical ARM and independent human
+qualification) / not blocked**.
+No PR, push, reviewer assignment or release was performed. Demonstrated support tier:
+QEMU 8.2.2 `virt-8.2`, `cortex-a72`, one CPU, 256 MiB.
+
+### Implemented
+
+- Added `kernel/arch/aarch64/usercopy_arm.S` with separate `LDTRB/STRB`
+  from-user and `LDRB/STTRB` to-user leaves. The leaves return 0/1, use only
+  x0-x3 and x30, have no stack frame and no x16-x18 use, and expose the exact
+  labels `je_copy_user_load_site`, `je_copy_user_store_site`, and
+  `je_copy_user_fixup`.
+- Extended the portable usercopy scope/prevalidation path for ARM, including
+  the live TTBR0 root equality check and the exact ARM predicate:
+  vector 4, EL1h, EC 0x25, IL 1, ISS 0x007/0x047 only, exact ELR site,
+  half-open FAR span, active current owner, and live-root equality.
+- Added the tri-valued vector guard and dedicated 304-byte copy restore tail.
+  The copy path requires guard state 2, rewrites ELR to the fixup, restores
+  guard state 1, and never calls `je_arm_restore_selected`.
+- Added the ARM current-user shim and separate ARM-local syscall glue for
+  `COPY_PROBE` plus SELF-only handle mint/close/query/rights/dup operations.
+  Wrong object types fail closed; x86 `syscall.c` and x86 usercopy behavior
+  remain outside the ARM path.
+- Extended the EL0 proof with exact byte round-trips for lengths 0, 256 and
+  255 (including page-crossing spans), prevalidation-versus-fixup counting,
+  SELF attenuation/query/rights/close/stale-close, and guard-state checking.
+  Added fourteen isolated fatal-negative copy-fault profiles, including
+  save-path, live-root-core, load-permission, guard-2, far-lower, and
+  prefilter-stray proofs, plus ARM MP3b mutant anchors for the new load-bearing
+  guards.
+
+Changed files:
+
+`docs/HANDOFF.md`; `docs/IMPLEMENTATION.md`;
+`docs/adr/0016-mp3b-aarch64-usercopy-and-handles.md`;
+`include/jeios/{syscall.h,usercopy.h}`; `kernel/core/usercopy.c`;
+`kernel/arch/aarch64/{el0_test.c,usercopy_arm.S,vectors.S}`;
+`mk/aarch64.mk`; `tools/{check_arm_usercopy_boundary.sh,mutants.json,run_arm_copy_fault.py,smoke_arm.py}`.
+
+New proof markers and labels:
+
+```text
+je_copy_user_load_site
+je_copy_user_store_site
+je_copy_user_fixup
+JeiOS/aarch64: EL0 COPY_PROBE_PASS slot=<N> lengths=0,256,255
+JeiOS/aarch64: EL0 HANDLE_ROUND_TRIP_PASS slot=<N> type=SELF attenuated=0 stale=3
+JeiOS/aarch64: EL0 COPY_FIXUP_RECOVERED slot=<N> count=2 guard=1
+JeiOS/aarch64: FATAL copy fault fixup rejected
+JeiOS/aarch64: FATAL el0-test copy-guard-cleared
+```
+
+### Tested
+
+Observed locally:
+
+```text
+make aarch64 ARM_EL0_TEST=1                                      PASS
+make smoke-aarch64 ARM_EL0_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60 PASS
+make smoke-aarch64 ARM_COPY_FAULT=<each of 14 profiles>          PASS
+make check                                                        PASS
+make mutants                                                       PASS (65 killed, 1 equivalent, 0 survived, 0 blocked, 1 skipped)
+sh tools/check_arm_usercopy_boundary.sh                           PASS
+python3 -m json.tool tools/mutants.json                           PASS
+python3 -m py_compile tools/smoke_arm.py tools/run_arm_copy_fault.py PASS
+git diff --check                                                  PASS
+```
+
+The positive boot tail included:
+
+```text
+JeiOS/aarch64: EL0 COPY_PROBE_PASS slot=1 lengths=0,256,255
+JeiOS/aarch64: EL0 COPY_FIXUP_RECOVERED slot=1 count=2 guard=1
+JeiOS/aarch64: EL0 HANDLE_ROUND_TRIP_PASS slot=1 type=SELF attenuated=0 stale=3
+JeiOS/aarch64: EL0 proof PASS reviewed-cache-tlb=not-observed
+QEMU aarch64 smoke: PASS
+```
+
+The final negative injection results were:
+
+```text
+exact-elr / far-bound / far-lower / owner / direction: C-path FATAL
+permission: ISS=0x04f FATAL; load-permission: ISS=0x00f FATAL
+l0: lower-level translation ISS FATAL; live-root: predicate FATAL
+live-root-core: FATAL sched copy live root
+save-path / guard-2 / prefilter-stray: bounded FATAL double fault
+restore-selected: FATAL el0-test copy-guard-cleared
+```
+
+The positive `COPY_FIXUP_RECOVERED ... guard=1` assertion is the load-bearing
+proof that the real restore-selected tail restores, rather than clears, the
+guard. The `restore-selected` negative profile is retained as a redundant
+tripwire for the explicitly mutated tail.
+
+The exact killer texts are recorded in `tools/mutants.json` for:
+`ARM-MP3B-TRANSLATION-ONLY`, `ARM-MP3B-TRANSLATION-ONLY-LOAD`,
+`ARM-MP3B-EXACT-ELR`, `ARM-MP3B-OWNER`, `ARM-MP3B-DIRECTION`,
+`ARM-MP3B-LIVE-ROOT`, `ARM-MP3B-LIVE-ROOT-CORE`,
+`ARM-MP3B-STACK-FREE-PREFILTER`, `ARM-MP3B-GUARD-3-STATE`, and
+`ARM-MP3B-GUARD-2-STATE`. The final mutant run killed all 10 ARM MP3b
+mutants; the one equivalent result is the pre-existing
+`IMAGE-SPAN-GUARD`, and the one skipped result is the pre-existing
+`GAP-EP-WAIT-INFLIGHT`.
+
+### Planned / blocked / not enforced
+
+Next bounded task: owner review of this MP3b change and its ADR 0016 evidence,
+then remote CI/physical-ARM reproduction. Nothing is currently blocked.
+Not enforced or observed here: the hosted ARM predicate matrix mirroring
+`tests/test_usercopy.c` with one ARM fault-predicate field flipped per case,
+physical ARM execution, SMP, cache/TLB freshness beyond QEMU TCG, arbitrary
+boards, remote CI, dynamic loading, general application ABIs, and independent
+human qualification. Copy-fault smoke runs still use the full timeout rather
+than an early FATAL stop. The QEMU support tier must not be generalized to all
+ARM hardware.
+
 ## Current status — MP3a-2 FINAL FIX PASS — observed 2026-11-09T03:38:01+00:00
 
 Repository `/tmp/wt-mp3a2`, branch `wip/mp3a2`, exact inspected base commit

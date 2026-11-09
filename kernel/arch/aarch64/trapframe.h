@@ -47,7 +47,7 @@
 #define JE_ARM_SPSR_M_EL1H UINT64_C(0x5)
 #define JE_ARM_SPSR_M_EL0T UINT64_C(0x0)
 
-typedef struct {
+typedef struct je_arm_trapframe {
     uint64_t gpr[31];   /* x0..x30 */
     uint64_t sp;        /* interrupted-mode SP (SP_EL1 or SP_EL0) */
     uint64_t elr;       /* ELR_EL1 (faulting PC) */

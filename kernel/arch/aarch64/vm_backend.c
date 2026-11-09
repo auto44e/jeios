@@ -577,6 +577,26 @@ static void arm_backend_panic(void *ctx, const char *why)
     arm_fail_stop();
 }
 
+#ifdef JE_ARM_EL0_TEST
+/*
+ * Negative-proof seam only: the caller has switched TTBR0_EL1 to the kernel
+ * root before entering here, so identity_page() can create its bounded runtime
+ * alias without faulting in the injector itself.  The process root is then
+ * returned to the caller for restoration of the current user root.
+ */
+je_status je_arm_test_clear_process_l0(uint32_t process)
+{
+    if (process >= JE_VM_MAX_PROCESSES || !arm_vm.process[process].used)
+        return JE_ERR_INVALID;
+    const uint64_t root_pa = arm_vm.process[process].root;
+    uint64_t *root = identity_page(root_pa);
+    if (root == NULL) return JE_ERR_INVALID;
+    root[(JE_VM_ARENA_BASE >> 39) & UINT64_C(0x1ff)] = 0u;
+    identity_page_release(root_pa);
+    return JE_OK;
+}
+#endif
+
 static const je_vm_ops arm_ops = {
     .context = &arm_vm,
     .reserve_hold = arm_reserve_hold,

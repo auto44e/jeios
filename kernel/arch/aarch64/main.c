@@ -28,6 +28,9 @@
 #if defined(JE_ARM_USER_TEST) || defined(JE_ARM_EL0_TEST)
 #include <jeios/vm.h>
 #endif
+#ifdef JE_ARM_EL0_TEST
+#include <jeios/usercopy.h>
+#endif
 #include "gic.h"
 #include "paging.h"
 #include "physmem.h"
@@ -40,11 +43,21 @@ bool je_arm_sched_guard_fault_check(const je_arm_trapframe *tf, uint64_t ec);
 extern _Noreturn void je_arm_el0_test_run(void);
 #endif
 
-/* MP1 reentrancy guard (vectors.S): 0 outside a handler, 1 inside. A nested
- * synchronous fault (fault while handling) trips je_arm_double_fault. Plain byte,
- * single CPU, no atomics (ADR 0002: no exclusives pre-MMU). In .data so it is a
- * defined 0 at boot without depending on the BSS clear order. */
+/* MP3b reentrancy guard (vectors.S): 0 outside a handler, 1 inside an SVC or
+ * ordinary returning handler, 2 inside the copy-fault C check. Any state other
+ * than the one exact copy-site transition is stack-free double-fault fatal.
+ * Plain byte, single CPU, no atomics. In .data so it is defined before BSS
+ * clearing. */
 volatile uint8_t je_arm_in_handler __attribute__((section(".data"))) = 0u;
+
+#ifdef JE_ARM_EL0_TEST
+/* Slot-4 saves these before using x16-x18 as its guard/vector scratch. */
+uint64_t je_arm_copy_saved_gprs[3] __attribute__((section(".data"))) = {0u, 0u, 0u};
+#ifdef JE_ARM_COPY_FAULT_MUTANT_RESTORE_SELECTED
+volatile uint8_t je_arm_copy_restore_selected_seen
+    __attribute__((section(".data"))) = 0u;
+#endif
+#endif
 
 /* DTB physical address, stashed by boot.S into .data BEFORE the BSS clear so it
  * survives (a .bss slot would have been zeroed). boot.S has already checked it
@@ -378,6 +391,23 @@ _Noreturn void je_arm_exception(je_arm_trapframe *tf)
     console_write("JeiOS/aarch64: exception handled; halted\r\n");
     for (;;) __asm__ volatile("wfe");
 }
+
+#ifdef JE_ARM_EL0_TEST
+/*
+ * The only C entry reachable from the returning slot-4 copy branch.  Rejects
+ * stay on the existing fatal diagnostic; acceptance returns the frame pointer
+ * so the dedicated assembly tail can assert that the C seam did not redirect
+ * the restore target.
+ */
+je_arm_trapframe *je_arm_copy_fixup_dispatch(je_arm_trapframe *tf)
+{
+    if (!je_arm_copy_fault(tf)) {
+        console_write("JeiOS/aarch64: FATAL copy fault fixup rejected\r\n");
+        je_arm_exception(tf);
+    }
+    return tf;
+}
+#endif
 
 /* je_arm_double_fault lives in vectors.S (pure asm, guaranteed stack-free — a C
  * function could grow a stack-touching prologue under -O0/flag changes and then

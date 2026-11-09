@@ -58,24 +58,26 @@ own software L3 table; the per-process TTBR0 root is `je_arm_user_root[slot]`.
 
 Exactly one kernel fault becomes recoverable: a not-present (translation-fault,
 level 3) data abort at the **exact** approved copy instruction, taken while an
-owner-matched copy scope is active inside an EL0 SVC. Everything else at EL1h stays
-fatal and `je_arm_exception` stays `_Noreturn`.
+owner-matched copy scope is active while `guard==1` in a returning handler.
+The current proof exercises EL0 SVC return, but the guard is not an SVC-type
+tag; an exact-site fault from any returning handler context is covered.
+Everything else at EL1h stays fatal and `je_arm_exception` stays `_Noreturn`.
 
 Mechanism:
 
 1. **Entry prefilter (stack-free asm).** On the `je_arm_vec_common` guard-hit
    branch, before any stack use, test `ELR_EL1 ∈ {je_copy_user_load_site,
-   je_copy_user_store_site}` **and** the guard == 1 (exactly one nesting, inside an
-   SVC). If either fails, branch to `je_arm_double_fault` unchanged. This keeps the
+   je_copy_user_store_site}` **and** the guard == 1 (exactly one nesting, in a
+   returning handler). If either fails, branch to `je_arm_double_fault` unchanged. This keeps the
    double-fault guarantee intact for every fault that is not the approved copy site.
 2. **Three-state guard.** `je_arm_in_handler` becomes tri-valued: 0 = not in a
-   handler, 1 = in an EL0 SVC (set by the sync saver), 2 = inside the copy-fault
+   handler, 1 = in a returning handler (set by the relevant saver), 2 = inside the copy-fault
    check. The prefilter sets the guard to 2 before building the frame, so a fault
    *inside the check itself* is still a double fault. On recovery the guard is
    **restored to 1, never cleared**, so the remainder of the SVC stays guarded.
 3. **Check (C).** Build the frozen 304-byte frame and call `je_arm_copy_fault(tf)`,
    which recovers only if: `vector==4`, `(spsr & 0x1f)==0x5` (EL1h), `EC==0x25`,
-   `IL==1`, `ISS[10:0]` is exactly `0x007` (load) or `0x047` (store) — translation
+   `IL==1`, `ISS[24:0]` is exactly `0x007` (load) or `0x047` (store) — translation
    fault level 3 with FnV=EA=CM=S1PTW=0 — the faulting `ELR` exactly equals the load
    or store site for the scope's direction, `FAR ∈ [user_lo, user_hi)`, the scope
    owner is the current user process, **and** the live `TTBR0_EL1.BADDR` equals
@@ -147,7 +149,7 @@ These were decided by the two-lineage review and are recorded for provenance:
   scratch in x16–x18; a returning slot-4 exception must preserve them, so the copy
   routines stay leaf and touch only x0–x3 and x30. Enforced by a `tools/` grep check
   on the `.S` file.
-- **DFSC exactly 0x07.** Recover only a level-3 translation fault (`ISS[10:0]`
+- **DFSC exactly 0x07.** Recover only a level-3 translation fault (`ISS[24:0]`
   `0x007`/`0x047`). The arena L0→L1→L2 chain is built at create time and never
   changes, so an in-arena L0–L2 fault indicates a wrong/corrupt root and must stay
   fatal. Access-flag and permission faults stay fatal (user leaves set AF; stores are
@@ -166,7 +168,7 @@ These were decided by the two-lineage review and are recorded for provenance:
   negative needs an input that **only** its target check rejects (ELR=site+4;
   FAR=span upper bound; owner mismatch; direction mismatch; a permission fault at the
   exact site). Positive copies use distinct non-zero patterns, cross a page, and
-  include lengths 0/256/257 and an unmapped-hole recovery, counting fixups so a
+  include lengths 0/256/255 and an unmapped-hole recovery, counting fixups so a
   prevalidation rejection is distinguishable from a recovered fault. A returning
   copy-fixup must assert guard==1 afterward, with a mutant that returns through
   `restore_selected` (which the base proof could not otherwise detect).

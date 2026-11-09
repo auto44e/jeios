@@ -867,6 +867,176 @@
       },
       "enabled": true,
       "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3B-TRANSLATION-ONLY",
+      "invariant": "ARM copy-fault recovery accepts only exact ISS[24:0]=0x007/0x047 translation level-3 faults; a permission fault at the exact user site remains fatal",
+      "file": "kernel/core/usercopy.c",
+      "find": "    is_store = iss == UINT64_C(0x047);",
+      "replace": "    is_store = (iss & UINT64_C(0x047)) == UINT64_C(0x047);",
+      "build": "build/aarch64-copyfault-permission/Image",
+      "run": "tools/run_arm_copy_fault.py",
+      "killer": "copy-fault permission stage: weakening the exact translation-only ISS check must die at the proof assertion \"copy-negative-recovered\" for ISS=0x04f",
+      "env": {
+        "ARM_COPY_FAULT": "permission",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3B-TRANSLATION-ONLY-LOAD",
+      "invariant": "ARM copy-fault recovery rejects an exact-site load permission fault with ISS[24:0]=0x00f",
+      "file": "kernel/core/usercopy.c",
+      "find": "    is_load = iss == UINT64_C(0x007);",
+      "replace": "    is_load = (iss & UINT64_C(0x007)) == UINT64_C(0x007);",
+      "build": "build/aarch64-copyfault-load-permission/Image",
+      "run": "tools/run_arm_copy_fault.py",
+      "killer": "copy-fault load-permission stage: weakening the exact load ISS check must die at the proof assertion \"copy-negative-recovered\" for ISS=0x00f",
+      "env": {
+        "ARM_COPY_FAULT": "load-permission",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3B-EXACT-ELR",
+      "invariant": "ARM copy-fault recovery requires ELR to equal the exact user load/store instruction label",
+      "file": "kernel/core/usercopy.c",
+      "find": "    if (tf->elr != expected_site) return 0;",
+      "replace": "    if (0 && (tf->elr != expected_site)) return 0;",
+      "build": "build/aarch64-copyfault-exact-elr/Image",
+      "run": "tools/run_arm_copy_fault.py",
+      "killer": "copy-fault exact-ELR stage: deleting the exact-ELR predicate must FATAL \"copy-negative-recovered\" instead of recovering ELR=site+4",
+      "env": {
+        "ARM_COPY_FAULT": "exact-elr",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3B-OWNER",
+      "invariant": "ARM copy-fault recovery requires the active scope owner to equal the current user process",
+      "file": "kernel/core/usercopy.c",
+      "find": "    if (current_vm != g_scope.owner_vm || current_index != g_scope.owner_index)\n        return 0;",
+      "replace": "    if (0 && (current_vm != g_scope.owner_vm || current_index != g_scope.owner_index))\n        return 0;",
+      "build": "build/aarch64-copyfault-owner/Image",
+      "run": "tools/run_arm_copy_fault.py",
+      "killer": "copy-fault owner stage: deleting the owner equality check must FATAL \"copy-negative-recovered\" for a mismatched scope owner",
+      "env": {
+        "ARM_COPY_FAULT": "owner",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3B-DIRECTION",
+      "invariant": "ARM copy-fault recovery requires the fault direction to match the active copy scope",
+      "file": "kernel/core/usercopy.c",
+      "find": "        if (!is_store) return 0;",
+      "replace": "        if (0 && (!is_store)) return 0;",
+      "build": "build/aarch64-copyfault-direction/Image",
+      "run": "tools/run_arm_copy_fault.py",
+      "killer": "copy-fault direction stage: deleting the scope-direction check must reach the proof assertion \"copy-negative-returned\" for a load fault in a to-user scope",
+      "env": {
+        "ARM_COPY_FAULT": "direction",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3B-LIVE-ROOT",
+      "invariant": "ARM copy-fault recovery requires the live TTBR0 root to equal the current process root",
+      "file": "kernel/core/usercopy.c",
+      "find": "    if (!arm_live_root_matches(current_vm, current_index, slot))\n        return 0;",
+      "replace": "    if (0 && !arm_live_root_matches(current_vm, current_index, slot))\n        return 0;",
+      "build": "build/aarch64-copyfault-live-root/Image",
+      "run": "tools/run_arm_copy_fault.py",
+      "killer": "copy-fault live-root stage: deleting the live-root equality check must FATAL \"copy-negative-recovered\" after TTBR0 is switched to another process root",
+      "env": {
+        "ARM_COPY_FAULT": "live-root",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3B-LIVE-ROOT-CORE",
+      "invariant": "the real copy_core path must reject a live TTBR0 root that belongs to another process",
+      "file": "kernel/core/usercopy.c",
+      "find": "    if (!arm_live_root_matches(vm, index, slot))\n        je_arm_copy_live_root_fail();",
+      "replace": "    if (0 && !arm_live_root_matches(vm, index, slot))\n        je_arm_copy_live_root_fail();",
+      "build": "build/aarch64-copyfault-live-root-core/Image",
+      "run": "tools/run_arm_copy_fault.py",
+      "killer": "copy-fault live-root-core stage: removing the copy_core live-root guard must die at the proof assertion \"copy-live-root-recovered\" after process 1's TTBR0 is installed",
+      "env": {
+        "ARM_COPY_FAULT": "live-root-core",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3B-STACK-FREE-PREFILTER",
+      "invariant": "a stray in-scope EL1h data abort must be rejected by the stack-free exact-site prefilter before a C frame exists",
+      "file": "kernel/arch/aarch64/vectors.S",
+      "find": "    adrp    x1, je_copy_user_store_site\n    add     x1, x1, #:lo12:je_copy_user_store_site\n    cmp     x0, x1\n    b.ne    je_arm_double_fault\n",
+      "replace": "    adrp    x1, je_copy_user_store_site\n    add     x1, x1, #:lo12:je_copy_user_store_site\n    cmp     x0, x1\n",
+      "build": "build/aarch64-copyfault-prefilter-stray/Image",
+      "run": "tools/run_arm_copy_fault.py",
+      "killer": "copy-fault prefilter-stray stage: deleting the store-site stack-free b.ne prefilter must change the required stack-free \"double fault\" into C FATAL \"copy fault fixup rejected\"",
+      "env": {
+        "ARM_COPY_FAULT": "prefilter-stray",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3B-GUARD-3-STATE",
+      "invariant": "the ARM slot-4 copy path may build a frame only while the tri-valued guard is exactly in state 2",
+      "file": "kernel/arch/aarch64/vectors.S",
+      "find": "#define JE_ARM_COPY_GUARD_STATE 2",
+      "replace": "#define JE_ARM_COPY_GUARD_STATE 1",
+      "build": "build/aarch64-copyfault-exact-elr/Image",
+      "run": "tools/run_arm_copy_fault.py",
+      "killer": "copy-fault guard-3-state stage: weakening the guard state to 1 must be killed by the .Lcopy_frame_build guard==2 assertion and FATAL \"JeiOS/aarch64: FATAL double fault\"",
+      "env": {
+        "ARM_COPY_FAULT": "exact-elr",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3B-GUARD-2-STATE",
+      "invariant": "guard state 2 must remain load-bearing while the C predicate is running; weakening both the state write and assertion must not recover a nested exact-site fault",
+      "file": "kernel/arch/aarch64/vectors.S",
+      "find": "#define JE_ARM_COPY_GUARD_STATE 2\n#define JE_ARM_COPY_GUARD_ASSERT_STATE 2",
+      "replace": "#define JE_ARM_COPY_GUARD_STATE 1\n#define JE_ARM_COPY_GUARD_ASSERT_STATE 1",
+      "build": "build/aarch64-copyfault-guard-2/Image",
+      "run": "tools/run_arm_copy_fault.py",
+      "killer": "copy-fault guard-2 stage: weakening guard state 2 and its assertion must die at the proof assertion \"copy-negative-recovered\" when the nested exact-site fault is wrongly recovered",
+      "env": {
+        "ARM_COPY_FAULT": "guard-2",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
     }
   ]
 }

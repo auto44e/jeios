@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <jeios/abi.h>
 #include <jeios/trap.h>
+#if defined(JE_ARCH_AARCH64)
+struct je_arm_trapframe;
+typedef struct je_arm_trapframe je_arm_trapframe;
+#endif
 
 /* Copy between kernel storage and a user arena span. Prevalidate presence +
  * permission for every page, copy through the approved assembly site, and
@@ -27,6 +31,17 @@ je_abi_status je_copy_probe(uint64_t usrc, uint64_t udst, uint64_t len);
  * not-present fault under an active, owner-matched, direction-matched scope with
  * CR2 in the declared span; else 0 (caller keeps the fatal path). */
 int je_usercopy_try_fixup(je_trap_frame *frame, uint64_t cr2, uint64_t pfec);
+
+#if defined(JE_ARCH_AARCH64)
+/* ARM direction-specific leaf sites and the returnable slot-4 predicate. */
+int je_copy_from_user_run(void *kdst, const void *usrc, uint64_t len);
+int je_copy_to_user_run(void *udst, const void *ksrc, uint64_t len);
+int je_arm_copy_fault(je_arm_trapframe *frame);
+#ifdef JE_ARM_EL0_TEST
+uint32_t je_arm_copy_fixup_count(void);
+int je_arm_copy_fixup_inject(void);
+#endif
+#endif
 
 #ifdef JE_DEV_COPY_INJECT
 /* Dev-only (compile-guarded): raw-copy an unmapped arena page from the current
