@@ -20,11 +20,10 @@
  * je_arm_mmu_enable runs the documented cache/barrier/TLB sequence and turns the
  * MMU on; after it returns the kernel executes translated (identity) addresses.
  *
- * MP3a-1 limitation: per-process table/user-frame construction is deliberately
- * MMU-off, and the user backend rejects its identity-pointer map/clear/flush
- * operations after enable. The enable leaf's DC IVAC ranges cover the static
- * kernel tables/image, not later process tables/frames at or above
- * 0x40100000; their MMU-on mappings and cache maintenance are MP3a-2 work.
+ * MP3a-2 extends the identity ledger with bounded MMU-on aliases for process
+ * table/user-frame construction and teardown. These aliases are single-page,
+ * runtime-ledgered mappings and are removed before a frame is published or
+ * freed.
  *
  * HONESTY (ADR 0011 D6): QEMU TCG models no caches, so the DC IVAC / barrier
  * maintenance in the enable leaf is REVIEWED, not observed. Translation and
@@ -207,7 +206,7 @@ extern volatile uint64_t je_arm_tlbi_hosted_last_operand;
  * Each call edits exactly ONE 4 KiB level-3 leaf, and only between the two
  * states INVALID <-> VALID (never valid -> different valid, so break-before-make
  * never arises). After the store it runs, in this order:
- *     DSB ISHST ; TLBI VALE1IS, (va >> 12) ; DSB ISH ; ISB
+ *     DSB ISHST ; TLBI VAE1IS, (va >> 12) ; DSB ISH ; ISB
  * (store visible to the Inner-Shareable walker; drop any last-level TLB entry
  * for va at EL1; wait for completion; resync the instruction stream).
  *
@@ -258,15 +257,29 @@ je_status je_arm_mmu_unmap_page(je_arm_mmu *mmu, uint64_t va);
 
 /*
  * Register/unregister a published MP3a USER_CODE or USER_RODATA frame in the
- * same physical-frame ledger consulted by je_arm_mmu_map_page(). These calls
- * are construction/teardown operations for the MMU-off MP3a-1 backend; they
- * reject an enabled context. A later RW alias of a registered frame returns
- * JE_ERR_DENIED, and teardown clears the entry before the frame is freed.
+ * same physical-frame ledger consulted by je_arm_mmu_map_page(). They are legal
+ * both before and after MMU enable. A later RW alias of a registered frame
+ * returns JE_ERR_DENIED, and teardown clears the entry before the frame is
+ * freed.
  */
 je_status je_arm_mmu_publish_user_frame(je_arm_mmu *mmu, uint64_t physical,
                                          je_map_class cls);
 je_status je_arm_mmu_unpublish_user_frame(je_arm_mmu *mmu,
                                            uint64_t physical);
+
+/*
+ * Complete the reviewed code-cache handoff for a USER_CODE frame after its
+ * cacheable identity alias has been written and before EL0 can fetch it.
+ * QEMU TCG does not model this cache/coherency hazard; the sequence remains
+ * required for the Cortex-A72 target profile.
+ */
+je_status je_arm_mmu_sync_user_code(uint64_t physical);
+
+/* Complete the descriptor-store -> TLBI sequence for a user VA after a
+ * backend clears a process leaf. QEMU TCG does not model stale TLB entries;
+ * this is reviewed ordering evidence, not an observed cache/TLB result. */
+je_status je_arm_mmu_flush_va(uint64_t virtual_address);
+je_status je_arm_mmu_flush_va_asid(uint64_t virtual_address, uint16_t asid);
 
 /*
  * Guarded kernel stack (ADR 0013 D4) over a run of JE_ARM_STACK_RUN_PAGES

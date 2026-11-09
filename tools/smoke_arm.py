@@ -1031,6 +1031,232 @@ def check_user_test(lines, syms, image):
           f"TLB staleness reviewed, not observed under QEMU TCG)")
 
 
+# ---- --el0-test (MP3a-2, ADR 0015 D2/D3) -----------------------------------
+EL0_SETUP = b"JeiOS/aarch64: EL0 setup two-processes real-code timer-live"
+EL0_MODE_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 MODE_CHECK EL1h-frame-rejected-as-EL0")
+EL0_MODE_VECTOR9_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 MODE_CHECK vector9-EL1h-rejected")
+EL0_MODE_VECTOR5_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 MODE_CHECK vector5-EL0t-rejected")
+EL0_MODE_AARCH32_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 MODE_CHECK aarch32-M4-composite-rejected")
+EL0_KSTACK_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 SP_EL1 trap frame verified slot=(\d+)")
+EL0_SVC_PROOF_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 SVC register proof slot=(\d+) status=(\d+)"
+    rb" result=(" + HEX16 + rb") x16=(" + HEX16 + rb") x17=("
+    + HEX16 + rb") x18=(" + HEX16 + rb") tpidrro=(" + HEX16 + rb")")
+EL0_TPIDRRO_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 TPIDRRO_ROUND_TRIP slot=(\d+) value=("
+    + HEX16 + rb")")
+EL0_REGISTER_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 REGISTER_ROUND_TRIP slot=(\d+) marker=("
+    + HEX16 + rb")")
+EL0_TIMER_PREEMPT_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 TIMER_PREEMPT from=(\d+) to=(\d+)"
+    rb" switches=(\d+)")
+EL0_LONE_SURVIVOR_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 LONE_SURVIVOR_YIELD slot=(\d+) count=(\d+)")
+EL0_LONE_IRQ_RESELECT_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 LONE_IRQ_RESELECT slot=(\d+)")
+EL0_CNTKCTL_TRAP_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 CNTKCTL_PREEMPT_WRITE_TRAP stage=(\d+)")
+EL0_DCC_TRAP_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 DCC_CHANNEL_TRAP stage=(\d+)")
+EL0_REAP_LONE_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 REAP_WITH_SURVIVOR lone slot=(\d+)")
+EL0_RUN_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 RUN slot=(\d+) data=(" + HEX16
+    + rb") arena=(" + HEX16 + rb")")
+EL0_SPAWN_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 NEGATIVE spawn stage=(\d+)")
+EL0_DEATH_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 EXPECTED_DEATH stage=(\d+) slot=(\d+)"
+    rb" reason=(\d+) ec=(" + HEX16 + rb") far=(" + HEX16
+    + rb") il=(\d+) iss=(" + HEX16 + rb") fsc=(" + HEX16
+    + rb") wnr=(\d+)")
+EL0_TERMINATED_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 TERMINATED slot=(\d+) reason=(\d+) ec=("
+    + HEX16 + rb") far=(" + HEX16 + rb") il=(\d+) iss=(" + HEX16
+    + rb") fsc=(" + HEX16 + rb") wnr=(\d+)")
+EL0_REAP_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 REAP_WITH_SURVIVOR stage=(\d+)")
+EL0_BAD_RETURN_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 BAD_RETURN (sp|elr)-mutated slot=(\d+)")
+EL0_PASS = b"JeiOS/aarch64: EL0 proof PASS reviewed-cache-tlb=not-observed"
+EL0_ARENA_DATA = 0x0000100000002000
+
+
+def el0_test_markers():
+    # Timer delivery can legitimately make slot 2 reach its first SVC before
+    # slot 1, and the detailed checker below validates every proof marker
+    # without imposing that scheduling order. These three markers are the
+    # stable phase envelope; all values and failure cases are checked below.
+    return [
+        exact(b"JeiOS/aarch64: EL0 MODE_CHECK "
+              b"EL1h-frame-rejected-as-EL0"),
+        exact(b"JeiOS/aarch64: EL0 MODE_CHECK vector9-EL1h-rejected"),
+        exact(b"JeiOS/aarch64: EL0 MODE_CHECK vector5-EL0t-rejected"),
+        exact(b"JeiOS/aarch64: EL0 MODE_CHECK "
+              b"aarch32-M4-composite-rejected"),
+        exact(EL0_SETUP),
+        exact(EL0_PASS),
+    ]
+
+
+def check_el0_test(lines):
+    """Re-derive the MP3a-2 proof claims from trusted serial observations.
+
+    The harness does not trust a user-reported success bit: it checks the
+    kernel-observed SVC ABI, saved exception syndromes/FARs, lifecycle/reap
+    ordering, canaries, TPIDR reset, and the two distinct values at one arena
+    VA.
+    """
+    if not any(EL0_MODE_RE.fullmatch(ln) for ln in lines):
+        fail("el0-test: EL1h-as-EL0 negative was not exercised")
+    for mode_re, name in (
+            (EL0_MODE_VECTOR9_RE, "vector9/EL1h"),
+            (EL0_MODE_VECTOR5_RE, "vector5/EL0t"),
+            (EL0_MODE_AARCH32_RE, "AArch32 M[4] composite")):
+        if not any(mode_re.fullmatch(ln) for ln in lines):
+            fail(f"el0-test: {name} mode-negative was not exercised")
+    kstacks = [m for m in (EL0_KSTACK_RE.fullmatch(ln) for ln in lines) if m]
+    if sorted(int(m.group(1)) for m in kstacks) != [1, 2]:
+        fail("el0-test: SP_EL1 frame markers missing")
+    proofs = [m for m in
+              (EL0_SVC_PROOF_RE.fullmatch(ln) for ln in lines) if m]
+    if sorted(int(m.group(1)) for m in proofs) != [1, 2]:
+        fail(f"el0-test: expected two non-vacuous SVC proofs, found "
+             f"{[m.group(1).decode() for m in proofs]}")
+    for m in proofs:
+        if (int(m.group(2)) != 1 or int(m.group(3), 16) != 0x5aa5 or
+                int(m.group(4), 16) != 0x1616 or
+                int(m.group(5), 16) != 0x1717 or
+                int(m.group(6), 16) != 0x1818 or
+                int(m.group(7), 16) != 0):
+            fail("el0-test: non-vacuous SVC status/result/register proof failed")
+    tpidrro = [m for m in
+               (EL0_TPIDRRO_RE.fullmatch(ln) for ln in lines) if m]
+    if sorted(int(m.group(1)) for m in tpidrro) != [1, 2] or \
+            any(int(m.group(2), 16) != 0 for m in tpidrro):
+        fail("el0-test: TPIDRRO zero round-trip markers missing or non-zero")
+    registers = [m for m in
+                 (EL0_REGISTER_RE.fullmatch(ln) for ln in lines) if m]
+    if sorted(int(m.group(1)) for m in registers) != [1, 2] or \
+            any(int(m.group(2), 16) != 0x5245 for m in registers):
+        fail("el0-test: post-SVC register round-trip marker failed")
+    preempts = [m for m in
+                (EL0_TIMER_PREEMPT_RE.fullmatch(ln) for ln in lines) if m]
+    if len(preempts) != 1 or (int(preempts[0].group(1)),
+                              int(preempts[0].group(2))) != (1, 2) or \
+            int(preempts[0].group(3)) < 1:
+        fail("el0-test: timer-live EL0 preemption marker missing")
+    lone = [m for m in
+            (EL0_LONE_SURVIVOR_RE.fullmatch(ln) for ln in lines) if m]
+    lone_irq = [m for m in
+                (EL0_LONE_IRQ_RESELECT_RE.fullmatch(ln) for ln in lines)
+                if m]
+    if not any(EL0_REAP_LONE_RE.fullmatch(ln) for ln in lines) or \
+            len(lone) < 2 or len(lone_irq) != 1:
+        fail("el0-test: lone-survivor reap/yield markers missing")
+    lone_slots = {int(m.group(1)) for m in lone}
+    if len(lone_slots) != 1 or int(lone_irq[0].group(1)) not in lone_slots or \
+            max(int(m.group(2)) for m in lone) < 2:
+        fail("el0-test: lone-survivor self-yield/reselect evidence is weak")
+
+    cntp_traps = [m for m in
+                  (EL0_CNTKCTL_TRAP_RE.fullmatch(ln) for ln in lines) if m]
+    dcc_traps = [m for m in
+                 (EL0_DCC_TRAP_RE.fullmatch(ln) for ln in lines) if m]
+    if [int(m.group(1)) for m in cntp_traps] != [8] or \
+            [int(m.group(1)) for m in dcc_traps] != [9]:
+        fail("el0-test: CNTKCTL/DCC negative exercise markers missing")
+
+    runs = [m for m in (EL0_RUN_RE.fullmatch(ln) for ln in lines) if m]
+    values = {}
+    for m in runs:
+        slot = int(m.group(1))
+        value = int(m.group(2), 16)
+        arena = int(m.group(3), 16)
+        if slot in values and values[slot] != value:
+            fail(f"el0-test: slot {slot} changed its arena value")
+        if arena != EL0_ARENA_DATA:
+            fail(f"el0-test: arena VA=0x{arena:x} != 0x{EL0_ARENA_DATA:x}")
+        values[slot] = value
+    if values.get(1) != 0x1111 or values.get(2) != 0x2222:
+        fail(f"el0-test: expected distinct per-process arena values, got {values}")
+
+    spawns = [m for m in (EL0_SPAWN_RE.fullmatch(ln) for ln in lines) if m]
+    deaths = [m for m in (EL0_DEATH_RE.fullmatch(ln) for ln in lines) if m]
+    terminated = [m for m in
+                  (EL0_TERMINATED_RE.fullmatch(ln) for ln in lines) if m]
+    reaps = [m for m in (EL0_REAP_RE.fullmatch(ln) for ln in lines) if m]
+    if [int(m.group(1)) for m in spawns] != list(range(10)) or \
+            [int(m.group(1)) for m in deaths] != list(range(10)) or \
+            [int(m.group(1)) for m in reaps] != list(range(10)):
+        fail("el0-test: negative stages did not spawn, die, and reap in order")
+    negative_terminated = [
+        m for m in terminated if int(m.group(2)) != 1  # JE_ABI_DEATH_EXIT
+    ]
+    exits = [
+        m for m in terminated if int(m.group(2)) == 1  # JE_ABI_DEATH_EXIT
+    ]
+    if len(negative_terminated) != 10 or len(exits) != 1:
+        fail(f"el0-test: expected 10 negative and 1 exit termination markers, "
+             f"found {len(negative_terminated)} negative/{len(exits)} exit")
+    if (int(exits[0].group(1)) != 2 or int(exits[0].group(3), 16) != 0x15 or
+            int(exits[0].group(5)) != 1 or
+            int(exits[0].group(6), 16) != 0 or
+            int(exits[0].group(7), 16) != 0 or
+            int(exits[0].group(8)) != 0):
+        fail("el0-test: survivor exit syndrome was not the expected SVC return")
+    expected = {
+        0: (0, 0x24, 0x40000000, 1, 0x0000000f),
+        1: (0, 0x24, 0x40000000, 1, 0x0000004f),
+        2: (0, 0x20, 0x40000000, 1, 0x0000000f),
+        3: (2, 0x00, 0x00000000, 0, 0x00000000),
+        4: (2, 0x00, 0x00000000, 0, 0x00000000),
+        5: (0, 0x07, None, 1, 0x001e00000),
+        6: (0, 0x18, None, 1, 0x00034f801),
+        7: (0, 0x15, None, 1, 0x00000001),
+        8: (0, 0x18, None, 1, 0x000000000032f804),
+        9: (0, 0x18, None, 1, 0x000000000020c003),
+    }
+    for m in deaths:
+        stage = int(m.group(1))
+        reason = int(m.group(3))
+        ec = int(m.group(4), 16)
+        far = int(m.group(5), 16)
+        il = int(m.group(6))
+        iss = int(m.group(7), 16)
+        fsc = int(m.group(8), 16)
+        wnr = int(m.group(9))
+        exp_reason, exp_ec, exp_far, exp_il, exp_iss = expected[stage]
+        data_abort = ec in (0x20, 0x24)
+        expected_fsc = {
+            0: 0xf, 1: 0xf, 2: 0xf, 8: 0x4, 9: 0x3
+        }.get(stage)
+        expected_wnr = {0: 0, 1: 1, 2: 0, 8: 0, 9: 0}.get(stage)
+        if ((reason, ec, il) !=
+                (exp_reason, exp_ec, exp_il) or
+                (exp_iss is not None and iss != exp_iss) or
+                (exp_far is not None and far != exp_far) or
+                (expected_fsc is not None and fsc != expected_fsc) or
+                (expected_wnr is not None and wnr != expected_wnr)):
+            fail(f"el0-test: stage {stage} syndrome "
+                 f"{(reason, ec, far, il, iss, fsc, wnr)} != "
+                 f"{expected[stage]}")
+    bad_returns = [m for m in
+                   (EL0_BAD_RETURN_RE.fullmatch(ln) for ln in lines) if m]
+    if [m.group(1) for m in bad_returns] != [b"sp", b"elr"]:
+        fail("el0-test: bad SP/ELR return cases were not both exercised")
+    print("el0-test: real EL0 execution, SVC ABI, kernel-VA fault death, "
+          "SP/ELR validation, FP/CNTVCT/SVC#1 death, arena isolation, "
+          "TPIDR reset, and reap-with-survivor verified; cache/TLB "
+          "maintenance reviewed, not observed under QEMU TCG")
+
+
 # ---- GIC + CNTP timer (MP2 PR-2a, ADR 0012 D2/D3/D4/D6/D8) -----------------
 # Runs in EVERY good-boot mode (gic_timer_bringup follows mmu_bringup in every
 # build). IRQs stay MASKED in PR-2a: this proves the GIC configuration and, in
@@ -2052,6 +2278,9 @@ def main():
     ap.add_argument("--user-test", action="store_true",
                     help="expect the MP3a-1 EL1-only TTBR0/AT S1E0 proof "
                          "(two process roots, permissions, isolation, audit)")
+    ap.add_argument("--el0-test", action="store_true",
+                    help="expect the MP3a-2 real EL0/SVC/fault-death proof "
+                         "(two processes, isolation, hardening, reap)")
     ap.add_argument("--sched-mutation",
                     choices=("drop-mov-sp", "pick-skips-b", "rebuild-fake-frame",
                              "unconditional-cur-ready", "wfi-i-masked",
@@ -2110,8 +2339,14 @@ def main():
     if args.user_test and (args.dtb_bad or args.vector_test or args.mmu_fault
                            or args.bss_verified or args.timer_poll
                            or args.timer_test or args.sched_test
-                           or args.phys_alloc):
+                           or args.phys_alloc or args.el0_test):
         fail("--user-test is only valid alone (its build excludes the other "
+             "toggles)")
+    if args.el0_test and (args.dtb_bad or args.vector_test or args.mmu_fault
+                          or args.bss_verified or args.timer_poll
+                          or args.timer_test or args.sched_test
+                          or args.phys_alloc or args.user_test):
+        fail("--el0-test is only valid alone (its build excludes the other "
              "toggles)")
     if args.sched_mutation is not None and not args.sched_test:
         fail("--sched-mutation requires --sched-test")
@@ -2205,6 +2440,8 @@ def main():
                             exact(IRQ_BRK_TRIGGER), exact(IRQ_BRK_EXC), exact(TERM_EXC)]
             elif args.sched_test:
                 markers += sched_markers()
+            elif args.el0_test:
+                markers += el0_test_markers()
             else:
                 markers += [exact(TERM_DEFAULT)]
     # Every mode ends on a fixed (exact) line; that line is the terminal marker.
@@ -2354,9 +2591,14 @@ def main():
     if args.phys_alloc:
         check_phys_alloc(lines, fx, image_extent)
     if not args.dtb_bad:
-        check_mmu(lines, mmu_syms, prebuild_ram_l3=args.user_test)
+        check_mmu(lines, mmu_syms,
+                  prebuild_ram_l3=(args.user_test or args.el0_test))
         if args.user_test:
             next_ok = lambda ln: ln == USER_PASS
+        elif args.el0_test:
+            next_ok = lambda ln: ln == (
+                b"JeiOS/aarch64: EL0 MODE_CHECK "
+                b"EL1h-frame-rejected-as-EL0")
         elif args.vector_test:
             next_ok = lambda ln: ln == vector_test_markers(0)[0][0]
         elif args.mmu_fault:
@@ -2382,6 +2624,8 @@ def main():
             fail("irq/double-fault lines present without --timer-test (wrong build?)")
         if args.user_test:
             check_user_test(lines, mmu_syms, proof_image)
+        elif args.el0_test:
+            check_el0_test(lines)
     if args.mmu_fault:
         check_mmu_fault(lines, args.mmu_fault, fault_exp, mmu_syms)
 

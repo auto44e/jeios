@@ -816,7 +816,7 @@ bool je_arm_mmu_is_enabled(const je_arm_mmu *mmu)
 je_status je_arm_mmu_publish_user_frame(je_arm_mmu *mmu, uint64_t physical,
                                          je_map_class cls)
 {
-    if (!mmu || !mmu->valid || je_arm_mmu_is_enabled(mmu) ||
+    if (!mmu || !mmu->valid ||
         (cls != JE_MAP_USER_CODE && cls != JE_MAP_USER_RODATA) ||
         !in_window(physical) || table_frame(mmu, physical))
         return JE_ERR_INVALID;
@@ -833,7 +833,7 @@ je_status je_arm_mmu_publish_user_frame(je_arm_mmu *mmu, uint64_t physical,
 je_status je_arm_mmu_unpublish_user_frame(je_arm_mmu *mmu,
                                            uint64_t physical)
 {
-    if (!mmu || !mmu->valid || je_arm_mmu_is_enabled(mmu) ||
+    if (!mmu || !mmu->valid ||
         !in_window(physical))
         return JE_ERR_INVALID;
 
@@ -844,6 +844,34 @@ je_status je_arm_mmu_unpublish_user_frame(je_arm_mmu *mmu,
         return JE_ERR_INVALID;
     mmu->frame_flags[index] = 0u;
     return JE_OK;
+}
+
+je_status je_arm_mmu_sync_user_code(uint64_t physical)
+{
+    if (!in_window(physical) || (physical & (JE_PAGE_SIZE - 1u)) != 0u)
+        return JE_ERR_INVALID;
+#ifdef JE_ARM_PAGING_HOSTED_TEST
+    return JE_OK;
+#else
+    /*
+     * DDI0487 cache maintenance: clean the data cache to the point of
+     * unification, invalidate the instruction cache to that point, then
+     * complete both operations before an EL0 fetch.
+     */
+    for (uint64_t offset = 0u; offset < JE_PAGE_SIZE;
+         offset += UINT64_C(64)) {
+        const uint64_t va = physical + offset;
+        __asm__ volatile("dc cvau, %0" : : "r"(va) : "memory");
+    }
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (uint64_t offset = 0u; offset < JE_PAGE_SIZE;
+         offset += UINT64_C(64)) {
+        const uint64_t va = physical + offset;
+        __asm__ volatile("ic ivau, %0" : : "r"(va) : "memory");
+    }
+    __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+    return JE_OK;
+#endif
 }
 
 /*
@@ -895,11 +923,12 @@ volatile uint64_t je_arm_tlbi_hosted_calls;
 volatile uint64_t je_arm_tlbi_hosted_last_operand;
 
 /*
- * TLBI VALE1IS operand, Xt (Arm ARM DDI0487, "TLBI VALE1, TLBI VALE1IS, TLBI
- * VALE1ISNXS, TLBI VALE1NXS: TLB Invalidate by VA, Last level, EL1" in the A64
+ * TLBI VAE1IS operand, Xt (Arm ARM DDI0487, "TLBI VAE1, TLBI VAE1IS, TLBI
+ * VAE1ISNXS, TLBI VAE1NXS: TLB Invalidate by VA, EL1" in the A64
  * system-instruction chapter, C5.5 in DDI0487 K.a):
- *   Xt[63:48] ASID  = 0. Our leaves are global (nG=0) and global entries match
- *                     regardless of ASID; the kernel runs with ASID 0 anyway.
+ *   Xt[63:48] ASID  = the caller-selected 16-bit ASID. Runtime kernel leaves
+ *                     use ASID 0; process user leaves use their non-global
+ *                     process ASID (currently ASID 1).
  *   Xt[47:44] TTL   = 0. "No information about the translation level" (the
  *                     FEAT_TTL hint is optional and not used).
  *   Xt[43:0]  VA[55:12]. va < 2^48, so this is va >> 12 in bits [35:0].
@@ -912,25 +941,41 @@ volatile uint64_t je_arm_tlbi_hosted_last_operand;
  * new translation (DDI0487 D8 "TLB maintenance requirements" / "Ordering and
  * completion of TLB maintenance instructions").
  */
-static uint64_t tlbi_va_operand(uint64_t virtual_address)
+static uint64_t tlbi_va_operand(uint64_t virtual_address, uint16_t asid)
 {
-    return (virtual_address >> JE_ARM_PAGE_SHIFT) &
-           ((UINT64_C(1) << 44) - 1u);
+    return ((uint64_t)asid << 48) |
+           ((virtual_address >> JE_ARM_PAGE_SHIFT) &
+           ((UINT64_C(1) << 44) - 1u));
 }
 
-static void leaf_changed_sync(uint64_t virtual_address)
+static void leaf_changed_sync(uint64_t virtual_address, uint16_t asid)
 {
-    const uint64_t operand = tlbi_va_operand(virtual_address);
+    const uint64_t operand = tlbi_va_operand(virtual_address, asid);
 #ifdef JE_ARM_PAGING_HOSTED_TEST
     ++je_arm_tlbi_hosted_calls;
     je_arm_tlbi_hosted_last_operand = operand;
 #else
     __asm__ volatile("dsb ishst\n\t"
-                     "tlbi vale1is, %0\n\t"
+                     "tlbi vae1is, %0\n\t"
                      "dsb ish\n\t"
                      "isb"
                      : : "r"(operand) : "memory");
 #endif
+}
+
+je_status je_arm_mmu_flush_va(uint64_t virtual_address)
+{
+    return je_arm_mmu_flush_va_asid(virtual_address, 0u);
+}
+
+je_status je_arm_mmu_flush_va_asid(uint64_t virtual_address, uint16_t asid)
+{
+    if (virtual_address >= JE_ARM_VA_LIMIT ||
+        (virtual_address & (JE_PAGE_SIZE - 1u)) != 0u ||
+        asid > UINT16_C(0xff))
+        return JE_ERR_INVALID;
+    leaf_changed_sync(virtual_address, asid);
+    return JE_OK;
 }
 
 static bool runtime_context_ok(const je_arm_mmu *mmu)
@@ -1035,7 +1080,7 @@ je_status je_arm_mmu_map_page(je_arm_mmu *mmu, uint64_t va, uint64_t pa,
     mmu->frame_flags[index] = (uint8_t)(class_flags(cls) | JE_ARM_MAP_PRESENT |
                                         JE_ARM_MAP_RUNTIME);
     *(volatile uint64_t *)slot = descriptor;
-    leaf_changed_sync(va);
+    leaf_changed_sync(va, 0u);
     return JE_OK;
 }
 
@@ -1048,7 +1093,7 @@ je_status je_arm_mmu_unmap_page(je_arm_mmu *mmu, uint64_t va)
     je_status status = runtime_leaf_owned(mmu, va, &slot, &index);
     if (status != JE_OK) return status;
     *(volatile uint64_t *)slot = 0u;
-    leaf_changed_sync(va);
+    leaf_changed_sync(va, 0u);
     mmu->frame_flags[index] = 0u;      /* translation gone; frame unledgered */
     return JE_OK;
 }
