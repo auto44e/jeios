@@ -13,9 +13,12 @@
 #include <stdint.h>
 
 #include <jeios/abi.h>
+#include <jeios/handle.h>
 #include <jeios/lifecycle.h>
 #include <jeios/proc.h>
 #include <jeios/status.h>
+#include <jeios/syscall.h>
+#include <jeios/usercopy.h>
 #include <jeios/vm.h>
 
 #include "paging.h"
@@ -33,6 +36,8 @@ extern je_status je_arm_sched_current_user(je_vm **out_vm, uint32_t *out_index,
 extern uint32_t je_arm_el0_test_mode_rejection(uint32_t slot);
 extern _Noreturn void je_arm_sched_start_user(void);
 extern const je_vm_ops *je_arch_vm_ops(je_pages *pages, int nx_available);
+extern uint64_t je_arm_user_root[];
+extern void je_arm_sched_install_ttbr0(uint64_t root_pa, uint16_t asid);
 
 #define UART_DR UINT64_C(0x09000000)
 #define UART_FR UINT64_C(0x09000018)
@@ -82,6 +87,13 @@ extern const je_vm_ops *je_arch_vm_ops(je_pages *pages, int nx_available);
 #define JE_EL0_SP_POISON (JE_VM_ARENA_BASE + UINT64_C(0x100))
 #define JE_EL0_CNTP_CTL_ISS UINT64_C(0x000000000032f804)
 #define JE_EL0_DCC_ISS UINT64_C(0x000000000020c003)
+#define JE_EL0_COPY_ROUND_COUNT 3u
+#define JE_EL0_COPY_SRC0 UINT64_C(0x100)
+#define JE_EL0_COPY_DST0 UINT64_C(0x200)
+#define JE_EL0_COPY_SRC256 UINT64_C(0xff0)
+#define JE_EL0_COPY_DST256 UINT64_C(0x1200)
+#define JE_EL0_COPY_SRC255 UINT64_C(0x1300)
+#define JE_EL0_COPY_DST255 UINT64_C(0x1e01)
 
 typedef enum {
     JE_EL0_NEG_KERNEL_READ = 0,
@@ -99,9 +111,9 @@ typedef enum {
 
 static je_vm je_el0_vm;
 static je_proc_pool je_el0_pool;
-static uint8_t je_el0_good_blob[2][2u * JE_PAGE_SIZE]
+static uint8_t je_el0_good_blob[2][3u * JE_PAGE_SIZE]
     __attribute__((aligned(16)));
-static uint8_t je_el0_negative_blob[2u * JE_PAGE_SIZE]
+static uint8_t je_el0_negative_blob[3u * JE_PAGE_SIZE]
     __attribute__((aligned(16)));
 static je_vm_image je_el0_image;
 static je_proc_id je_el0_good_proc[2];
@@ -127,6 +139,13 @@ static uint64_t je_el0_lone_yields;
 static bool je_el0_lone_irq_reselect;
 static unsigned je_el0_spin_start;
 static unsigned je_el0_spin_end;
+static uint32_t je_el0_copy_round[2];
+static uint32_t je_el0_handle_step[2];
+static bool je_el0_copy_fixup_proven;
+extern volatile uint8_t je_arm_in_handler;
+#ifdef JE_ARM_COPY_FAULT_MUTANT_RESTORE_SELECTED
+extern volatile uint8_t je_arm_copy_restore_selected_seen;
+#endif
 
 static void proof_putc(char c)
 {
@@ -239,6 +258,93 @@ static void emit_yield_args(uint8_t *blob, unsigned *pc)
     emit(blob, pc, A64_SVC(0u));
 }
 
+static void emit_zero_syscall_args(uint8_t *blob, unsigned *pc)
+{
+    for (unsigned reg = 0u; reg <= 5u; ++reg)
+        emit(blob, pc, A64_MOVZ(reg, 0u, 0u));
+}
+
+static void emit_expect(uint8_t *blob, unsigned *pc, unsigned reg,
+                        uint64_t expected, unsigned *fail_branches,
+                        unsigned *fail_branch_count)
+{
+    if (*fail_branch_count >= 64u) proof_fatal("branch-table-overflow");
+    emit_load_u64(blob, pc, 22u, expected);
+    emit(blob, pc, A64_CMP(reg, 22u));
+    fail_branches[(*fail_branch_count)++] = *pc;
+    emit(blob, pc, A64_BCOND(A64_BCOND_NE, 0));
+}
+
+static void emit_syscall(uint8_t *blob, unsigned *pc, uint64_t op)
+{
+    emit(blob, pc, A64_MOVZ(8u, (uint16_t)op, 0u));
+    emit(blob, pc, A64_SVC(0u));
+}
+
+static void emit_copy_probe(uint8_t *blob, unsigned *pc, uint64_t src,
+                            uint64_t dst, uint64_t len,
+                            unsigned *fail_branches,
+                            unsigned *fail_branch_count)
+{
+    emit_load_u64(blob, pc, 0u, JE_VM_ARENA_BASE + 2u * JE_PAGE_SIZE + src);
+    emit_load_u64(blob, pc, 1u, JE_VM_ARENA_BASE + 2u * JE_PAGE_SIZE + dst);
+    emit_load_u64(blob, pc, 2u, len);
+    for (unsigned reg = 3u; reg <= 5u; ++reg)
+        emit(blob, pc, A64_MOVZ(reg, 0u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_COPY_PROBE);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+}
+
+static void emit_handle_round_trip(uint8_t *blob, unsigned *pc,
+                                   unsigned *fail_branches,
+                                   unsigned *fail_branch_count)
+{
+    /* SELF -> dup(SELF, 0): the duplicate is deliberately rights-attenuated. */
+    emit_zero_syscall_args(blob, pc);
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_SELF);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+    emit(blob, pc, A64_ADD(19u, 1u, 0u));
+
+    emit_zero_syscall_args(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_DUP);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+    emit(blob, pc, A64_ADD(20u, 1u, 0u));
+
+    emit_zero_syscall_args(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 20u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_QUERY);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+    emit_expect(blob, pc, 1u, JE_ABI_OBJ_SELF,
+                fail_branches, fail_branch_count);
+
+    emit_zero_syscall_args(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 20u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_RIGHTS);
+    emit_expect(blob, pc, 0u, JE_ABI_H_DENIED,
+                fail_branches, fail_branch_count);
+    emit_expect(blob, pc, 1u, 0u, fail_branches, fail_branch_count);
+
+    emit_zero_syscall_args(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 20u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_CLOSE);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+    emit_expect(blob, pc, 1u, 0u, fail_branches, fail_branch_count);
+
+    emit_zero_syscall_args(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 20u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_CLOSE);
+    emit_expect(blob, pc, 0u, JE_ABI_H_STALE,
+                fail_branches, fail_branch_count);
+    emit_expect(blob, pc, 1u, 0u, fail_branches, fail_branch_count);
+
+    emit_zero_syscall_args(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_CLOSE);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+    emit_expect(blob, pc, 1u, 0u, fail_branches, fail_branch_count);
+}
+
 static void emit_user_sp_check(uint8_t *blob, unsigned *pc,
                                uint64_t expected_sp,
                                unsigned *sp_fail_branches,
@@ -258,9 +364,9 @@ static void make_good_blob(uint8_t *blob, uint16_t value,
                            uint64_t expected_sp, bool spin,
                            bool exits_after_signal)
 {
-    for (size_t i = 0u; i < 2u * JE_PAGE_SIZE; ++i) blob[i] = 0u;
+    for (size_t i = 0u; i < 3u * JE_PAGE_SIZE; ++i) blob[i] = 0u;
     unsigned pc = 0u;
-    unsigned fail_branches[8];
+    unsigned fail_branches[64];
     unsigned fail_branch_count = 0u;
     unsigned sp_fail_branches[8];
     unsigned sp_fail_count = 0u;
@@ -294,6 +400,7 @@ static void make_good_blob(uint8_t *blob, uint16_t value,
     emit(blob, &pc, A64_MOVZ(19u, UINT16_C(0x1919), 0u));
     emit(blob, &pc, A64_MOVZ(20u, UINT16_C(0x1020), 0u));
     emit(blob, &pc, A64_MRS_TPIDRRO_EL0(2u));
+    emit(blob, &pc, A64_ADD(6u, 2u, 0u)); /* preserve it across later SVC args */
 
     if (spin) {
         emit(blob, &pc, A64_MOVZ(30u, JE_EL0_SPIN_COUNT, 1u));
@@ -305,8 +412,19 @@ static void make_good_blob(uint8_t *blob, uint16_t value,
         je_el0_spin_end = pc;
     }
 
-    emit(blob, &pc, A64_MOVZ(8u, JE_ARM_EL0_PROOF_OP, 0u));
-    emit(blob, &pc, A64_SVC(0u));
+    emit_copy_probe(blob, &pc, JE_EL0_COPY_SRC0, JE_EL0_COPY_DST0, 0u,
+                    fail_branches, &fail_branch_count);
+    emit_copy_probe(blob, &pc, JE_EL0_COPY_SRC256, JE_EL0_COPY_DST256, 256u,
+                    fail_branches, &fail_branch_count);
+    emit_copy_probe(blob, &pc, JE_EL0_COPY_SRC255, JE_EL0_COPY_DST255, 255u,
+                    fail_branches, &fail_branch_count);
+    emit_handle_round_trip(blob, &pc, fail_branches, &fail_branch_count);
+
+    emit_load_u64(blob, &pc, 0u, JE_ARM_EL0_PROOF_ARG0);
+    for (unsigned reg = 1u; reg <= 5u; ++reg)
+        emit(blob, &pc, A64_MOVZ(reg, 0u, 0u));
+    emit(blob, &pc, A64_ADD(2u, 6u, 0u));
+    emit_syscall(blob, &pc, JE_ARM_EL0_PROOF_OP);
 
     emit(blob, &pc, A64_MOVZ(20u, (uint16_t)JE_ARM_EL0_PROOF_STATUS, 0u));
     emit(blob, &pc, A64_CMP(0u, 20u));
@@ -389,6 +507,11 @@ static void make_good_blob(uint8_t *blob, uint16_t value,
         patch_pc_relative(blob, sp_fail_branches[i], sp_fail_target, true,
                           A64_BCOND_NE);
 
+    for (unsigned i = 0u; i < 2u * JE_PAGE_SIZE; ++i) {
+        uint8_t byte = (uint8_t)((value + (uint16_t)(i * 13u) + 1u) & 0xffu);
+        if (byte == 0u) byte = 1u;
+        blob[JE_PAGE_SIZE + i] = byte;
+    }
     for (unsigned i = 0u; i < sizeof(uint64_t); ++i)
         blob[JE_PAGE_SIZE + i] = (uint8_t)((uint64_t)value >> (i * 8u));
 }
@@ -449,7 +572,8 @@ static void image_init(void)
         .reserved = 0u,
         .segments = {
             { 0u, JE_PAGE_SIZE, 0u, JE_PAGE_SIZE, JE_VM_R | JE_VM_X, 0u },
-            { JE_PAGE_SIZE, JE_PAGE_SIZE, 2u * JE_PAGE_SIZE, JE_PAGE_SIZE,
+            { JE_PAGE_SIZE, 2u * JE_PAGE_SIZE, 2u * JE_PAGE_SIZE,
+              2u * JE_PAGE_SIZE,
               JE_VM_R | JE_VM_W, 0u },
         },
     };
@@ -468,7 +592,7 @@ static void build_user(uint8_t *blob, uint32_t *out_index,
 {
     je_proc_id id = allocate_process();
     je_status status = je_vm_build(&je_el0_vm, &je_el0_image, blob,
-                                   2u * JE_PAGE_SIZE, 1, out_index);
+                                   3u * JE_PAGE_SIZE, 1, out_index);
     if (status != JE_OK) proof_fatal("vm-build");
     status = je_arm_sched_create_user(&je_el0_vm, *out_index, id, out_slot);
     if (status != JE_OK) proof_fatal("thread-create");
@@ -487,6 +611,163 @@ static void spawn_negative(void)
     proof_write("JeiOS/aarch64: EL0 NEGATIVE spawn stage=");
     proof_dec((uint64_t)je_el0_active);
     proof_write("\r\n");
+}
+
+static uint8_t copy_pattern(uint32_t index, uint64_t offset)
+{
+    const uint16_t seed = index == 0u ? UINT16_C(0x1111) : UINT16_C(0x2222);
+    uint8_t byte = (uint8_t)((seed + (uint16_t)(offset * 13u) + 1u) &
+                             UINT16_C(0xff));
+    return byte == 0u ? 1u : byte;
+}
+
+static void verify_copy_probe(uint32_t index, uint32_t current_slot,
+                              uint64_t status)
+{
+    static const uint64_t lengths[JE_EL0_COPY_ROUND_COUNT] = { 0u, 256u, 255u };
+    static const uint64_t sources[JE_EL0_COPY_ROUND_COUNT] = {
+        JE_EL0_COPY_SRC0, JE_EL0_COPY_SRC256, JE_EL0_COPY_SRC255
+    };
+    static const uint64_t destinations[JE_EL0_COPY_ROUND_COUNT] = {
+        JE_EL0_COPY_DST0, JE_EL0_COPY_DST256, JE_EL0_COPY_DST255
+    };
+    uint8_t source[256];
+    uint8_t destination[256];
+    const uint32_t round = je_el0_copy_round[index];
+    if (round >= JE_EL0_COPY_ROUND_COUNT || status != JE_ABI_OK)
+        proof_fatal("copy-probe-status");
+    if (lengths[round] != 0u) {
+        if (je_copy_from_user(source,
+                              JE_VM_ARENA_BASE + 2u * JE_PAGE_SIZE +
+                                  sources[round],
+                              lengths[round]) != JE_ABI_OK ||
+            je_copy_from_user(destination,
+                              JE_VM_ARENA_BASE + 2u * JE_PAGE_SIZE +
+                                  destinations[round],
+                              lengths[round]) != JE_ABI_OK)
+            proof_fatal("copy-probe-readback");
+        for (uint64_t i = 0u; i < lengths[round]; ++i) {
+            if (source[i] != copy_pattern(index, sources[round] + i) ||
+                destination[i] != source[i])
+                proof_fatal("copy-probe-bytes");
+        }
+    }
+    ++je_el0_copy_round[index];
+    if (round == JE_EL0_COPY_ROUND_COUNT - 1u) {
+        proof_write("JeiOS/aarch64: EL0 COPY_PROBE_PASS slot=");
+        proof_dec(current_slot);
+        proof_write(" lengths=0,256,255\r\n");
+    }
+}
+
+static void verify_handle_step(uint32_t index, uint32_t current_slot,
+                               uint64_t op, const je_arm_trapframe *tf)
+{
+    const uint32_t step = je_el0_handle_step[index];
+    if (tf == NULL) proof_fatal("handle-null");
+    switch (step) {
+    case 0u:
+        if (op != JE_SYSCALL_HANDLE_SELF || tf->gpr[0] != JE_ABI_OK ||
+            tf->gpr[1] == 0u)
+            proof_fatal("handle-self");
+        break;
+    case 1u:
+        if (op != JE_SYSCALL_HANDLE_DUP || tf->gpr[0] != JE_ABI_OK ||
+            tf->gpr[1] == 0u)
+            proof_fatal("handle-dup");
+        break;
+    case 2u:
+        if (op != JE_SYSCALL_HANDLE_QUERY || tf->gpr[0] != JE_ABI_OK ||
+            tf->gpr[1] != JE_ABI_OBJ_SELF)
+            proof_fatal("handle-query");
+        break;
+    case 3u:
+        if (op != JE_SYSCALL_HANDLE_RIGHTS ||
+            tf->gpr[0] != JE_ABI_H_DENIED || tf->gpr[1] != 0u)
+            proof_fatal("handle-rights");
+        break;
+    case 4u:
+        if (op != JE_SYSCALL_HANDLE_CLOSE || tf->gpr[0] != JE_ABI_OK ||
+            tf->gpr[1] != 0u)
+            proof_fatal("handle-close");
+        break;
+    case 5u:
+        if (op != JE_SYSCALL_HANDLE_CLOSE ||
+            tf->gpr[0] != JE_ABI_H_STALE || tf->gpr[1] != 0u)
+            proof_fatal("handle-stale");
+        break;
+    case 6u:
+        if (op != JE_SYSCALL_HANDLE_CLOSE || tf->gpr[0] != JE_ABI_OK ||
+            tf->gpr[1] != 0u)
+            proof_fatal("handle-self-close");
+        proof_write("JeiOS/aarch64: EL0 HANDLE_ROUND_TRIP_PASS slot=");
+        proof_dec(current_slot);
+        proof_write(" type=SELF attenuated=0 stale=3\r\n");
+        break;
+    default:
+        proof_fatal("handle-step");
+    }
+    ++je_el0_handle_step[index];
+}
+
+static void prove_copy_fixup(uint32_t current_slot)
+{
+    if (je_el0_copy_fixup_proven) return;
+    je_el0_copy_fixup_proven = true;
+    if (je_arm_copy_fixup_count() != 0u)
+        proof_fatal("copy-count-prevalidation");
+#if defined(JE_ARM_COPY_FAULT_STAGE)
+    (void)current_slot;
+#if JE_ARM_COPY_FAULT_STAGE == 10
+    /*
+     * Real copy_core proof: keep process 0 current, install process 1's root,
+     * and copy from the shared arena VA.  The live-root guard must fail before
+     * LDTRB can silently read process 1's distinct data value.
+     */
+    uint64_t observed = 0u;
+    const uint32_t other_slot = je_el0_good_slot[1];
+    if (other_slot == 0u || je_arm_user_root[other_slot] == 0u)
+        proof_fatal("copy-live-root-setup");
+    je_arm_sched_install_ttbr0(je_arm_user_root[other_slot], 0u);
+    const je_abi_status status = je_copy_from_user(
+        &observed,
+        JE_VM_ARENA_BASE + 2u * JE_PAGE_SIZE,
+        sizeof(observed));
+    if (status == JE_ABI_OK && observed == UINT64_C(0x2222))
+        proof_fatal("copy-live-root-recovered");
+    proof_fatal("copy-live-root-returned");
+#elif JE_ARM_COPY_FAULT_STAGE == 12
+    /*
+     * Guard state 2 is load-bearing: the base build reaches the stack-free
+     * double-fault halt for the nested exact-site fault injected inside the C
+     * predicate.  The paired guard-state mutant reaches this assertion if it
+     * incorrectly recovers that nested fault.
+     */
+    if (je_arm_copy_fixup_inject() != 0)
+        proof_fatal("copy-negative-recovered");
+    proof_fatal("copy-negative-returned");
+#else
+    if (je_arm_copy_fixup_inject() != 0)
+        proof_fatal("copy-negative-recovered");
+    proof_fatal("copy-negative-returned");
+#endif
+#elif defined(JE_ARM_COPY_FAULT_MUTANT_RESTORE_SELECTED)
+    (void)current_slot;
+    if (je_arm_copy_fixup_inject() == 0)
+        proof_fatal("copy-fixup");
+    if (je_arm_in_handler != 0u)
+        proof_fatal("copy-guard-cleared");
+#else
+    const int recovered = je_arm_copy_fixup_inject();
+    if (recovered == 0 ||
+        je_arm_copy_fixup_count() != 2u ||
+        je_arm_in_handler != 1u) {
+        proof_fatal("copy-fixup");
+    }
+    proof_write("JeiOS/aarch64: EL0 COPY_FIXUP_RECOVERED slot=");
+    proof_dec(current_slot);
+    proof_write(" count=2 guard=1\r\n");
+#endif
 }
 
 void je_arm_el0_test_note_kstack(uint32_t slot)
@@ -555,6 +836,10 @@ void je_arm_el0_test_note_svc(uint32_t slot, uint64_t op,
                               je_arm_trapframe *tf)
 {
     if (tf == NULL) proof_fatal("svc-null");
+#ifdef JE_ARM_COPY_FAULT_MUTANT_RESTORE_SELECTED
+    if (je_arm_copy_restore_selected_seen != 0u)
+        proof_fatal("copy-guard-cleared");
+#endif
     (void)slot;
     if (op == JE_ARM_EL0_PROOF_OP) {
         if (tf->gpr[0] != JE_ARM_EL0_PROOF_STATUS ||
@@ -562,35 +847,55 @@ void je_arm_el0_test_note_svc(uint32_t slot, uint64_t op,
             proof_fatal("svc-proof-status");
         return;
     }
-    if (op != JE_SYS_YIELD) return;
     je_vm *vm = NULL;
     uint32_t index = UINT32_MAX;
     uint32_t current_slot = UINT32_MAX;
-    if (je_arm_sched_current_user(&vm, &index, &current_slot) != JE_OK)
-        proof_fatal("current-user");
+    const bool copy_op = op == JE_SYSCALL_COPY_PROBE;
+    const bool handle_op = op >= JE_SYSCALL_HANDLE_SELF &&
+                           op <= JE_SYSCALL_HANDLE_DUP;
+    if (copy_op || handle_op || op == JE_SYS_YIELD) {
+        if (je_arm_sched_current_user(&vm, &index, &current_slot) != JE_OK)
+            proof_fatal("current-user");
+    }
+    if (copy_op) {
+        if (index >= 2u) proof_fatal("copy-index");
+        verify_copy_probe(index, current_slot, tf->gpr[0]);
+        if (index == 0u &&
+            je_el0_copy_round[index] == JE_EL0_COPY_ROUND_COUNT)
+            prove_copy_fixup(current_slot);
+        return;
+    }
+    if (handle_op) {
+        if (index >= 2u) proof_fatal("handle-index");
+        verify_handle_step(index, current_slot, op, tf);
+        return;
+    }
+    if (op != JE_SYS_YIELD) return;
     if (je_el0_negative_live && index == je_el0_negative_index) return;
     if (index < 2u) {
-        const volatile uint64_t *marker =
-            (const volatile uint64_t *)(uintptr_t)
-                (JE_VM_ARENA_BASE + 2u * JE_PAGE_SIZE + 8u);
-        if (*marker == JE_EL0_SP_FAIL)
+        uint64_t marker;
+        if (je_copy_from_user(&marker,
+                              JE_VM_ARENA_BASE + 2u * JE_PAGE_SIZE + 8u,
+                              sizeof(marker)) != JE_ABI_OK)
+            proof_fatal("marker-copy");
+        if (marker == JE_EL0_SP_FAIL)
             proof_fatal("user-sp");
-        if (*marker != JE_EL0_REGISTER_PASS)
+        if (marker != JE_EL0_REGISTER_PASS)
             proof_fatal("register-round-trip");
         if ((je_el0_register_roundtrip_mask & (UINT32_C(1) << index)) == 0u) {
             je_el0_register_roundtrip_mask |= UINT32_C(1) << index;
             proof_write("JeiOS/aarch64: EL0 REGISTER_ROUND_TRIP slot=");
             proof_dec(current_slot);
             proof_write(" marker=");
-            proof_hex(*marker);
+            proof_hex(marker);
             proof_write("\r\n");
         }
         if (je_el0_irq_preempted && current_slot == je_el0_good_slot[1])
             je_el0_irq_peer_ran = true;
-        const volatile uint64_t *value =
-            (const volatile uint64_t *)(uintptr_t)
-                (JE_VM_ARENA_BASE + 2u * JE_PAGE_SIZE);
-        je_el0_good_value[index] = *value;
+        if (je_copy_from_user(&je_el0_good_value[index],
+                              JE_VM_ARENA_BASE + 2u * JE_PAGE_SIZE,
+                              sizeof(je_el0_good_value[index])) != JE_ABI_OK)
+            proof_fatal("value-copy");
         je_el0_good_yield_mask |= UINT32_C(1) << index;
         proof_write("JeiOS/aarch64: EL0 RUN slot=");
         proof_dec(current_slot);

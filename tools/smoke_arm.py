@@ -1086,6 +1086,37 @@ EL0_BAD_RETURN_RE = re.compile(
     rb"JeiOS/aarch64: EL0 BAD_RETURN (sp|elr)-mutated slot=(\d+)")
 EL0_PASS = b"JeiOS/aarch64: EL0 proof PASS reviewed-cache-tlb=not-observed"
 EL0_ARENA_DATA = 0x0000100000002000
+EL0_COPY_PASS_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 COPY_PROBE_PASS slot=(\d+) lengths=0,256,255")
+EL0_COPY_PASS = valued(
+    b"JeiOS/aarch64: EL0 COPY_PROBE_PASS slot=<N> lengths=0,256,255",
+    EL0_COPY_PASS_RE.pattern)
+COPY_FAULT_FATAL = b"JeiOS/aarch64: FATAL copy fault fixup rejected"
+COPY_GUARD_FATAL = b"JeiOS/aarch64: FATAL el0-test copy-guard-cleared"
+COPY_DOUBLE_FAULT = b"JeiOS/aarch64: FATAL double fault; halted"
+COPY_LIVE_ROOT_FATAL = b"JeiOS/aarch64: FATAL sched copy live root"
+COPY_FAULTS = {
+    "exact-elr": 1,
+    "far-bound": 2,
+    "far-lower": 13,
+    "prefilter-stray": 14,
+    "owner": 3,
+    "direction": 4,
+    "permission": 5,
+    "l0": 6,
+    "live-root": 7,
+    "restore-selected": 8,
+    "save-path": 9,
+    "live-root-core": 10,
+    "load-permission": 11,
+    "guard-2": 12,
+}
+COPY_PAGE_SIZE = 0x1000
+COPY_FAULT_HOLE = EL0_ARENA_DATA - COPY_PAGE_SIZE
+COPY_FAULT_CODE = EL0_ARENA_DATA - 2 * COPY_PAGE_SIZE
+COPY_FAULT_KERNEL = 0x40080000
+COPY_LOAD_SITE_SYM = b"je_copy_user_load_site"
+COPY_STORE_SITE_SYM = b"je_copy_user_store_site"
 
 
 def el0_test_markers():
@@ -1103,6 +1134,123 @@ def el0_test_markers():
         exact(EL0_SETUP),
         exact(EL0_PASS),
     ]
+
+
+def copy_fault_markers(name):
+    markers = [
+        exact(b"JeiOS/aarch64: EL0 MODE_CHECK "
+              b"EL1h-frame-rejected-as-EL0"),
+        exact(b"JeiOS/aarch64: EL0 MODE_CHECK vector9-EL1h-rejected"),
+        exact(b"JeiOS/aarch64: EL0 MODE_CHECK vector5-EL0t-rejected"),
+        exact(b"JeiOS/aarch64: EL0 MODE_CHECK "
+              b"aarch32-M4-composite-rejected"),
+        exact(EL0_SETUP),
+        valued(
+            b"JeiOS/aarch64: EL0 SP_EL1 trap frame verified slot=<N>",
+            EL0_KSTACK_RE.pattern),
+        EL0_COPY_PASS,
+    ]
+    if name == "restore-selected":
+        markers.append(exact(COPY_GUARD_FATAL))
+    elif name in ("save-path", "guard-2", "prefilter-stray"):
+        markers.append(exact(COPY_DOUBLE_FAULT))
+    elif name == "live-root-core":
+        markers.append(exact(COPY_LIVE_ROOT_FATAL))
+    else:
+        markers += [
+            exact(COPY_FAULT_FATAL),
+            valued(b"JeiOS/aarch64: EXCEPTION copy-fault syndrome",
+                   rb"JeiOS/aarch64: EXCEPTION vector=" + HEX16 +
+                   rb" ec=" + HEX16 + rb" il=" + HEX16 + rb" iss=" + HEX16),
+            valued(b"JeiOS/aarch64: copy-fault frame",
+                   rb"JeiOS/aarch64:   esr=" + HEX16 + rb" elr=" +
+                   HEX16 + rb" spsr=" + HEX16),
+            valued(b"JeiOS/aarch64: copy-fault address",
+                   rb"JeiOS/aarch64:   far=" + HEX16 + rb" vbar=" + HEX16),
+            exact(b"JeiOS/aarch64: exception handled; halted"),
+        ]
+    return markers
+
+
+def check_copy_fault(lines, name, elf_path):
+    if name == "restore-selected":
+        if lines.count(COPY_GUARD_FATAL) != 1 or lines[-1] != COPY_GUARD_FATAL:
+            fail("--copy-fault restore-selected did not expose the cleared guard")
+        if any(b"copy fault fixup rejected" in ln for ln in lines):
+            fail("--copy-fault restore-selected took the ordinary reject path")
+        print("copy-fault: restore-selected -> guard-cleared FATAL")
+        return
+
+    if name in ("save-path", "guard-2", "prefilter-stray"):
+        if lines.count(COPY_DOUBLE_FAULT) != 1 or lines[-1] != COPY_DOUBLE_FAULT:
+            fail(f"--copy-fault {name} did not take the bounded double-fault halt")
+        if any(COPY_FAULT_FATAL in ln for ln in lines):
+            fail(f"--copy-fault {name} reached the C fixup-rejection path")
+        print(f"copy-fault: {name} -> stack-free double-fault FATAL")
+        return
+
+    if name == "live-root-core":
+        if lines.count(COPY_LIVE_ROOT_FATAL) != 1 or \
+                lines[-1] != COPY_LIVE_ROOT_FATAL:
+            fail("--copy-fault live-root-core did not reject the live root")
+        if any(COPY_FAULT_FATAL in ln for ln in lines):
+            fail("--copy-fault live-root-core reached the raw exception path")
+        print("copy-fault: live-root-core -> live-root FATAL")
+        return
+
+    if lines.count(COPY_FAULT_FATAL) != 1:
+        fail(f"--copy-fault {name}: expected one exact fixup-rejected FATAL")
+    syms = resolve_syms(elf_path, (COPY_LOAD_SITE_SYM, COPY_STORE_SITE_SYM),
+                        f"--copy-fault {name}")
+    esr_lines = [EXC_ESR_RE.fullmatch(ln) for ln in lines if
+                 EXC_ESR_RE.fullmatch(ln)]
+    far_lines = [EXC_FAR_RE.fullmatch(ln) for ln in lines if
+                 EXC_FAR_RE.fullmatch(ln)]
+    exc_lines = [ln for ln in lines
+                 if ln.startswith(b"JeiOS/aarch64: EXCEPTION vector=")]
+    if len(exc_lines) != 1 or len(esr_lines) != 1 or len(far_lines) != 1:
+        fail(f"--copy-fault {name}: expected one raw exception, esr, and far line")
+    esr, elr, spsr = (int(x, 16) for x in esr_lines[0].groups())
+    far, _ = (int(x, 16) for x in far_lines[0].groups())
+    ec = (esr >> 26) & 0x3f
+    il = (esr >> 25) & 1
+    iss = esr & 0x1ffffff
+    fsc = iss & 0x3f
+    if ec != 0x25 or il != 1 or (spsr & 0x1f) != 0x5 or \
+            ((spsr >> 6) & 0xf) != 0xf:
+        fail(f"--copy-fault {name}: non-EL1h data-abort syndrome "
+             f"esr=0x{esr:x} spsr=0x{spsr:x}")
+    expected_elr = syms[COPY_LOAD_SITE_SYM]
+    expected_far = COPY_FAULT_HOLE
+    if name == "exact-elr":
+        expected_elr += 4
+    elif name == "far-bound":
+        expected_far += 1
+    elif name == "far-lower":
+        expected_far -= 1
+    elif name == "permission":
+        expected_elr = syms[COPY_STORE_SITE_SYM]
+        expected_far = COPY_FAULT_CODE
+    elif name == "load-permission":
+        expected_far = COPY_FAULT_KERNEL
+    if elr != expected_elr or far != expected_far:
+        fail(f"--copy-fault {name}: ELR/FAR 0x{elr:x}/0x{far:x} != "
+             f"0x{expected_elr:x}/0x{expected_far:x}")
+    if name == "permission":
+        if iss != 0x4f:
+            fail(f"--copy-fault permission: expected ISS 0x4f, got 0x{iss:x}")
+    elif name == "load-permission":
+        if iss != 0x0f:
+            fail(f"--copy-fault load-permission: expected ISS 0x0f, got 0x{iss:x}")
+    elif name == "l0":
+        if fsc not in (0x04, 0x05, 0x06):
+            fail(f"--copy-fault l0: expected L0-L2 translation FSC, got 0x{fsc:x}")
+    else:
+        if iss != 0x007:
+            fail(f"--copy-fault {name}: expected exact L3 load ISS 0x007, "
+                 f"got 0x{iss:x}")
+    print(f"copy-fault: {name} FATAL ec=0x{ec:02x} iss=0x{iss:x} "
+          f"ELR=0x{elr:x} FAR=0x{far:x}")
 
 
 def check_el0_test(lines):
@@ -2281,6 +2429,9 @@ def main():
     ap.add_argument("--el0-test", action="store_true",
                     help="expect the MP3a-2 real EL0/SVC/fault-death proof "
                          "(two processes, isolation, hardening, reap)")
+    ap.add_argument("--copy-fault", choices=sorted(COPY_FAULTS), metavar="NAME",
+                    help="expect one MP3b ARM copy-fault guard to reject: "
+                         + ", ".join(sorted(COPY_FAULTS)))
     ap.add_argument("--sched-mutation",
                     choices=("drop-mov-sp", "pick-skips-b", "rebuild-fake-frame",
                              "unconditional-cur-ready", "wfi-i-masked",
@@ -2348,6 +2499,13 @@ def main():
                           or args.phys_alloc or args.user_test):
         fail("--el0-test is only valid alone (its build excludes the other "
              "toggles)")
+    if args.copy_fault and (args.dtb_bad or args.vector_test or args.mmu_fault
+                            or args.bss_verified or args.timer_poll
+                            or args.timer_test or args.sched_test
+                            or args.phys_alloc or args.user_test):
+        fail("--copy-fault is only valid with the EL0 proof build")
+    if args.copy_fault and not args.el0_test:
+        fail("--copy-fault requires --el0-test")
     if args.sched_mutation is not None and not args.sched_test:
         fail("--sched-mutation requires --sched-test")
     if (args.late_corruption is not None or args.stalled_timer) and not args.timer_test:
@@ -2440,6 +2598,8 @@ def main():
                             exact(IRQ_BRK_TRIGGER), exact(IRQ_BRK_EXC), exact(TERM_EXC)]
             elif args.sched_test:
                 markers += sched_markers()
+            elif args.copy_fault:
+                markers += copy_fault_markers(args.copy_fault)
             elif args.el0_test:
                 markers += el0_test_markers()
             else:
@@ -2452,7 +2612,8 @@ def main():
     # injection was not rejected. The checks below then fail with a clear
     # message; this only shortens the wait, it never makes a run PASS.
     early_stop = (VALIDATED if args.dtb_bad
-                  else None if args.sched_mutation is not None else b"FATAL")
+                  else None if args.sched_mutation is not None or
+                  args.copy_fault else b"FATAL")
     if not args.dtb_bad:
         check_dtb_gic_timer(fx)   # static: pinned bases/INTID vs fixture DTB
 
@@ -2571,6 +2732,19 @@ def main():
         for forbidden in (b"JeiOS/aarch64: dtb parsed", VALIDATED, TERM_DEFAULT):
             if forbidden in out:
                 fail(f"--dtb-bad: forbidden marker present: {forbidden.decode()}")
+    elif args.copy_fault:
+        fatal_lines = [line_of(ln) for ln in out.split(b"\n") if b"FATAL" in ln]
+        if args.copy_fault == "restore-selected":
+            expected_fatal = COPY_GUARD_FATAL
+        elif args.copy_fault in ("save-path", "guard-2", "prefilter-stray"):
+            expected_fatal = COPY_DOUBLE_FAULT
+        elif args.copy_fault == "live-root-core":
+            expected_fatal = COPY_LIVE_ROOT_FATAL
+        else:
+            expected_fatal = COPY_FAULT_FATAL
+        if fatal_lines != [expected_fatal]:
+            fail(f"--copy-fault {args.copy_fault}: expected only "
+                 f"{expected_fatal!r}, got {fatal_lines!r}")
     elif b"FATAL" in out:
         fail("FATAL marker present")
 
@@ -2595,7 +2769,7 @@ def main():
                   prebuild_ram_l3=(args.user_test or args.el0_test))
         if args.user_test:
             next_ok = lambda ln: ln == USER_PASS
-        elif args.el0_test:
+        elif args.copy_fault or args.el0_test:
             next_ok = lambda ln: ln == (
                 b"JeiOS/aarch64: EL0 MODE_CHECK "
                 b"EL1h-frame-rejected-as-EL0")
@@ -2620,10 +2794,14 @@ def main():
             check_timer_test(lines, tt_exp)
         elif args.sched_test:
             check_sched_test(lines, sched_syms)
-        elif any(ln.startswith(IRQ_TICK_PREFIX) or DOUBLE_FAULT in ln for ln in lines):
+        elif not args.copy_fault and any(
+                ln.startswith(IRQ_TICK_PREFIX) or DOUBLE_FAULT in ln
+                for ln in lines):
             fail("irq/double-fault lines present without --timer-test (wrong build?)")
         if args.user_test:
             check_user_test(lines, mmu_syms, proof_image)
+        elif args.copy_fault:
+            check_copy_fault(lines, args.copy_fault, elf)
         elif args.el0_test:
             check_el0_test(lines)
     if args.mmu_fault:

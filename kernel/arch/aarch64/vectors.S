@@ -49,7 +49,12 @@ je_arm_vectors:
     VEC 2    /* FIQ    */
     VEC 3    /* SError */
     /* Group 1: Current EL with SP_ELx  (EL1h — the reachable group in MP1). */
+#ifdef JE_ARM_EL0_TEST
+    .balign 0x80
+    b       je_arm_vec_copy_slot
+#else
     VEC 4    /* Sync   <- BRK / undefined / data abort land here */
+#endif
     /* IRQ: preserve x16-x19 before using any scratch register. */
     .balign 0x80
     sub     sp, sp, #JE_TF_SIZE
@@ -81,18 +86,89 @@ je_arm_vectors:
     .extern je_arm_exception
     .extern je_arm_double_fault
     .extern je_arm_in_handler
+#ifdef JE_ARM_EL0_TEST
+    .extern je_copy_user_load_site
+    .extern je_copy_user_store_site
+    .extern je_copy_user_fixup
+    .extern je_arm_copy_fixup_dispatch
+    .extern je_arm_copy_saved_gprs
+
+#define JE_ARM_COPY_GUARD_STATE 2
+#define JE_ARM_COPY_GUARD_ASSERT_STATE 2
+
+    /*
+     * Slot 4 must preserve the interrupted x16-x18 values before the common
+     * guard uses them as vector/guard scratch.  x0-x2 are caller-saved at the
+     * leaf fault site, so this stack-free veneer uses them as the temporary
+     * save carriers.  A fatal path never restores them; the copy path copies
+     * them into the frozen frame before C runs.
+     */
+    .globl  je_arm_vec_copy_slot
+je_arm_vec_copy_slot:
+    mov     x0, x16
+    mov     x1, x17
+    mov     x2, x18
+    mov     w16, #4
+    b       je_arm_vec_common
+#endif
 
 je_arm_vec_common:
     /* ---- Reentrancy guard FIRST, before any stack access that could itself
-     * fault: if je_arm_in_handler != 0 we are already handling an exception ->
-     * nested/double fault -> fatal bounded halt. Set it to 1 otherwise. This is
-     * a plain byte load/store (single CPU, MMU-off Normal access, no atomics). */
+     * fault.  The sole returning exception is an exact copy-site abort nested
+     * inside an EL0 SVC; every other nonzero state is still stack-free fatal. */
     adrp    x17, je_arm_in_handler
     add     x17, x17, #:lo12:je_arm_in_handler
     ldrb    w18, [x17]
+#ifdef JE_ARM_EL0_TEST
+    cbz     w18, .Lguard_clear
+    cmp     w18, #1
+    b.ne    je_arm_double_fault
+
+    /*
+     * Enter the copy-check state before the first potentially faulting store.
+     * A fault while saving the interrupted x16-x18 must re-enter with state 2
+     * and take the unchanged stack-free double-fault halt; state 1 here would
+     * retry this save forever if the save target were unavailable.
+     */
+    mov     w18, #JE_ARM_COPY_GUARD_STATE
+    strb    w18, [x17]
+
+    /*
+     * Preserve the interrupted x16-x18 before the exact-site prefilter uses
+     * the scratch registers.  This is kernel .data and remains stack-free.
+     */
+    adrp    x16, je_arm_copy_saved_gprs
+    add     x16, x16, #:lo12:je_arm_copy_saved_gprs
+#if defined(JE_ARM_COPY_FAULT_STAGE) && JE_ARM_COPY_FAULT_STAGE == 9
+    /* Test-only: force the first save store to an unmapped address. */
+    mov     x16, xzr
+#endif
+    stp     x0, x1, [x16]
+    str     x2, [x16, #16]
+
+    mrs     x0, ELR_EL1
+    adrp    x1, je_copy_user_load_site
+    add     x1, x1, #:lo12:je_copy_user_load_site
+    cmp     x0, x1
+    b.eq    .Lcopy_guard_accept
+    adrp    x1, je_copy_user_store_site
+    add     x1, x1, #:lo12:je_copy_user_store_site
+    cmp     x0, x1
+    b.ne    je_arm_double_fault
+
+.Lcopy_guard_accept:
+    mov     w18, #JE_ARM_COPY_GUARD_STATE
+    strb    w18, [x17]
+    b       .Lcopy_frame_build
+
+.Lguard_clear:
+    mov     w18, #1
+    strb    w18, [x17]
+#else
     cbnz    w18, je_arm_double_fault
     mov     w18, #1
     strb    w18, [x17]
+#endif
 
     /* ---- Build the trap frame on the current (EL1) stack. Reserve JE_TF_SIZE
      * (304, 16-aligned) and fill it to the trapframe.h layout. ---- */
@@ -148,6 +224,111 @@ je_arm_vec_common:
     /* je_arm_exception is _Noreturn; if it ever returns, halt hard. */
 1:  wfe
     b       1b
+
+#ifdef JE_ARM_EL0_TEST
+/*
+ * Copy-fault frame build.  It uses the same frozen 304-byte layout, but the
+ * three saved x16-x18 values captured by the stack-free prefilter are written
+ * into their frozen GPR slots instead of the vector/guard scratch values.
+ */
+.Lcopy_frame_build:
+    adrp    x17, je_arm_in_handler
+    add     x17, x17, #:lo12:je_arm_in_handler
+    ldrb    w18, [x17]
+    cmp     w18, #JE_ARM_COPY_GUARD_ASSERT_STATE
+    b.ne    je_arm_double_fault
+    adrp    x16, je_arm_copy_saved_gprs
+    add     x16, x16, #:lo12:je_arm_copy_saved_gprs
+    ldp     x0, x1, [x16]
+    ldr     x2, [x16, #16]
+    sub     sp, sp, #JE_TF_SIZE
+    str     x0, [sp, #(JE_TF_GPR + 128)]
+    str     x1, [sp, #(JE_TF_GPR + 136)]
+    str     x2, [sp, #(JE_TF_GPR + 144)]
+    stp     x0,  x1,  [sp, #(JE_TF_GPR + 0)]
+    stp     x2,  x3,  [sp, #(JE_TF_GPR + 16)]
+    stp     x4,  x5,  [sp, #(JE_TF_GPR + 32)]
+    stp     x6,  x7,  [sp, #(JE_TF_GPR + 48)]
+    stp     x8,  x9,  [sp, #(JE_TF_GPR + 64)]
+    stp     x10, x11, [sp, #(JE_TF_GPR + 80)]
+    stp     x12, x13, [sp, #(JE_TF_GPR + 96)]
+    stp     x14, x15, [sp, #(JE_TF_GPR + 112)]
+    str     x19,      [sp, #(JE_TF_GPR + 152)]
+    stp     x20, x21, [sp, #(JE_TF_GPR + 160)]
+    stp     x22, x23, [sp, #(JE_TF_GPR + 176)]
+    stp     x24, x25, [sp, #(JE_TF_GPR + 192)]
+    stp     x26, x27, [sp, #(JE_TF_GPR + 208)]
+    stp     x28, x29, [sp, #(JE_TF_GPR + 224)]
+    str     x30,      [sp, #(JE_TF_GPR + 240)]
+
+    add     x0, sp, #JE_TF_SIZE
+    str     x0, [sp, #JE_TF_SP]
+    mrs     x0, ELR_EL1
+    mrs     x1, SPSR_EL1
+    stp     x0, x1, [sp, #JE_TF_ELR]
+    mrs     x0, ESR_EL1
+    mrs     x1, FAR_EL1
+    stp     x0, x1, [sp, #JE_TF_ESR]
+    mov     x0, #4
+    str     x0, [sp, #JE_TF_VECTOR]
+    str     xzr, [sp, #JE_TF_PAD]
+
+    mov     x0, sp
+    bl      je_arm_copy_fixup_dispatch
+    b       je_arm_copy_restore
+
+    .globl  je_arm_copy_restore
+je_arm_copy_restore:
+    mov     x16, sp
+    cmp     x0, x16
+    b.ne    je_arm_double_fault
+    ldr     x1, [sp, #JE_TF_ELR]
+    adrp    x2, je_copy_user_fixup
+    add     x2, x2, #:lo12:je_copy_user_fixup
+    cmp     x1, x2
+    b.ne    je_arm_double_fault
+    ldr     x1, [sp, #JE_TF_SPSR]
+    and     x2, x1, #0x0fffffff
+    cmp     x2, #0x3c5
+    b.ne    je_arm_double_fault
+
+    /* Recovery returns to the still-active EL0 SVC, so restore guard state 1. */
+    adrp    x17, je_arm_in_handler
+    add     x17, x17, #:lo12:je_arm_in_handler
+    mov     w18, #1
+    strb    w18, [x17]
+
+    ldp     x0, x1, [sp, #JE_TF_ELR]
+    msr     ELR_EL1, x0
+    msr     SPSR_EL1, x1
+    ldp     x0, x1, [sp, #(JE_TF_GPR + 0)]
+    ldp     x2, x3, [sp, #(JE_TF_GPR + 16)]
+    ldp     x4, x5, [sp, #(JE_TF_GPR + 32)]
+    ldp     x6, x7, [sp, #(JE_TF_GPR + 48)]
+    ldp     x8, x9, [sp, #(JE_TF_GPR + 64)]
+    ldp     x10, x11, [sp, #(JE_TF_GPR + 80)]
+    ldp     x12, x13, [sp, #(JE_TF_GPR + 96)]
+    ldp     x14, x15, [sp, #(JE_TF_GPR + 112)]
+    ldp     x16, x17, [sp, #(JE_TF_GPR + 128)]
+    ldp     x18, x19, [sp, #(JE_TF_GPR + 144)]
+    ldp     x20, x21, [sp, #(JE_TF_GPR + 160)]
+    ldp     x22, x23, [sp, #(JE_TF_GPR + 176)]
+    ldp     x24, x25, [sp, #(JE_TF_GPR + 192)]
+    ldp     x26, x27, [sp, #(JE_TF_GPR + 208)]
+    ldp     x28, x29, [sp, #(JE_TF_GPR + 224)]
+    ldr     x30, [sp, #(JE_TF_GPR + 240)]
+#ifdef JE_ARM_COPY_FAULT_MUTANT_RESTORE_SELECTED
+    adrp    x17, je_arm_copy_restore_selected_seen
+    add     x17, x17, #:lo12:je_arm_copy_restore_selected_seen
+    mov     w18, #1
+    strb    w18, [x17]
+    mov     x0, sp
+    b       je_arm_restore_selected
+#else
+    add     sp, sp, #JE_TF_SIZE
+    eret
+#endif
+#endif
 
 /* ---- Double/nested fault (je_arm_in_handler was already set). Pure asm so it
  * is guaranteed STACK-FREE: a C handler could gain a stack-touching prologue and

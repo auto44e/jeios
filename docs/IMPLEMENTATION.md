@@ -2,6 +2,32 @@
 
 Current checkpoint and work order: [STATUS.md](STATUS.md). Dated status and next-task statements below are historical when superseded by that checkpoint.
 
+## Current status — MP3b fix pass — observed 2026-11-09T08:04:29Z
+
+Repository `/tmp/wt-mp3b`, branch `wip/mp3b`, exact inspected base commit
+`5b338b7b89f787365ddff37f1969ae2d8416925d` (the exact inspected pre-fix-pass
+base; this working tree contains the fix pass). State:
+**implemented / tested locally / planned (owner review, remote CI, physical ARM
+and independent human qualification) / not blocked**. This is AI-assisted
+evidence, not human or release qualification. Demonstrated support tier:
+**QEMU 8.2.2 `virt-8.2`, `cortex-a72`, one CPU, 256 MiB**.
+
+| Area | ARM MP3b status | Evidence boundary |
+| --- | --- | --- |
+| Usercopy leaves | Implemented: separate load/store leaves, exact sites, returnable fixup | QEMU positive round-trip and exact-fatal matrix; physical ARM not observed |
+| Copy-fault predicate | Implemented: exact syndrome/ELR/FAR/owner/live-root checks, both FAR bounds, and load-side permission rejection | Fourteen isolated fatal-negative builds; 65 killed, 0 survived, 0 blocked mutants |
+| Slot-4 exception path | Implemented: save-before-compare ordering, guard states 0/1/2 and dedicated restore | Positive `count=2 guard=1`; save-path, guard-2, prefilter-stray, and restore-selected proofs pass |
+| ARM syscall glue | Implemented: COPY_PROBE and SELF-only handle operations | EL0 proof covers mint, attenuated dup, query, rights denial, close and stale close |
+| x86 compatibility | Preserved by ARM guards and separate translation unit | `make check` PASS; x86 sources remain unchanged except ARM-guarded core additions |
+| Qualification | Planned | No remote CI, physical ARM or independent human qualification claim |
+
+The implementation files are `kernel/core/usercopy.c`,
+`kernel/arch/aarch64/{usercopy_arm.S,syscall_arm.c,vectors.S,main.c,sched_arm.c,el0_test.c,vm_backend.c,trapframe.h}`,
+`include/jeios/{syscall.h,usercopy.h}`, `mk/aarch64.mk`, `tools/smoke_arm.py`,
+`tools/run_arm_copy_fault.py`, `tools/check_arm_usercopy_boundary.sh`,
+`tools/mutants.json`, and `Makefile`. The detailed current handoff is
+`docs/HANDOFF.md`.
+
 ## Current status — MP3a-2 FINAL FIX PASS — observed 2026-11-09T03:38:01+00:00
 
 Repository `/tmp/wt-mp3a2`, branch `wip/mp3a2`, exact inspected base commit
