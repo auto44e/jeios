@@ -667,7 +667,9 @@ MAIR_NORMAL_WB, MAIR_DEVICE_NGNRNE = 0xFF, 0x00
 FSC_TRANSLATION_L3, FSC_PERMISSION_L3 = 0x07, 0x0F
 MMU_LAYOUT_SYMS = (b"_text", b"__text_end", b"__rodata_end", b"__data_end",
                    b"__stack_guard", b"__stack_bottom", b"_end",
-                   b"je_arm_vectors")
+                   b"je_arm_vectors", b"je_arm_bss_probe",
+                   b"je_arm_sched_install_ttbr0")
+A64_TLBI_ASIDE1IS_X1 = 0xD5088341
 A64_RET = 0xD65F03C0
 # STR Xt, [Xn, #0] (unsigned-offset, 64-bit) with Rt == XZR; Rn free.
 A64_STR_XZR_MASK, A64_STR_XZR_BITS = 0xFFFFFC1F, 0xF900001F
@@ -713,6 +715,21 @@ def par_expect_ok(par, va, attr, sh, what):
         fail(f"{what}: PAR.SH=0b{(par >> 7) & 3:02b} != 0b{sh:02b}")
 
 
+def par_expect_user_ok(par, attr, sh, what):
+    """PAR_EL1 after a successful user-root AT: the frame must be a managed
+    physical page with the expected Normal/shareable attributes. User arena
+    virtual addresses are intentionally not identity mapped."""
+    if par & 1:
+        fail(f"{what}: PAR=0x{par:016x} has F=1")
+    pa = par & 0x0000FFFFFFFFF000
+    if pa < PHYS_WINDOW[0] or pa >= PHYS_WINDOW[1] or pa % PHYS_PAGE:
+        fail(f"{what}: PAR.PA=0x{pa:x} is outside the managed frame window")
+    if (par >> 56) & 0xFF != attr:
+        fail(f"{what}: PAR.ATTR=0x{(par >> 56) & 0xFF:02x} != 0x{attr:02x}")
+    if (par >> 7) & 3 != sh:
+        fail(f"{what}: PAR.SH=0b{(par >> 7) & 3:02b} != 0b{sh:02b}")
+
+
 def par_expect_fault(par, fst, what):
     """PAR_EL1 after a faulting AT (F=1): FST[6:1] must be the given stage-1
     fault, PTW[8]=0 (not a walk fault), S[9]=0 (stage 1)."""
@@ -724,7 +741,7 @@ def par_expect_fault(par, fst, what):
         fail(f"{what}: PAR=0x{par:016x} reports PTW/S2 fault; expected stage-1 leaf fault")
 
 
-def mmu_expected_leaves(regions_pages, root):
+def mmu_expected_leaves(regions_pages, root, prebuild_ram_l3=False):
     """Independent leaf count for the audit line: every mapped 4 KiB page of the
     requested regions, plus one RW identity leaf per page-table frame. The table
     frames are modelled as a contiguous first-fit run [root, root + T pages)
@@ -734,6 +751,18 @@ def mmu_expected_leaves(regions_pages, root):
     ever stops being first-fit-contiguous this check FAILS (never false-passes)
     and must be re-derived."""
     base = set(regions_pages)
+    if prebuild_ram_l3:
+        # MP3a-1 prebuilds an empty L3 for every 2 MiB RAM slot. It adds table
+        # frames, not RAM leaves; all table frames are in the managed RAM
+        # window, so their identity leaves fit inside this already-complete
+        # hierarchy and do not create a second fixed-point case.
+        ram_base, ram_limit = PHYS_WINDOW
+        slots = range(ram_base, ram_limit, 0x200000)
+        hierarchy_vas = base | set(slots)
+        tables = (1 + len({va >> 39 for va in hierarchy_vas})
+                  + len({va >> 30 for va in hierarchy_vas})
+                  + len({va >> 21 for va in hierarchy_vas}))
+        return len(base) + tables, tables
     tables = 1
     while True:
         vas = base | {root + i * PHYS_PAGE for i in range(tables)}
@@ -744,7 +773,7 @@ def mmu_expected_leaves(regions_pages, root):
         tables = need
 
 
-def check_mmu(lines, syms):
+def check_mmu(lines, syms, prebuild_ram_l3=False):
     """Default MMU block: one contiguous block of the 10 lines, each value
     recomputed independently. Returns the parsed block for later checks."""
     idx = [i for i, ln in enumerate(lines)
@@ -783,7 +812,8 @@ def check_mmu(lines, syms):
         pages += range(lo, hi, PHYS_PAGE)
     if s[b"__stack_guard"] in pages:
         fail("mmu: oracle bug: guard page in the mapped set")
-    want_leaves, tables = mmu_expected_leaves(pages, root)
+    want_leaves, tables = mmu_expected_leaves(
+        pages, root, prebuild_ram_l3=prebuild_ram_l3)
     if leaves != want_leaves:
         fail(f"mmu audit: leaves=0x{leaves:x} != independent count 0x{want_leaves:x} "
              f"({len(pages)} region pages + {tables} table frames)")
@@ -832,6 +862,173 @@ def check_mmu(lines, syms):
           f"(F=0 PA==VA ATTR=0x00)")
     print(f"mmu:   PAR gicd=0x{gd_par:016x} gicc=0x{gc_par:016x} (F=0 PA==VA "
           f"ATTR=0x00 Device) gicc_dir=0x{dir_par:016x} (F=1 FST=xlate L3, unmapped)")
+
+
+# ---- --user-test (MP3a-1, ADR 0015 D1) --------------------------------------
+USER_INSTALL_RE = re.compile(
+    rb"JeiOS/aarch64: user-test install (p[12]) root=" + H
+    + rb" ttbr0=" + H + rb" tlbi=" + H)
+USER_PROBE_RE = re.compile(
+    rb"JeiOS/aarch64: user-test "
+    rb"(p1 kernel-read|p1 kernel-write|p1 code-read|p1 code-write|"
+    rb"p1 data-write|p1 rodata-read|p1 rodata-write|p1 uart-read|"
+    rb"p1 gicd-read|p2 data-read) va=" + H + rb" par=" + H)
+USER_ISOLATE_RE = re.compile(
+    rb"JeiOS/aarch64: user-test isolate p1-par=" + H + rb" p2-par=" + H)
+USER_AUDIT_RUNTIME_RE = re.compile(
+    rb"JeiOS/aarch64: user-test pre-enable-audit cycles=" + H
+    + rb" reads=" + H)
+USER_WX_RE = re.compile(
+    rb"JeiOS/aarch64: user-test wx-refuse code-pa=" + H
+    + rb" status=DENIED")
+USER_AUDIT = b"JeiOS/aarch64: user-test audit PASS"
+USER_TLBI_RE = re.compile(rb"JeiOS/aarch64: user-test tlbi (p[12]) operand=" + H)
+USER_TLBI_P1_RE = re.compile(rb"JeiOS/aarch64: user-test tlbi p1 operand=" + H)
+USER_TLBI_P2_RE = re.compile(rb"JeiOS/aarch64: user-test tlbi p2 operand=" + H)
+USER_PASS = b"JeiOS/aarch64: user-test PASS reviewed-tlb=not-observed"
+USER_TEST_LABELS = (
+    b"p1 kernel-read", b"p1 kernel-write", b"p1 code-read",
+    b"p1 code-write", b"p1 data-write", b"p1 rodata-read",
+    b"p1 rodata-write", b"p1 uart-read", b"p1 gicd-read",
+    b"p2 data-read")
+
+
+def user_test_markers():
+    return [
+        valued(b"JeiOS/aarch64: user-test pre-enable-audit cycles=<hex> reads=<hex>",
+               USER_AUDIT_RUNTIME_RE.pattern),
+        valued(b"JeiOS/aarch64: user-test install p1 root=<hex> tlbi=<hex>",
+               USER_INSTALL_RE.pattern),
+        *[valued(b"JeiOS/aarch64: user-test " + label + b" va=<hex> par=<hex>",
+                 re.escape(b"JeiOS/aarch64: user-test " + label)
+                 + rb" va=" + HEX16 + rb" par=" + HEX16)
+          for label in USER_TEST_LABELS[:9]],
+        valued(b"JeiOS/aarch64: user-test wx-refuse code-pa=<hex> status=DENIED",
+               USER_WX_RE.pattern),
+        valued(b"JeiOS/aarch64: user-test install p2 root=<hex> ttbr0=<hex> tlbi=<hex>",
+               USER_INSTALL_RE.pattern),
+        valued(b"JeiOS/aarch64: user-test p2 data-read va=<hex> par=<hex>",
+               re.escape(b"JeiOS/aarch64: user-test p2 data-read va=")
+               + HEX16 + rb" par=" + HEX16),
+        valued(b"JeiOS/aarch64: user-test isolate p1-par=<hex> p2-par=<hex>",
+               USER_ISOLATE_RE.pattern),
+        exact(USER_AUDIT),
+        valued(b"JeiOS/aarch64: user-test tlbi p1 operand=<hex>",
+               USER_TLBI_P1_RE.pattern),
+        valued(b"JeiOS/aarch64: user-test tlbi p2 operand=<hex>",
+               USER_TLBI_P2_RE.pattern),
+        exact(USER_PASS),
+    ]
+
+
+def check_user_test(lines, syms, image):
+    """Independently decode every MP3a-1 PAR, TTBR0 and ASIDE1IS marker."""
+    audit_runtime = [USER_AUDIT_RUNTIME_RE.fullmatch(ln) for ln in lines]
+    audit_runtime = [m for m in audit_runtime if m]
+    if len(audit_runtime) != 1:
+        fail("user-test: missing or duplicate pre-enable audit timing marker")
+    if int(audit_runtime[0].group(1), 16) == 0 or \
+            int(audit_runtime[0].group(2), 16) == 0:
+        fail("user-test: pre-enable audit timing/read count must be nonzero")
+    installs = [USER_INSTALL_RE.fullmatch(ln) for ln in lines]
+    installs = [m for m in installs if m]
+    if len(installs) != 2 or [m.group(1) for m in installs] != [b"p1", b"p2"]:
+        fail(f"user-test: expected exactly p1/p2 installs, found "
+             f"{[m.group(1) for m in installs]}")
+    roots = [int(m.group(2), 16) for m in installs]
+    ttbr0s = [int(m.group(3), 16) for m in installs]
+    operands = [int(m.group(4), 16) for m in installs]
+    if any(root == 0 or root % PHYS_PAGE for root in roots) or roots[0] == roots[1]:
+        fail(f"user-test: roots must be distinct nonzero pages, got {roots}")
+    for root, ttbr0 in zip(roots, ttbr0s):
+        if (ttbr0 & 0x0000FFFFFFFFF000) != root or \
+                ((ttbr0 >> 48) & 0xff) != 1:
+            fail(f"user-test: TTBR0=0x{ttbr0:016x} does not contain "
+                 f"root=0x{root:016x} and ASID 1")
+    if operands != [1 << 48, 1 << 48]:
+        fail(f"user-test: ASIDE1IS operands {operands} != shared ASID 1")
+
+    probes = {}
+    for m in (USER_PROBE_RE.fullmatch(ln) for ln in lines):
+        if m:
+            label = m.group(1)
+            if label in probes:
+                fail(f"user-test: duplicate probe {label!r}")
+            probes[label] = (int(m.group(2), 16), int(m.group(3), 16))
+    if tuple(probes) != USER_TEST_LABELS:
+        fail(f"user-test: probe labels/order {tuple(probes)} != "
+             f"{USER_TEST_LABELS}")
+
+    expected_va = {
+        b"p1 kernel-read": syms[b"_text"],
+        b"p1 kernel-write": syms[b"je_arm_bss_probe"],
+        b"p1 code-read": 0x0000100000000000,
+        b"p1 code-write": 0x0000100000000000,
+        b"p1 data-write": 0x0000100000002000,
+        b"p1 rodata-read": 0x0000100000001000,
+        b"p1 rodata-write": 0x0000100000001000,
+        b"p1 uart-read": PL011_PA,
+        b"p1 gicd-read": GICD_PA,
+        b"p2 data-read": 0x0000100000002000,
+    }
+    for label, want_va in expected_va.items():
+        va, par = probes[label]
+        if va != want_va:
+            fail(f"user-test: {label.decode()} VA=0x{va:x} != "
+                 f"expected 0x{want_va:x}")
+
+    for label in (b"p1 kernel-read", b"p1 kernel-write", b"p1 uart-read",
+                  b"p1 gicd-read", b"p1 code-write", b"p1 rodata-write"):
+        par_expect_fault(probes[label][1], FSC_PERMISSION_L3,
+                         f"user-test {label.decode()}")
+
+    for label in (b"p1 code-read", b"p1 data-write", b"p1 rodata-read",
+                  b"p2 data-read"):
+        par_expect_user_ok(probes[label][1], MAIR_NORMAL_WB, 0b11,
+                           f"user-test {label.decode()}")
+
+    wx = [USER_WX_RE.fullmatch(ln) for ln in lines]
+    wx = [m for m in wx if m]
+    if len(wx) != 1:
+        fail(f"user-test: expected one W^X ledger refusal marker, found {len(wx)}")
+    if int(wx[0].group(1), 16) != \
+            (probes[b"p1 code-read"][1] & 0x0000FFFFFFFFF000):
+        fail("user-test: W^X refusal marker names the wrong code frame")
+
+    if image is None or b"je_arm_sched_install_ttbr0" not in syms:
+        fail("user-test: missing ELF/image for ASIDE1IS instruction proof")
+    install = syms[b"je_arm_sched_install_ttbr0"]
+    if not any(image_word(image, syms[b"_text"], install + offset,
+                          "user-test ASIDE1IS") == A64_TLBI_ASIDE1IS_X1
+               for offset in range(0, 0x80, 4)):
+        fail("user-test: ELF install seam contains no ASIDE1IS x1 instruction")
+
+    isolates = [USER_ISOLATE_RE.fullmatch(ln) for ln in lines]
+    isolates = [m for m in isolates if m]
+    if len(isolates) != 1:
+        fail(f"user-test: expected one cross-process isolate line, found "
+             f"{len(isolates)}")
+    p1_pa = int(isolates[0].group(1), 16) & 0x0000FFFFFFFFF000
+    p2_pa = int(isolates[0].group(2), 16) & 0x0000FFFFFFFFF000
+    if (int(isolates[0].group(1), 16) & 1 or
+            int(isolates[0].group(2), 16) & 1):
+        fail("user-test: cross-process data probes faulted")
+    if p1_pa == p2_pa:
+        fail(f"user-test: same arena VA resolved to same PA 0x{p1_pa:x}")
+
+    tlbi = [USER_TLBI_RE.fullmatch(ln) for ln in lines]
+    tlbi = [m for m in tlbi if m]
+    if len(tlbi) != 2 or [m.group(1) for m in tlbi] != [b"p1", b"p2"]:
+        fail("user-test: missing p1/p2 TLBI evidence")
+    if any(int(m.group(2), 16) != 1 << 48 for m in tlbi):
+        fail("user-test: recorded TLBI operand is not ASID 1")
+    if lines.count(USER_AUDIT) != 1:
+        fail("user-test: missing or duplicate independent-audit marker")
+    print(f"user-test: kernel faults/data permissions and W^X verified; "
+          f"p1 PA=0x{p1_pa:x} p2 PA=0x{p2_pa:x} differ; ASIDE1IS operand=0x{1 << 48:016x} "
+          f"(audit cycles=0x{int(audit_runtime[0].group(1), 16):x}, "
+          f"reads=0x{int(audit_runtime[0].group(2), 16):x}; "
+          f"TLB staleness reviewed, not observed under QEMU TCG)")
 
 
 # ---- GIC + CNTP timer (MP2 PR-2a, ADR 0012 D2/D3/D4/D6/D8) -----------------
@@ -1852,6 +2049,9 @@ def main():
     ap.add_argument("--sched-test", action="store_true",
                     help="expect the ARM_SCHED_TEST preemptive scheduler proof "
                          "(counter table, READY oracle, and worker guard fault)")
+    ap.add_argument("--user-test", action="store_true",
+                    help="expect the MP3a-1 EL1-only TTBR0/AT S1E0 proof "
+                         "(two process roots, permissions, isolation, audit)")
     ap.add_argument("--sched-mutation",
                     choices=("drop-mov-sp", "pick-skips-b", "rebuild-fake-frame",
                              "unconditional-cur-ready", "wfi-i-masked",
@@ -1907,6 +2107,12 @@ def main():
                             or args.timer_test or args.phys_alloc):
         fail("--sched-test is only valid alone (its build excludes the other "
              "toggles)")
+    if args.user_test and (args.dtb_bad or args.vector_test or args.mmu_fault
+                           or args.bss_verified or args.timer_poll
+                           or args.timer_test or args.sched_test
+                           or args.phys_alloc):
+        fail("--user-test is only valid alone (its build excludes the other "
+             "toggles)")
     if args.sched_mutation is not None and not args.sched_test:
         fail("--sched-mutation requires --sched-test")
     if (args.late_corruption is not None or args.stalled_timer) and not args.timer_test:
@@ -1944,6 +2150,13 @@ def main():
         fail(f"{'--require' if args.dtb_bad else 'MMU oracle'}: ELF {elf} not found")
     boot_image = make_timer_negative_image(
         elf, args.image, args.late_corruption, args.stalled_timer)
+    proof_image = None
+    if args.user_test:
+        try:
+            with open(boot_image, "rb") as f:
+                proof_image = f.read()
+        except OSError as e:
+            fail(f"user-test: cannot read Image for ELF instruction proof: {e}")
     image_extent = resolve_image_extent(elf) if args.phys_alloc else None
     mmu_syms = None if args.dtb_bad else resolve_syms(elf, MMU_LAYOUT_SYMS, "mmu")
     sched_syms = (resolve_syms(
@@ -1971,26 +2184,29 @@ def main():
         if args.phys_alloc:
             markers += phys_alloc_markers()
         markers += mmu_markers()
-        markers += gic_markers()
-        if args.timer_poll:
-            markers += timer_poll_markers()
-        if args.vector_test:
-            markers += vector_test_markers(resolve_brk_site(elf, args.image))
-        elif args.mmu_fault:
-            markers += mmu_fault_markers(args.mmu_fault, fault_exp)
-        elif args.timer_test:
-            markers += [exact(IRQ_CANARY_HI)]
-            markers += [valued(b"JeiOS/aarch64: irq tick n=" + hx(n) + b" ...",
-                               re.escape(b"JeiOS/aarch64: irq tick n=" + hx(n) + b" ")
-                               + rb".*")
-                        for n in range(1, IRQ_TICKS + 1)]
-            markers += [valued(b"JeiOS/aarch64: irq timer PASS ticks=<hex>",
-                               IRQ_PASS_RE.pattern),
-                        exact(IRQ_BRK_TRIGGER), exact(IRQ_BRK_EXC), exact(TERM_EXC)]
-        elif args.sched_test:
-            markers += sched_markers()
+        if args.user_test:
+            markers += user_test_markers()
         else:
-            markers += [exact(TERM_DEFAULT)]
+            markers += gic_markers()
+            if args.timer_poll:
+                markers += timer_poll_markers()
+            if args.vector_test:
+                markers += vector_test_markers(resolve_brk_site(elf, args.image))
+            elif args.mmu_fault:
+                markers += mmu_fault_markers(args.mmu_fault, fault_exp)
+            elif args.timer_test:
+                markers += [exact(IRQ_CANARY_HI)]
+                markers += [valued(b"JeiOS/aarch64: irq tick n=" + hx(n) + b" ...",
+                                   re.escape(b"JeiOS/aarch64: irq tick n=" + hx(n) + b" ")
+                                   + rb".*")
+                            for n in range(1, IRQ_TICKS + 1)]
+                markers += [valued(b"JeiOS/aarch64: irq timer PASS ticks=<hex>",
+                                   IRQ_PASS_RE.pattern),
+                            exact(IRQ_BRK_TRIGGER), exact(IRQ_BRK_EXC), exact(TERM_EXC)]
+            elif args.sched_test:
+                markers += sched_markers()
+            else:
+                markers += [exact(TERM_DEFAULT)]
     # Every mode ends on a fixed (exact) line; that line is the terminal marker.
     final_line = markers[-1][0]
     # Stop early (instead of burning the whole timeout) once the run can no
@@ -2138,8 +2354,10 @@ def main():
     if args.phys_alloc:
         check_phys_alloc(lines, fx, image_extent)
     if not args.dtb_bad:
-        check_mmu(lines, mmu_syms)
-        if args.vector_test:
+        check_mmu(lines, mmu_syms, prebuild_ram_l3=args.user_test)
+        if args.user_test:
+            next_ok = lambda ln: ln == USER_PASS
+        elif args.vector_test:
             next_ok = lambda ln: ln == vector_test_markers(0)[0][0]
         elif args.mmu_fault:
             next_ok = lambda ln: MMU_FAULT_TEST_RE.fullmatch(ln) is not None
@@ -2149,13 +2367,21 @@ def main():
             next_ok = lambda ln: SCHED_WORKERS_RE.fullmatch(ln) is not None
         else:
             next_ok = lambda ln: ln == TERM_DEFAULT
-        check_gic(lines, args.timer_poll, next_ok)
+        if args.user_test:
+            if any(ln.startswith(b"JeiOS/aarch64: gic ") or
+                   ln.startswith(b"JeiOS/aarch64: timer ")
+                   for ln in lines):
+                fail("user-test: GIC/timer boot ran before the proof terminal")
+        else:
+            check_gic(lines, args.timer_poll, next_ok)
         if args.timer_test:
             check_timer_test(lines, tt_exp)
         elif args.sched_test:
             check_sched_test(lines, sched_syms)
         elif any(ln.startswith(IRQ_TICK_PREFIX) or DOUBLE_FAULT in ln for ln in lines):
             fail("irq/double-fault lines present without --timer-test (wrong build?)")
+        if args.user_test:
+            check_user_test(lines, mmu_syms, proof_image)
     if args.mmu_fault:
         check_mmu_fault(lines, args.mmu_fault, fault_exp, mmu_syms)
 

@@ -367,6 +367,40 @@ def apply_one(m, timeout=DEFAULT_TIMEOUT, jobs=0):
         shutil.rmtree(work, ignore_errors=True)
 
 
+_TOOLCHAIN_CACHE = {}
+
+
+def _toolchain_usable(cc):
+    """True iff `cc` exists AND can compile a freestanding TU that includes the
+    standard headers the aarch64 kernel build uses. A container may ship the
+    cross compiler binary without the matching libc headers (no
+    bits/libc-header-start.h), which breaks the real build; such an environment
+    must SKIP an ARM-targeted mutant, not BLOCK it. Cached per command."""
+    if cc in _TOOLCHAIN_CACHE:
+        return _TOOLCHAIN_CACHE[cc]
+    ok = False
+    if shutil.which(cc) is not None:
+        import tempfile
+        probe = ("#include <stdint.h>\n#include <stddef.h>\n"
+                 "#include <stdbool.h>\nint je_probe(void){return 0;}\n")
+        d = tempfile.mkdtemp()
+        try:
+            src = os.path.join(d, "probe.c")
+            with open(src, "w") as f:
+                f.write(probe)
+            r = subprocess.run(
+                [cc, "-ffreestanding", "-mstrict-align", "-mgeneral-regs-only",
+                 "-std=c11", "-c", src, "-o", os.path.join(d, "probe.o")],
+                capture_output=True)
+            ok = (r.returncode == 0)
+        except Exception:
+            ok = False
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    _TOOLCHAIN_CACHE[cc] = ok
+    return ok
+
+
 def run_manifest(mutants, only_ids, timeout, jobs):
     results = []
     for m in mutants:
@@ -376,6 +410,12 @@ def run_manifest(mutants, only_ids, timeout, jobs):
         if not m.get("enabled", True):
             results.append((mid, SKIPPED, "disabled"))
             print(f"[SKIP ] {mid}")
+            continue
+        need = m.get("skip_if_no_cmd")
+        if need is not None and not _toolchain_usable(need):
+            results.append((mid, SKIPPED, f"{need} absent or incomplete"))
+            print(f"[SKIP ] {mid}: {need} not a usable freestanding toolchain "
+                  f"(cross-build env required; verified where it is present)")
             continue
         status, detail = apply_one(m, timeout=timeout, jobs=jobs)
         results.append((mid, status, detail))

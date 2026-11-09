@@ -427,6 +427,9 @@ je_status je_vm_destroy_owned(je_vm *vm, uint32_t index, je_proc_id owner)
 
 je_status je_vm_audit(const je_vm *vm, uint32_t index)
 {
+#if defined(JE_ARCH_AARCH64)
+    return je_arch_vm_audit(vm, index);
+#else
     if (!vm || !vm->ops || index >= JE_VM_MAX_PROCESSES) return JE_ERR_INVALID;
     const je_vm_ops *o = vm->ops;
     const je_vm_process *p = &vm->procs[index];
@@ -546,4 +549,5 @@ je_status je_vm_audit(const je_vm *vm, uint32_t index)
         }
     }
     return JE_OK;
+#endif
 }

@@ -66,6 +66,8 @@ _Static_assert(JE_PHYSICAL_BASE == UINT64_C(0x40000000),
 #define D_OA_MASK UINT64_C(0x0000fffffffff000)
 #define AP_EL1_RW 0u
 #define AP_EL1_RO 2u
+#define AP_EL0_RW 1u
+#define AP_EL0_RO 3u
 #define SH_INNER 3u
 
 /* ADR 0011 D4 permission table, written out literally. */
@@ -85,6 +87,15 @@ static uint64_t spec_leaf(uint64_t pa, je_map_class cls)
     case JE_MAP_DEVICE:
         return oa | D_VALID_PAGE | D_ATTR(1) | D_AP(AP_EL1_RW) | D_SH(0) |
                D_AF | D_PXN | D_UXN;
+    case JE_MAP_USER_CODE:
+        return oa | D_VALID_PAGE | D_ATTR(0) | D_AP(AP_EL0_RO) |
+               D_SH(SH_INNER) | D_AF | D_NG | D_PXN;
+    case JE_MAP_USER_RODATA:
+        return oa | D_VALID_PAGE | D_ATTR(0) | D_AP(AP_EL0_RO) |
+               D_SH(SH_INNER) | D_AF | D_NG | D_PXN | D_UXN;
+    case JE_MAP_USER_DATA:
+        return oa | D_VALID_PAGE | D_ATTR(0) | D_AP(AP_EL0_RW) |
+               D_SH(SH_INNER) | D_AF | D_NG | D_PXN | D_UXN;
     default:
         assert(0 && "bad class");
         return 0;
@@ -236,15 +247,25 @@ static void test_encoder(void)
             assert(FIELD(d, 0, 2) == 3u);               /* valid L3 page */
             assert((d & D_OA_MASK) == pas[i]);          /* OA preserved */
             assert(FIELD(d, 5, 1) == 0u);               /* NS */
-            assert(FIELD(d, 6, 1) == 0u);               /* AP[1] (bit 6): no EL0 */
+            const bool user = cls == JE_MAP_USER_CODE ||
+                              cls == JE_MAP_USER_RODATA ||
+                              cls == JE_MAP_USER_DATA;
+            assert(FIELD(d, 6, 1) == (user ? 1u : 0u)); /* AP[1]: EL0 gate */
             assert((d & D_AF) != 0u);                   /* AF always 1 */
-            assert((d & D_NG) == 0u);                   /* global kernel */
-            assert((d & D_UXN) != 0u);                  /* never EL0-exec */
+            assert(((d & D_NG) != 0u) == user);         /* nG on user leaves */
+            assert((d & D_UXN) != 0u ||
+                   cls == JE_MAP_USER_CODE);            /* only code EL0-exec */
             const bool w = FIELD(d, 7, 1) == 0u;         /* AP[2] (bit 7) = 0: RW */
-            const bool x = (d & D_PXN) == 0u;
-            assert(!(w && x));                          /* W^X per leaf */
-            assert(x == (cls == JE_MAP_TEXT));          /* only text executes */
-            assert(w == (cls == JE_MAP_RW || cls == JE_MAP_DEVICE));
+            const bool el1_x = (d & D_PXN) == 0u;
+            const bool el0_x = (d & D_UXN) == 0u;
+            assert(!(w && el1_x));                      /* kernel W^X */
+            assert(!(w && el0_x));                      /* user W^X */
+            assert(el1_x == (cls == JE_MAP_TEXT));      /* kernel text only */
+            assert(el0_x == (cls == JE_MAP_USER_CODE)); /* user code only */
+            assert(w == (cls == JE_MAP_RW || cls == JE_MAP_DEVICE ||
+                         cls == JE_MAP_USER_DATA));
+            assert((d & D_PXN) != 0u ||
+                   cls == JE_MAP_TEXT);                 /* USER_CODE PXN=1 */
             assert(FIELD(d, 2, 3) == (cls == JE_MAP_DEVICE ? 1u : 0u));
             assert(FIELD(d, 8, 2) == (cls == JE_MAP_DEVICE ? 0u : 3u));
             /* Sub-page / >48-bit garbage in the PA never leaks into attrs. */
@@ -408,8 +429,8 @@ static void test_good_build_and_audit(void)
 
 /* Field-for-field mirror of paging.c's struct je_arm_mmu (layout verified by
  * check_mirror before use). MIRROR_MAX_TABLES mirrors JE_ARM_MAX_TABLES; the
- * COUNT boundary case (128 -> not COUNT, 129 -> COUNT) independently pins it. */
-#define MIRROR_MAX_TABLES 128u
+ * COUNT boundary case (256 -> not COUNT, 257 -> COUNT) independently pins it. */
+#define MIRROR_MAX_TABLES 256u
 #define MIRROR_EXTERNAL_FRAMES 64u
 struct mmu_mirror {
     bool valid;
@@ -569,7 +590,7 @@ static void test_structural_tampers(void)
                   "shared child root[7] == root[0]");
 
     /* 6. Bad count. The huge value must be rejected before table_pa[] is
-     *    indexed (reads == 0, no fault). 128 is the inclusive bound: it passes
+     *    indexed (reads == 0, no fault). 256 is the inclusive bound: it passes
      *    the COUNT check and fails the ledger (zero entry) instead. */
     count_tamper(0u, JE_ARM_AUDIT_REJECT_COUNT, "table_count 0");
     count_tamper(MIRROR_MAX_TABLES + 1u, JE_ARM_AUDIT_REJECT_COUNT,
@@ -729,8 +750,8 @@ static void test_enable_gating(void)
  * behaviour and the guard-page data abort are QEMU evidence (ARM_SCHED_TEST),
  * not claimed here. The maintenance sequence is observed through the hosted
  * seam (count + TLBI operand), never executed. */
-extern uint64_t je_arm_tlbi_hosted_calls;
-extern uint64_t je_arm_tlbi_hosted_last_operand;
+extern volatile uint64_t je_arm_tlbi_hosted_calls;
+extern volatile uint64_t je_arm_tlbi_hosted_last_operand;
 
 /* Independent DDI0487 TLBI VALE1IS Xt layout: [63:48] ASID=0, [47:44] TTL=0,
  * [43:0] = VA[55:12]. */

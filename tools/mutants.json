@@ -493,6 +493,142 @@
         "ASAN_OPTIONS": "detect_leaks=0"
       },
       "enabled": true
+    },
+    {
+      "id": "ARM-USER-SKIP-DECORATE-KERNEL-L0",
+      "invariant": "the MP3a-1 proof decorates every kernel-root L0 entry before process roots are built, so kernel mappings remain EL0-denied",
+      "file": "kernel/arch/aarch64/main.c",
+      "find": "    status = je_arch_vm_decorate_kernel_root();",
+      "replace": "    status = JE_OK;",
+      "build": "build/aarch64-usertest/Image",
+      "run": "tools/run_arm_user_test.py",
+      "killer": "user-test audit-p1: an undecorated kernel root must be rejected before the process root is published",
+      "env": {
+        "ARM_USER_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-WRONG-ROOT-P2",
+      "invariant": "the p2 proof installs p2's own process root, not p1's root",
+      "file": "kernel/arch/aarch64/main.c",
+      "find": "    const uint64_t p2_root = (uint64_t)je_arm_user_vm.procs[1].root;",
+      "replace": "    const uint64_t p2_root = (uint64_t)je_arm_user_vm.procs[0].root;",
+      "build": "build/aarch64-usertest/Image",
+      "run": "tools/run_arm_user_test.py",
+      "killer": "user-test TTBR0/root and cross-process isolation checks: p2 must read back its distinct root and frame",
+      "env": {
+        "ARM_USER_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-STRAY-ARENA-L1-ENTRY",
+      "invariant": "the per-process audit rejects any valid arena-branch L1 entry outside L1[0]",
+      "file": "kernel/arch/aarch64/vm_backend.c",
+      "find": "    l1[0] = table_descriptor(l2_pa);",
+      "replace": "    l1[0] = table_descriptor(l2_pa);\n    l1[1] = l1[0];",
+      "build": "build/aarch64-usertest/Image",
+      "run": "tools/run_arm_user_test.py",
+      "killer": "user-test audit-p1: arena upper-entry emptiness must reject a stray L1[1] table",
+      "env": {
+        "ARM_USER_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-GUARD-PAGE-SHIFT",
+      "invariant": "the per-process audit requires the guard hole and the stack's exact declared top-page placement",
+      "file": "kernel/core/vm.c",
+      "find": "        uint64_t varena = JE_VM_STACK_OFFSET + pg * JE_PAGE_SIZE;",
+      "replace": "        uint64_t varena = JE_VM_GUARD_OFFSET + pg * JE_PAGE_SIZE;",
+      "build": "build/aarch64-usertest/Image",
+      "run": "tools/run_arm_user_test.py",
+      "killer": "user-test audit-p1: guard-page invalidity and exact stack-leaf placement must reject a shifted stack",
+      "env": {
+        "ARM_USER_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-UNMAPPED-KERNEL-PROBE",
+      "invariant": "the user-test oracle verifies kernel probe VAs against ELF symbols instead of accepting an arbitrary translation fault",
+      "file": "kernel/arch/aarch64/main.c",
+      "find": "    const uint64_t kernel_text = (uint64_t)(uintptr_t)_text;\n    const uint64_t kernel_data = (uint64_t)(uintptr_t)&je_arm_bss_probe;",
+      "replace": "    const uint64_t kernel_text = UINT64_C(0x1000);\n    const uint64_t kernel_data = UINT64_C(0x2000);",
+      "build": "build/aarch64-usertest/Image",
+      "run": "tools/run_arm_user_test.py",
+      "killer": "smoke user-test ELF-VA and exact level-3 permission-fault checks: unmapped 0x1000/0x2000 probes must fail",
+      "env": {
+        "ARM_USER_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-NO-ASIDE1IS-TLBI",
+      "invariant": "the scheduler proof path emits the required ASIDE1IS invalidation for the installed ASID",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "                     \"tlbi aside1is, %1\\n\\t\"",
+      "replace": "",
+      "build": "build/aarch64-usertest/Image",
+      "run": "tools/run_arm_user_test.py",
+      "killer": "smoke user-test ELF instruction proof: the install seam must contain ASIDE1IS x1",
+      "env": {
+        "ARM_USER_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-NO-ASID-IN-TTBR0",
+      "invariant": "TTBR0_EL1 installation includes the bounded 8-bit ASID selected by the proof",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "    const uint64_t ttbr0 = root_pa | asid_operand;",
+      "replace": "    const uint64_t ttbr0 = root_pa;",
+      "build": "build/aarch64-usertest/Image",
+      "run": "tools/run_arm_user_test.py",
+      "killer": "user-test TTBR0 readback: both installs must retain ASID 1 in bits [55:48]",
+      "env": {
+        "ARM_USER_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-MAP-USER-CODE-FRAME-RW",
+      "invariant": "publishing a USER_CODE frame records it in the paging W^X ledger before a later RW alias can be attempted",
+      "file": "kernel/arch/aarch64/vm_backend.c",
+      "find": "        if (je_arm_mmu_publish_user_frame(&je_arm_mmu_context, physical, cls) !=\n            JE_OK)",
+      "replace": "        if (0 && (je_arm_mmu_publish_user_frame(&je_arm_mmu_context, physical, cls) !=\n            JE_OK))",
+      "build": "build/aarch64-usertest/Image",
+      "run": "tools/run_arm_user_test.py",
+      "killer": "user-test W^X in-proof assertion: RW alias of p1 USER_CODE must return JE_ERR_DENIED",
+      "env": {
+        "ARM_USER_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
     }
   ]
 }

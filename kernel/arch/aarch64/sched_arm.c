@@ -421,10 +421,48 @@ static je_status arm_frame_check(const je_rr_ctx *ctx, void *frame,
     return frame_shape_valid(ctx, frame, phase, true, true) ? JE_OK : JE_ERR_INVALID;
 }
 
+void je_arm_sched_install_ttbr0(uint64_t root_pa, uint16_t asid)
+{
+    if (root_pa == 0u || (root_pa & (JE_ARM_PAGE_SIZE - 1u)) != 0u ||
+        asid > UINT16_C(0xff))
+        sched_fatal("ttbr0 root");
+
+    const uint64_t asid_operand = (uint64_t)asid << 48;
+    const uint64_t ttbr0 = root_pa | asid_operand;
+    /*
+     * DDI0487: TTBR0_EL1 selects the next stage-1 root; ASIDE1IS invalidates
+     * EL1&0 entries for this ASID in the Inner Shareable domain. The DSB/ISB
+     * completion sequence is part of the reviewed contract. QEMU TCG does not
+     * model stale-TLB behavior, so this ordering is reviewed, not observed.
+     */
+    __asm__ volatile("msr ttbr0_el1, %0\n\t"
+                     "isb\n\t"
+                     "tlbi aside1is, %1\n\t"
+                     "dsb ish\n\t"
+                     "isb\n\t"
+                     : : "r"(ttbr0), "r"(asid_operand) : "memory");
+    ++je_arm_tlbi_hosted_calls;
+    je_arm_tlbi_hosted_last_operand = asid_operand;
+}
+
+uint64_t je_arm_sched_read_ttbr0(void)
+{
+    uint64_t value;
+    __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(value));
+    return value;
+}
+
 static je_status arm_dispatch_install(je_rr_ctx *prev, je_rr_ctx *next)
 {
     (void)prev;
-    (void)next;
+    if (next == NULL || next->slot >= JE_RR_MAX) return JE_ERR_INVALID;
+    /* MP3a-1 has no scheduler-owned user-root binding. The EL1 proof installs
+     * roots directly, and MP3a-2 must add root ownership plus an unbind before
+     * slot reuse can select a user root. */
+    je_arm_sched_install_ttbr0(je_arm_mmu_root(&je_arm_mmu_context), 0u);
+    /* SP_EL1 installation is deferred to MP3a-2: this seam is called while C
+     * still uses the current EL1 stack, so changing SP_EL1 here would make the
+     * current call's stack lifetime ambiguous. */
     return JE_OK;
 }
 

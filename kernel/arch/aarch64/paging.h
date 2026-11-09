@@ -20,6 +20,12 @@
  * je_arm_mmu_enable runs the documented cache/barrier/TLB sequence and turns the
  * MMU on; after it returns the kernel executes translated (identity) addresses.
  *
+ * MP3a-1 limitation: per-process table/user-frame construction is deliberately
+ * MMU-off, and the user backend rejects its identity-pointer map/clear/flush
+ * operations after enable. The enable leaf's DC IVAC ranges cover the static
+ * kernel tables/image, not later process tables/frames at or above
+ * 0x40100000; their MMU-on mappings and cache maintenance are MP3a-2 work.
+ *
  * HONESTY (ADR 0011 D6): QEMU TCG models no caches, so the DC IVAC / barrier
  * maintenance in the enable leaf is REVIEWED, not observed. Translation and
  * permissions ARE observed (a fault is a fault on TCG). main.c / HANDOFF must
@@ -27,6 +33,8 @@
  */
 #ifndef JEIOS_AARCH64_PAGING_H
 #define JEIOS_AARCH64_PAGING_H
+
+#include <stdbool.h>
 
 #include <jeios/alloc.h>
 #include <jeios/status.h>
@@ -40,8 +48,31 @@ typedef enum {
     JE_MAP_RODATA,     /* R   : AP=10,          PXN=1, UXN=1, AttrIdx 0 */
     JE_MAP_RW,         /* RW  : AP=00 (EL1 RW), PXN=1, UXN=1, AttrIdx 0 (data, tables) */
     JE_MAP_DEVICE,     /* RW+XN device: AP=00,  PXN=1, UXN=1, AttrIdx 1 (nGnRnE) */
+    /* MP3a-1 EL0 classes. AP[1] is descriptor bit 6, so these are the only
+     * classes that may be reached by an EL0 translation. USER_CODE is the
+     * sole EL0-executable class and remains EL0 read-only (W^X). */
+    JE_MAP_USER_CODE,   /* EL0 RX: AP=11, PXN=1, UXN=0, nG=1, AttrIdx 0 */
+    JE_MAP_USER_RODATA, /* EL0 R : AP=11, PXN=1, UXN=1, nG=1, AttrIdx 0 */
+    JE_MAP_USER_DATA,   /* EL0 RW: AP=01, PXN=1, UXN=1, nG=1, AttrIdx 0 */
     JE_MAP_CLASS_COUNT
 } je_map_class;
+
+/* One source for the MP3a user-leaf literals. The ARM VM backend's
+ * per-process audit and the paging.c encoder/ledger both consume these
+ * definitions; keeping them in the contract header prevents the two
+ * translation units from silently accepting different permissions. */
+#define JE_ARM_USER_CODE_BITS   UINT64_C(0x0020000000000fc3)
+#define JE_ARM_USER_RODATA_BITS UINT64_C(0x0060000000000fc3)
+#define JE_ARM_USER_DATA_BITS   UINT64_C(0x0060000000000f43)
+
+_Static_assert((JE_ARM_USER_CODE_BITS & (UINT64_C(1) << 6)) != 0u &&
+               (JE_ARM_USER_RODATA_BITS & (UINT64_C(1) << 6)) != 0u &&
+               (JE_ARM_USER_DATA_BITS & (UINT64_C(1) << 6)) != 0u,
+               "ARM user leaves must set AP[1]");
+_Static_assert((JE_ARM_USER_CODE_BITS & (UINT64_C(1) << 54)) == 0u &&
+               (JE_ARM_USER_RODATA_BITS & (UINT64_C(1) << 54)) != 0u &&
+               (JE_ARM_USER_DATA_BITS & (UINT64_C(1) << 54)) != 0u,
+               "only ARM user code may execute at EL0");
 
 /* One contiguous identity mapping request: physical == virtual, [base, base+size)
  * both page-aligned, mapped with `class` permissions. The builder splits into
@@ -127,6 +158,15 @@ je_status je_arm_mmu_audit(const je_arm_mmu *mmu,
  */
 je_status je_arm_mmu_enable(const je_arm_mmu *mmu);
 
+/* MP3a-1 user-root construction is MMU-off only. This explicit decoration
+ * hook is called once, immediately after the unchanged MP2 audit and before
+ * any per-process root is built; link_tables never decorates lazily. */
+je_status je_arch_vm_decorate_kernel_root(void);
+
+/* Read-only state used by the MP3a-1 backend to fail closed before it
+ * dereferences physical table/frame addresses through identity pointers. */
+bool je_arm_mmu_is_enabled(const je_arm_mmu *mmu);
+
 /*
  * Translation probe for the proofs (ADR 0011 D7): run `AT S1E1R`/`AT S1E1W` on
  * `va` and return PAR_EL1. The caller decodes PAR.F (fault), PAR.PA, PAR.ATTR,
@@ -135,9 +175,27 @@ je_status je_arm_mmu_enable(const je_arm_mmu *mmu);
  * crash". write==true selects S1E1W. Must run with the MMU on.
  */
 uint64_t je_arm_at_s1e1(uint64_t va, int write);
+/* MP3a-1 EL0-permission probe. AT executes at EL1 but applies EL0 access
+ * permissions; no ERET or EL0 instruction is involved. */
+uint64_t je_arm_at_s1e0(uint64_t va, int write);
 
 /* Root-table physical address of a built context (for markers/evidence). */
 uint64_t je_arm_mmu_root(const je_arm_mmu *mmu);
+
+/*
+ * Build empty L3 coverage for the managed RAM window. This deliberately adds
+ * table pages only; it does NOT add valid RAM leaves or a linear map. The
+ * MP3a-1 user-test profile uses it so every future runtime 2 MiB slot has a
+ * prebuilt L3 table while ADR 0011's no-RAM-wide-map invariant remains true.
+ * Caller context is EL1, MMU off, before the pre-enable audit.
+ */
+je_status je_arm_mmu_prebuild_ram_l3(je_arm_mmu *mmu);
+
+/* The scheduler records the ASID operand here for evidence. QEMU TCG does not
+ * model stale-TLB behavior; the MSR/TLBI/DSB/ISB sequence is reviewed, not
+ * observed. */
+extern volatile uint64_t je_arm_tlbi_hosted_calls;
+extern volatile uint64_t je_arm_tlbi_hosted_last_operand;
 
 /*
  * ---- Runtime single-page map/unmap (ADR 0013 D4; reviewed contract update) ----
@@ -197,6 +255,18 @@ uint64_t je_arm_mmu_root(const je_arm_mmu *mmu);
 je_status je_arm_mmu_map_page(je_arm_mmu *mmu, uint64_t va, uint64_t pa,
                               je_map_class cls);
 je_status je_arm_mmu_unmap_page(je_arm_mmu *mmu, uint64_t va);
+
+/*
+ * Register/unregister a published MP3a USER_CODE or USER_RODATA frame in the
+ * same physical-frame ledger consulted by je_arm_mmu_map_page(). These calls
+ * are construction/teardown operations for the MMU-off MP3a-1 backend; they
+ * reject an enabled context. A later RW alias of a registered frame returns
+ * JE_ERR_DENIED, and teardown clears the entry before the frame is freed.
+ */
+je_status je_arm_mmu_publish_user_frame(je_arm_mmu *mmu, uint64_t physical,
+                                         je_map_class cls);
+je_status je_arm_mmu_unpublish_user_frame(je_arm_mmu *mmu,
+                                           uint64_t physical);
 
 /*
  * Guarded kernel stack (ADR 0013 D4) over a run of JE_ARM_STACK_RUN_PAGES

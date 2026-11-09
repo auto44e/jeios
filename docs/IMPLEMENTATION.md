@@ -2,6 +2,163 @@
 
 Current checkpoint and work order: [STATUS.md](STATUS.md). Dated status and next-task statements below are historical when superseded by that checkpoint.
 
+## MP3a-1 ARM TTBR0/EL0 proof — observed 2026-11-08T23:29:54Z
+
+Repository `/tmp/wt-mp3a1`, branch `wip/mp3a1`, exact inspected base commit
+`8cb1f3d1d0fd9ede667db1014cdd86729a7ae510` (the implementation commit; this status refresh is a
+documentation-only descendant). State: **implemented / tested locally /
+planned (owner review,
+remote CI, physical ARM and independent human qualification) / not blocked**.
+This is AI-assisted evidence, not human or release qualification. Demonstrated
+support tier: **QEMU 8.2.2 only**. No push, PR publication, reviewer
+assignment or release was performed. The pre-existing untracked
+`MP3A1-BRIEF.md` was preserved and not modified.
+
+### Implemented
+
+- Added `kernel/arch/aarch64/vm_backend.c`, an ARM implementation of the
+  existing `je_vm_ops` builder/journal path. Each process gets a private
+  TTBR0 root: the decorated kernel L0 entries are copied byte-for-byte, and
+  the arena uses private L1/L2/L3 tables at `0x0000100000000000`.
+- Kept the pre-enable `je_arm_mmu_audit` contract unchanged. The per-process
+  audit is separate and checks shared kernel-root identity, L0 placement
+  (`[0,31]`), kernel AP[1]==0 leaves, exact user leaf literals, no W^X, and
+  cross-process physical disjointness. It also requires every arena-branch
+  L1/L2 upper entry outside `[0]` to be invalid, the guard L3 entry to be
+  invalid, the stack leaves to occupy exactly the declared top pages, and
+  every walked table pointer to be that process's own table-extent page in the
+  physical window before dereference. Kernel L0 table descriptors are
+  decorated once, explicitly after the frozen bring-up audit; the private
+  arena L0 has PXNTable=1.
+- Added the documented EL0 leaf classes and pinned literals:
+  `USER_CODE=0x0020000000000fc3`, `USER_RODATA=0x0060000000000fc3`, and
+  `USER_DATA=0x0060000000000f43`. Only code is EL0 executable; code is
+  EL0-read-only, data is EL0-read/write, and rodata is EL0-read-only.
+- Added `AT S1E0R/W` probes and the `ARM_USER_TEST=1` build/smoke profile.
+  The profile builds P1/P2 with distinct physical backing and proves kernel
+  denial, per-kind permissions, and same-VA cross-process PA difference
+  entirely at EL1. It does not use `eret`, SVC, a user trapframe or EL0
+  execution.
+- Added TTBR0 installation with ASID 1 for user roots and ASID 0 for the
+  kernel root. The required `ASIDE1IS; DSB ISH; ISB` sequence is emitted and
+  the operand is recorded; only `ASIDE1IS` is retained. Its ordering and
+  instruction encoding are reviewed and ELF-checked, not observed as a
+  hardware-TLB effect under QEMU TCG.
+- Registered published USER_CODE/USER_RODATA frames in the paging.c W^X
+  ledger and clear that entry on PTE teardown. USER_DATA remains writable and
+  non-executable without a ledger entry. The in-kernel proof attempts an RW
+  alias of p1's code frame and requires `JE_ERR_DENIED`.
+- Strengthened the user oracle to print and ELF-check every probe VA, require
+  exact level-3 permission faults (`PAR=0x...081f`) for kernel, device, code
+  write, and rodata write probes, and verify TTBR0 root plus ASID readback.
+- Increased `JE_ARM_MAX_TABLES` from 128 to 256 with headroom. The user
+  profile prebuilds empty L3 paths for the 256 MiB managed RAM window; the
+  observed audit shape is 134 tables and 124 mapped-region pages, for
+  `leaves=0x102`. The user run recorded the enlarged pre-enable audit as
+  `cycles=0x000000000051df1f reads=0x0000000001081800`; CNTVCT cycles are
+  QEMU execution-counter evidence, while the descriptor-read count is the
+  stable input-size evidence.
+- Preserved x86's `JE_VM_ARENA_BASE=0x40000000` and the existing x86 VM audit
+  path.
+
+### Decision and logic
+
+The ARM backend shares only the frozen kernel root descriptors and allocates
+the arena hierarchy privately per process. This preserves the ADR 0015 D1
+shape while ensuring a kernel mapping is never reachable through an EL0
+translation: shared kernel leaves retain AP[1]==0, shared L0 table attributes
+deny EL0, and the arena branch has hierarchical PXN. User leaves are emitted
+from three independent exact literals rather than from a permissive encoder;
+the audit rejects any class mismatch or W+X combination.
+
+The dead `je_arm_sched_bind_user_root` seam was removed for MP3a-1 because the
+proof calls `je_arm_sched_install_ttbr0` directly and no slot ownership or
+unbind existed. MP3a-2 must add root ownership and clear the root on slot
+free/reuse before scheduler dispatch can select a process root. Writing SP_EL1
+from this C seam while the current call is still using the current EL1 stack
+would make the lifetime of the active stack ambiguous. Per-process
+SP_EL1/kstack handoff is therefore planned for MP3a-2 together with EL0 entry
+and the user trapframe.
+
+MP3a-1 builds process tables and user frames MMU-off. Its identity-pointer
+map/clear/flush paths and cache maintenance for tables/frames at or above
+`0x40100000` are not silently valid after enable: the ARM backend fail-stops
+if those operations are reached with the MMU on. MMU-on table/frame mappings,
+cache maintenance, clear-PTE and TLBI lifecycle are MP3a-2 work.
+
+### Verification actually run
+
+```text
+make aarch64                                  PASS
+make aarch64 ARM_USER_TEST=1                  PASS
+make smoke-aarch64 ARM_USER_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60
+                                               PASS
+make smoke-aarch64 ARM_REQUIRE=1              PASS
+make smoke-aarch64 ARM_SCHED_TEST=1 ARM_REQUIRE=1
+                                               PASS
+make smoke-aarch64 ARM_MMU_FAULT=text ARM_REQUIRE=1
+                                               PASS
+make check                                    PASS
+make mutants                                  PASS
+git diff --check                              PASS
+python3 -m py_compile tools/smoke_arm.py tools/run_arm_user_test.py
+                                               PASS
+make build/0/test_paging_bits && ./build/0/test_paging_bits
+                                               PASS
+```
+
+The user-test serial evidence was:
+
+```text
+mmu audit ok leaves=0x0000000000000102
+user-test pre-enable-audit cycles=0x000000000051df1f reads=0x0000000001081800
+user-test install p1 root=0x0000000040105000 ttbr0=0x0001000040105000 tlbi=0x0001000000000000
+p1 kernel-read  va=0x0000000040080000 par=0x000000000000081f
+p1 kernel-write va=0x000000004008d028 par=0x000000000000081f
+p1 code-read    va=0x0000100000000000 par=0xff00000040109b80
+p1 code-write   va=0x0000100000000000 par=0x000000000000081f
+p1 data-write   va=0x0000100000002000 par=0xff0000004010bb80
+p1 rodata-read  va=0x0000100000001000 par=0xff0000004010ab80
+p1 rodata-write va=0x0000100000001000 par=0x000000000000081f
+p1 uart-read    va=0x0000000009000000 par=0x000000000000081f
+p1 gicd-read    va=0x0000000008000000 par=0x000000000000081f
+user-test wx-refuse code-pa=0x0000000040109000 status=DENIED
+user-test install p2 root=0x0000000040115000 ttbr0=0x0001000040115000 tlbi=0x0001000000000000
+p2 data-read    va=0x0000100000002000 par=0xff0000004011bb80
+user-test isolate p1-par=0xff0000004010bb80 p2-par=0xff0000004011bb80
+user-test audit PASS
+user-test tlbi p1 operand=0x0001000000000000
+user-test tlbi p2 operand=0x0001000000000000
+user-test PASS reviewed-tlb=not-observed
+```
+
+The independent oracle decoded PAR.F/PAR.PA, checked all expected permission
+faults and successes, checked the ELF-resolved VAs, verified distinct roots and
+distinct data PAs `0x4010b000`/`0x4011b000`, checked both ASIDE1IS operands for
+ASID 1, and required the audit marker and the ASIDE1IS instruction in the ELF.
+The current user image SHA-256 was
+`3494a76dcdd3fb79b850964976dcc537025605224e3264dbd7224e7a2c74b0e5`.
+
+The required B1 scratch injections both built and then failed closed:
+
+```text
+stray arena L1[1] block: build_rc=0, smoke_rc=2, FATAL user-test audit-p1
+stray arena L2[1] block: build_rc=0, smoke_rc=2, FATAL user-test audit-p1
+shifted stack/guard:     build_rc=0, smoke_rc=2, FATAL user-test audit-p1
+```
+
+The full mutant result was `41 killed, 1 equivalent, 0 SURVIVED, 0 BLOCKED,
+1 skipped`; all eight new ARM user mutants were killed, and the pre-existing
+enabled set remained `33 killed, 1 equivalent, 0 SURVIVED, 0 BLOCKED` before
+the ARM additions.
+
+Not enforced or observed: EL0 execution, SVC/trapframe behavior, SP_EL1
+handoff, physical ARM, SMP, dynamic loading, arbitrary hardware support,
+remote CI, and independent human qualification. QEMU TCG does not establish
+cache/TLB staleness behavior; the barrier/TLBI ordering is reviewed, not
+observed. The next bounded task is MP3a-2's user entry/trapframe/SP_EL1 seam,
+after owner review of this MMU slice.
+
 ## ADR 0014 lifecycle extraction — observed 2026-11-08T20:00:36Z
 
 Repository `/tmp/wt-adr14-extract`, branch `wip/adr0014-extract`, baseline
