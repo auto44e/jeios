@@ -21,6 +21,13 @@
 #include <jeios/alloc.h>
 #include <jeios/sched_rr.h>
 #include <jeios/status.h>
+#ifdef JE_ARM_EL0_TEST
+#include <jeios/abi.h>
+#include <jeios/lifecycle.h>
+#include <jeios/proc.h>
+#include <jeios/syscall.h>
+#include <jeios/vm.h>
+#endif
 
 #include "paging.h"
 #include "trapframe.h"
@@ -29,8 +36,15 @@
 #define JE_ARM_SPSR_NZCV UINT64_C(0xf0000000)
 #define JE_ARM_SPSR_POLICY UINT64_C(0x345)
 #define JE_ARM_DAIF_I (UINT64_C(1) << 7)
-#define JE_ARM_SPSR_M_MASK UINT64_C(0x1f)
-#define JE_ARM_SPSR_M_EL1H UINT64_C(0x5)
+#define JE_ARM_SPSR_EL0_POLICY UINT64_C(0x340)
+#define JE_ARM_VECTOR_EL1_FIRST 4u
+#define JE_ARM_VECTOR_EL1_LAST 7u
+#define JE_ARM_VECTOR_EL0_FIRST 8u
+#define JE_ARM_VECTOR_EL0_LAST 11u
+#define JE_ARM_EL0_PROOF_OP UINT64_C(0x7a)
+#define JE_ARM_EL0_PROOF_ARG0 UINT64_C(0x1000)
+#define JE_ARM_EL0_PROOF_STATUS JE_ABI_UNSUPPORTED
+#define JE_ARM_EL0_PROOF_RESULT UINT64_C(0x5aa5)
 #define JE_ARM_MAX_PROOF_WORKERS 2u
 #define JE_ARM_SENTINEL_SLOT 3u
 #define JE_ARM_MONITOR_SLOT 4u
@@ -48,6 +62,50 @@ static je_rr_table je_arm_rr;
 static bool je_arm_rr_ready;
 static bool je_arm_stack_mapped[JE_RR_MAX];
 static uint32_t je_arm_frame_generation[JE_RR_MAX];
+
+#ifdef JE_ARM_EL0_TEST
+/* These arrays are the scheduler-owned binding. A slot is never allowed to
+ * retain a stale root after stack teardown/reuse. */
+uint64_t je_arm_user_root[JE_RR_MAX];
+uint64_t je_arm_user_sp_el1[JE_RR_MAX];
+static je_vm *je_arm_user_vm[JE_RR_MAX];
+static uint32_t je_arm_user_index[JE_RR_MAX];
+static je_proc_id je_arm_user_proc[JE_RR_MAX];
+static uint64_t je_arm_user_entry[JE_RR_MAX];
+static bool je_arm_user_slot[JE_RR_MAX];
+static je_proc_pool *je_arm_proc_pool;
+static bool je_arm_pending_user;
+static je_vm *je_arm_pending_vm;
+static uint32_t je_arm_pending_index;
+static je_proc_id je_arm_pending_proc;
+
+static uint64_t arm_user_expected_sp(uint32_t slot)
+{
+    if (slot == 0u || slot >= JE_RR_MAX ||
+        !je_arm_user_slot[slot] ||
+        je_arm_user_index[slot] >= JE_VM_MAX_PROCESSES)
+        return 0u;
+    return JE_VM_ARENA_BASE + JE_VM_ARENA_SIZE -
+           ((uint64_t)je_arm_user_index[slot] * UINT64_C(0x40));
+}
+
+extern void je_arm_el0_test_note_svc(uint32_t slot, uint64_t op,
+                                     je_arm_trapframe *tf);
+extern void je_arm_el0_test_before_return(uint32_t slot,
+                                          je_arm_trapframe *tf);
+extern void je_arm_el0_test_note_fault(uint32_t slot, uint32_t reason,
+                                       uint64_t ec, uint64_t far,
+                                       uint64_t il, uint64_t iss,
+                                       uint64_t fsc, uint64_t wnr);
+extern void je_arm_el0_test_note_reaped(uint32_t index, je_proc_id proc_id);
+extern void je_arm_el0_test_poison_tpidr(void);
+extern void je_arm_el0_test_note_kstack(uint32_t slot);
+extern void je_arm_el0_test_note_irq_switch(uint32_t from_slot,
+                                            uint32_t to_slot,
+                                            uint64_t elr);
+extern void je_arm_el0_test_note_svc_proof(uint32_t slot,
+                                           const je_arm_trapframe *tf);
+#endif
 
 /*
  * These symbols are deliberately volatile: the handler owns the current
@@ -142,6 +200,22 @@ _Noreturn static void sched_fatal(const char *reason)
     sched_halt();
 }
 
+uint64_t *je_arm_tf_kernel_sp(je_arm_trapframe *frame)
+{
+    if (frame == NULL ||
+        (frame->spsr & JE_ARM_SPSR_M_MASK) != JE_ARM_SPSR_M_EL1H)
+        sched_fatal("kernel-sp mode");
+    return &frame->sp;
+}
+
+uint64_t *je_arm_tf_user_sp(je_arm_trapframe *frame)
+{
+    if (frame == NULL ||
+        (frame->spsr & JE_ARM_SPSR_M_MASK) != JE_ARM_SPSR_M_EL0T)
+        sched_fatal("user-sp mode");
+    return &frame->sp;
+}
+
 static inline void arm_daif_set_i(void)
 {
     __asm__ volatile("msr daifset, #2" ::: "memory");
@@ -220,9 +294,16 @@ static bool sched_test_worker_frame_elr(uint32_t slot, uint64_t elr)
 }
 #endif
 
-static bool frame_shape_valid(const je_rr_ctx *ctx, const void *opaque,
-                              unsigned phase, bool exact_record,
-                              bool require_cookie)
+typedef enum {
+    JE_ARM_FRAME_BAD = 0,
+    JE_ARM_FRAME_OK,
+    JE_ARM_FRAME_USER_DEATH
+} je_arm_frame_result;
+
+static je_arm_frame_result frame_shape_class(const je_rr_ctx *ctx,
+                                             void *opaque, unsigned phase,
+                                             bool exact_record,
+                                             bool require_cookie)
 {
     const uintptr_t frame_address = (uintptr_t)opaque;
     uintptr_t frame_end;
@@ -231,46 +312,40 @@ static bool frame_shape_valid(const je_rr_ctx *ctx, const void *opaque,
     const uintptr_t lower = ctx != NULL ? ctx->usable_base : 0u;
     const uintptr_t text_start = (uintptr_t)_text;
     const uintptr_t text_end = (uintptr_t)__text_end;
-    const je_arm_trapframe *frame;
+    je_arm_trapframe *frame;
 
-    if (ctx == NULL || opaque == NULL || phase > 1u) return false;
+    if (ctx == NULL || opaque == NULL || phase > 1u)
+        return JE_ARM_FRAME_BAD;
     if (ctx->slot >= JE_RR_MAX || !je_arm_stack_mapped[ctx->slot])
-        return false;
-    if (exact_record && ctx->frame != opaque) return false;
-    if (top < lower || top - lower < size) return false;
-    if (frame_address > UINTPTR_MAX - size) return false;
-    if (frame_address < lower || frame_address > top - size) return false;
-    if ((frame_address & (uintptr_t)0xf) != 0u) return false;
+        return JE_ARM_FRAME_BAD;
+    if (exact_record && ctx->frame != opaque) return JE_ARM_FRAME_BAD;
+    if (top < lower || top - lower < size) return JE_ARM_FRAME_BAD;
+    if (frame_address > UINTPTR_MAX - size) return JE_ARM_FRAME_BAD;
+    if (frame_address < lower || frame_address > top - size)
+        return JE_ARM_FRAME_BAD;
+    if ((frame_address & (uintptr_t)0xf) != 0u) return JE_ARM_FRAME_BAD;
     frame_end = frame_address + size;
-    if (frame_end > top || (frame_end & (uintptr_t)0xf) != 0u) return false;
-    if (phase == 0u && frame_address != top - size) return false;
+    if (frame_end > top || (frame_end & (uintptr_t)0xf) != 0u)
+        return JE_ARM_FRAME_BAD;
 
     /*
      * This dereference happens only after the selected context's owned stack
      * range has been proven to contain the complete frame.  A cross-stack
      * pointer swap therefore fails before C reads attacker-controlled memory.
      */
-    frame = (const je_arm_trapframe *)opaque;
-    if (frame->sp != (uint64_t)frame_end ||
-        (frame->sp & UINT64_C(0xf)) != 0u || frame->sp > (uint64_t)top)
-        return false;
-    if ((frame->spsr & ~JE_ARM_SPSR_NZCV) != JE_ARM_SPSR_POLICY)
-        return false;
-    if ((frame->elr & UINT64_C(3)) != 0u ||
-        frame->elr < (uint64_t)text_start ||
-        frame->elr >= (uint64_t)text_end)
-        return false;
-    if (phase == 0u &&
-        (ctx->slot == 0u ||
-         frame->elr != (uint64_t)(uintptr_t)arm_sched_trampoline ||
-         frame->gpr[0] != (uint64_t)ctx->slot))
-        return false;
-#ifdef JE_ARM_SCHED_TEST
-    if (phase == 1u && ctx->slot != 0u &&
-        ctx->slot <= JE_ARM_MAX_PROOF_WORKERS &&
-        !sched_test_worker_frame_elr(ctx->slot, frame->elr))
-        return false;
-#endif
+    frame = (je_arm_trapframe *)opaque;
+
+    /* Shared mode discriminator: vector group and SPSR.M must agree. */
+    const uint64_t mode = frame->spsr & JE_ARM_SPSR_M_MASK;
+    const bool vector_el1 = frame->vector >= JE_ARM_VECTOR_EL1_FIRST &&
+                            frame->vector <= JE_ARM_VECTOR_EL1_LAST;
+    const bool vector_el0 = frame->vector >= JE_ARM_VECTOR_EL0_FIRST &&
+                            frame->vector <= JE_ARM_VECTOR_EL0_LAST;
+    if ((frame->spsr & (UINT64_C(1) << 4)) != 0u ||
+        (vector_el1 && mode != JE_ARM_SPSR_M_EL1H) ||
+        (vector_el0 && mode != JE_ARM_SPSR_M_EL0T) ||
+        (!vector_el1 && !vector_el0))
+        return JE_ARM_FRAME_BAD;
 
     if (require_cookie && phase != 0u) {
         const uint64_t cookie = frame->pad;
@@ -280,10 +355,76 @@ static bool frame_shape_valid(const je_rr_ctx *ctx, const void *opaque,
 #ifdef JE_ARM_SCHED_TEST
             je_arm_sched_generation_fault_slot = ctx->slot;
 #endif
-            return false;
+            return JE_ARM_FRAME_BAD;
         }
     }
-    return true;
+
+    if (mode == JE_ARM_SPSR_M_EL0T) {
+#ifdef JE_ARM_EL0_TEST
+        if (!je_arm_user_slot[ctx->slot] ||
+            je_arm_user_sp_el1[ctx->slot] == 0u ||
+            frame_address != top - size ||
+            frame_end != (uintptr_t)je_arm_user_sp_el1[ctx->slot])
+            return JE_ARM_FRAME_BAD;
+        /* EL0 resumes with the fixed EL1 policy and M=EL0t. This is a
+         * normalization, not a user-controlled privilege decision. */
+        frame->spsr = (frame->spsr & JE_ARM_SPSR_NZCV) |
+                      JE_ARM_SPSR_EL0_POLICY;
+        const uint64_t user_sp = *je_arm_tf_user_sp(frame);
+        const uint64_t arena = JE_VM_ARENA_BASE;
+        const uint64_t arena_end = arena + JE_VM_ARENA_SIZE;
+        if (phase == 0u) {
+            if (frame->elr != arena + je_arm_user_entry[ctx->slot] ||
+                user_sp != arm_user_expected_sp(ctx->slot))
+                return JE_ARM_FRAME_BAD;
+            for (unsigned i = 0u; i < 31u; ++i)
+                if (frame->gpr[i] != 0u) return JE_ARM_FRAME_BAD;
+        } else if ((frame->elr & UINT64_C(3)) != 0u ||
+                   frame->elr < arena || frame->elr >= arena_end ||
+                   (user_sp & UINT64_C(0xf)) != 0u ||
+                   user_sp <= arena || user_sp > arena_end) {
+            return JE_ARM_FRAME_USER_DEATH;
+        }
+        return JE_ARM_FRAME_OK;
+#else
+        return JE_ARM_FRAME_BAD;
+#endif
+    }
+
+    /* EL1h-only policy: this is the MP3a-1 behavior, including the exact
+     * trampoline/gpr[0] phase-0 gate. */
+    const uint64_t kernel_sp = *je_arm_tf_kernel_sp(frame);
+    if (phase == 0u && frame_address != top - size)
+        return JE_ARM_FRAME_BAD;
+    if (kernel_sp != (uint64_t)frame_end ||
+        (kernel_sp & UINT64_C(0xf)) != 0u || kernel_sp > (uint64_t)top)
+        return JE_ARM_FRAME_BAD;
+    if ((frame->spsr & ~JE_ARM_SPSR_NZCV) != JE_ARM_SPSR_POLICY)
+        return JE_ARM_FRAME_BAD;
+    if ((frame->elr & UINT64_C(3)) != 0u ||
+        frame->elr < (uint64_t)text_start ||
+        frame->elr >= (uint64_t)text_end)
+        return JE_ARM_FRAME_BAD;
+    if (phase == 0u &&
+        (ctx->slot == 0u ||
+         frame->elr != (uint64_t)(uintptr_t)arm_sched_trampoline ||
+         frame->gpr[0] != (uint64_t)ctx->slot))
+        return JE_ARM_FRAME_BAD;
+#ifdef JE_ARM_SCHED_TEST
+    if (phase == 1u && ctx->slot != 0u &&
+        ctx->slot <= JE_ARM_MAX_PROOF_WORKERS &&
+        !sched_test_worker_frame_elr(ctx->slot, frame->elr))
+        return JE_ARM_FRAME_BAD;
+#endif
+    return JE_ARM_FRAME_OK;
+}
+
+static bool frame_shape_valid(const je_rr_ctx *ctx, const void *opaque,
+                              unsigned phase, bool exact_record,
+                              bool require_cookie)
+{
+    return frame_shape_class(ctx, (void *)opaque, phase, exact_record,
+                             require_cookie) == JE_ARM_FRAME_OK;
 }
 
 /*
@@ -347,6 +488,35 @@ static je_status arm_stack_alloc(je_rr_ctx *ctx)
     je_status status;
 
     if (ctx == NULL || ctx->slot == 0u) return JE_ERR_INVALID;
+#ifdef JE_ARM_EL0_TEST
+    if (je_arm_pending_user) {
+        if (!je_arm_pending_vm || je_arm_pending_index >= JE_VM_MAX_PROCESSES ||
+            je_arm_pending_vm->procs[je_arm_pending_index].state != JE_VM_READY)
+            return JE_ERR_INVALID;
+        run_base = je_arm_pending_vm->procs[je_arm_pending_index]
+                       .kstack_physical;
+        status = je_arm_mmu_stack_map(&je_arm_mmu_context, run_base, &top);
+        if (status != JE_OK) return status;
+        je_arm_user_slot[ctx->slot] = true;
+        je_arm_user_vm[ctx->slot] = je_arm_pending_vm;
+        je_arm_user_index[ctx->slot] = je_arm_pending_index;
+        je_arm_user_proc[ctx->slot] = je_arm_pending_proc;
+        je_arm_user_entry[ctx->slot] =
+            je_arm_pending_vm->procs[je_arm_pending_index].entry;
+        je_arm_user_root[ctx->slot] =
+            je_arm_pending_vm->procs[je_arm_pending_index].root;
+        je_arm_user_sp_el1[ctx->slot] = top;
+        ctx->usable_base = (uintptr_t)(run_base + JE_ARM_PAGE_SIZE);
+        ctx->top = (uintptr_t)top;
+        je_arm_stack_mapped[ctx->slot] = true;
+        je_arm_pending_user = false;
+#ifdef JE_ARM_SCHED_TEST
+        je_arm_sched_stack_base[ctx->slot] = ctx->usable_base;
+        je_arm_sched_stack_top[ctx->slot] = ctx->top;
+#endif
+        return JE_OK;
+    }
+#endif
     pages = je_arm_scheduler_pages();
     if (pages == NULL) return JE_ERR_INVALID;
     status = je_pages_alloc(pages, JE_ARM_STACK_RUN_PAGES, &run_base);
@@ -368,6 +538,30 @@ static je_status arm_stack_alloc(je_rr_ctx *ctx)
 
 static void arm_stack_free(je_rr_ctx *ctx)
 {
+#ifdef JE_ARM_EL0_TEST
+    if (ctx != NULL && ctx->slot < JE_RR_MAX &&
+        je_arm_user_slot[ctx->slot]) {
+        const uint64_t run_base =
+            (uint64_t)(ctx->usable_base - JE_ARM_PAGE_SIZE);
+        if (je_arm_mmu_stack_unmap(&je_arm_mmu_context, run_base) != JE_OK)
+            sched_fatal("user-stack-unmap");
+        je_arm_user_root[ctx->slot] = 0u;
+        je_arm_user_sp_el1[ctx->slot] = 0u;
+        je_arm_user_vm[ctx->slot] = NULL;
+        je_arm_user_index[ctx->slot] = 0u;
+        je_arm_user_proc[ctx->slot] = JE_PROC_ID_NONE;
+        je_arm_user_entry[ctx->slot] = 0u;
+        je_arm_user_slot[ctx->slot] = false;
+        je_arm_stack_mapped[ctx->slot] = false;
+        ctx->usable_base = 0u;
+        ctx->top = 0u;
+#ifdef JE_ARM_SCHED_TEST
+        je_arm_sched_stack_base[ctx->slot] = 0u;
+        je_arm_sched_stack_top[ctx->slot] = 0u;
+#endif
+        return;
+    }
+#endif
     je_pages *pages;
     uint64_t run_base;
     je_status status;
@@ -409,7 +603,17 @@ static je_status arm_frame_init(je_rr_ctx *ctx, void (*entry)(void *),
     frame->gpr[0] = (uint64_t)(uintptr_t)arg;
     frame->elr = (uint64_t)(uintptr_t)arm_sched_trampoline;
     frame->spsr = JE_ARM_SPSR_POLICY;
-    frame->sp = (uint64_t)ctx->top;
+    *je_arm_tf_kernel_sp(frame) = (uint64_t)ctx->top;
+    frame->vector = JE_ARM_VECTOR_EL1_FIRST + 1u;
+#ifdef JE_ARM_EL0_TEST
+    if (je_arm_user_slot[ctx->slot]) {
+        frame->gpr[0] = 0u;
+        frame->elr = JE_VM_ARENA_BASE + je_arm_user_entry[ctx->slot];
+        frame->spsr = JE_ARM_SPSR_EL0_POLICY;
+        *je_arm_tf_user_sp(frame) = arm_user_expected_sp(ctx->slot);
+        frame->vector = JE_ARM_VECTOR_EL0_FIRST;
+    }
+#endif
     frame->pad = 0u;
     *out_frame = frame;
     return JE_OK;
@@ -420,6 +624,44 @@ static je_status arm_frame_check(const je_rr_ctx *ctx, void *frame,
 {
     return frame_shape_valid(ctx, frame, phase, true, true) ? JE_OK : JE_ERR_INVALID;
 }
+
+#ifdef JE_ARM_EL0_TEST
+static bool arm_user_harden(void)
+{
+    uint64_t value;
+    __asm__ volatile("mrs %0, cpacr_el1" : "=r"(value));
+    value &= ~(UINT64_C(3) << 20); /* CPACR_EL1.FPEN=00: no EL0 FP/SIMD. */
+    __asm__ volatile("msr cpacr_el1, %0\n\tisb" : : "r"(value) : "memory");
+    const uint64_t mdscr = UINT64_C(1) << 12; /* MDSCR_EL1.TDCC */
+    const uint64_t cntkctl = UINT64_C(0);
+    const uint64_t cntkctl_forbidden = UINT64_C(0x303);
+    __asm__ volatile("msr cntkctl_el1, %1\n\t"
+                     "msr pmuserenr_el0, xzr\n\t"
+                     "msr mdscr_el1, %0\n\t"
+                     "msr tpidr_el0, xzr\n\t"
+                     "msr tpidrro_el0, xzr\n\t"
+                     "isb" : : "r"(mdscr), "r"(cntkctl) : "memory");
+
+    __asm__ volatile("mrs %0, cpacr_el1" : "=r"(value));
+    if ((value & (UINT64_C(3) << 20)) != 0u) return false;
+    __asm__ volatile("mrs %0, cntkctl_el1" : "=r"(value));
+    if ((value & cntkctl_forbidden) != 0u) return false;
+    __asm__ volatile("mrs %0, pmuserenr_el0" : "=r"(value));
+    if (value != 0u) return false;
+    __asm__ volatile("mrs %0, mdscr_el1" : "=r"(value));
+    if ((value & (UINT64_C(1) << 12)) == 0u) return false;
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(value));
+    /*
+     * UCI, UCT, DZE and UMA are the EL0-facing SCTLR controls in this target
+     * profile. MP1 owns their initial value; this path refuses if read-back
+     * shows any of them enabled rather than weakening boot.S.
+     */
+    const uint64_t el0_sctlr =
+        (UINT64_C(1) << 26) | (UINT64_C(1) << 15) |
+        (UINT64_C(1) << 14) | (UINT64_C(1) << 9);
+    return (value & el0_sctlr) == 0u;
+}
+#endif
 
 void je_arm_sched_install_ttbr0(uint64_t root_pa, uint16_t asid)
 {
@@ -456,13 +698,16 @@ static je_status arm_dispatch_install(je_rr_ctx *prev, je_rr_ctx *next)
 {
     (void)prev;
     if (next == NULL || next->slot >= JE_RR_MAX) return JE_ERR_INVALID;
-    /* MP3a-1 has no scheduler-owned user-root binding. The EL1 proof installs
-     * roots directly, and MP3a-2 must add root ownership plus an unbind before
-     * slot reuse can select a user root. */
+#ifdef JE_ARM_EL0_TEST
+    if (je_arm_user_slot[next->slot]) {
+        if (je_arm_user_root[next->slot] == 0u ||
+            !arm_user_harden())
+            return JE_ERR_DENIED;
+        je_arm_sched_install_ttbr0(je_arm_user_root[next->slot], 1u);
+        return JE_OK;
+    }
+#endif
     je_arm_sched_install_ttbr0(je_arm_mmu_root(&je_arm_mmu_context), 0u);
-    /* SP_EL1 installation is deferred to MP3a-2: this seam is called while C
-     * still uses the current EL1 stack, so changing SP_EL1 here would make the
-     * current call's stack lifetime ambiguous. */
     return JE_OK;
 }
 
@@ -490,9 +735,150 @@ void je_arm_sched_init(void)
     je_arm_sched_current_identity = 0u;
 }
 
-static void record_current_frame(je_rr_ctx *current, je_arm_trapframe *tf)
+#ifdef JE_ARM_EL0_TEST
+void je_arm_sched_set_proc_pool(je_proc_pool *pool)
+{
+    je_arm_proc_pool = pool;
+}
+
+je_status je_arm_sched_create_user(je_vm *vm, uint32_t index,
+                                   je_proc_id proc_id, uint32_t *out_slot)
+{
+    if (!vm || !je_arm_proc_pool || !out_slot ||
+        index >= JE_VM_MAX_PROCESSES ||
+        vm->procs[index].state != JE_VM_READY ||
+        !je_proc_valid(je_arm_proc_pool, proc_id))
+        return JE_ERR_INVALID;
+    if (je_arm_pending_user) return JE_ERR_BUSY;
+    je_arm_pending_user = true;
+    je_arm_pending_vm = vm;
+    je_arm_pending_index = index;
+    je_arm_pending_proc = proc_id;
+    const je_status status = je_rr_create(&je_arm_rr, arm_sched_trampoline,
+                                          (void *)(uintptr_t)0u, out_slot);
+    if (status != JE_OK) {
+        je_arm_pending_user = false;
+        je_arm_pending_vm = NULL;
+        je_arm_pending_proc = JE_PROC_ID_NONE;
+        return status;
+    }
+    const je_status link = je_proc_link(je_arm_proc_pool, proc_id, *out_slot,
+                                        index);
+    if (link != JE_OK) {
+        je_rr_exit(&je_arm_rr, *out_slot);
+        return link;
+    }
+    if (je_sched_register_process(vm, index, proc_id) != JE_OK)
+        sched_fatal("register user");
+    return JE_OK;
+}
+
+je_status je_arm_sched_current_user(je_vm **out_vm, uint32_t *out_index,
+                                    uint32_t *out_slot)
+{
+    const uint32_t slot = je_rr_current(&je_arm_rr);
+    if (!out_vm || !out_index || !out_slot || slot >= JE_RR_MAX ||
+        !je_arm_user_slot[slot])
+        return JE_ERR_INVALID;
+    *out_vm = je_arm_user_vm[slot];
+    *out_index = je_arm_user_index[slot];
+    *out_slot = slot;
+    return JE_OK;
+}
+
+uint32_t je_arm_el0_test_mode_rejection(uint32_t slot)
+{
+    if (slot == 0u || slot >= JE_RR_MAX || !je_arm_user_slot[slot])
+        return 0u;
+    je_rr_ctx *ctx = &je_arm_rr.slots[slot];
+    je_arm_trapframe *frame = (je_arm_trapframe *)ctx->frame;
+    if (frame == NULL) return 0u;
+
+    const uint64_t saved_elr = frame->elr;
+    const uint64_t saved_spsr = frame->spsr;
+    const uint64_t saved_sp = *je_arm_tf_user_sp(frame);
+    const uint64_t saved_gpr0 = frame->gpr[0];
+    const uint64_t saved_vector = frame->vector;
+    uint32_t passed = 0u;
+
+    /*
+     * Branch-isolation preflight for the mode mutant: the real EL0t branch
+     * must classify this malformed user return as BAD.  If the branch is
+     * inverted, it reaches the EL1h SP accessor with M=EL0t and fails closed
+     * at the mode boundary instead of being hidden by the aggregate marker.
+     */
+    frame->elr = JE_VM_ARENA_BASE + je_arm_user_entry[slot];
+    frame->spsr = JE_ARM_SPSR_EL0_POLICY;
+    *je_arm_tf_user_sp(frame) = JE_VM_ARENA_BASE;
+    frame->vector = JE_ARM_VECTOR_EL0_FIRST;
+    if (frame_shape_class(ctx, frame, 0u, false, false) !=
+        JE_ARM_FRAME_BAD)
+        sched_fatal("mode probe");
+
+    /*
+     * The first case is also the load-bearing negative for the mode mutant:
+     * the bad EL1h frame would be accepted by an inverted EL0 branch only if
+     * its SP field has the valid EL0 phase-0 value.
+     */
+    frame->elr = JE_VM_ARENA_BASE + je_arm_user_entry[slot];
+    frame->spsr = JE_ARM_SPSR_POLICY;
+    *je_arm_tf_kernel_sp(frame) = arm_user_expected_sp(slot);
+    frame->gpr[0] = 0u;
+    frame->vector = JE_ARM_VECTOR_EL1_FIRST;
+    je_arm_frame_result result =
+        frame_shape_class(ctx, frame, 0u, false, false);
+    if (result == JE_ARM_FRAME_BAD) passed |= UINT32_C(1);
+
+    /*
+     * Reset the synthetic frame before case 2.  This is an otherwise-valid
+     * EL1h frame whose only deliberate defect is the lower-EL vector tag.
+     * Without the vector_el0/M agreement check, the EL1h branch would accept
+     * it; stale SP/ELR fields must not reject it first.
+     */
+    frame->elr = (uint64_t)(uintptr_t)arm_sched_trampoline;
+    frame->spsr = JE_ARM_SPSR_POLICY;
+    *je_arm_tf_kernel_sp(frame) = (uint64_t)ctx->top;
+    frame->gpr[0] = (uint64_t)slot;
+    frame->vector = JE_ARM_VECTOR_EL0_FIRST + 1u;
+    result = frame_shape_class(ctx, frame, 0u, false, false);
+    if (result == JE_ARM_FRAME_BAD) passed |= UINT32_C(2);
+
+    /*
+     * Reset the synthetic frame before case 3.  This is an otherwise-valid
+     * EL0t frame whose only deliberate defect is the EL1 vector tag.
+     */
+    frame->elr = JE_VM_ARENA_BASE + je_arm_user_entry[slot];
+    frame->spsr = JE_ARM_SPSR_EL0_POLICY;
+    *je_arm_tf_user_sp(frame) = arm_user_expected_sp(slot);
+    frame->vector = JE_ARM_VECTOR_EL1_FIRST + 1u;
+    result = frame_shape_class(ctx, frame, 0u, false, false);
+    if (result == JE_ARM_FRAME_BAD) passed |= UINT32_C(4);
+
+    /*
+     * M[4] remains a composite negative: its rejection is covered by the
+     * shared AArch64 mode/vector checks, not by a dedicated isolating probe.
+     */
+    frame->spsr = JE_ARM_SPSR_EL0_POLICY | (UINT64_C(1) << 4);
+    frame->vector = JE_ARM_VECTOR_EL0_FIRST;
+    result = frame_shape_class(ctx, frame, 0u, false, false);
+    if (result == JE_ARM_FRAME_BAD) passed |= UINT32_C(8);
+
+    frame->elr = saved_elr;
+    frame->spsr = saved_spsr;
+    *je_arm_tf_user_sp(frame) = saved_sp;
+    frame->gpr[0] = saved_gpr0;
+    frame->vector = saved_vector;
+    return passed;
+}
+
+extern _Noreturn void je_arm_enter_frame(void *frame);
+#endif
+
+static je_arm_frame_result record_current_frame(je_rr_ctx *current,
+                                                je_arm_trapframe *tf)
 {
     uint32_t generation;
+    je_arm_frame_result result;
 
     if (current == NULL || tf == NULL) sched_fatal("current-frame null");
     if (current->frame != NULL) {
@@ -513,12 +899,15 @@ static void record_current_frame(je_rr_ctx *current, je_arm_trapframe *tf)
         }
         sched_fatal("frame not consumed");
     }
-    if (!frame_shape_valid(current, tf, current->phase, false, false))
+    result = frame_shape_class(current, tf, current->phase, false, false);
+    if (result == JE_ARM_FRAME_BAD)
         sched_fatal("observed_running");
+    if (result == JE_ARM_FRAME_USER_DEATH) return result;
     generation = next_frame_generation(je_arm_frame_generation[current->slot]);
     je_arm_frame_generation[current->slot] = generation;
     current->frame = tf;
     tf->pad = ((uint64_t)current->slot << 32) | generation;
+    return JE_ARM_FRAME_OK;
 }
 
 static void no_switch_frame(je_rr_ctx *current, je_arm_trapframe *tf)
@@ -529,6 +918,220 @@ static void no_switch_frame(je_rr_ctx *current, je_arm_trapframe *tf)
     current->frame = NULL;
 }
 
+#ifdef JE_ARM_EL0_TEST
+static bool arm_current_is_user(uint32_t slot)
+{
+    return slot < JE_RR_MAX && je_arm_user_slot[slot];
+}
+
+static void arm_user_mark_dying(uint32_t slot, uint32_t reason,
+                                uint64_t code, uint64_t vector)
+{
+    if (!arm_current_is_user(slot) || !je_arm_proc_pool)
+        sched_fatal("user death binding");
+    const je_status status = je_lc_on_dying(
+        slot, je_arm_user_proc[slot], reason, code, vector);
+    if (status != JE_OK) sched_fatal("lifecycle dying");
+    je_rr_exit(&je_arm_rr, slot);
+}
+
+static void arm_reap_zombies(void)
+{
+    const uint32_t current = je_rr_current(&je_arm_rr);
+    for (uint32_t slot = 1u; slot < JE_RR_MAX; ++slot) {
+        if (!je_arm_user_slot[slot] ||
+            je_arm_rr.slots[slot].state != JE_RR_ZOMBIE ||
+            slot == current)
+            continue;
+        je_vm *vm = je_arm_user_vm[slot];
+        const uint32_t index = je_arm_user_index[slot];
+        const je_proc_id proc_id = je_arm_user_proc[slot];
+        if (je_rr_reap(&je_arm_rr, slot, current) != JE_OK)
+            sched_fatal("rr reap");
+        if (je_sched_unregister_process(vm, index) != JE_OK ||
+            je_lc_reaped(vm, index, proc_id) != JE_OK)
+            sched_fatal("lifecycle reap");
+        je_arm_el0_test_note_reaped(index, proc_id);
+    }
+}
+
+static void *arm_switch_to_ready(void)
+{
+    const uint32_t current = je_rr_current(&je_arm_rr);
+    if (current != 0u && current < JE_RR_MAX &&
+        je_arm_rr.slots[current].state == JE_RR_RUNNING)
+        je_arm_rr.slots[current].state = JE_RR_READY;
+    for (uint32_t attempt = 0u; attempt < JE_RR_MAX; ++attempt) {
+        const uint32_t next = je_rr_pick(&je_arm_rr);
+        if (next == 0u) {
+            sched_fatal("no live EL0 successor");
+        }
+        void *resume = NULL;
+        const je_status status = je_rr_switch(&je_arm_rr, next, &resume);
+        if (status == JE_OK && resume != NULL) {
+            je_arm_rr.slots[next].frame = NULL;
+            je_arm_frame_generation[next] =
+                next_frame_generation(je_arm_frame_generation[next]);
+            je_arm_sched_current_identity = next;
+            if (arm_current_is_user(next))
+                je_arm_el0_test_poison_tpidr();
+            return resume;
+        }
+        if (arm_current_is_user(next) &&
+            frame_shape_class(&je_arm_rr.slots[next],
+                              je_arm_rr.slots[next].frame,
+                              je_arm_rr.slots[next].phase, true, true) ==
+                JE_ARM_FRAME_USER_DEATH) {
+            je_arm_el0_test_note_fault(next, JE_ABI_DEATH_BAD_RETURN,
+                                       0u, 0u, 0u, 0u, 0u, 0u);
+            sched_console_write("JeiOS/aarch64: EL0 TERMINATED slot=");
+            sched_console_dec(next);
+            sched_console_write(" reason=");
+            sched_console_dec(JE_ABI_DEATH_BAD_RETURN);
+            sched_console_write(" ec=0x0000000000000000 far=0x0000000000000000"
+                                " il=0 iss=0x0000000000000000"
+                                " fsc=0x0000000000000000 wnr=0\r\n");
+            arm_user_mark_dying(next, JE_ABI_DEATH_BAD_RETURN, 0u,
+                                JE_ARM_VECTOR_EL0_FIRST);
+            continue;
+        }
+        if (status == JE_ERR_DENIED)
+            sched_fatal("hardening refusal");
+        sched_fatal("frame invalid");
+    }
+    sched_fatal("successor bound");
+}
+
+static void *arm_user_death(je_arm_trapframe *tf, uint32_t reason,
+                            uint64_t code)
+{
+    const uint32_t slot = je_rr_current(&je_arm_rr);
+    if (!arm_current_is_user(slot) || tf == NULL)
+        sched_fatal("fault from non-user");
+    const uint64_t vector = tf->vector;
+    const uint64_t esr = tf->esr;
+    const uint64_t ec = (esr >> 26) & UINT64_C(0x3f);
+    const uint64_t il = (esr >> 25) & UINT64_C(1);
+    const uint64_t iss = esr & UINT64_C(0x01ffffff);
+    const uint64_t fsc = iss & UINT64_C(0x3f);
+    const uint64_t wnr = (iss >> 6) & UINT64_C(1);
+    je_arm_el0_test_note_fault(slot, reason, ec, tf->far, il, iss, fsc, wnr);
+    sched_console_write("JeiOS/aarch64: EL0 TERMINATED slot=");
+    sched_console_dec(slot);
+    sched_console_write(" reason=");
+    sched_console_dec(reason);
+    sched_console_write(" ec=");
+    sched_console_hex(ec);
+    sched_console_write(" far=");
+    sched_console_hex(tf->far);
+    sched_console_write(" il=");
+    sched_console_dec(il);
+    sched_console_write(" iss=");
+    sched_console_hex(iss);
+    sched_console_write(" fsc=");
+    sched_console_hex(fsc);
+    sched_console_write(" wnr=");
+    sched_console_dec(wnr);
+    sched_console_write("\r\n");
+    arm_user_mark_dying(slot, reason, code, vector);
+    return arm_switch_to_ready();
+}
+
+void *je_arm_el0_fault(je_arm_trapframe *tf)
+{
+    if (tf == NULL) sched_fatal("null EL0 fault");
+    const je_arm_frame_result shape =
+        frame_shape_class(&je_arm_rr.slots[je_rr_current(&je_arm_rr)],
+                          tf, 1u, false, false);
+    if (shape == JE_ARM_FRAME_USER_DEATH &&
+        arm_current_is_user(je_rr_current(&je_arm_rr))) {
+        return arm_user_death(tf, JE_ABI_DEATH_FAULT, 0u);
+    }
+    if (shape != JE_ARM_FRAME_OK) sched_fatal("EL0 fault frame");
+    return arm_user_death(tf, JE_ABI_DEATH_FAULT, 0u);
+}
+
+void *je_arm_el0_svc(je_arm_trapframe *tf)
+{
+    if (tf == NULL || !arm_current_is_user(je_rr_current(&je_arm_rr)))
+        sched_fatal("SVC from non-user");
+    /*
+     * Reap only after the restore seam has put execution on the successor's
+     * SP_EL1. Reaping from arm_switch_to_ready() would unmap the old current
+     * kernel stack while this C call is still using it.
+     */
+    arm_reap_zombies();
+    const je_arm_frame_result shape =
+        frame_shape_class(&je_arm_rr.slots[je_rr_current(&je_arm_rr)],
+                          tf, 1u, false, false);
+    if (shape == JE_ARM_FRAME_BAD)
+        sched_fatal("EL0 SVC frame invariant");
+    if (shape == JE_ARM_FRAME_USER_DEATH)
+        return arm_user_death(tf, JE_ABI_DEATH_BAD_RETURN, 0u);
+
+    const uint32_t svc_slot = je_rr_current(&je_arm_rr);
+    je_arm_el0_test_note_kstack(svc_slot);
+    const uint64_t esr = tf->esr;
+    if (((esr >> 26) & UINT64_C(0x3f)) != UINT64_C(0x15) ||
+        ((esr >> 25) & UINT64_C(1)) == 0u ||
+        (esr & UINT64_C(0xffff)) != 0u)
+        return arm_user_death(tf, JE_ABI_DEATH_FAULT, 0u);
+
+    uint64_t args[6];
+    for (unsigned i = 0u; i < 6u; ++i) args[i] = tf->gpr[i];
+    const uint64_t op = tf->gpr[8];
+    je_abi_status abi_status = JE_ABI_UNSUPPORTED;
+    uint64_t result = 0u;
+    je_syscall_action action;
+#ifdef JE_ARM_EL0_TEST
+    if (op == JE_ARM_EL0_PROOF_OP) {
+        action = JE_SYSCALL_RETURN;
+        if (args[0] == JE_ARM_EL0_PROOF_ARG0) {
+            abi_status = JE_ARM_EL0_PROOF_STATUS;
+            result = JE_ARM_EL0_PROOF_RESULT;
+        } else {
+            abi_status = JE_ABI_INVALID;
+            result = 0u;
+        }
+    } else
+#endif
+        action = je_syscall_decode(op, args, &abi_status, &result);
+    if (action != JE_SYSCALL_RETURN && action != JE_SYSCALL_YIELD &&
+        action != JE_SYSCALL_EXIT) {
+        abi_status = JE_ABI_UNSUPPORTED;
+        result = 0u;
+    }
+    tf->gpr[0] = (uint64_t)abi_status;
+    tf->gpr[1] = result;
+    if (op == JE_ARM_EL0_PROOF_OP)
+        je_arm_el0_test_note_svc_proof(svc_slot, tf);
+    je_arm_el0_test_note_svc(je_rr_current(&je_arm_rr), op, tf);
+
+    if (action == JE_SYSCALL_EXIT && abi_status == JE_ABI_OK)
+        return arm_user_death(tf, JE_ABI_DEATH_EXIT, result);
+    if (action == JE_SYSCALL_YIELD && abi_status == JE_ABI_OK) {
+        if (record_current_frame(&je_arm_rr.slots[je_rr_current(&je_arm_rr)],
+                                 tf) != JE_ARM_FRAME_OK)
+            sched_fatal("yield frame classification");
+        je_arm_el0_test_before_return(je_rr_current(&je_arm_rr), tf);
+        return arm_switch_to_ready();
+    }
+    je_rr_ctx *svc_current = &je_arm_rr.slots[je_rr_current(&je_arm_rr)];
+    if (record_current_frame(svc_current, tf) != JE_ARM_FRAME_OK)
+        sched_fatal("SVC frame classification");
+    no_switch_frame(&je_arm_rr.slots[je_rr_current(&je_arm_rr)], tf);
+    return tf;
+}
+
+_Noreturn void je_arm_sched_start_user(void)
+{
+    if (je_arm_rr.current != 0u || !je_arm_rr_ready)
+        sched_fatal("user start state");
+    void *resume = arm_switch_to_ready();
+    je_arm_enter_frame(resume);
+}
+#endif
+
 void *je_arm_sched_no_tick(je_arm_trapframe *tf)
 {
     uint32_t current_slot;
@@ -538,7 +1141,15 @@ void *je_arm_sched_no_tick(je_arm_trapframe *tf)
 #ifdef JE_ARM_SCHED_TEST
     arm_sched_validate_sleeping();
 #endif
-    record_current_frame(&je_arm_rr.slots[current_slot], tf);
+    const je_arm_frame_result result =
+        record_current_frame(&je_arm_rr.slots[current_slot], tf);
+#ifdef JE_ARM_EL0_TEST
+    if (result == JE_ARM_FRAME_USER_DEATH &&
+        arm_current_is_user(current_slot))
+        return arm_user_death(tf, JE_ABI_DEATH_BAD_RETURN, 0u);
+#else
+    (void)result;
+#endif
     no_switch_frame(&je_arm_rr.slots[current_slot], tf);
     return tf;
 }
@@ -558,7 +1169,14 @@ void *je_arm_sched_irq(je_arm_trapframe *tf)
     current_slot = je_rr_current(&je_arm_rr);
     if (current_slot >= JE_RR_MAX) sched_fatal("current slot");
     current = &je_arm_rr.slots[current_slot];
-    record_current_frame(current, tf);
+    const je_arm_frame_result result = record_current_frame(current, tf);
+#ifdef JE_ARM_EL0_TEST
+    if (result == JE_ARM_FRAME_USER_DEATH &&
+        arm_current_is_user(current_slot))
+        return arm_user_death(tf, JE_ABI_DEATH_BAD_RETURN, 0u);
+#else
+    (void)result;
+#endif
 
 #ifdef JE_ARM_SCHED_TEST
     /* The core tick owns wakeups and the scheduler tick count. */
@@ -571,6 +1189,16 @@ void *je_arm_sched_irq(je_arm_trapframe *tf)
     proof_ready_bound_step();
     return je_arm_sched_test_irq(tf, current_slot);
 #else
+#ifdef JE_ARM_EL0_TEST
+    if (arm_current_is_user(current_slot)) {
+        je_rr_tick(&je_arm_rr, je_arm_timer_ticks());
+        void *resume = arm_switch_to_ready();
+        je_arm_el0_test_note_irq_switch(current_slot,
+                                        je_rr_current(&je_arm_rr),
+                                        tf->elr);
+        return resume;
+    }
+#endif
     arm_sched_validate_sleeping();
     no_switch_frame(current, tf);
     return tf;
@@ -1137,7 +1765,7 @@ void *je_arm_sched_test_irq(je_arm_trapframe *tf, uint32_t current_slot)
         fake->gpr[0] = next;
         fake->elr = (uint64_t)(uintptr_t)arm_sched_trampoline;
         fake->spsr = JE_ARM_SPSR_POLICY;
-        fake->sp = (uint64_t)(uintptr_t)resume + JE_TF_SIZE;
+        *je_arm_tf_kernel_sp(fake) = (uint64_t)(uintptr_t)resume + JE_TF_SIZE;
         fake->pad = ((uint64_t)next << 32) | UINT64_C(1);
     }
 #endif

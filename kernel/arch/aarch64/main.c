@@ -25,7 +25,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <jeios/fdt.h>
-#ifdef JE_ARM_USER_TEST
+#if defined(JE_ARM_USER_TEST) || defined(JE_ARM_EL0_TEST)
 #include <jeios/vm.h>
 #endif
 #include "gic.h"
@@ -35,6 +35,9 @@
 
 #ifdef JE_ARM_SCHED_TEST
 bool je_arm_sched_guard_fault_check(const je_arm_trapframe *tf, uint64_t ec);
+#endif
+#ifdef JE_ARM_EL0_TEST
+extern _Noreturn void je_arm_el0_test_run(void);
 #endif
 
 /* MP1 reentrancy guard (vectors.S): 0 outside a handler, 1 inside. A nested
@@ -435,10 +438,12 @@ extern uint64_t je_arm_mmu_last_audit_leaves;
 extern uint8_t _text[], _end[];   /* IMAGE extent [_text, _end), linker.ld */
 extern uint8_t __text_end[], __rodata_end[], __data_end[];
 extern uint8_t __stack_guard[], __stack_bottom[];
-#ifdef JE_ARM_USER_TEST
+#if defined(JE_ARM_USER_TEST) || defined(JE_ARM_EL0_TEST)
 extern void je_arm_sched_install_ttbr0(uint64_t root_pa, uint16_t asid);
 extern uint64_t je_arm_sched_read_ttbr0(void);
 extern je_status je_arch_vm_decorate_kernel_root(void);
+#endif
+#ifdef JE_ARM_USER_TEST
 static je_vm je_arm_user_vm;
 static uint8_t je_arm_user_blob[3u * JE_PAGE_SIZE]
     __attribute__((aligned(16)));
@@ -1113,8 +1118,16 @@ static void mmu_bringup(void)
     console_hex(gicc);
     console_write("\r\n");
 
+#if defined(JE_ARM_USER_TEST) || defined(JE_ARM_EL0_TEST)
 #ifdef JE_ARM_USER_TEST
     user_test_prepare_l3();
+#else
+    status = je_arm_mmu_prebuild_ram_l3(&je_arm_mmu_context);
+    if (status != JE_OK) {
+        console_write("JeiOS/aarch64: FATAL el0-test l3-prebuild\r\n");
+        halt();
+    }
+#endif
 #endif
 
 #ifdef JE_ARM_USER_TEST
@@ -1136,7 +1149,7 @@ static void mmu_bringup(void)
     console_hex(je_arm_mmu_last_audit_leaves);
     console_write("\r\n");
 
-#ifdef JE_ARM_USER_TEST
+#if defined(JE_ARM_USER_TEST) || defined(JE_ARM_EL0_TEST)
     /* MP3a-1 changes the kernel-root L0 attributes only after the frozen MP2
      * audit. Do this once, explicitly, before any process root is built; a
      * lazy decoration during link_tables would be a live table mutation. */
@@ -1145,7 +1158,9 @@ static void mmu_bringup(void)
         console_write("JeiOS/aarch64: FATAL user-test kernel-decoration\r\n");
         halt();
     }
+#ifdef JE_ARM_USER_TEST
     user_test_prepare();
+#endif
 #endif
 
     status = je_arm_mmu_enable(&je_arm_mmu_context);
@@ -1317,10 +1332,11 @@ static void timer_poll_proof(void)
 }
 #endif
 
-/* Returning IRQ handler (ADR 0012 D5/D6/D8). Caller context is EL1h with I
- * masked by exception entry. This path performs no allocation, blocking,
- * console I/O or unmasking. The assembly saver owns the transient guard and
- * restores ELR/SPSR/GPRs after this function returns. */
+/* Returning IRQ handler (ADR 0012 D5/D6/D8). Caller context is normally EL1h
+ * with I masked by exception entry; the MP3a-2 lower-EL IRQ saver reaches the
+ * same bounded handler with an SP_EL0-backed frame. This path performs no
+ * allocation, blocking, console I/O or unmasking. The assembly saver owns the
+ * transient guard and restores ELR/SPSR/GPRs after this function returns. */
 void *je_arm_irq(je_arm_trapframe *tf)
 {
     /* Sample at handler entry, before ACK/EOI can change interrupt status. */
@@ -1342,7 +1358,10 @@ void *je_arm_irq(je_arm_trapframe *tf)
             evidence->isr = isr;
             evidence->spsr = tf->spsr;
             evidence->elr = tf->elr;
-            evidence->sp = tf->sp;
+            evidence->sp = ((tf->spsr & JE_ARM_SPSR_M_MASK) ==
+                            JE_ARM_SPSR_M_EL0T)
+                               ? *je_arm_tf_user_sp(tf)
+                               : *je_arm_tf_kernel_sp(tf);
             evidence->cntpct = cntpct;
 #ifdef JE_ARM_TIMER_TEST
             evidence->heartbeat = je_arm_canary_heartbeat;
@@ -1361,7 +1380,10 @@ void *je_arm_irq(je_arm_trapframe *tf)
         je_arm_irq_last_busy_wakeup.isr = isr;
         je_arm_irq_last_busy_wakeup.spsr = tf->spsr;
         je_arm_irq_last_busy_wakeup.elr = tf->elr;
-        je_arm_irq_last_busy_wakeup.sp = tf->sp;
+        je_arm_irq_last_busy_wakeup.sp =
+            ((tf->spsr & JE_ARM_SPSR_M_MASK) == JE_ARM_SPSR_M_EL0T)
+                ? *je_arm_tf_user_sp(tf)
+                : *je_arm_tf_kernel_sp(tf);
         je_arm_irq_last_busy_wakeup.cntpct = cntpct;
 #ifdef JE_ARM_TIMER_TEST
         je_arm_irq_last_busy_wakeup.heartbeat = je_arm_canary_heartbeat;
@@ -1685,6 +1707,9 @@ _Noreturn void je_arm_main(void)
 #endif
     je_arm_sched_init();
     gic_timer_bringup();
+#ifdef JE_ARM_EL0_TEST
+    je_arm_el0_test_run();
+#endif
 #ifdef JE_ARM_SCHED_TEST
     je_arm_sched_test();
 #endif

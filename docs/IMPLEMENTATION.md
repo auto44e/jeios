@@ -2,6 +2,169 @@
 
 Current checkpoint and work order: [STATUS.md](STATUS.md). Dated status and next-task statements below are historical when superseded by that checkpoint.
 
+## Current status — MP3a-2 FINAL FIX PASS — observed 2026-11-09T03:38:01+00:00
+
+Repository `/tmp/wt-mp3a2`, branch `wip/mp3a2`, exact inspected base commit
+`59e19046b515dac52f439478c2ae1c4e1df10782` (pre-change inspected commit;
+the final fix pass is the current local change recorded by this ledger). State:
+**implemented / tested locally / planned (owner review, remote CI, physical
+ARM and independent human qualification) / not blocked**. This is AI-assisted
+evidence, not human or release qualification. Demonstrated support tier:
+**QEMU 8.2.2, cortex-a72, one CPU, 256 MiB**. No push, PR publication,
+reviewer assignment, or release was performed. Review transcripts are committed
+under `docs/adr/debates/0015-mp3a-el0-svc/`; the stray root-level
+`MP3A2-BRIEF.md` and `MP3A2-REVIEW.md` are removed in this fix pass.
+
+MP3a-2 is implemented for the scoped QEMU profile, including the empirical
+fix pass. MP3b and MP3c remain deferred. The implementation is in
+`kernel/arch/aarch64/{vectors.S,sched_arm.c,vm_backend.c,paging.c,el0_test.c}`,
+`kernel/core/lifecycle.c`, `mk/aarch64.mk`, `tools/smoke_arm.py`,
+`tools/run_arm_el0_test.py`, and `tools/mutants.json`; the frozen trapframe
+layout and existing EL1h IRQ path were retained.
+
+### Implemented
+
+- Added real lower-EL AArch64 savers for vector slots 8/9. They spill
+  x16-x19 first, capture `SP_EL0` into the frozen `tf->sp`, save the complete
+  304-byte frame and syndrome registers, enforce the existing reentrancy guard,
+  and route SVC versus lower-EL fault/IRQ handling.
+- Added the EL0 restore branch: validated `SP_EL0` and both EL0 TPIDR registers
+  are installed before ERET, and the selected user thread's kernel stack is
+  installed as the current `SP_EL1` only after C dispatch has returned.
+  Non-EL0 profiles retain fatal vector 8/9 stubs and do not link EL0 handlers.
+- Split frame validation by mode. Shared bounds, alignment, cookie, AArch64
+  mode, and vector-group/M agreement run before frame dereference. EL1h keeps
+  the MP3a-1 policy/trampoline checks, including the phase-0 exact frame
+  address. EL0t requires the exact kstack-top frame, normalizes the EL1
+  policy with `M=EL0t`, validates phase-0 startup, and classifies only
+  well-formed out-of-arena ELR/SP as user death; structural/mode breaks are
+  fatal. `je_arm_tf_kernel_sp()` and `je_arm_tf_user_sp()` enforce the D3
+  SP accessor boundary. The `(!vector_el1 && !vector_el0)` range clause has no
+  independent negative probe yet and is not independently enforced by this
+  proof.
+- Added per-slot process-root and kernel-stack ownership, lifecycle registration,
+  stale-root clearing on reap/reuse, user frame synthesis, SVC decode/dispatch
+  (`x8`, six arguments, status in x0, result always in x1), and exit/yield/
+  unsupported handling.
+- Added lower-EL fault death with lifecycle `DYING -> DEAD -> FREE` teardown
+  and reap-with-survivor. The MMU-on VM backend now uses bounded identity
+  aliases for table/frame lifecycle, publishes/unpublishes user frames after
+  enable, clears PTEs with `DSB ISHST; TLBI VAE1IS; DSB ISH; ISB`, and performs
+  reviewed `dc cvau`/`ic ivau` maintenance for user code.
+- Added user-path hardening/readback for CPACR FPEN, CNTKCTL, PMUSERENR,
+  MDSCR.TDCC, TPIDR_EL0/RO, and EL0-facing SCTLR bits. The EL0 proof seeds
+  CPACR and trusted TPIDR/TPIDRRO poison so skipped hardening cannot silently pass;
+  the no-device-hooks profile requires an explicit build acknowledgement.
+  CNTKCTL readback covers `0x303` (including EL0PTEN), and the proof attempts
+  an EL0 `CNTP_CTL_EL0` write plus an EL0 DCC read; both must trap. Hardware
+  trap behavior remains target-profile QEMU evidence, not physical-ARM evidence.
+- Added `ARM_EL0_TEST=1`: two real AArch64 code/data images execute at EL0,
+  execute with the timer live, prove an IRQ preempts a spinning worker and
+  resumes it with registers intact, issue a non-zero proof SVC and yield,
+  preserve x16-x18, verify distinct initial SP_EL0 values after entry and
+  every SVC/yield, verify that a poisoned TPIDRRO_EL0 is scrubbed to zero
+  before EL0 observes it through an SVC-reported round-trip (the earlier
+  hardening write itself is not independently observable), write distinct data
+  at the same arena VA, and exercise
+  kernel read/write/execute faults, bad SP/ELR returns, FP, CNTVCT, SVC#1,
+  CNTP_CTL_EL0, and DCC deaths. The proof gates PASS only after reap-with-
+  survivor, at least one completed lone-survivor self-yield reselect, and at
+  least one lone-survivor self-targeted timer IRQ reselect. The PASS marker is
+  emitted before the second lone self-yield dispatch completes.
+- User PTE teardown now emits `TLBI VAE1IS` with explicit ASID 1 for
+  non-global arena leaves; kernel runtime leaves retain ASID 0. The
+  64-byte cache-line stride, identity-VA I-cache invalidation, and
+  `VALE1IS` to `VAE1IS` maintenance edit remain target-profile assumptions
+  or reviewed-not-observed items.
+- Added an independent smoke oracle and ARM-USER mutants. The oracle
+  re-derives non-zero SVC status/result and x16-x18 canaries, EC/IL/ISS and
+  data-abort FSC/WnR details, stage ordering, isolation values, timer
+  preemption, three isolated mode checks plus a composite AArch32 check,
+  user-SP/TPIDRRO/DCC/CNTKCTL checks, survivor reaping, the completed
+  self-yield + self-targeted IRQ reselect gate, and the
+  terminal proof marker. The mutant reverting the scheduler's
+  `sched_arm.c:922-924` READY-before-pick demotion is proven to FATAL
+  `sched no live EL0 successor`.
+
+### Observed proof markers
+
+```text
+EL0 MODE_CHECK EL1h-frame-rejected-as-EL0
+EL0 MODE_CHECK vector9-EL1h-rejected
+EL0 MODE_CHECK vector5-EL0t-rejected
+EL0 MODE_CHECK aarch32-M4-composite-rejected
+EL0 TIMER_PREEMPT from=1 to=2 switches=1
+EL0 SVC register proof slot=1 status=1 result=0x...5aa5 x16=0x...1616 x17=0x...1717 x18=0x...1818 tpidrro=0x...0000
+EL0 TPIDRRO_ROUND_TRIP slot=1 value=0x...0000
+EL0 SVC register proof slot=2 status=1 result=0x...5aa5 x16=0x...1616 x17=0x...1717 x18=0x...1818 tpidrro=0x...0000
+EL0 TPIDRRO_ROUND_TRIP slot=2 value=0x...0000
+EL0 REGISTER_ROUND_TRIP slot=1 marker=0x...5245
+EL0 REGISTER_ROUND_TRIP slot=2 marker=0x...5245
+EL0 RUN slot=1 data=0x...1111 arena=0x0000100000002000
+EL0 RUN slot=2 data=0x...2222 arena=0x0000100000002000
+EL0 EXPECTED_DEATH stage=0 ... ec=0x...0024 far=0x0000000040000000
+EL0 EXPECTED_DEATH stage=1 ... ec=0x...0024 far=0x0000000040000000
+EL0 EXPECTED_DEATH stage=2 ... ec=0x...0020 far=0x0000000040000000
+EL0 EXPECTED_DEATH stage=3 ... reason=2 ec=0 far=0
+EL0 EXPECTED_DEATH stage=4 ... reason=2 ec=0 far=0
+EL0 EXPECTED_DEATH stage=5 ... ec=0x...0007 far=0x0000000040000000
+EL0 EXPECTED_DEATH stage=6 ... ec=0x...0018 far=0x0000000040000000
+EL0 EXPECTED_DEATH stage=7 ... ec=0x...0015 far=0x0000000040000000
+EL0 CNTKCTL_PREEMPT_WRITE_TRAP stage=8
+EL0 DCC_CHANNEL_TRAP stage=9
+EL0 REAP_WITH_SURVIVOR stage=0..9
+EL0 REAP_WITH_SURVIVOR lone slot=2
+EL0 LONE_SURVIVOR_YIELD slot=1 count=1
+EL0 LONE_IRQ_RESELECT slot=1
+EL0 proof PASS reviewed-cache-tlb=not-observed
+```
+
+The EL0 smoke observed these exception-entry, SVC, register, arena-content,
+and lifecycle facts under QEMU with the timer live. Cache coherency, TLB
+staleness, and `dc cvau`/`ic ivau`/TLBI hardware effects are **reviewed, not
+observed** under QEMU TCG. The EL1h restore logic is behaviorally identical
+to the frozen path; vectors.o contains only the two inert inserted
+instructions. Physical ARM, SMP, arbitrary hardware, dynamic loading, remote
+CI, and independent human qualification remain unclaimed.
+
+### Verification actually run
+
+```text
+make aarch64 ARM_EL0_TEST=1                       PASS
+make aarch64 ARM_USER_TEST=1                      PASS
+make smoke-aarch64 ARM_USER_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60
+                                                     PASS
+make smoke-aarch64 ARM_EL0_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60
+                                                     PASS
+make smoke-aarch64 ARM_REQUIRE=1                  PASS
+make smoke-aarch64 ARM_SCHED_TEST=1 ARM_REQUIRE=1 PASS
+make smoke-aarch64 ARM_TIMER_TEST=1 ARM_REQUIRE=1 PASS
+make smoke-aarch64 ARM_MMU_FAULT=text ARM_REQUIRE=1 PASS
+timeout 60 qemu-system-aarch64 -M virt-8.2,gic-version=2,virtualization=off,secure=off,dtb-randomness=off -cpu cortex-a72 -smp 1 -m 256M -display none -serial file:/tmp/fx2.log -no-reboot -kernel build/aarch64-el0test/Image
+                                                     serial PASS; timeout rc 124 after halt
+make mutants                                       PASS (55 killed, 1 equivalent, 0 SURVIVED, 0 BLOCKED, 1 skipped)
+make check                                         PASS
+sh tools/check_arm_trapframe_boundary.sh           PASS (self-test catches all 3 raw-SP forms)
+git diff --check                                   PASS
+python3 -m py_compile tools/smoke_arm.py tools/run_arm_el0_test.py
+                                                     PASS
+```
+
+The complete mutant result was `55 killed, 1 equivalent, 0 SURVIVED,
+0 BLOCKED, 1 skipped`; all enabled critical mutants were killed or justified
+equivalent. The default, MP3a-1, scheduler, timer, and MMU-fault smoke
+profiles all passed after the EL0 vector linkage was scoped to
+`ARM_EL0_TEST`.
+
+The fix-pass proof injections were also run in disposable builds. Removing
+the TPIDRRO scrub died at `FATAL el0-test svc-proof-result`; removing the
+EL0t mode discriminator died at `FATAL el0-test mode-negative`; the old
+CNTKCTL mask died at `FATAL el0-test cntkctl-trap-syndrome`; clearing TDCC
+died at `FATAL el0-test dcc-trap-syndrome`; and MODE-CONFUSION died at
+`FATAL sched kernel-sp mode` inside the synthetic probe. The boundary
+self-test catches `(*tf).sp`, `tf[0].sp`, and `tf-> sp`, while the real
+source scan passes. These are failure proofs, not marker-only checks.
+
 ## MP3a-1 ARM TTBR0/EL0 proof — observed 2026-11-08T23:29:54Z
 
 Repository `/tmp/wt-mp3a1`, branch `wip/mp3a1`, exact inspected base commit

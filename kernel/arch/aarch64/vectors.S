@@ -58,9 +58,16 @@ je_arm_vectors:
     b       je_arm_irq_common
     VEC 6    /* FIQ    (masked in MP1) */
     VEC 7    /* SError */
-    /* Group 2: Lower EL using AArch64 (no EL0 yet in MP1). */
-    VEC 8    /* Sync   */
-    VEC 9    /* IRQ    */
+    /* Group 2: Lower EL using AArch64 (MP3a-2 user entry). */
+#ifdef JE_ARM_EL0_TEST
+    .balign 0x80
+    b       je_arm_el0_sync_entry
+    .balign 0x80
+    b       je_arm_el0_irq_entry
+#else
+    VEC 8    /* Sync   (EL0 disabled in this profile) */
+    VEC 9    /* IRQ    (EL0 disabled in this profile) */
+#endif
     VEC 10   /* FIQ    */
     VEC 11   /* SError */
     /* Group 3: Lower EL using AArch32 (unsupported; defined halt). */
@@ -173,6 +180,10 @@ je_arm_df_msg:
  * uses the vector, GIC IAR and ISR_EL1 instead, never stale syndrome registers. */
     .globl  je_arm_irq_common
     .extern je_arm_irq
+#ifdef JE_ARM_EL0_TEST
+    .extern je_arm_el0_svc
+    .extern je_arm_el0_fault
+#endif
 je_arm_irq_common:
     /* The only supported returning IRQ source is Current EL using SP_ELx
      * (EL1h). Check SPSR_EL1 before the guard is set; any other mode is an
@@ -225,6 +236,7 @@ je_arm_irq_common:
      * never redirect SP to an unchecked address.  x0 is not touched by the
      * guard clear, so it remains the selected frame pointer.
      */
+je_arm_restore_selected:
     tst     x0, #0xf
     b.ne    je_arm_double_fault
 #ifndef JE_ARM_SCHED_MUTANT_DROP_MOV_SP
@@ -241,6 +253,9 @@ je_arm_irq_common:
     ldp     x0, x1, [sp, #JE_TF_ELR]
     msr     ELR_EL1, x0
     msr     SPSR_EL1, x1
+    /* The flags from this test survive the GPR restore below. M==EL0t is the
+     * only mode that takes the lower-EL SP/TPIDR/SP_EL1 handoff. */
+    tst     x1, #0xf
 
     /*
      * Restore every GPR from the selected frozen frame.  tf->sp is validated
@@ -273,9 +288,139 @@ je_arm_irq_common:
 #endif
     ldp     x28, x29, [sp, #(JE_TF_GPR + 224)]
     ldr     x30,      [sp, #(JE_TF_GPR + 240)]
+    b.eq    je_arm_restore_el0
     add     sp, sp, #JE_TF_SIZE
     eret
 
+je_arm_restore_el0:
+    /*
+     * The selected EL0 frame is always at kstack_top-JE_TF_SIZE. The frame's
+     * SP field is the interrupted SP_EL0, not the kernel frame address.
+     * Install SP_EL1 only after all C work has returned and before ERET; writing
+     * it in the C dispatch seam would replace the live stack of that call.
+     */
+    ldr     x2, [sp, #JE_TF_SP]
+    msr     SP_EL0, x2
+    msr     TPIDR_EL0, xzr
+    msr     TPIDRRO_EL0, xzr
+    add     x2, sp, #JE_TF_SIZE
+    /*
+     * The restore seam is executing EL1h, so MOV SP writes the selected
+     * SP_EL1 bank directly. This is the architecturally permitted EL1 form;
+     * no SPSel write is needed or allowed in the seam.
+     */
+    mov     sp, x2
+    /* Changing the current EL1h SP means reload the two scratch registers
+     * used by this tail from the frame at top-304. */
+    sub     x2, sp, #304
+    ldr     x0, [x2, #0]
+    ldr     x2, [x2, #16]
+    eret
+
+    .globl  je_arm_enter_frame
+je_arm_enter_frame:
+    b       je_arm_restore_selected
+
+#ifdef JE_ARM_EL0_TEST
+/*
+ * Lower-EL savers. Slot 8/9 enter here with the interrupted state in the
+ * architectural GPRs and SP_EL0 selected by the exception mechanism. Spill
+ * x16-x19 before using any scratch, matching the frozen slot-5 veneer.
+ */
+    .balign 16
+je_arm_el0_sync_entry:
+    sub     sp, sp, #JE_TF_SIZE
+    stp     x16, x17, [sp, #(JE_TF_GPR + 128)]
+    stp     x18, x19, [sp, #(JE_TF_GPR + 144)]
+    b       je_arm_el0_sync_save
+
+    .balign 16
+je_arm_el0_irq_entry:
+    sub     sp, sp, #JE_TF_SIZE
+    stp     x16, x17, [sp, #(JE_TF_GPR + 128)]
+    stp     x18, x19, [sp, #(JE_TF_GPR + 144)]
+    b       je_arm_el0_irq_save
+
+je_arm_el0_sync_save:
+    stp     x0,  x1,  [sp, #(JE_TF_GPR + 0)]
+    stp     x2,  x3,  [sp, #(JE_TF_GPR + 16)]
+    stp     x4,  x5,  [sp, #(JE_TF_GPR + 32)]
+    stp     x6,  x7,  [sp, #(JE_TF_GPR + 48)]
+    stp     x8,  x9,  [sp, #(JE_TF_GPR + 64)]
+    stp     x10, x11, [sp, #(JE_TF_GPR + 80)]
+    stp     x12, x13, [sp, #(JE_TF_GPR + 96)]
+    stp     x14, x15, [sp, #(JE_TF_GPR + 112)]
+    stp     x20, x21, [sp, #(JE_TF_GPR + 160)]
+    stp     x22, x23, [sp, #(JE_TF_GPR + 176)]
+    stp     x24, x25, [sp, #(JE_TF_GPR + 192)]
+    stp     x26, x27, [sp, #(JE_TF_GPR + 208)]
+    stp     x28, x29, [sp, #(JE_TF_GPR + 224)]
+    str     x30,      [sp, #(JE_TF_GPR + 240)]
+    mrs     x0, SP_EL0
+    str     x0, [sp, #JE_TF_SP]
+    mrs     x0, ELR_EL1
+    mrs     x1, SPSR_EL1
+    stp     x0, x1, [sp, #JE_TF_ELR]
+    mrs     x0, ESR_EL1
+    mrs     x1, FAR_EL1
+    stp     x0, x1, [sp, #JE_TF_ESR]
+    mov     x0, #8
+    str     x0, [sp, #JE_TF_VECTOR]
+    str     xzr, [sp, #JE_TF_PAD]
+    adrp    x17, je_arm_in_handler
+    add     x17, x17, #:lo12:je_arm_in_handler
+    ldrb    w18, [x17]
+    cbnz    w18, je_arm_double_fault
+    mov     w18, #1
+    strb    w18, [x17]
+    ldr     x0, [sp, #JE_TF_ESR]
+    lsr     x1, x0, #26
+    and     x1, x1, #0x3f
+    cmp     x1, #0x15
+    b.eq    1f
+    mov     x0, sp
+    bl      je_arm_el0_fault
+    b       je_arm_restore_selected
+1:
+    mov     x0, sp
+    bl      je_arm_el0_svc
+    b       je_arm_restore_selected
+
+je_arm_el0_irq_save:
+    stp     x0,  x1,  [sp, #(JE_TF_GPR + 0)]
+    stp     x2,  x3,  [sp, #(JE_TF_GPR + 16)]
+    stp     x4,  x5,  [sp, #(JE_TF_GPR + 32)]
+    stp     x6,  x7,  [sp, #(JE_TF_GPR + 48)]
+    stp     x8,  x9,  [sp, #(JE_TF_GPR + 64)]
+    stp     x10, x11, [sp, #(JE_TF_GPR + 80)]
+    stp     x12, x13, [sp, #(JE_TF_GPR + 96)]
+    stp     x14, x15, [sp, #(JE_TF_GPR + 112)]
+    stp     x20, x21, [sp, #(JE_TF_GPR + 160)]
+    stp     x22, x23, [sp, #(JE_TF_GPR + 176)]
+    stp     x24, x25, [sp, #(JE_TF_GPR + 192)]
+    stp     x26, x27, [sp, #(JE_TF_GPR + 208)]
+    stp     x28, x29, [sp, #(JE_TF_GPR + 224)]
+    str     x30,      [sp, #(JE_TF_GPR + 240)]
+    mrs     x0, SP_EL0
+    str     x0, [sp, #JE_TF_SP]
+    mrs     x0, ELR_EL1
+    mrs     x1, SPSR_EL1
+    stp     x0, x1, [sp, #JE_TF_ELR]
+    stp     xzr, xzr, [sp, #JE_TF_ESR]
+    mov     x0, #9
+    str     x0, [sp, #JE_TF_VECTOR]
+    str     xzr, [sp, #JE_TF_PAD]
+    adrp    x17, je_arm_in_handler
+    add     x17, x17, #:lo12:je_arm_in_handler
+    ldrb    w18, [x17]
+    cbnz    w18, je_arm_double_fault
+    mov     w18, #1
+    strb    w18, [x17]
+    mov     x0, sp
+    bl      je_arm_irq
+    b       je_arm_restore_selected
+
+#endif
 #ifdef JE_ARM_TIMER_TEST
 /* ---- Returning IRQ restore proof (ADR 0012 D8). This loop owns x0-x30 while
  * I is unmasked, so C cannot accidentally hide an x16-x18 restore defect.

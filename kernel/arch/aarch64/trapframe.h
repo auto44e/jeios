@@ -31,7 +31,7 @@
 
 /* Byte offsets — shared by the asm saver (via the JE_TF_* macros) and C. */
 #define JE_TF_GPR     0    /* x0..x30, 31 * 8 = 248 bytes */
-#define JE_TF_SP      248  /* SP_EL1 at fault time */
+#define JE_TF_SP      248  /* interrupted-mode SP: SP_EL1 or SP_EL0 */
 #define JE_TF_ELR     256  /* ELR_EL1 — faulting PC (D5-3 fixup key) */
 #define JE_TF_SPSR    264  /* SPSR_EL1 — pre-exception PSTATE */
 #define JE_TF_ESR     272  /* ESR_EL1 — syndrome (EC/IL/ISS) */
@@ -43,9 +43,13 @@
 #ifndef __ASSEMBLER__
 #include <stdint.h>
 
+#define JE_ARM_SPSR_M_MASK UINT64_C(0x1f)
+#define JE_ARM_SPSR_M_EL1H UINT64_C(0x5)
+#define JE_ARM_SPSR_M_EL0T UINT64_C(0x0)
+
 typedef struct {
     uint64_t gpr[31];   /* x0..x30 */
-    uint64_t sp;        /* SP_EL1 at fault */
+    uint64_t sp;        /* interrupted-mode SP (SP_EL1 or SP_EL0) */
     uint64_t elr;       /* ELR_EL1 (faulting PC) */
     uint64_t spsr;      /* SPSR_EL1 */
     uint64_t esr;       /* ESR_EL1 */
@@ -53,6 +57,15 @@ typedef struct {
     uint64_t vector;    /* 0..15 */
     uint64_t pad;       /* reserved */
 } je_arm_trapframe;
+
+/*
+ * D3 boundary: callers must select the SP accessor matching the validated
+ * interrupted mode. Each accessor fail-stops on the other mode; returning a
+ * pointer permits the frame builder and proof fault-injection path to update
+ * the field without raw ->sp access outside the scheduler boundary.
+ */
+uint64_t *je_arm_tf_kernel_sp(je_arm_trapframe *frame);
+uint64_t *je_arm_tf_user_sp(je_arm_trapframe *frame);
 
 _Static_assert(sizeof(je_arm_trapframe) == JE_TF_SIZE, "arm trapframe size");
 _Static_assert(__builtin_offsetof(je_arm_trapframe, gpr)    == JE_TF_GPR,    "tf gpr");

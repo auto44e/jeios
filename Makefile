@@ -122,6 +122,8 @@ check: all test
 	@! comm -12 $(BUILD)/spawn_undef.txt $(BUILD)/main_def.txt | grep .
 	@echo "Lifecycle boundary (ADR 0014): neutral module has no x86 tokens and compiles arch-neutral"
 	@sh tools/check_lifecycle_boundary.sh
+	@echo "AArch64 trap-frame boundary (ADR 0015 D3): SP uses mode-checked accessors"
+	@sh tools/check_arm_trapframe_boundary.sh
 # Critical-mutant assurance (issue #18/#19, "curl-style" local CI). For each named
 # critical mutant, tools/mutants.py applies a precise reversible source transform
 # that BREAKS one security/correctness invariant, rebuilds the one hosted test that

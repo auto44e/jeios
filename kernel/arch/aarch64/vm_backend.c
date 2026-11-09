@@ -13,13 +13,11 @@
  *   arena L2[0]             = private arena L3
  *   arena L3                = private EL0 leaves
  *
- * The roots are built while the MMU is off. The proof then installs each root
- * and uses AT S1E0R/W from EL1. No EL0 entry, trap frame, or SVC path is
- * involved in this slice. MP3a-1 therefore does not provide MMU-on mappings
- * for process table/user-frame construction or teardown: the identity
- * phys_ptr() accesses, cache maintenance, and clear-PTE/TLBI lifecycle are
- * explicit MP3a-2 work. The backend fails closed if those operations are
- * reached after enable.
+ * The backend uses the same physical ownership model before and after enable.
+ * Once the MMU is on, each process table or transient user-frame access is
+ * exposed through one bounded identity alias, then removed before publication
+ * or reuse. The page-table and cache/TLBI ordering is therefore explicit at
+ * every MMU-on boundary.
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -144,6 +142,39 @@ static void zero_frames(uint64_t physical, size_t pages)
     }
 }
 
+static uint64_t *identity_page(uint64_t physical)
+{
+    if (!in_phys_window(physical) ||
+        (physical & (JE_PAGE_SIZE - 1u)) != 0u)
+        return NULL;
+    if (je_arm_mmu_is_enabled(&je_arm_mmu_context) &&
+        je_arm_mmu_map_page(&je_arm_mmu_context, physical, physical,
+                            JE_MAP_RW) != JE_OK)
+        return NULL;
+    return (uint64_t *)phys_ptr(physical);
+}
+
+static void identity_page_release(uint64_t physical)
+{
+    if (je_arm_mmu_is_enabled(&je_arm_mmu_context) &&
+        je_arm_mmu_unmap_page(&je_arm_mmu_context, physical) != JE_OK)
+        arm_fail_stop();
+}
+
+static void zero_extent(arm_extent *extent)
+{
+    if (!extent) arm_fail_stop();
+    for (size_t page = 0u; page < extent->pages; ++page) {
+        const uint64_t physical = extent_frame(extent, (uint32_t)page);
+        uint64_t *mapped = identity_page(physical);
+        if (!mapped) arm_fail_stop();
+        for (size_t word = 0u; word < JE_PAGE_SIZE / sizeof(uint64_t);
+             ++word)
+            mapped[word] = 0u;
+        identity_page_release(physical);
+    }
+}
+
 static uint64_t table_descriptor(uint64_t physical)
 {
     return (physical & ARM_DESC_ADDR_MASK) | ARM_DESC_TABLE;
@@ -236,7 +267,6 @@ static je_status arm_link_tables(void *ctx, uint32_t process,
                                  uint32_t table_extent, uint32_t *out_root)
 {
     arm_vm_state *state = ctx;
-    if (je_arm_mmu_is_enabled(&je_arm_mmu_context)) arm_fail_stop();
     if (!state || !out_root || process >= JE_VM_MAX_PROCESSES ||
         state->kernel_root == 0u)
         return JE_ERR_INVALID;
@@ -246,15 +276,17 @@ static je_status arm_link_tables(void *ctx, uint32_t process,
         return JE_ERR_INVALID;
 
     if (!state->kernel_root_decorated) return JE_ERR_INVALID;
-    uint64_t *kernel_root = phys_ptr(state->kernel_root);
     uint64_t root_pa = extent_frame(extent, 0u);
     uint64_t l1_pa = extent_frame(extent, 1u);
     uint64_t l2_pa = extent_frame(extent, 2u);
     uint64_t l3_pa = extent_frame(extent, 3u);
-    uint64_t *root = phys_ptr(root_pa);
-    uint64_t *l1 = phys_ptr(l1_pa);
-    uint64_t *l2 = phys_ptr(l2_pa);
+    uint64_t *root = identity_page(root_pa);
+    uint64_t *l1 = identity_page(l1_pa);
+    uint64_t *l2 = identity_page(l2_pa);
+    uint64_t *l3 = identity_page(l3_pa);
+    if (!root || !l1 || !l2 || !l3) arm_fail_stop();
     zero_frames(root_pa, JE_VM_TABLE_PAGES);
+    uint64_t *kernel_root = (uint64_t *)phys_ptr(state->kernel_root);
 
     /* The process root shares the complete kernel L0 array byte-for-byte.
      * The kernel root was decorated once, after the unchanged MP2 audit, so
@@ -266,6 +298,10 @@ static je_status arm_link_tables(void *ctx, uint32_t process,
     root[32] = table_descriptor(l1_pa) | ARM_L0_ARENA_PXNTABLE;
     l1[0] = table_descriptor(l2_pa);
     l2[0] = table_descriptor(l3_pa);
+    identity_page_release(l3_pa);
+    identity_page_release(l2_pa);
+    identity_page_release(l1_pa);
+    identity_page_release(root_pa);
     state->process[process] = (arm_process){ true, root_pa, table_extent };
     *out_root = (uint32_t)root_pa;
     return JE_OK;
@@ -275,7 +311,6 @@ static je_status arm_install_pte(void *ctx, je_vm_ref frame,
                                  uint64_t arena_offset)
 {
     arm_vm_state *state = ctx;
-    if (je_arm_mmu_is_enabled(&je_arm_mmu_context)) arm_fail_stop();
     if (!state || frame.process >= JE_VM_MAX_PROCESSES ||
         arena_offset >= JE_VM_ARENA_SIZE ||
         (arena_offset & (JE_PAGE_SIZE - 1u)) != 0u)
@@ -287,26 +322,33 @@ static je_status arm_install_pte(void *ctx, je_vm_ref frame,
         return JE_ERR_INVALID;
     arm_extent *tables = extent_of(state, frame.process, process->table_extent);
     if (!tables) return JE_ERR_INVALID;
-    uint64_t *l3 = phys_ptr(extent_frame(tables, 3u));
+    const uint64_t l3_pa = extent_frame(tables, 3u);
+    uint64_t *l3 = identity_page(l3_pa);
+    if (!l3) arm_fail_stop();
     size_t index = (size_t)(arena_offset / JE_PAGE_SIZE);
-    if ((l3[index] & ARM_DESC_VALID) != 0u) return JE_ERR_INVALID;
+    if ((l3[index] & ARM_DESC_VALID) != 0u) {
+        identity_page_release(l3_pa);
+        return JE_ERR_INVALID;
+    }
     const uint64_t physical = extent_frame(extent, frame.page);
     if (extent->kind != JE_VM_USER_DATA) {
         const je_map_class cls = extent->kind == JE_VM_USER_CODE
                                      ? JE_MAP_USER_CODE
                                      : JE_MAP_USER_RODATA;
         if (je_arm_mmu_publish_user_frame(&je_arm_mmu_context, physical, cls) !=
-            JE_OK)
+            JE_OK) {
+            identity_page_release(l3_pa);
             return JE_ERR_DENIED;
+        }
     }
     l3[index] = physical | user_leaf_bits(extent->kind);
+    identity_page_release(l3_pa);
     return JE_OK;
 }
 
 static je_status arm_demote_alias(void *ctx, je_vm_ref frame)
 {
     arm_vm_state *state = ctx;
-    if (je_arm_mmu_is_enabled(&je_arm_mmu_context)) arm_fail_stop();
     arm_extent *extent = extent_of(state, frame.process, frame.extent);
     if (!extent || !user_kind(extent->kind) ||
         extent->kind == JE_VM_USER_DATA || frame.page >= extent->pages)
@@ -319,16 +361,24 @@ static je_status arm_demote_alias(void *ctx, je_vm_ref frame)
 
 static void arm_unmap(void *ctx, je_vm_ref frame)
 {
-    (void)ctx;
-    (void)frame;
-    if (je_arm_mmu_is_enabled(&je_arm_mmu_context)) arm_fail_stop();
+    arm_vm_state *state = ctx;
+    const arm_extent *extent = extent_of_const(state, frame.process,
+                                               frame.extent);
+    if (!extent || !user_kind(extent->kind) || frame.page >= extent->pages)
+        arm_fail_stop();
+    const uint64_t physical = extent_frame(extent, frame.page);
+    if (extent->kind == JE_VM_USER_CODE &&
+        je_arm_mmu_sync_user_code(physical) != JE_OK)
+        arm_fail_stop();
+    if (je_arm_mmu_is_enabled(&je_arm_mmu_context) &&
+        je_arm_mmu_unmap_page(&je_arm_mmu_context, physical) != JE_OK)
+        arm_fail_stop();
 }
 
 static void arm_clear_pte(void *ctx, uint32_t process, uint64_t arena_offset)
 {
     arm_vm_state *state = ctx;
-    if (state == NULL || je_arm_mmu_is_enabled(&je_arm_mmu_context))
-        arm_fail_stop();
+    if (state == NULL) arm_fail_stop();
     arm_process *proc = process < JE_VM_MAX_PROCESSES
                             ? &state->process[process] : NULL;
     if (!proc || !proc->used || arena_offset >= JE_VM_ARENA_SIZE ||
@@ -336,10 +386,17 @@ static void arm_clear_pte(void *ctx, uint32_t process, uint64_t arena_offset)
         for (;;) __asm__ volatile("wfe");
     arm_extent *tables = extent_of(state, process, proc->table_extent);
     if (!tables) for (;;) __asm__ volatile("wfe");
-    uint64_t *l3 = phys_ptr(extent_frame(tables, 3u));
+    const uint64_t l3_pa = extent_frame(tables, 3u);
+    uint64_t *l3 = identity_page(l3_pa);
+    if (!l3) arm_fail_stop();
     uint64_t *slot = &l3[arena_offset / JE_PAGE_SIZE];
     const uint64_t descriptor = *slot;
     if ((descriptor & ARM_DESC_VALID) == 0u) arm_fail_stop();
+    *slot = 0u;
+    if (je_arm_mmu_is_enabled(&je_arm_mmu_context) &&
+        je_arm_mmu_flush_va_asid(JE_VM_ARENA_BASE + arena_offset, 1u) !=
+            JE_OK)
+        arm_fail_stop();
     const uint64_t bits = descriptor & ~ARM_DESC_ADDR_MASK;
     if (bits == JE_ARM_USER_CODE_BITS ||
         bits == JE_ARM_USER_RODATA_BITS) {
@@ -347,13 +404,12 @@ static void arm_clear_pte(void *ctx, uint32_t process, uint64_t arena_offset)
                 &je_arm_mmu_context, descriptor & ARM_DESC_ADDR_MASK) != JE_OK)
             arm_fail_stop();
     }
-    *slot = 0u;
+    identity_page_release(l3_pa);
 }
 
 static void arm_restore_alias(void *ctx, je_vm_ref frame)
 {
     arm_vm_state *state = ctx;
-    if (je_arm_mmu_is_enabled(&je_arm_mmu_context)) arm_fail_stop();
     arm_extent *extent = extent_of(state, frame.process, frame.extent);
     if (!extent || !user_kind(extent->kind) ||
         extent->kind == JE_VM_USER_DATA || frame.page >= extent->pages)
@@ -366,10 +422,9 @@ static void arm_restore_alias(void *ctx, je_vm_ref frame)
 static void arm_free_extent(void *ctx, uint32_t process, uint32_t id)
 {
     arm_vm_state *state = ctx;
-    if (je_arm_mmu_is_enabled(&je_arm_mmu_context)) arm_fail_stop();
     arm_extent *extent = extent_of(state, process, id);
     if (!extent) for (;;) __asm__ volatile("wfe");
-    zero_frames(extent->physical, extent->pages);
+    zero_extent(extent);
     if (je_pages_free(state->pages, extent->physical, extent->pages) != JE_OK)
         for (;;) __asm__ volatile("wfe");
     extent->used = false;
@@ -378,11 +433,18 @@ static void arm_free_extent(void *ctx, uint32_t process, uint32_t id)
 static void arm_release_hold(void *ctx, uint64_t physical, size_t pages)
 {
     arm_vm_state *state = ctx;
-    if (je_arm_mmu_is_enabled(&je_arm_mmu_context)) arm_fail_stop();
     if (!state || !in_phys_window(physical) ||
         pages == 0u || pages > (JE_PHYSICAL_LIMIT - physical) / JE_PAGE_SIZE)
         for (;;) __asm__ volatile("wfe");
-    zero_frames(physical, pages);
+    for (size_t page = 0u; page < pages; ++page) {
+        const uint64_t pa = physical + (uint64_t)page * JE_PAGE_SIZE;
+        uint64_t *mapped = identity_page(pa);
+        if (!mapped) arm_fail_stop();
+        for (size_t word = 0u; word < JE_PAGE_SIZE / sizeof(uint64_t);
+             ++word)
+            mapped[word] = 0u;
+        identity_page_release(pa);
+    }
     if (je_pages_free(state->pages, physical, pages) != JE_OK)
         for (;;) __asm__ volatile("wfe");
 }
@@ -399,25 +461,11 @@ static void arm_drop_tables(void *ctx, uint32_t process)
 static void arm_flush(void *ctx)
 {
     (void)ctx;
-    /* MP3a-1 builds and tears down user roots MMU-off. A no-op after enable
-     * would silently violate clear-PTE -> flush and cache-maintenance
-     * ownership; MP3a-2 must provide mapped-table maintenance before teardown. */
-    if (je_arm_mmu_is_enabled(&je_arm_mmu_context)) arm_fail_stop();
-}
-
-static bool arm_l3(const arm_vm_state *state, uint32_t process,
-                   uint64_t arena_offset, uint64_t **out_l3)
-{
-    if (!state || !out_l3 || process >= JE_VM_MAX_PROCESSES ||
-        arena_offset >= JE_VM_ARENA_SIZE)
-        return false;
-    const arm_process *proc = &state->process[process];
-    const arm_extent *tables =
-        extent_of_const(state, process, proc->table_extent);
-    if (!proc->used || !tables) return false;
-    *out_l3 = &((uint64_t *)phys_ptr(extent_frame(tables, 3u)))
-        [arena_offset / JE_PAGE_SIZE];
-    return true;
+    if (je_arm_mmu_is_enabled(&je_arm_mmu_context))
+        __asm__ volatile("dsb ish\n\t"
+                         "tlbi vmalle1is\n\t"
+                         "dsb ish\n\t"
+                         "isb" ::: "memory");
 }
 
 static je_status arm_read_user_pte(void *ctx, uint32_t process,
@@ -425,27 +473,43 @@ static je_status arm_read_user_pte(void *ctx, uint32_t process,
                                     je_vm_perm *out_perm, int *out_present)
 {
     arm_vm_state *state = ctx;
-    uint64_t *slot = NULL;
     if (!out_phys || !out_perm || !out_present ||
-        !arm_l3(state, process, arena_offset, &slot))
+        process >= JE_VM_MAX_PROCESSES ||
+        arena_offset >= JE_VM_ARENA_SIZE ||
+        (arena_offset & (JE_PAGE_SIZE - 1u)) != 0u)
         return JE_ERR_INVALID;
+    const arm_process *proc = &state->process[process];
+    const arm_extent *tables =
+        extent_of_const(state, process, proc->table_extent);
+    if (!proc->used || !tables) return JE_ERR_INVALID;
+    const uint64_t l3_pa = extent_frame(tables, 3u);
+    uint64_t *l3 = identity_page(l3_pa);
+    if (!l3) return JE_ERR_INVALID;
+    uint64_t *slot = &l3[arena_offset / JE_PAGE_SIZE];
     uint64_t descriptor = *slot;
     if ((descriptor & ARM_DESC_VALID) == 0u) {
         *out_phys = 0u;
         *out_perm = (je_vm_perm)0;
         *out_present = 0;
+        identity_page_release(l3_pa);
         return JE_OK;
     }
     if ((descriptor & UINT64_C(3)) != ARM_DESC_TABLE ||
-        (descriptor & ARM_DESC_AP1) == 0u)
+        (descriptor & ARM_DESC_AP1) == 0u) {
+        identity_page_release(l3_pa);
         return JE_ERR_INVALID;
+    }
     *out_phys = descriptor & ARM_DESC_ADDR_MASK;
     *out_present = 1;
     const bool writable = (descriptor & ARM_DESC_AP2) == 0u;
     const bool executable = (descriptor & ARM_DESC_UXN) == 0u;
-    if (writable && executable) return JE_ERR_INVALID;
+    if (writable && executable) {
+        identity_page_release(l3_pa);
+        return JE_ERR_INVALID;
+    }
     *out_perm = executable ? JE_VM_PERM_RX
                            : writable ? JE_VM_PERM_RW_NX : JE_VM_PERM_R_NX;
+    identity_page_release(l3_pa);
     return JE_OK;
 }
 
@@ -468,13 +532,16 @@ static je_status arm_read_upper(void *ctx, uint32_t process, int level,
     case 1: table_page = 3u; break;
     default: return JE_ERR_INVALID;
     }
-    uint64_t descriptor =
-        ((uint64_t *)phys_ptr(extent_frame(tables, table_page)))[index];
+    const uint64_t table_pa = extent_frame(tables, table_page);
+    uint64_t *table = identity_page(table_pa);
+    if (!table) return JE_ERR_INVALID;
+    uint64_t descriptor = table[index];
     /* The arch-neutral flags contract is x86-shaped. ARM table descriptors
      * do not carry leaf AP/XN permissions, and decoding those bits here would
      * report meaningless values. The ARM topology audit bypasses this seam;
      * expose only presence for any legacy caller. */
     *out_flags = (descriptor & ARM_DESC_VALID) != 0u ? 1u : 0u;
+    identity_page_release(table_pa);
     return JE_OK;
 }
 
@@ -535,11 +602,15 @@ static const je_vm_ops arm_ops = {
 static void *arm_map(void *ctx, je_vm_ref frame)
 {
     arm_vm_state *state = ctx;
-    if (je_arm_mmu_is_enabled(&je_arm_mmu_context)) arm_fail_stop();
     const arm_extent *extent = extent_of_const(state, frame.process, frame.extent);
     if (!extent || !user_kind(extent->kind) || frame.page >= extent->pages)
         return NULL;
-    return phys_ptr(extent_frame(extent, frame.page));
+    const uint64_t physical = extent_frame(extent, frame.page);
+    if (je_arm_mmu_is_enabled(&je_arm_mmu_context) &&
+        je_arm_mmu_map_page(&je_arm_mmu_context, physical, physical,
+                            JE_MAP_RW) != JE_OK)
+        return NULL;
+    return phys_ptr(physical);
 }
 
 /*

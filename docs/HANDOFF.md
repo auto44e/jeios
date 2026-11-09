@@ -1,5 +1,157 @@
 # Agent handoff: M1/M2 kernel foundation
 
+## Current status — MP3a-2 FINAL FIX PASS — observed 2026-11-09T03:38:01+00:00
+
+Repository `/tmp/wt-mp3a2`, branch `wip/mp3a2`, exact inspected base commit
+`59e19046b515dac52f439478c2ae1c4e1df10782` (pre-change inspected commit;
+the final fix pass is the current local change recorded by this handoff). State:
+**implemented / tested locally / planned / not blocked**. Support tier
+demonstrated: QEMU 8.2.2 `virt-8.2`, `cortex-a72`, one CPU, 256 MiB. PR/issue
+state: no PR published, no push, no reviewer assignment; owner review, remote
+CI, physical ARM, and independent human qualification are still planned.
+The review transcripts are committed under
+`docs/adr/debates/0015-mp3a-el0-svc/`; the stray root-level
+`MP3A2-BRIEF.md` and `MP3A2-REVIEW.md` are removed by this fix pass.
+
+### Implemented
+
+MP3a-2 adds actual AArch64 EL0 execution on top of MP3a-1: slots 8/9 lower-EL
+savers, frozen-frame EL0 validation, first ERET, per-process TTBR0/ASID and
+kernel-stack selection, `SP_EL0`/TPIDR restore, x8 SVC decode/dispatch,
+fault-death, lifecycle reap-with-survivor, MMU-on user-frame/table teardown,
+EL0 sysreg hardening, and the two-process real-code proof. Non-EL0 profiles
+retain their fatal lower-EL stubs and existing EL1h behavior.
+
+Files changed or added:
+
+- `kernel/arch/aarch64/{main.c,paging.c,paging.h,sched_arm.c,trapframe.h,vectors.S,vm_backend.c,el0_test.c}`
+- `kernel/core/lifecycle.c`
+- `mk/aarch64.mk`
+- `tools/{check_arm_trapframe_boundary.sh,smoke_arm.py,run_arm_el0_test.py,mutants.json}`
+- `docs/{IMPLEMENTATION.md,HANDOFF.md}`
+- Removed the stray root-level `MP3A2-BRIEF.md` and `MP3A2-REVIEW.md`;
+  retained the committed review transcripts under
+  `docs/adr/debates/0015-mp3a-el0-svc/`.
+
+The proof is kernel/trusted-state driven. It does not accept a user-reported
+success flag: the smoke oracle checks non-zero SVC status/result and x16-x18
+canaries, distinct user-SP round-trips, a poisoned-TPIDRRO scrub round-trip,
+exact syndrome fields, same-VA different contents, timer-live preemption,
+three isolated mode discriminators plus one composite AArch32 case,
+DCC/CNTKCTL negative exercises, structural-vs-user-death classification,
+ordered death/reap, and continued peer execution. The MMU-on barrier/TLBI/cache
+sequences are documented and reviewed; QEMU TCG does not model stale TLB or
+cache behavior. The EL0 run keeps the timer live. Its PASS gate is evidence of
+at least one completed lone self-yield reselect plus at least one lone
+self-targeted IRQ reselect; the PASS marker is emitted before the second lone
+self-yield dispatch completes.
+The `(!vector_el1 && !vector_el0)` range clause has no independent negative
+probe yet and is not independently enforced by this proof.
+
+### Tested
+
+Exact commands and observed results:
+
+```text
+make aarch64 ARM_EL0_TEST=1                       PASS
+make aarch64 ARM_USER_TEST=1                      PASS
+make smoke-aarch64 ARM_USER_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60
+                                                     PASS
+make smoke-aarch64 ARM_EL0_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60
+                                                     PASS
+make smoke-aarch64 ARM_REQUIRE=1                  PASS
+make smoke-aarch64 ARM_SCHED_TEST=1 ARM_REQUIRE=1 PASS
+make smoke-aarch64 ARM_TIMER_TEST=1 ARM_REQUIRE=1 PASS
+make smoke-aarch64 ARM_MMU_FAULT=text ARM_REQUIRE=1 PASS
+timeout 60 qemu-system-aarch64 -M virt-8.2,gic-version=2,virtualization=off,secure=off,dtb-randomness=off -cpu cortex-a72 -smp 1 -m 256M -display none -serial file:/tmp/fx2.log -no-reboot -kernel build/aarch64-el0test/Image
+                                                     serial PASS; timeout rc 124 after halt
+make mutants                                       PASS (55 killed, 1 equivalent, 0 survived, 0 blocked, 1 skipped)
+make check                                         PASS
+sh tools/check_arm_trapframe_boundary.sh           PASS (self-test catches all 3 raw-SP forms)
+git diff --check                                   PASS
+python3 -m json.tool tools/mutants.json            PASS
+python3 -m py_compile tools/smoke_arm.py tools/run_arm_el0_test.py
+                                                     PASS
+```
+
+The final `make mutants` result was `55 killed, 1 equivalent, 0 SURVIVED,
+0 BLOCKED, 1 skipped`; there were no survivors or blocked mutants. The
+ARM-USER mutants include the TPIDRRO scrub, vector/M discriminator, and
+CNTKCTL/DCC syndrome guards; each is required to be killed. The scheduler
+mutant is load-bearing: its mutated raw boot FATALs
+`sched no live EL0 successor`. The remaining unobserved items are hardware
+cache/TLB effects and physical-ARM execution.
+
+### Fix-pass mutation evidence
+
+Each listed mutation was injected into a disposable build and booted far
+enough to verify a kernel `FATAL`; no result below relies only on a printed
+success marker:
+
+- Deleting the EL0t `TPIDRRO_EL0` scrub caused
+  `FATAL el0-test svc-proof-result`.
+- Deleting the `vector_el0 && mode != EL0t` discriminator caused
+  `FATAL el0-test mode-negative`.
+- Replacing CNTKCTL zero-hardening with the old EL0PTEN-enabled mask caused
+  `FATAL el0-test cntkctl-trap-syndrome`.
+- Clearing TDCC in a disposable DCC mutation caused
+  `FATAL el0-test dcc-trap-syndrome`.
+- The MODE-CONFUSION mutation caused
+  `FATAL sched kernel-sp mode` inside the synthetic probe.
+- The boundary self-test catches `(*tf).sp`, `tf[0].sp`, and `tf-> sp`;
+  the real source scan passes.
+
+### EL0 proof serial evidence
+
+```text
+EL0 MODE_CHECK EL1h-frame-rejected-as-EL0
+EL0 MODE_CHECK vector9-EL1h-rejected
+EL0 MODE_CHECK vector5-EL0t-rejected
+EL0 MODE_CHECK aarch32-M4-composite-rejected
+EL0 setup two-processes real-code timer-live
+EL0 TIMER_PREEMPT from=1 to=2 switches=1
+EL0 SVC register proof slot=1 status=1 result=0x...5aa5 x16=...1616 x17=...1717 x18=...1818 tpidrro=0x...0000
+EL0 TPIDRRO_ROUND_TRIP slot=1 value=0x...0000
+EL0 SVC register proof slot=2 status=1 result=0x...5aa5 x16=...1616 x17=...1717 x18=...1818 tpidrro=0x...0000
+EL0 TPIDRRO_ROUND_TRIP slot=2 value=0x...0000
+EL0 RUN slot=1 data=0x...1111 arena=0x0000100000002000
+EL0 RUN slot=2 data=0x...2222 arena=0x0000100000002000
+EL0 EXPECTED_DEATH stage=0 ec=0x...0024 FAR=0x0000000040000000
+EL0 EXPECTED_DEATH stage=1 ec=0x...0024 FAR=0x0000000040000000
+EL0 EXPECTED_DEATH stage=2 ec=0x...0020 FAR=0x0000000040000000
+EL0 EXPECTED_DEATH stage=3 reason=2 (bad SP)
+EL0 EXPECTED_DEATH stage=4 reason=2 (bad ELR)
+EL0 EXPECTED_DEATH stage=5 ec=0x...0007 (FP)
+EL0 EXPECTED_DEATH stage=6 ec=0x...0018 (CNTVCT)
+EL0 EXPECTED_DEATH stage=7 ec=0x...0015 (SVC #1)
+EL0 CNTKCTL_PREEMPT_WRITE_TRAP stage=8
+EL0 DCC_CHANNEL_TRAP stage=9
+EL0 REAP_WITH_SURVIVOR stage=0..9
+EL0 REAP_WITH_SURVIVOR lone slot=2
+EL0 LONE_SURVIVOR_YIELD slot=1 count=1
+EL0 LONE_IRQ_RESELECT slot=1
+EL0 proof PASS reviewed-cache-tlb=not-observed
+```
+
+### Planned
+
+MP3b and MP3c are deferred to their bounded ADR/roadmap gates. Remaining
+qualification work is owner review, remote CI reproduction, physical ARM
+execution, independent human review, and any future runtime IRQ/EL0 profile
+needed to promote beyond the demonstrated QEMU tier.
+
+### Blocked / not enforced
+
+Nothing is currently blocked. Not enforced or observed here: cache/TLB
+staleness on hardware, physical ARM, SMP, arbitrary board support, dynamic
+loading, broad application ABIs, remote CI, and independent human
+qualification. Security statements above map to actual EL0 frame validation,
+TTBR0/ASID installation, explicit ASID-1 per-page TLBI, sysreg readback,
+exception syndrome checks, mode-checked SP accessors, and lifecycle state
+transitions; they are not blanket claims about all hardware. The 64-byte
+cache-line stride, identity-VA I-cache invalidation, and VALE1IS-to-VAE1IS
+maintenance edit remain target-profile/flagged items.
+
 ## Current status — MP3a-1 adversarial fix pass — observed 2026-11-08T23:29:54Z
 
 Repository `/tmp/wt-mp3a1`, branch `wip/mp3a1`, exact inspected base commit

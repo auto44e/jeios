@@ -21,6 +21,10 @@
 #include <jeios/endpoint_kern.h>
 #include <jeios/lifecycle.h>
 
+#if defined(JE_ARM_NO_DEVICE_HOOKS) && !defined(JE_ARM_NO_DEVICE_HOOKS_ACK)
+#error "JE_ARM_NO_DEVICE_HOOKS requires an explicit build-profile acknowledgement"
+#endif
+
 static je_proc_pool *process_pool;
 static je_vm *registered_vm[JE_VM_MAX_PROCESSES];
 static je_proc_id registered_proc[JE_VM_MAX_PROCESSES];
@@ -84,7 +88,11 @@ je_proc_pool *je_lc_proc_pool(void)
  * corrected). */
 void je_lc_release_waiter(uint32_t slot)
 {
+#if defined(JE_ARM_NO_DEVICE_HOOKS)
+    (void)slot;
+#else
     (void)je_endpoint_kern_waiter_release_by_id(slot);
+#endif
 }
 
 /* The ordered dying side-effect prefix, moved verbatim from mark_dying. ORDER is
@@ -101,10 +109,10 @@ je_status je_lc_on_dying(uint32_t slot, je_proc_id proc_id, uint32_t reason,
 {
     je_lc_release_waiter(slot);
     if (proc_id.gen == 0u) return JE_OK;
-#ifdef JE_SCHED_HOSTED_TEST
+#if defined(JE_SCHED_HOSTED_TEST) || defined(JE_ARM_NO_DEVICE_HOOKS)
     (void)vector;
 #endif
-#ifndef JE_SCHED_HOSTED_TEST
+#if !defined(JE_SCHED_HOSTED_TEST) && !defined(JE_ARM_NO_DEVICE_HOOKS)
     if (reason == JE_ABI_DEATH_FAULT)
         je_device_note_fault_after_admin_revoke(je_kernel_device(), proc_id, vector);
     je_device_on_process_dying(je_kernel_device(), proc_id);

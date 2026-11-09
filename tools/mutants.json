@@ -629,6 +629,244 @@
       },
       "enabled": true,
       "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-DROP-SP-EL0-RESTORE",
+      "invariant": "the EL0 restore tail must install the captured SP_EL0 before ERET so the first and subsequent lower-EL traps land on the user stack",
+      "file": "kernel/arch/aarch64/vectors.S",
+      "find": "    msr     SP_EL0, x2",
+      "replace": "    nop",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 smoke named user-SP round-trip check: the user must observe its distinct in-arena SP_EL0 after entry and every SVC/yield; omitting SP_EL0 restoration must FATAL el0-test user-sp",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-EL0-VALIDATOR-MODE-CONFUSION",
+      "invariant": "the EL0 validator path is selected only for SPSR.M=EL0t; an EL1h frame must not be accepted as an EL0 return",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "    if (mode == JE_ARM_SPSR_M_EL0T) {",
+      "replace": "    if (mode == JE_ARM_SPSR_M_EL1H) {",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 smoke mode probe: the mutant dies at FATAL sched kernel-sp mode inside the synthetic probe, before the mode-negative marker can be claimed",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-MODE-VECTOR-EL0T",
+      "invariant": "a lower-EL vector must carry SPSR.M=EL0t; an otherwise-valid EL1h frame tagged as vector 9 must be rejected by the vector/M discriminator",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "        (vector_el0 && mode != JE_ARM_SPSR_M_EL0T) ||",
+      "replace": "        (0 && (vector_el0 && mode != JE_ARM_SPSR_M_EL0T)) ||",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 smoke mode probe: deleting the vector 9/SPSR.M=EL0t discriminator must FATAL el0-test mode-negative",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-SVC-WRITES-X0-BEFORE-DECODE",
+      "invariant": "the ARM SVC dispatcher must copy syscall arguments and decode before overwriting x0 with the ABI status",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "    uint64_t args[6];",
+      "replace": "    tf->gpr[0] = UINT64_C(0xffffffffffffffff);\n    uint64_t args[6];",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 smoke SVC proof: status/result and x16-x18 must remain correct after argument capture",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-FAULT-DOES-NOT-KILL",
+      "invariant": "a lower-EL synchronous fault must mark only the offending process dying and resume a live successor",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "    arm_user_mark_dying(slot, reason, code, vector);",
+      "replace": "    (void)code;\n    (void)vector;\n    sched_fatal(\"EL0 fault did not kill\");",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 smoke kernel-VA fault and reap-with-survivor markers: the faulting process must die without a kernel halt",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-SKIP-CPACR-FPEN",
+      "invariant": "the user dispatch path must pin CPACR_EL1.FPEN=00 and fail closed if the readback is not hardened",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "    value &= ~(UINT64_C(3) << 20); /* CPACR_EL1.FPEN=00: no EL0 FP/SIMD. */",
+      "replace": "    value |= UINT64_C(3) << 20; /* mutant: permit EL0 FP/SIMD. */",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 smoke hardening/FP stage: the seeded FPEN state must be cleared before the first ERET",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-SKIP-TPIDR-EL0-ZERO",
+      "invariant": "the EL0 restore tail must clear TPIDR_EL0 so a value from one process cannot leak into the next process",
+      "file": "kernel/arch/aarch64/vectors.S",
+      "find": "    msr     TPIDR_EL0, xzr",
+      "replace": "    nop",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 smoke TPIDR_EL0 reset/round-trip checks: the scheduler-seeded poison must never be observed by either process",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-NO-TPIDRRO-SCRUB",
+      "invariant": "the EL0 restore tail must clear a scheduler-poisoned TPIDRRO_EL0 before ERET",
+      "file": "kernel/arch/aarch64/vectors.S",
+      "find": "    msr     TPIDRRO_EL0, xzr",
+      "replace": "    nop",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 raw proof: deleting the TPIDRRO_EL0 scrub must FATAL el0-test svc-proof-result when the poisoned readback reaches the SVC proof",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-CNTKCTL-OLD-MASK",
+      "invariant": "CNTKCTL_EL1 hardening must write zero rather than an old mask that leaves EL0PTEN enabled",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "    const uint64_t cntkctl = UINT64_C(0);\n    const uint64_t cntkctl_forbidden = UINT64_C(0x303);",
+      "replace": "    const uint64_t cntkctl = UINT64_C(0x300);\n    const uint64_t cntkctl_forbidden = UINT64_C(0x3);",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 raw proof: old CNTKCTL mask permits the CNTP_CTL write, then the wrong undefined-instruction death must FATAL cntkctl-trap-syndrome instead of printing the trap marker",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-CNTKCTL-ISS-GUARD",
+      "invariant": "the CNTKCTL negative marker is printed only for EC=0x18 with the exact CNTP_CTL_EL0 ISS",
+      "file": "kernel/arch/aarch64/el0_test.c",
+      "find": "#define JE_EL0_CNTP_CTL_ISS UINT64_C(0x000000000032f804)",
+      "replace": "#define JE_EL0_CNTP_CTL_ISS UINT64_C(0x00000000deadbeef)",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 raw proof: an incorrect CNTP_CTL syndrome must FATAL cntkctl-trap-syndrome before printing CNTKCTL_PREEMPT_WRITE_TRAP",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-DCC-ISS-GUARD",
+      "invariant": "the DCC negative marker is printed only for EC=0x18 with the exact MDCCSR_EL0 ISS",
+      "file": "kernel/arch/aarch64/el0_test.c",
+      "find": "#define JE_EL0_DCC_ISS UINT64_C(0x000000000020c003)",
+      "replace": "#define JE_EL0_DCC_ISS UINT64_C(0x00000000deadbeef)",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 raw proof: an incorrect DCC syndrome must FATAL dcc-trap-syndrome before printing DCC_CHANNEL_TRAP",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-ACCEPT-BAD-USER-ELR",
+      "invariant": "a captured EL0 return ELR outside the process arena must be classified as user death before ERET",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "                   frame->elr < arena || frame->elr >= arena_end ||",
+      "replace": "                   false ||",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 smoke BAD_RETURN ELR marker: the bad return must die as reason=BAD_RETURN before a lower-EL fetch",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-NO-SP-EL1-INSTALL",
+      "invariant": "the EL0 restore seam must install the selected user thread's kernel stack as SP_EL1 before ERET",
+      "file": "kernel/arch/aarch64/vectors.S",
+      "find": "    mov     sp, x2",
+      "replace": "    nop",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 smoke SP_EL1 boundary check: omitting the restore-seam SP_EL1 install must fail the EL0 frame-position check at sched_arm.c:366-367 and reach FATAL sched observed_running at sched_arm.c:865",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-USER-LONE-SURVIVOR-READY-BEFORE-PICK",
+      "invariant": "arm_switch_to_ready must demote a still-RUNNING current EL0 slot to READY before je_rr_pick so a lone live survivor can re-select itself",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "    if (current != 0u && current < JE_RR_MAX &&\n        je_arm_rr.slots[current].state == JE_RR_RUNNING)\n        je_arm_rr.slots[current].state = JE_RR_READY;",
+      "replace": "    if (0 && (current != 0u && current < JE_RR_MAX &&\n        je_arm_rr.slots[current].state == JE_RR_RUNNING))\n        je_arm_rr.slots[current].state = JE_RR_READY;",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 raw boot/liveness proof: reverting the arm_switch_to_ready READY-before-pick demotion (sched_arm.c:922-924) must FATAL sched no live EL0 successor before the proof can complete a lone self-yield reselect or self-targeted IRQ reselect",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
     }
   ]
 }
