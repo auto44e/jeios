@@ -253,10 +253,15 @@ def _build_and_run(workdir, m, timeout, jobs):
     tgt = m.get("build")
     if tgt:
         tgt_path = os.path.join(workdir, tgt)
-        try:
-            os.remove(tgt_path)   # force a real recompile of the (maybe #included) TU
-        except OSError:
-            pass
+        # Rebuild the target's private tree, not just its final artifact.
+        # Several kernel TUs include source fragments (notably the ARM/x86
+        # syscall glue), while the hand-written Makefile rules cannot list
+        # every fragment as a prerequisite.  Removing only Image would let
+        # the mutated build reuse the pristine object and report a false
+        # SURVIVED result.  The runner owns this disposable snapshot, so
+        # deleting the target's build directory is recoverable and keeps the
+        # baseline and mutant configurations symmetric.
+        shutil.rmtree(os.path.dirname(tgt_path), ignore_errors=True)
         make = ["make", tgt] + ([f"-j{jobs}"] if jobs else [])
         rc, out, to = _run(make, cwd=workdir, env=env, timeout=timeout)
         if to:

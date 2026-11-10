@@ -34,7 +34,14 @@ typedef enum {
     JE_SYSCALL_PROC_KILL = 16,       /* ADR 0010 D8: glue resolves KILL, calls je_sched_kill */
     JE_SYSCALL_DEV_ASSIGN = 17,
     JE_SYSCALL_DEV_REVOKE = 18,
-    JE_SYSCALL_DEV_IRQ_ACK = 19
+    JE_SYSCALL_DEV_IRQ_ACK = 19,
+    /*
+     * Internal glue action, deliberately outside the public operation-number
+     * space.  A blocking recv parks before status/result write-back; the ARM
+     * SVC seam uses this value to keep that control transfer distinct from
+     * every decoded ABI operation.
+     */
+    JE_SYSCALL_BLOCK = 0x100
 #ifdef JE_DEV_COPY_INJECT
     , JE_SYSCALL_COPY_FIXUP_INJECT = 4  /* glue raw-copies an unmapped page (fixup test) */
 #endif

@@ -190,6 +190,26 @@ void je_rr_sleep(je_rr_table *t, uint32_t slot, uint64_t now, uint64_t n)
     ctx->state = JE_RR_SLEEPING;
 }
 
+void je_rr_block(je_rr_table *t, uint32_t slot)
+{
+    je_rr_ctx *ctx;
+
+    if (t == NULL || slot == 0u || slot >= JE_RR_MAX ||
+        slot != t->current)
+        return;
+    ctx = &t->slots[slot];
+    if (ctx->state != JE_RR_RUNNING) return;
+    ctx->wake = 0u;
+    ctx->state = JE_RR_BLOCKED;
+}
+
+void je_rr_wake(je_rr_table *t, uint32_t slot)
+{
+    if (t == NULL || slot == 0u || slot >= JE_RR_MAX) return;
+    if (t->slots[slot].state == JE_RR_BLOCKED)
+        t->slots[slot].state = JE_RR_READY;
+}
+
 void je_rr_exit(je_rr_table *t, uint32_t slot)
 {
     je_rr_ctx *ctx;

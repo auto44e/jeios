@@ -20,13 +20,37 @@ ARM_SCHED_MUTATION_SET := $(if $(strip $(ARM_SCHED_MUTATION)),1,)
 ARM_SCHED_TEST_SET := $(if $(filter 1,$(ARM_SCHED_TEST)),1,)
 ARM_USER_TEST_SET := $(if $(filter 1,$(ARM_USER_TEST)),1,)
 ARM_EL0_TEST_SET := $(if $(filter 1,$(ARM_EL0_TEST)),1,)
+ARM_EL0_NO_WAKE_KILL_SET := $(if $(filter 1,$(ARM_EL0_NO_WAKE_KILL)),1,)
+ARM_EL0_DEATH_RACE_SET := $(if $(filter 1,$(ARM_EL0_DEATH_RACE)),1,)
 ARM_COPY_FAULT_SET := $(if $(strip $(ARM_COPY_FAULT)),1,)
+ARM_IPC_FAULT_SET := $(if $(strip $(ARM_IPC_FAULT)),1,)
+ifeq ($(ARM_EL0_DEATH_RACE),1)
+ifneq ($(ARM_EL0_TEST),1)
+$(error ARM_EL0_DEATH_RACE requires ARM_EL0_TEST=1)
+endif
+ifeq ($(ARM_EL0_NO_WAKE_KILL),1)
+$(error ARM_EL0_DEATH_RACE cannot combine with ARM_EL0_NO_WAKE_KILL=1)
+endif
+endif
 ifneq ($(ARM_COPY_FAULT_SET),)
 ifeq ($(ARM_EL0_TEST),1)
 $(error ARM_COPY_FAULT selects its own ARM_EL0_TEST build; do not combine ARM_EL0_TEST=1)
 endif
 ARM_EL0_TEST := 1
 ARM_EL0_TEST_SET :=
+endif
+ifneq ($(ARM_IPC_FAULT_SET),)
+ifeq ($(ARM_EL0_TEST),1)
+$(error ARM_IPC_FAULT selects its own ARM_EL0_TEST build; do not combine ARM_EL0_TEST=1)
+endif
+ARM_EL0_TEST := 1
+ARM_EL0_TEST_SET :=
+endif
+ifeq ($(ARM_EL0_NO_WAKE_KILL),1)
+ifneq ($(ARM_EL0_TEST),1)
+$(error ARM_EL0_NO_WAKE_KILL requires ARM_EL0_TEST=1)
+endif
+ARM_EL0_TEST_SET := 1
 endif
 ifneq ($(ARM_SCHED_MUTATION_SET),)
 ifeq ($(ARM_SCHED_TEST),1)
@@ -35,9 +59,9 @@ $(error ARM_SCHED_MUTATION requires ARM_SCHED_TEST=1)
 endif
 ARM_SCHED_TEST_SET := 1
 endif
-ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL) $(ARM_TIMER_TEST) $(ARM_SCHED_TEST_SET) $(ARM_USER_TEST_SET) $(ARM_EL0_TEST_SET) $(ARM_COPY_FAULT_SET))),0)
-ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL) $(ARM_TIMER_TEST) $(ARM_SCHED_TEST_SET) $(ARM_USER_TEST_SET) $(ARM_EL0_TEST_SET) $(ARM_COPY_FAULT_SET))),1)
-$(error ARM_BSS_CHECK, ARM_VECTOR_TEST, ARM_DTB_BAD, ARM_MMU_FAULT, ARM_TIMER_POLL, ARM_TIMER_TEST, ARM_SCHED_TEST, ARM_USER_TEST, ARM_EL0_TEST and ARM_COPY_FAULT are mutually exclusive; set at most one)
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL) $(ARM_TIMER_TEST) $(ARM_SCHED_TEST_SET) $(ARM_USER_TEST_SET) $(ARM_EL0_TEST_SET) $(ARM_COPY_FAULT_SET) $(ARM_IPC_FAULT_SET))),0)
+ifneq ($(words $(filter 1,$(ARM_BSS_CHECK) $(ARM_VECTOR_TEST) $(ARM_DTB_BAD) $(ARM_MMU_FAULT_SET) $(ARM_TIMER_POLL) $(ARM_TIMER_TEST) $(ARM_SCHED_TEST_SET) $(ARM_USER_TEST_SET) $(ARM_EL0_TEST_SET) $(ARM_COPY_FAULT_SET) $(ARM_IPC_FAULT_SET))),1)
+$(error ARM_BSS_CHECK, ARM_VECTOR_TEST, ARM_DTB_BAD, ARM_MMU_FAULT, ARM_TIMER_POLL, ARM_TIMER_TEST, ARM_SCHED_TEST, ARM_USER_TEST, ARM_EL0_TEST, ARM_COPY_FAULT and ARM_IPC_FAULT are mutually exclusive; set at most one)
 endif
 endif
 
@@ -116,6 +140,12 @@ endif
 # MP3a-2 actual EL0 entry/SVC/fault-death proof.
 ifeq ($(ARM_EL0_TEST),1)
 ARM_BUILD   := build/aarch64-el0test
+ifeq ($(ARM_EL0_DEATH_RACE),1)
+ARM_BUILD   := build/aarch64-el0test-death-race
+endif
+ifeq ($(ARM_EL0_NO_WAKE_KILL),1)
+ARM_BUILD   := build/aarch64-el0test-nokill
+endif
 endif
 # MP3b one-profile-per-fatal-stage proofs.  Each profile owns its build
 # directory so a successful recovery from a mutant cannot reuse a prior Image.
@@ -152,6 +182,30 @@ ifeq ($(ARM_COPY_FAULT_$(ARM_COPY_FAULT)),)
 $(error ARM_COPY_FAULT=$(ARM_COPY_FAULT) is not one of: exact-elr far-bound far-lower prefilter-stray owner direction permission l0 live-root restore-selected save-path live-root-core load-permission guard-2)
 endif
 ARM_BUILD := build/aarch64-copyfault-$(ARM_COPY_FAULT)
+endif
+# MP3c one-profile-per-fatal-stage IPC proofs.  Every profile gets an isolated
+# build directory so a successful base image cannot be reused accidentally.
+ARM_IPC_FAULT_drop-the-rewind       := 1
+ARM_IPC_FAULT_wrong-resume-assertion := 2
+ARM_IPC_FAULT_re-resolve-on-resume  := 4
+ARM_IPC_FAULT_commit-mismatch       := 5
+ARM_IPC_FAULT_copy-fault-resume     := 6
+ARM_IPC_FAULT_short-buffer-resume   := 7
+ARM_IPC_FAULT_waiters-busy          := 10
+ARM_IPC_FAULT_idle-no-panic         := 11
+ARM_IPC_FAULT_SMOKE_drop-the-rewind       := drop-the-rewind
+ARM_IPC_FAULT_SMOKE_wrong-resume-assertion := wrong-resume-assertion
+ARM_IPC_FAULT_SMOKE_re-resolve-on-resume  := re-resolve-on-resume
+ARM_IPC_FAULT_SMOKE_commit-mismatch       := commit-mismatch
+ARM_IPC_FAULT_SMOKE_copy-fault-resume     := copy-fault-resume
+ARM_IPC_FAULT_SMOKE_short-buffer-resume   := short-buffer-resume
+ARM_IPC_FAULT_SMOKE_waiters-busy          := waiters-busy
+ARM_IPC_FAULT_SMOKE_idle-no-panic         := idle-no-panic
+ifneq ($(ARM_IPC_FAULT_SET),)
+ifeq ($(ARM_IPC_FAULT_$(ARM_IPC_FAULT)),)
+$(error ARM_IPC_FAULT=$(ARM_IPC_FAULT) is not one of: drop-the-rewind wrong-resume-assertion re-resolve-on-resume commit-mismatch copy-fault-resume short-buffer-resume waiters-busy idle-no-panic)
+endif
+ARM_BUILD := build/aarch64-ipcfault-$(ARM_IPC_FAULT)
 endif
 
 # Freestanding, no PIC/stack-protector, STRICT alignment (pre-MMU RAM is
@@ -202,6 +256,12 @@ ifeq ($(ARM_EL0_TEST),1)
 ARM_CFLAGS  += -DJE_ARM_EL0_TEST -DJE_ARM_NO_DEVICE_HOOKS \
                -DJE_ARM_NO_DEVICE_HOOKS_ACK
 ARM_ASFLAGS += -DJE_ARM_EL0_TEST
+ifeq ($(ARM_EL0_NO_WAKE_KILL),1)
+ARM_CFLAGS  += -DJE_ARM_EL0_DISABLE_WAKE_KILL
+endif
+ifeq ($(ARM_EL0_DEATH_RACE),1)
+ARM_CFLAGS  += -DJE_ARM_EL0_FORCE_DEATH_RELEASE_RACE
+endif
 endif
 ifneq ($(ARM_COPY_FAULT_SET),)
 ifeq ($(ARM_COPY_FAULT_$(ARM_COPY_FAULT)),8)
@@ -211,6 +271,10 @@ else
 ARM_CFLAGS  += -DJE_ARM_COPY_FAULT_STAGE=$(ARM_COPY_FAULT_$(ARM_COPY_FAULT))
 ARM_ASFLAGS += -DJE_ARM_COPY_FAULT_STAGE=$(ARM_COPY_FAULT_$(ARM_COPY_FAULT))
 endif
+endif
+ifneq ($(ARM_IPC_FAULT_SET),)
+ARM_CFLAGS  += -DJE_ARM_IPC_FAULT=$(ARM_IPC_FAULT_$(ARM_IPC_FAULT))
+ARM_ASFLAGS += -DJE_ARM_IPC_FAULT=$(ARM_IPC_FAULT_$(ARM_IPC_FAULT))
 endif
 ARM_SCHED_MUTATION_DEFINE_drop-mov-sp := JE_ARM_SCHED_MUTANT_DROP_MOV_SP
 ARM_SCHED_MUTATION_DEFINE_pick-skips-b := JE_ARM_SCHED_MUTANT_PICK_SKIP_B
@@ -240,7 +304,9 @@ endif
 ARM_OBJS := $(ARM_BUILD)/boot.o $(ARM_BUILD)/main.o $(ARM_BUILD)/gic.o $(ARM_BUILD)/physmem.o $(ARM_BUILD)/paging.o $(ARM_BUILD)/paging_enable.o $(ARM_BUILD)/alloc.o $(ARM_BUILD)/bootctx.o $(ARM_BUILD)/memory.o $(ARM_BUILD)/vectors.o $(ARM_BUILD)/fdt.o $(ARM_BUILD)/sched_rr.o $(ARM_BUILD)/sched_arm.o $(ARM_BUILD)/vm.o $(ARM_BUILD)/handle.o $(ARM_BUILD)/vm_backend.o
 ifeq ($(ARM_EL0_TEST),1)
 ARM_OBJS += $(ARM_BUILD)/proc.o $(ARM_BUILD)/lifecycle.o $(ARM_BUILD)/syscall.o $(ARM_BUILD)/el0_test.o
-ARM_OBJS += $(ARM_BUILD)/usercopy.o $(ARM_BUILD)/usercopy_arm.o $(ARM_BUILD)/syscall_arm.o
+ARM_OBJS += $(ARM_BUILD)/usercopy.o $(ARM_BUILD)/usercopy_arm.o $(ARM_BUILD)/syscall_arm_ipc.o
+ARM_OBJS += $(ARM_BUILD)/endpoint.o $(ARM_BUILD)/endpoint_kern.o
+ARM_OBJS += $(ARM_BUILD)/arch_shims.o $(ARM_BUILD)/device_arm.o
 endif
 
 # Shared arch-neutral bounded DTB parser (issue #52), compiled with the ARM
@@ -284,6 +350,26 @@ $(ARM_BUILD)/syscall.o: kernel/core/syscall.c include/jeios/syscall.h $(wildcard
 $(ARM_BUILD)/syscall_arm.o: $(ARM_ARCH)/syscall_arm.c include/jeios/syscall.h $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
 	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
+
+$(ARM_BUILD)/syscall_arm_ipc.o: $(ARM_ARCH)/syscall_arm_ipc.c include/jeios/syscall.h $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
+
+$(ARM_BUILD)/endpoint.o: kernel/core/endpoint.c include/jeios/endpoint.h $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
+
+$(ARM_BUILD)/endpoint_kern.o: kernel/core/endpoint_kern.c include/jeios/endpoint_kern.h $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
+
+$(ARM_BUILD)/arch_shims.o: $(ARM_ARCH)/arch_shims.c $(ARM_ARCH)/trapframe.h $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -I$(ARM_ARCH) -c $< -o $@
+
+$(ARM_BUILD)/device_arm.o: $(ARM_ARCH)/device_arm.c $(wildcard include/jeios/*.h)
+	@mkdir -p $(@D)
+	$(ARM_CC) $(ARM_CFLAGS) -c $< -o $@
 
 $(ARM_BUILD)/usercopy.o: kernel/core/usercopy.c include/jeios/usercopy.h $(wildcard include/jeios/*.h)
 	@mkdir -p $(@D)
@@ -367,4 +453,4 @@ aarch64: $(ARM_BUILD)/Image
 # uses them).
 ARM_SMOKE_TIMEOUT ?= 15
 smoke-aarch64: $(ARM_BUILD)/Image
-	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_PHYSALLOC)),--phys-alloc,) $(if $(filter 1,$(ARM_TIMER_POLL)),--timer-poll,) $(if $(filter 1,$(ARM_TIMER_TEST)),--timer-test,) $(if $(filter 1,$(ARM_SCHED_TEST)),--sched-test,) $(if $(filter 1,$(ARM_USER_TEST)),--user-test,) $(if $(filter 1,$(ARM_EL0_TEST)),--el0-test,) $(if $(filter 1,$(ARM_COPY_FAULT_SET)),--copy-fault $(ARM_COPY_FAULT_SMOKE_$(ARM_COPY_FAULT)),) $(if $(filter 1,$(ARM_SCHED_MUTATION_SET)),--sched-mutation $(ARM_SCHED_MUTATION),) $(if $(filter 1,$(ARM_REQUIRE)),--require,) $(if $(filter 1,$(ARM_MMU_FAULT_SET)),--mmu-fault $(ARM_MMU_FAULT_SMOKE_$(ARM_MMU_FAULT)),)
+	$(PYTHON) tools/smoke_arm.py $(ARM_BUILD)/Image --elf $(ARM_BUILD)/jeios-arm.elf --log $(ARM_BUILD)/serial.log --timeout $(ARM_SMOKE_TIMEOUT) $(if $(filter 1,$(ARM_BSS_CHECK)),--bss-verified,) $(if $(filter 1,$(ARM_VECTOR_TEST)),--vector-test,) $(if $(filter 1,$(ARM_DTB_BAD)),--dtb-bad,) $(if $(filter 1,$(ARM_PHYSALLOC)),--phys-alloc,) $(if $(filter 1,$(ARM_TIMER_POLL)),--timer-poll,) $(if $(filter 1,$(ARM_TIMER_TEST)),--timer-test,) $(if $(filter 1,$(ARM_SCHED_TEST)),--sched-test,) $(if $(filter 1,$(ARM_USER_TEST)),--user-test,) $(if $(filter 1,$(ARM_EL0_TEST)),--el0-test,) $(if $(filter 1,$(ARM_EL0_NO_WAKE_KILL)),--el0-no-wake-kill,) $(if $(filter 1,$(ARM_COPY_FAULT_SET)),--copy-fault $(ARM_COPY_FAULT_SMOKE_$(ARM_COPY_FAULT)),) $(if $(filter 1,$(ARM_IPC_FAULT_SET)),--ipc-fault $(ARM_IPC_FAULT_SMOKE_$(ARM_IPC_FAULT)),) $(if $(filter 1,$(ARM_SCHED_MUTATION_SET)),--sched-mutation $(ARM_SCHED_MUTATION),) $(if $(filter 1,$(ARM_REQUIRE)),--require,) $(if $(filter 1,$(ARM_MMU_FAULT_SET)),--mmu-fault $(ARM_MMU_FAULT_SMOKE_$(ARM_MMU_FAULT)),)

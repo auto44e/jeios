@@ -392,7 +392,10 @@ int je_arm_copy_fixup_inject(void)
     je_vm *vm;
     uint32_t index;
     uint32_t slot;
-    const uint64_t hole = JE_VM_ARENA_BASE + JE_PAGE_SIZE;
+    /* The EL0 IPC proof image uses two RX pages; keep the deliberate
+     * not-present copy-fixup hole beyond its two-page RX + two-page data
+     * layout. */
+    const uint64_t hole = JE_VM_ARENA_BASE + 4u * JE_PAGE_SIZE;
     const uint64_t code = JE_VM_ARENA_BASE;
     uint64_t off;
     uint64_t physical;

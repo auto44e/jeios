@@ -88,11 +88,7 @@ je_proc_pool *je_lc_proc_pool(void)
  * corrected). */
 void je_lc_release_waiter(uint32_t slot)
 {
-#if defined(JE_ARM_NO_DEVICE_HOOKS)
-    (void)slot;
-#else
     (void)je_endpoint_kern_waiter_release_by_id(slot);
-#endif
 }
 
 /* The ordered dying side-effect prefix, moved verbatim from mark_dying. ORDER is

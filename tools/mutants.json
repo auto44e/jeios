@@ -284,6 +284,20 @@
       "enabled": true
     },
     {
+      "id": "EP-TIMED-OUT-SEND-TERMINAL",
+      "invariant": "a send wake must not overwrite a waiter that already reached the terminal TIMED_OUT cause",
+      "file": "kernel/core/endpoint.c",
+      "find": "    if (!e->waiter.present || e->waiter.cause != JE_EP_WAIT_WAITING)\n        return JE_EP_ARB_LOST;",
+      "replace": "    if (!e->waiter.present ||\n        (e->waiter.cause != JE_EP_WAIT_WAITING &&\n         e->waiter.cause != JE_EP_WAIT_TIMED_OUT))\n        return JE_EP_ARB_LOST;",
+      "build": "build/0/test_endpoint",
+      "run": "build/0/test_endpoint",
+      "killer": "test_endpoint: the timed-out-then-send terminal assertion must reject a late WOKEN arbitration and preserve TIMED_OUT while allowing the queued message to drain",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true
+    },
+    {
       "id": "GAP-VM-AUDIT-ONE-TO-ONE",
       "invariant": "je_vm_audit rejects a page table where two arena offsets map the same physical frame (no user-visible aliasing of a single frame)",
       "file": "kernel/core/vm.c",
@@ -310,7 +324,8 @@
         "ASAN_OPTIONS": "detect_leaks=0"
       },
       "enabled": false,
-      "gap": true
+      "gap": true,
+      "disabled_reason": "The hosted endpoint suite does not yet construct a live parked waiter through endpoint close and timeout sweep; keep this gap disabled until that lifetime fixture exists."
     },
     {
       "id": "GAP-DEV-DISPATCH-OWNER",
@@ -685,7 +700,7 @@
       "id": "ARM-USER-SVC-WRITES-X0-BEFORE-DECODE",
       "invariant": "the ARM SVC dispatcher must copy syscall arguments and decode before overwriting x0 with the ABI status",
       "file": "kernel/arch/aarch64/sched_arm.c",
-      "find": "    uint64_t args[6];",
+      "find": "    uint64_t args[6];\n    for (unsigned i = 0u; i < 6u; ++i) args[i] = tf->gpr[i];",
       "replace": "    tf->gpr[0] = UINT64_C(0xffffffffffffffff);\n    uint64_t args[6];",
       "build": "build/aarch64-el0test/Image",
       "run": "tools/run_arm_el0_test.py",
@@ -859,7 +874,7 @@
       "replace": "    if (0 && (current != 0u && current < JE_RR_MAX &&\n        je_arm_rr.slots[current].state == JE_RR_RUNNING))\n        je_arm_rr.slots[current].state = JE_RR_READY;",
       "build": "build/aarch64-el0test/Image",
       "run": "tools/run_arm_el0_test.py",
-      "killer": "EL0 raw boot/liveness proof: reverting the arm_switch_to_ready READY-before-pick demotion (sched_arm.c:922-924) must FATAL sched no live EL0 successor before the proof can complete a lone self-yield reselect or self-targeted IRQ reselect",
+      "killer": "EL0 raw boot/liveness proof: reverting the arm_switch_to_ready READY-before-pick demotion (sched_arm.c:922-924) must FATAL sched nothing can wake before the proof can complete a lone self-yield reselect or self-targeted IRQ reselect",
       "env": {
         "ARM_EL0_TEST": "1",
         "ARM_REQUIRE": "1",
@@ -1032,6 +1047,211 @@
       "killer": "copy-fault guard-2 stage: weakening guard state 2 and its assertion must die at the proof assertion \"copy-negative-recovered\" when the nested exact-site fault is wrongly recovered",
       "env": {
         "ARM_COPY_FAULT": "guard-2",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3C-REWIND",
+      "invariant": "parking a blocking receive must rewind ELR by exactly one SVC instruction so the resumed trap re-enters the same syscall",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "    tf->elr -= 4u;",
+      "replace": "    /* mutant: do not rewind the parked SVC */",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "positive EL0 IPC smoke: removing tf->elr -= 4u is killed by the adjacent IPC rewind guard postcondition before EL0 proof PASS",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3C-RESUME-ASSERT",
+      "invariant": "a resumed blocking receive must assert the trapped ELR equals the saved post-SVC ELR, not the rewound address",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "            if (tf->elr != wpost ||\n",
+      "replace": "            if (tf->elr != (wpost - 4u) ||\n",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "positive EL0 IPC smoke: accepting post-SVC ELR minus four must FATAL IPC resume assertion on every wake",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3C-WAKE-BLOCKED",
+      "invariant": "je_rr_wake may transition only BLOCKED to READY; SLEEPING and other states remain unchanged",
+      "file": "kernel/core/sched_rr.c",
+      "find": "    if (t->slots[slot].state == JE_RR_BLOCKED)\n        t->slots[slot].state = JE_RR_READY;",
+      "replace": "    if (0 && (t->slots[slot].state == JE_RR_BLOCKED))\n        t->slots[slot].state = JE_RR_READY;",
+      "build": "build/0/test_sched_rr",
+      "run": "build/0/test_sched_rr",
+      "killer": "test_sched_rr: blocked wake reaches READY while the new sleeping-wake negative case remains SLEEPING",
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3C-ATTENUATION",
+      "invariant": "endpoint cap transfer rejects requested rights not held by the source cap",
+      "file": "kernel/core/endpoint_kern.c",
+      "find": "    if (req_rights & ~rights) return JE_EP_DENIED;",
+      "replace": "    if (0 && (req_rights & ~rights)) return JE_EP_DENIED;",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "positive EL0 IPC smoke: allowing SEND|RECV from a SEND-only source is killed at register-round-trip before proof PASS",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3C-PEER-CLOSED-WAKE",
+      "invariant": "a peer close must arbitrate PEER_CLOSED and wake the blocked receiver only after drain-first emptiness",
+      "file": "kernel/core/endpoint_kern.c",
+      "find": "    if (je_endpoint_wait_arbitrate(rec, side, JE_EP_WAIT_PEER_CLOSED, &id)\n        == JE_EP_ARB_WON) {",
+      "replace": "    if (0 && (je_endpoint_wait_arbitrate(rec, side, JE_EP_WAIT_PEER_CLOSED, &id)\n        == JE_EP_ARB_WON)) {",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "positive EL0 IPC smoke: removing the real PEER_CLOSED arbitration is killed at reap-mismatch before the trusted PEER_CLOSED marker can complete",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3C-SHORT-BUFFER-MARKER",
+      "invariant": "the resumed short-buffer proof must emit its trusted kernel marker before the named fatal detector",
+      "file": "kernel/core/syscall_glue.inc",
+      "find": "        JE_G_NOTE_SHORT_BUFFER(index, rec, side, mlen, mcaps);",
+      "replace": "        /* mutant: omit the trusted short-buffer evidence */",
+      "build": "build/aarch64-ipcfault-short-buffer-resume/Image",
+      "run": "tools/run_arm_ipc_fault.py",
+      "killer": "short-buffer-resume IPC fault profile: removing the trusted marker callback must fail the dedicated marker/fatal control",
+      "env": {
+        "ARM_IPC_FAULT": "short-buffer-resume",
+        "ARM_IPC_EXPECTED_FATAL": "el0-test short-buffer resume",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "liveness": true,
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3C-DEADCAP-NULL",
+      "invariant": "the endpoint cap-descriptor liveness predicate must reject a dead queued cap so the receiver observes the A5-2 NULL marker while live siblings are minted",
+      "file": "kernel/core/endpoint.c",
+      "find": "    return st == JE_EP_END_OPEN || st == JE_EP_END_PEER_CLOSED;",
+      "replace": "    (void)st; /* mutant: treat a closed descriptor as live */\n    return true;",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "positive EL0 IPC smoke: treating the dead descriptor as live must produce a non-NULL minted cap and fail the trusted two-cap NULL/live-sibling proof",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3C-IDLE-HANDOFF",
+      "invariant": "when no user slot is READY, the ARM scheduler must hand off to the real slot-0 idle context rather than a blocked user slot",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "            next = 0u;",
+      "replace": "            next = 1u;",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "positive EL0 IPC smoke: redirecting the all-blocked handoff away from slot-0 idle must fail the trusted ALL_BLOCKED_IDLE proof or frame validation",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3C-TWO-PHASE-COMMIT",
+      "invariant": "a resumed receive commits the owned lease only after staged mint and user copies succeed",
+      "file": "kernel/core/syscall_glue.inc",
+      "find": "    JE_G_FAULT_RECV_COMMIT(lease);\n    je_ep_status cm = je_endpoint_kern_recv_commit(&lease);",
+      "replace": "    JE_G_FAULT_RECV_COMMIT(lease);\n    je_ep_status cm = JE_EP_OK;",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 resumed-receive fixture: omitting the owned lease commit must fail the trusted caps-bearing receive/release proof",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3C-DEADLINE-ARBITRATE-BEFORE-WAKE",
+      "invariant": "the ARM deadline sweep must arbitrate TIMED_OUT before waking the blocked RR slot",
+      "file": "kernel/arch/aarch64/sched_arm.c",
+      "find": "        (void)je_endpoint_wait_arbitrate(\n            p->rec, p->side, JE_EP_WAIT_TIMED_OUT, &waiter);",
+      "replace": "        je_rr_wake(&je_arm_rr, slot);\n        (void)je_endpoint_wait_arbitrate(\n            p->rec, p->side, JE_EP_WAIT_TIMED_OUT, &waiter);",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "GAP: add a deterministic timer/deadline race killer that distinguishes a pre-wake RR transition from endpoint-cause arbitration, then enable.",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": false,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc",
+      "disabled_reason": "The standalone EL0 woken-then-deadline injection was vacuous and was removed; re-enable only with a deterministic fixture that reaches a TIMED_OUT/WOKEN arbitration race."
+    },
+    {
+      "id": "ARM-MP3C-WAITER-RELEASE-DEATH",
+      "invariant": "the real death path must release a dying blocked receiver’s endpoint waiter and any WOKEN reservation before slot reuse",
+      "file": "kernel/core/lifecycle.c",
+      "find": "    (void)je_endpoint_kern_waiter_release_by_id(slot);",
+      "replace": "    (void)slot; /* mutant: leak the dying receiver waiter */",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "EL0 kill-and-slot-reuse fixture: leaking the dying receiver waiter must fail DEATH_RELEASED_WAITER and prevent the validated replacement reuse",
+      "env": {
+        "ARM_EL0_TEST": "1",
+        "ARM_REQUIRE": "1",
+        "ARM_SMOKE_TIMEOUT": "60"
+      },
+      "enabled": true,
+      "skip_if_no_cmd": "aarch64-linux-gnu-gcc"
+    },
+    {
+      "id": "ARM-MP3C-WOKEN-WAITER-LEAK",
+      "invariant": "releasing a WOKEN death waiter must clear its waiter state and drop its endpoint in-flight reference, or the still-allocated record is a D9 leak",
+      "file": "kernel/core/endpoint.c",
+      "find": "        e->inflight_refs--;            /* the waiter's own ref */",
+      "replace": "        /* mutant: clear the WOKEN waiter slot but leak its in-flight reference */",
+      "build": "build/aarch64-el0test/Image",
+      "run": "tools/run_arm_el0_test.py",
+      "killer": "positive EL0 kill-and-slot-reuse smoke: the WOKEN-victim leak must FATAL death-release because the still-allocated record has a PEER_CLOSED survivor but a nonzero in-flight reference",
+      "env": {
+        "ARM_EL0_TEST": "1",
         "ARM_REQUIRE": "1",
         "ARM_SMOKE_TIMEOUT": "60"
       },

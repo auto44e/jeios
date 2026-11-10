@@ -1,4 +1,452 @@
-# Agent handoff: M1/M2 kernel foundation
+# Agent handoff: MP3c ARM capability IPC
+
+## Current status — MP3c G1/G2/G3 tightening fix — observed 2026-11-10T12:58:14Z
+
+Repository `/tmp/wt-mp3c`, branch `wip/mp3c`, exact inspected base commit
+`a5b4914a2fa3fba17de26f4f4623d0f792cf6283` (the requested fix-pass changes
+were uncommitted at this observation). State:
+**implemented / tested locally / planned (owner review, remote CI, physical ARM
+and independent human qualification) / not blocked**. No push, PR publication,
+reviewer assignment or release was performed. The requested
+`docs/adr/debates/0017-mp3c-arm-ipc/06-claude-confirm-review.md` is absent from
+this worktree; the available ADR records and the task-provided findings were
+used. Demonstrated support tier remains QEMU 8.2.2 `virt-8.2`, `cortex-a72`,
+one CPU, 256 MiB. This is AI-assisted local evidence, not independent human or
+release qualification.
+
+### Implemented
+
+- G1: the F1-relaxed death/reuse oracle now accepts a still-allocated endpoint
+  record only when the non-victim end is `PEER_CLOSED`, the generation is
+  unchanged, the victim has no waiter in any state, and both ends have zero
+  in-flight references. The existing release-counter, no-stale-id, and
+  no-pending-continuation guards remain. The kernel D9 release ordering was
+  not changed.
+- G1 injection: `ARM-MP3C-WOKEN-WAITER-LEAK` skips the real endpoint
+  in-flight-reference decrement while clearing the WOKEN waiter slot. The
+  oracle rejects that record at `death-release`; the mutant is enabled and
+  killed through the real ARM path.
+- F1 race tolerance remains: the forced CPU-spin race still accepts the benign
+  `rec_freed=0` outcome. The new timer rearm is retained because removing it
+  prevents the TIMER_PREEMPT proof from firing.
+- F2 WAITERS_BUSY: the canonical baseline marker is
+  `FATAL sched IPC WAITERS_BUSY guard`; removing the endpoint guard reaches the
+  distinct `FATAL sched IPC WAITERS_BUSY guard missing` outcome.
+- G2: hosted endpoint case 30 asserts that a send cannot overwrite a
+  `TIMED_OUT` waiter; `EP-TIMED-OUT-SEND-TERMINAL` pins that reverse direction
+  and is killed by the hosted test.
+- F3/F4: the flaky or vacuous standalone timed-out-late-send,
+  woken-then-deadline, and attenuation-bypass stages remain removed. Their
+  remaining evidence is hosted endpoint coverage plus the load-bearing ARM
+  mutants; no standalone stage claim remains.
+- F5: the strict MP3a-2 TIMER_PREEMPT predicate was restored: the switch must
+  be from the first worker to the peer and the saved ELR must lie inside the
+  two-instruction CPU-only spin. The EL0 fixture rearms the timer after setup
+  so the first measured IRQ cannot preempt outside that spin.
+- G3: the honest resumed-receive limits list was restored in this handoff and
+  the implementation/ADR ledgers. It does not claim the mint rollback,
+  PEER_CLOSED release, short-buffer release, poisoned continuation,
+  reap/sweep-order, or two caps-bearing copy-fault cleanup branches.
+- NITs: the dead `JE_G_FAULT_WAITERS_BUSY` hook and unused
+  `EL0_IPC_LATE_SEND` constant were removed. The attenuation killer now names
+  `register-round-trip`, and the PEER_CLOSED-wake killer names
+  `reap-mismatch`. The shared body still contains `JE_TEST_MODE==13/15`
+  hooks and per-architecture handle macros, so this is partial convergence,
+  not full source purity.
+
+### Evidence observed
+
+```text
+make check                                                        PASS
+make smoke                                                        PASS
+make -B aarch64 ARM_EL0_TEST=1                                  PASS
+make smoke-aarch64 ARM_EL0_TEST=1 ARM_REQUIRE=1 \
+  ARM_SMOKE_TIMEOUT=70                                            PASS (6/6)
+make smoke-aarch64 ARM_EL0_TEST=1 ARM_EL0_DEATH_RACE=1 \
+  ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=70                              PASS (6/6)
+python3 tools/mutants.py --id ARM-MP3C-WOKEN-WAITER-LEAK \
+  --timeout 300                                                    KILL (3/3)
+python3 tools/mutants.py --id ARM-MP3C-WAITER-RELEASE-DEATH \
+  --timeout 300                                                    KILL
+python3 tools/mutants.py --id EP-TIMED-OUT-SEND-TERMINAL \
+  --timeout 300                                                    KILL
+```
+
+The forced F1 race repeatedly emitted
+`DEATH_RELEASED_WAITER rec_freed=0 no_stale_id=1` and passed. Reverting the
+waiter-release gate was killed by the same D9 proof; the WOKEN leak was also
+killed in 3/3 repeated runs and emitted the expected `death-release` fatal.
+The retained ARM IPC matrix (`drop-the-rewind`, `wrong-resume-assertion`,
+`re-resolve-on-resume`, `commit-mismatch`, `copy-fault-resume`,
+`short-buffer-resume`, `waiters-busy`, `idle-no-panic`) booted 8/8 to its exact
+named fatal detector. These expected-fatal smoke commands return make exit 2
+because the harness reports a caught injected failure as
+`FATAL as expected`; that is a passing negative result. The WAITERS_BUSY
+guard-removal injection reached the distinct `guard missing` fatal.
+
+`ARM_TIMER_TEST=1` and `ARM_SCHED_TEST=1` both passed their non-EL0 smoke
+profiles. All 13 non-EL0 scheduler-mutation profiles reached their expected
+named detectors. The x86 comparison built current and archived-base
+`build/<mode>/kernel/core/syscall.o` for TEST_MODE 0..15, extracted `.text`
+with `objcopy`, and `cmp` found all 16 byte-identical to base `52adf4f`.
+The full hosted check also included the reverse TIMED_OUT late-send assertion.
+
+The required solo `make mutants` result was:
+**77 killed, 1 equivalent, 0 SURVIVED, 0 BLOCKED, 2 skipped**.
+
+### Honest limits
+
+- The standalone F3/F4 stages are intentionally absent; they are not claimed
+  as deterministic proofs. The hosted terminal-transition test and the
+  attenuation/deadline mutants remain the available coverage.
+- The resumed positive fixture does not individually exercise these
+  resumed-receive branches: mint rollback after a later cap failure,
+  PEER_CLOSED release, short-buffer release after a nonfatal return, poisoned
+  continuation/identity rejection, and reap/sweep ordering beyond the
+  exercised waiter/reuse path.
+- It also does not individually exercise the two caps-bearing cleanup branches
+  in `kernel/core/syscall_glue.inc`: byte-copy fault cleanup at lines 79-83
+  and handle-array copy-fault cleanup at lines 90-94. Those branches remain
+  honest limits; the current copy-fault mutants and hosted coverage do not
+  prove them.
+- One-thread-per-process remains a fixture/model boundary and G6 remains
+  mutation-only; this pass does not claim a user-created multi-thread race or
+  a separate kernel poison profile.
+- The shared syscall glue is converged but not pure: its test-mode 13/15 hooks
+  and per-architecture handle accessors remain.
+- All results are local host/QEMU evidence. Remote CI, physical ARM, SMP,
+  arbitrary hardware support, and independent human qualification remain
+  unverified. No broad hardware or application-ABI claim is made.
+
+### Next bounded task and pass criteria
+
+Commit this reviewable fix pass to `wip/mp3c`, then perform owner review. Pass
+requires the evidence above to remain reproducible from the committed tree,
+with `git diff --check` clean and no regression of B1/B2/B3/E1. Remote CI,
+physical ARM, SMP, and independent human qualification remain separate gates.
+
+## Current status — MP3c B1/B2/B3 and vacuity fix pass — observed 2026-11-10T04:35:56Z
+
+Repository `/tmp/wt-mp3c`, branch `wip/mp3c`, exact inspected parent commit
+`fa7d1d63c6db97b1c72561d09ee425c6bad19636`, implementation commit
+`589447da065a0c135ef94b474fc0eaaf6ee162b0`; this entry is the required
+post-commit documentation refresh. State: **implemented / tested locally /
+planned (owner review, remote CI, physical ARM and independent human
+qualification) / not blocked**. No push, PR publication, reviewer assignment
+or release was performed. The named adversarial review
+`docs/adr/debates/0017-mp3c-arm-ipc/03-claude-impl-review.md` is absent from
+this worktree; the requested findings were applied from the task specification
+and the available ADR review records. Demonstrated platform remains QEMU 8.2.2
+`virt-8.2`, `cortex-a72`, one CPU, 256 MiB.
+
+### Implemented
+
+- B1: EL0 slot 0 now uses a separately allocated, mapped, aligned kernel stack
+  below an unmapped guard; the idle frame points into it. A5 canaries surround
+  the EL0 scheduler state and occupy the low idle-stack zone. The late
+  `IDLE_STACK_GUARD bss_overwrites=0 stack_guard=1 resumed=2` assertion checks
+  the real resumed identity, frame generation, pending continuation state and
+  canaries. Allocation failure frees the run before the fatal map error.
+- B2: the EL0-only idle-frame install and EL0 idle bookkeeping are gated out of
+  non-EL0 builds. The dead non-EL0 idle-frame object was removed so `-Werror`
+  preserves the baseline profiles.
+- B3: B is bound before the live-root-core fixture reads its slot; the
+  unmutated profile now reaches `FATAL sched copy live root`. The lone-survivor
+  witness uses a bounded, load-bearing survivor spin that is redirected only
+  after the negative stages; the READY-before-pick mutant is enabled again.
+- MP3a-2 gates are strict: exactly one real `TIMER_PREEMPT from=1 to=2`,
+  exactly one independent `TIMER_WAKE`, and exactly one real
+  `LONE_IRQ_RESELECT`; no timer/SVC substitutes are accepted.
+- Vacuity fixes: all-blocked idle is emitted only after both real user slots
+  were BLOCKED, slot 0 ran, and a user wake resumed; WOKEN_RESTART requires
+  the parked/woken/restarted state; TIMER_WAKE is emitted by the deadline
+  wake path independently of TIMED_OUT. The no-kill EL0 profile proves the
+  resumed context and idle guards without claiming the default profile’s
+  teardown/reuse marker.
+- Negative guards: drop-rewind, commit-mismatch, resumed copy-fault and
+  waiter-busy now observe the actual violated predicate; short-buffer is
+  targeted at a resumed receive and accepts only a trusted short-buffer result
+  with a real wake/restart witness. The shared glue case shape was not
+  refactored; only these test-gated guard conditions were tightened.
+- The dead-cap mutant now targets the real endpoint descriptor-liveness
+  predicate rather than a redundant glue branch. The positive caps-bearing
+  receive therefore proves the endpoint predicate by observing a live sibling
+  and a NULL dead-cap result.
+- Re-enabled mutants: `ARM-USER-LONE-SURVIVOR-READY-BEFORE-PICK`,
+  `ARM-MP3B-LIVE-ROOT-CORE`, and `ARM-MP3C-TWO-PHASE-COMMIT`; stale waiter
+  release killer text was corrected.
+
+### Evidence observed so far
+
+```text
+make smoke-aarch64 ARM_EL0_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=70       PASS
+make smoke-aarch64 ARM_EL0_TEST=1 ARM_EL0_NO_WAKE_KILL=1 \
+  ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=35                                       PASS
+make smoke-aarch64 ARM_TIMER_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60     PASS
+make smoke-aarch64 ARM_SCHED_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60     PASS
+make aarch64 ARM_EL0_TEST=1                                           PASS
+make check                                                            PASS
+```
+
+The no-kill EL0 run also passed and emitted the genuine
+`TIMER_PREEMPT`, `WOKEN_RESTART`, `DEADCAP_NULL_MARKER`, independent
+`TIMER_WAKE`, late `ALL_BLOCKED_IDLE`, zero-overwrite
+`IDLE_STACK_GUARD`, `TIMED_OUT`, `PEER_CLOSED`, and `LONE_IRQ_RESELECT`
+markers; it did not emit `sched frame invalid`. All 13 scheduler mutation
+profiles reached their named detectors. The IPC negative matrix reached its
+named detector for all 11 profiles, including drop-the-rewind,
+commit-mismatch, copy-fault-resume, short-buffer-resume, woken-then-deadline,
+timed-out-late-send, waiter-busy and idle-no-panic.
+`ARM_COPY_FAULT=live-root-core` reached `FATAL sched copy live root`.
+The final solo mutation sweep completed with **75 killed, 1 equivalent,
+0 survived, 0 blocked, 2 skipped**.
+
+### Unresolved / honesty boundaries
+
+- The no-kill profile intentionally does not claim `DEATH_RELEASED_WAITER`;
+  the default kill-and-slot-reuse profile owns that lifecycle proof.
+- The resumed fixture covers the caps-bearing receive, the endpoint
+  dead-cap-liveness predicate, and the resumed copy-fault release path. The
+  following resumed branches remain individually uncovered: mint rollback
+  after a later cap failure, short-buffer release after a non-fatal return,
+  PEER_CLOSED release, one-thread-per-process enforcement, continuation
+  identity under a poisoned proc id, and reap/sweep ordering beyond the
+  exercised waiter/reuse checks.
+- `can_wake` considers pending IPC deadlines and does not inspect `SLEEPING`;
+  ARM EL0 has no sleep syscall, so this is latent coverage rather than a
+  claimed sleep guarantee.
+- The `post_svc_elr >= ARENA_BASE + 4` check is defensive and does not prevent
+  a valid block-SVC at `ARENA_BASE` from rewinding to `ARENA_BASE`.
+- x86 whole-object evidence must record that `syscall.o` is unchanged while
+  `endpoint_kern.o` is +32 bytes from the waiter-release counter; the linked
+  x86 text therefore differs by 32 bytes. No x86 identity claim is made here.
+- All evidence is local QEMU/host evidence. Remote CI, physical ARM, SMP,
+  arbitrary hardware support and independent human qualification remain
+  unverified. AI-assisted review is not human qualification.
+
+### Next bounded task and pass criteria
+
+Commit this reviewable fix pass to `wip/mp3c`, then have the lead re-run the
+local gates and perform owner review. Pass requires the recorded zero
+SURVIVED/zero BLOCKED mutation result, clean formatting, all named negative
+detectors, the two non-EL0 profiles and the genuine EL0 proof. Remote CI,
+physical ARM, SMP, and independent human qualification remain separate gates.
+
+## Current status — MP3c completion pass — observed 2026-11-10T00:23:07Z
+
+Repository `/tmp/wt-mp3c`, branch `wip/mp3c`, exact inspected parent commit
+`a8f95e99d5f17446b587ad36c6bae6e1b9221f48`; completion-pass changes were
+uncommitted at this observation. State: **G1-G4 implemented and locally tested;
+G5 implemented except the timed-out-late-send proof remains a dropped claim; G6
+mutation-only; G7 implemented with IRQ-only reaping / no SVC fallback; final
+mutation result pending at this observation; owner review, remote CI, physical
+ARM and independent human qualification planned**. No push, PR publication,
+reviewer assignment or release was performed. Demonstrated platform remains
+QEMU 8.2.2 `virt-8.2`, `cortex-a72`, one CPU, 256 MiB.
+
+### Implemented and trusted markers
+
+- G1 PEER_CLOSED: the real blocked receiver is woken by endpoint peer-close
+  arbitration only after the endpoint is empty. Marker:
+  `EL0 IPC PEER_CLOSED trusted-cause blocked-before-ready=1`; the callback
+  checks endpoint state and pre-wake BLOCKED state.
+- G2 dead-cap NULL: the real message carries two cap descriptors, the source
+  handle for one descriptor is closed after enqueue, and the receiver observes
+  a live sibling plus handle `0` for the dead descriptor. The live sibling is
+  used for a real reply before close. Marker:
+  `EL0 IPC DEADCAP_NULL_MARKER slot=<n> live_sibling=ok`.
+- G3 death release / slot reuse: the fixture parks a real receiver, creates a
+  WOKEN reservation, kills it through the real lifecycle path (there is no ARM
+  PROC_KILL), reaps on the IRQ path, and creates a replacement in the same VM
+  index. Marker:
+  `EL0 IPC DEATH_RELEASED_WAITER rec_freed=1 no_stale_id=1`; it checks record
+  FREE, generation change, no stale waiter id, waiter-release progress, and no
+  pending continuation before reuse.
+- G4 all-blocked idle: both user slots enter real timed receives, slot 0 is
+  reached and WFI executes after ERET, then the timer wakes a user. Marker:
+  `EL0 IPC ALL_BLOCKED_IDLE woke=1`. Fault 11 removes every deadline in the
+  genuine all-blocked/no-wake state and reaches deterministic
+  `FATAL sched nothing can wake`.
+- G5 short-buffer has the trusted marker
+  `EL0 IPC SHORT_BUFFER trusted-cause required=1 caps=0` and ends at
+  `FATAL el0-test short-buffer resume`. Drop-rewind, wrong-resume-assertion,
+  attenuation-bypass, commit-mismatch, resumed-copy-fault,
+  woken-then-deadline, and WAITERS_BUSY retain their named fatal checks.
+  The timed-out-late-send profile currently detects a second waiter still
+  present and ends at `FATAL el0-test late-send ordering`; it does not prove
+  a user send after a fully released waiter, so that stronger claim is dropped.
+- G6 remains mutation-only. One thread per process prevents the requested user
+  race. Fault 4 injects the re-resolve mutation and reaches
+  `FATAL sched IPC re-resolve`, but no kernel-side poisoned-handle /
+  different-stale-answer profile was completed. This is not claimed as an
+  A6-5 proof.
+- G7 is resolved in favor of the ADR: peer-death reaping is IRQ-path
+  authoritative and the bounded SVC fallback was removed. The positive G1-G4
+  fixture and existing EL0 proof pass with IRQ-only reaping.
+
+### Evidence and exact commands
+
+Observed in this completion pass:
+
+```text
+make aarch64 ARM_EL0_TEST=1                         PASS
+make smoke-aarch64 ARM_EL0_TEST=1 \
+  ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60                 PASS
+```
+
+The positive serial evidence includes exactly one trusted marker for each of
+`WOKEN_RESTART`, `TIMED_OUT`, `TIMER_WAKE`, `PEER_CLOSED`,
+`DEADCAP_NULL_MARKER`, `ALL_BLOCKED_IDLE`, and
+`DEATH_RELEASED_WAITER`, followed by
+`EL0 proof PASS reviewed-cache-tlb=not-observed`.
+
+The named negative matrix was built and booted through
+`make aarch64 ARM_IPC_FAULT=<name>` plus
+`make smoke-aarch64 ARM_IPC_FAULT=<name> ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60`.
+All profiles except the deliberately dropped late-send claim reached their
+named detector; the late-send ordering control reached its explicit
+`FATAL el0-test late-send ordering`.
+
+The x86 preservation check rebuilt `kernel/core/syscall.o` for TEST_MODE 0
+through 15 and compared raw `.text` bytes against the exact parent commit
+`a8f95e9`; all 16 comparisons passed. Direct hashes between modes 11, 13 and
+15 differ for their pre-existing test-only code, so that is not the identity
+claim being made.
+
+### Changed invariants / unresolved hazards
+
+The ARM fixture now uses two RX and two RW pages, and the ARM usercopy fixup
+range covers that complete fixture. ARM lifecycle owns waiter release;
+architecture code clears the continuation before RR exit; the IRQ reaper
+performs record teardown and generation advancement before slot reuse. Remaining
+hazards are the dropped late-send ordering proof, mutation-only G6 re-resolve
+poison coverage, QEMU's lack of stale-cache/TLB modeling, physical ARM/SMP
+absence, remote CI absence, and the required independent human qualification.
+No claim is made for arbitrary hardware or ABIs.
+
+### Next bounded task and pass criteria
+
+Review the final mutation result and this handoff on `wip/mp3c`; if the owner
+requires exact G5 late-send or G6 A6-5 completion, add a separate bounded,
+owner-gated change. Pass for this completion handoff is: zero SURVIVED and
+zero BLOCKED mutants, `make check`, the exact positive ARM smoke, the named
+negative matrix, x86 parent-identity, `git diff --check`, and a local commit.
+Remote CI, physical ARM, and independent human review remain unverified.
+
+## Current status — MP3c implementation pass — observed 2026-11-09T23:19:19Z
+
+Repository `/tmp/wt-mp3c`, branch `wip/mp3c`, exact inspected commit
+`b1845a517b51dfc8947fc52d7ece585938129d02` (committed locally; working tree
+clean at observation). State: **implemented in part / tested locally in part / planned
+(remaining MP3c proof stages, owner review, remote CI, physical ARM and
+independent human qualification) / blocked for the requested completion gate**.
+No push, PR publication, reviewer assignment or release was performed.
+Demonstrated platform remains QEMU 8.2.2 `virt-8.2`, `cortex-a72`, one CPU,
+256 MiB.
+
+### Implemented
+
+- Added the frame-neutral syscall fragment `kernel/core/syscall_glue.inc` and
+  the x86-preserving include `kernel/core/syscall_glue_x86.inc`. ARM uses the
+  same endpoint/handle/send/receive case bodies with argument/status/result,
+  return, and park accessors; ARM PROCESS/DEVICE authority remains
+  `UNSUPPORTED`. The ARM dispatcher now decodes once and has a distinct
+  `JE_SYSCALL_BLOCK = 0x100` action.
+- Appended `JE_RR_BLOCKED` and added `je_rr_block()` /
+  `je_rr_wake()`; hosted tests cover exclusion, rejected switch, idempotent
+  wake, blocked death, and rejection of wake on SLEEPING.
+- Added the ARM continuation record, ELR rewind before parking, saved owned
+  endpoint record/side and arguments, process identity check, post-SVC ELR
+  assertion, shared resumed receive finish, and immediate return after
+  restart.
+- Added a real slot-0 idle frame below the live boot stack, WFI only after
+  ERET, ARM IRQ deadline sweep, endpoint bridge installation, ARM DAIF and
+  scheduler shims, and fail-closed ARM device hooks.
+- Split lifecycle waiter release from device hooks so blocked endpoint waiters
+  are released on the normal death path.
+- Extended the EL0 fixture with seeded bootstrap-channel routing, cap transfer,
+  destination-side cap use, WOKEN restart, post-commit EMPTY, and timer
+  TIMED_OUT checks. The current proof is trusted-kernel-marker based, not a
+  user-reported success bit.
+
+### Tested evidence
+
+Observed locally at this worktree state:
+
+```text
+make check                                      PASS
+make aarch64 ARM_EL0_TEST=1                    PASS
+make smoke-aarch64 ARM_EL0_TEST=1 \
+  ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60            PASS
+make mutants                                   PASS
+python3 -m json.tool tools/mutants.json         PASS
+python3 -m py_compile tools/smoke_arm.py \
+  tools/run_arm_ipc_fault.py                    PASS
+git diff --check                                PASS
+```
+
+The successful ARM serial tail includes:
+
+```text
+JeiOS/aarch64: EL0 IPC WOKEN_RESTART trusted-cause
+JeiOS/aarch64: EL0 IPC TIMED_OUT trusted-cause
+JeiOS/aarch64: EL0 IPC TIMER_WAKE trusted-cause
+JeiOS/aarch64: EL0 LONE_IRQ_RESELECT slot=1
+JeiOS/aarch64: EL0 proof PASS reviewed-cache-tlb=not-observed
+QEMU aarch64 smoke: PASS
+```
+
+The current mutation result is `69 killed, 1 equivalent, 0 SURVIVED,
+0 BLOCKED, 4 skipped`; the skipped entries are the pre-existing endpoint
+inflight gap plus the three explicitly disabled MP3c coverage gaps. The
+earlier MP3b mutation result must not be treated as current MP3c evidence.
+
+### Not yet verified / blockers
+
+- The requested x86 `objdump` byte-identity matrix is verified for TEST_MODE
+  0 through 15 at this source state: normalized disassembly and `.text` bytes
+  of `syscall.o` are identical. A separately linked whole-ELF comparison was
+  not performed.
+- `drop-the-rewind`, `wrong-resume-assertion`, `attenuation-bypass`,
+  `commit-mismatch`, resumed-copy-fault, woken-then-deadline, and WAITERS_BUSY
+  profiles have reached FATAL behavior in local runs. The short-buffer profile
+  currently reaches the generic EL0 proof failure rather than a dedicated
+  trusted SHORT_BUFFER marker.
+- `re-resolve-on-resume` is mutation-only: one thread per process prevents the
+  user race, and the current profile reaches proof completion rather than a
+  real failing mutation. It is not claimed as proven.
+- `timed-out-late-send` currently reaches the generic proof failure rather
+  than the intended endpoint late-send FATAL; its ordering is not deterministic
+  after the timed-out waiter is fully released.
+- `idle-no-panic` currently reaches proof completion and times out rather than
+  the intended no-wake FATAL control. The positive fixture does not yet force
+  both user slots into BLOCKED simultaneously.
+- The positive fixture does not yet provide the complete requested PEER_CLOSED,
+  dead-cap NULL-marker, death-releases-waiter/slot-reuse, and all-blocked idle
+  stages. These are implementation/proof gaps, not passing tests.
+- The IRQ path is authoritative for peer-death reaping, but a bounded SVC
+  fallback remains in `je_arm_el0_svc` to handle the synchronous death handoff
+  observed in the existing EL0 proof. This is a documented deviation from the
+  strict IRQ-only wording and must be resolved or owner-approved before exact
+  ADR 0017 completion.
+
+### Next bounded task and pass criteria
+
+Finish the missing ARM fixture stages and deterministic fault profiles, remove
+or explicitly approve the SVC reaping fallback, rerun x86 TEST_MODE 0..15
+byte identity, then run:
+
+```text
+make smoke-aarch64 ARM_EL0_TEST=1 ARM_REQUIRE=1 ARM_SMOKE_TIMEOUT=60
+make smoke-aarch64 ARM_IPC_FAULT=<each profile>
+make mutants
+```
+
+Pass requires every requested positive stage to complete from trusted kernel
+state, every enabled negative to produce its named FATAL/behavior, zero
+SURVIVED/BLOCKED mutants, current x86 byte identity, `make check`, and
+`git diff --check`. Remote CI, physical ARM, and independent human review
+remain unverified.
 
 ## Current status — MP3b fix pass — observed 2026-11-09T08:04:29Z
 

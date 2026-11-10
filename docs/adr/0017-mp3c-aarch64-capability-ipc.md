@@ -106,8 +106,8 @@ single-waiter assumption. *(Dated flex note 2026-11-09.)*
 
 **Park** (on a BLOCK action in `je_arm_el0_svc`): `record_current_frame`; save the continuation
 (the six args, the owned `rec`/`side`, and `post_svc_elr = tf->elr`); require
-`post_svc_elr >= JE_VM_ARENA_BASE + 4` (else take the normal death/error path, so a block-SVC at
-the very first arena instruction cannot rewind below the arena); rewind `tf->elr -= 4`
+`post_svc_elr >= JE_VM_ARENA_BASE + 4` (else take the normal death/error path as a defensive
+range/alignment check); rewind `tf->elr -= 4`
 (`JE_SVC_LEN`; the SVC re-executes on resume and the rewound ELR is still 4-aligned and in-arena,
 so `frame_shape_class` accepts it); `je_rr_block` the slot; `return arm_switch_to_ready()`. The
 BLOCK branch is taken **before** the `x0/x1` status/result write-back, so a parked frame is never
@@ -128,8 +128,11 @@ IPC deadlines, reap, and switch to a newly-READY user. The kernel stays **FATAL 
 is BLOCKED or SLEEPING** (nothing can ever wake); an all-blocked kernel idles and waits.
 
 **Why.** The ELR rewind is the architectural restart with no trap-entry assembly. The review
-measured that the first-draft `post_svc_elr − 4` assertion would FATAL every legitimate wake. A
-real ERET-reached idle is required because a bare `WFI` inside the handler runs with the
+measured that the first-draft `post_svc_elr − 4` assertion would FATAL every legitimate wake. The
+`post_svc_elr >= ARENA_BASE + 4` predicate is defensive: a block-SVC at `ARENA_BASE` has
+`post_svc_elr = ARENA_BASE + 4` and legitimately rewinds to `ARENA_BASE`, so this check does not
+prevent a below-arena rewind in that valid case. A real ERET-reached idle is required because a
+bare `WFI` inside the handler runs with the
 double-fault guard set and with interrupts masked.
 
 **Flex.** Multiple threads per process invalidates the one-frame-per-slot continuation and the
@@ -180,3 +183,28 @@ QEMU TCG does not model stale TLB/cache; cortex-a72 has no PAN/UAO/HAFDBS; physi
 not exercised. The restart prerequisites (immutable EL0 text, one thread per process,
 AArch64-only EL0 with ESR.IL=1) hold on ARM and are re-gated if any changes. This is AI-assisted
 work, not independent human qualification.
+
+## Completion-pass limits — observed 2026-11-10
+
+The trusted QEMU fixture now observes G1 PEER_CLOSED drain-first precedence,
+G2 dead-cap NULL with live-sibling use, G3 lifecycle waiter release and
+generation-safe slot reuse, and G4 all-blocked idle plus the deterministic
+no-wake fatal control. G5 has a dedicated SHORT_BUFFER marker and named
+negative detectors. The timed-out-late-send, woken-then-deadline, and
+attenuation-bypass standalone profiles were removed after re-review showed
+that their fixtures were flaky or vacuous. Hosted endpoint terminal-transition
+coverage and the ARM-MP3C-ATTENUATION mutant remain the load-bearing evidence
+for those invariants. The resumed positive fixture does not individually prove
+mint rollback after a later cap failure, PEER_CLOSED release, short-buffer
+release after a nonfatal return, poisoned continuation/identity rejection, or
+reap/sweep ordering beyond the exercised waiter/reuse path. It also does not
+prove the two caps-bearing copy-fault cleanup branches in `syscall_glue.inc`
+(byte-copy cleanup at lines 79-83 and handle-array cleanup at lines 90-94).
+These remain listed as honest limits in the current handoff.
+
+G6 remains mutation-only: one thread per process makes the requested user race
+unconstructable, and this pass did not complete the separate kernel poison
+profile that would distinguish an owned reference from a re-resolve. G7 is
+resolved as specified here: peer-death reaping is IRQ-authoritative and the
+bounded SVC fallback is removed. These limits are part of the ADR evidence
+boundary until a later owner-gated change closes them.

@@ -23,7 +23,8 @@ typedef enum {
     JE_RR_RUNNING,
     JE_RR_READY,
     JE_RR_SLEEPING,
-    JE_RR_ZOMBIE
+    JE_RR_ZOMBIE,
+    JE_RR_BLOCKED
 } je_rr_state;
 
 typedef struct {
@@ -163,6 +164,19 @@ je_status je_rr_switch(je_rr_table *t, uint32_t next,
  * SLEEPING state, so a tick cannot observe a sleeping slot without a deadline.
  */
 void je_rr_sleep(je_rr_table *t, uint32_t slot, uint64_t now, uint64_t n);
+
+/*
+ * Mark the current non-idle RUNNING worker BLOCKED.  BLOCKED is deliberately
+ * separate from SLEEPING: only an endpoint/deadline owner may make it READY.
+ * Invalid identities and non-RUNNING slots are ignored without changing state.
+ */
+void je_rr_block(je_rr_table *t, uint32_t slot);
+
+/*
+ * Make one BLOCKED worker READY.  This is a guarded, idempotent transition:
+ * READY, SLEEPING, ZOMBIE, EMPTY, and slot zero are never changed.
+ */
+void je_rr_wake(je_rr_table *t, uint32_t slot);
 
 /*
  * Mark a non-idle, non-EMPTY context ZOMBIE.  It is excluded from all future

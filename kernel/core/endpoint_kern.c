@@ -26,6 +26,17 @@ _Static_assert(JE_EP_POOL_CAP >= 2u * (JE_VM_MAX_PROCESSES - 1u) + JE_BROKER_MAX
 static je_endpoint_pool g_kep;
 static bool g_kep_inited;
 static uint32_t g_woken_reservations_released;
+static uint32_t g_waiters_released;
+
+#ifdef JE_ARM_EL0_TEST
+extern void je_arm_el0_test_note_ipc_send(je_ep_channel *rec, uint8_t side);
+extern void je_arm_el0_test_note_ipc_wake(je_ep_channel *rec, uint8_t side,
+                                          uint32_t waiter_id);
+extern void je_arm_el0_test_note_peer_closed(je_ep_channel *rec, uint8_t side,
+                                             uint32_t waiter_id);
+extern void je_arm_el0_test_note_ipc_close(je_ep_channel *rec, uint8_t side,
+                                           je_handle h);
+#endif
 
 static void kep_init_once(void)
 {
@@ -145,8 +156,12 @@ je_ep_status je_endpoint_kern_close(je_vm *vm, uint32_t index, je_handle h)
     bool have = (je_endpoint_resolve(&g_kep, &vm->procs[index].htable, h, &rec, &side)
                  == JE_EP_OK);
     je_ep_status s = je_endpoint_handle_close(&g_kep, &vm->procs[index].htable, h);
-    if (s == JE_EP_OK && have)
+    if (s == JE_EP_OK && have) {
+#ifdef JE_ARM_EL0_TEST
+        je_arm_el0_test_note_ipc_close(rec, side, h);
+#endif
         kern_peer_close_wake(rec, (uint8_t)(side ^ 1u));   /* peer end */
+    }
     return s;
 }
 
@@ -200,7 +215,9 @@ je_ep_status je_endpoint_kern_send_caps(je_vm *vm, uint32_t index, je_handle h,
     kep_init_once();
     je_ep_status s = je_endpoint_try_send_caps(&g_kep, &vm->procs[index].htable, h,
                                                kbuf, len, caps, ncaps);
-    if (s == JE_EP_OK) je_endpoint_kern_send_wake(vm, index, h);   /* A6: wake peer waiter */
+    if (s == JE_EP_OK) {
+        je_endpoint_kern_send_wake(vm, index, h);   /* A6: wake peer waiter */
+    }
     return s;
 }
 
@@ -395,6 +412,7 @@ bool je_endpoint_kern_waiter_release_by_id(uint32_t slot)
         if (woken_reserved) break;
     }
     bool released = je_endpoint_wait_release_by_id(&g_kep, slot);
+    if (released) ++g_waiters_released;
     if (released && woken_reserved) ++g_woken_reservations_released;
     return released;
 }
@@ -429,10 +447,17 @@ void je_endpoint_kern_send_wake(je_vm *vm, uint32_t index, je_handle h)
     je_ep_channel *rec; uint8_t side;
     if (je_endpoint_resolve(&g_kep, &vm->procs[index].htable, h, &rec, &side) != JE_EP_OK)
         return;
+#ifdef JE_ARM_EL0_TEST
+    je_arm_el0_test_note_ipc_send(rec, side);
+#endif
     uint32_t id = 0u;
     if (je_endpoint_wait_arbitrate(rec, (uint8_t)(side ^ 1u), JE_EP_WAIT_WOKEN, &id)
-        == JE_EP_ARB_WON)
+        == JE_EP_ARB_WON) {
+#ifdef JE_ARM_EL0_TEST
+        je_arm_el0_test_note_ipc_wake(rec, (uint8_t)(side ^ 1u), id);
+#endif
         je_sched_wake_ipc(id);
+    }
 }
 
 /* Wake a receiver blocked on an end that just became PEER_CLOSED (A6-PEERWAKE),
@@ -446,8 +471,12 @@ static void kern_peer_close_wake(je_ep_channel *rec, uint8_t side)
     if (je_endpoint_inbound_count(rec, side) != 0u) return;   /* drain-first */
     uint32_t id = 0u;
     if (je_endpoint_wait_arbitrate(rec, side, JE_EP_WAIT_PEER_CLOSED, &id)
-        == JE_EP_ARB_WON)
+        == JE_EP_ARB_WON) {
+#ifdef JE_ARM_EL0_TEST
+        je_arm_el0_test_note_peer_closed(rec, side, id);
+#endif
         je_sched_wake_ipc(id);
+    }
 }
 
 /* Internal cancel (A6-2; no ABI path in v1). Arbitrate CANCELLED on the waiter
@@ -497,4 +526,9 @@ void je_endpoint_kern_wait_release(je_ep_channel *rec, uint8_t side, uint32_t wh
 uint32_t je_endpoint_kern_woken_reservations_released(void)
 {
     return g_woken_reservations_released;
+}
+
+uint32_t je_endpoint_kern_waiters_released(void)
+{
+    return g_waiters_released;
 }
