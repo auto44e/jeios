@@ -1,5 +1,49 @@
 # Implementation ledger: M1 and M2
 
+## Current status — MP3c G1/G2/G3 tightening fix — observed 2026-11-10T12:58:14Z
+
+| Gate | Status | Evidence / remaining work |
+| --- | --- | --- |
+| MP3c shared endpoint/handle syscall glue | Implemented | E1 converged the ARM/x86 wrappers onto the shared `syscall_glue.inc` body; x86 `syscall.o` `.text` is byte-identical to base `52adf4f` for TEST_MODE 0..15, while the endpoint lifecycle change remains outside that object |
+| MP3c RR BLOCKED state | Implemented and hosted-tested | `JE_RR_BLOCKED`, `je_rr_block`, `je_rr_wake`; non-EL0 timer/scheduler profiles and all 13 scheduler mutations pass locally |
+| ARM park/restart and slot-0 idle | Implemented and QEMU-tested | ELR rewind/post-SVC assertion, dedicated guarded idle stack, real WFI idle, timer wake, and all-blocked fatal control |
+| ARM endpoint bridge and lifecycle waiter release | Implemented and QEMU-tested | PEER_CLOSED precedence, death release, generation bump, same-slot reuse, IRQ-only reaping |
+| EL0 positive IPC proof | Implemented and QEMU-tested | WOKEN_RESTART, TIMED_OUT, TIMER_WAKE, PEER_CLOSED, dead-cap NULL/live sibling use, all-blocked idle, death-release markers |
+| MP3c negative injection matrix | Implemented in part | Eight named local IPC FATAL profiles remain; hosted coverage now includes the reverse TIMED_OUT late-send assertion; the WOKEN endpoint-reference leak is a real-path ARM mutant and is killed. The timed-out-late-send, woken-then-deadline, and attenuation-bypass standalone stages remain removed as vacuous. |
+| ADR 0017 completion | Implemented in part / owner review required | B1/B2/B3/E1 and G1/G2/G3 are repaired; `make mutants` is 77 killed / 1 equivalent / 0 survived / 0 blocked / 2 skipped; exact commands and limits are recorded in the current handoff entry below |
+
+This refresh is AI-assisted local evidence, not independent human or release
+qualification. The current handoff at the top of `docs/HANDOFF.md` is the
+authoritative status; historical snapshots below remain tied to their original
+commits and environments.
+
+### MP3c resumed-receive honest limits — observed 2026-11-10
+
+The positive resumed-receive fixture does not individually prove mint rollback
+after a later cap failure, PEER_CLOSED release, short-buffer release after a
+nonfatal return, poisoned continuation/identity rejection, or reap/sweep
+ordering beyond the exercised waiter/reuse path. It also does not individually
+prove the two caps-bearing copy-fault cleanup branches in
+`kernel/core/syscall_glue.inc`: byte-copy cleanup at lines 79-83 and
+handle-array cleanup at lines 90-94. One-thread-per-process remains a
+fixture/model boundary and the G6 poison profile remains mutation-only.
+
+## Current status — MP3c ARM capability IPC — 2026-11-09
+
+| Gate | Status | Evidence / remaining work |
+| --- | --- | --- |
+| MP3c shared endpoint/handle syscall glue | Implemented in working tree | `syscall_glue.inc` is included by ARM and x86 wrappers; final x86 TEST_MODE 0..15 byte-identity rerun pending |
+| MP3c RR BLOCKED state | Implemented and hosted-tested | `JE_RR_BLOCKED`, `je_rr_block`, `je_rr_wake`; `make check` passes |
+| ARM park/restart and slot-0 idle | Implemented in part | ELR rewind, continuation identity, real idle frame and IRQ sweep are present; strict IRQ-only reaping and all-blocked proof remain open |
+| ARM endpoint bridge and fail-closed device hooks | Implemented | endpoint core is linked; lifecycle waiter release is unconditional; ARM device operations return `UNSUPPORTED` |
+| EL0 positive IPC proof | Implemented in part and QEMU-tested | bootstrap transfer, cap use, WOKEN restart, post-commit EMPTY and TIMED_OUT markers pass |
+| MP3c negative injection matrix | Partial | Several FATAL profiles pass; re-resolve is mutation-only, late-send/idle/short-buffer need dedicated deterministic proof |
+| ADR 0017 completion | Blocked | PEER_CLOSED, dead-cap NULL, death waiter release/slot reuse, and all-blocked idle remain; final mutants are 69 killed / 1 equivalent / 0 blocked / 0 survived / 4 skipped, and x86 syscall `.text` identity is verified |
+
+This is a current status snapshot; historical records below remain tied to
+their original commits and environments. The MP3c work is AI-assisted local
+evidence, not independent human or release qualification.
+
 Current checkpoint and work order: [STATUS.md](STATUS.md). Dated status and next-task statements below are historical when superseded by that checkpoint.
 
 ## Current status — MP3b fix pass — observed 2026-11-09T08:04:29Z

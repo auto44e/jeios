@@ -446,117 +446,6 @@ static je_abi_status ep_status_to_abi(je_ep_status s)
     return JE_ABI_INVALID;
 }
 
-/* M3c A6: finish a resumed blocking recv. The thread parked on (wrec,wside) with
- * out-args ubuf=rsi, cap=rdx, hbuf=r8, hcap=r9. Read the terminal cause the single
- * arbitrate CAS stamped and deliver into f. WOKEN: peek the reserved head (bytes +
- * caps) from the OWNED end (no handle re-resolve, A6-5), stage mints, copy out,
- * commit, release the waiter. TIMED_OUT/PEER_CLOSED/CANCELLED: write the status.
- * A copy/mint fault on WOKEN -> JE_ABI_INVALID, message stays queued, mints rolled
- * back, reservation released (the head returns to deliverable). */
-static void je_syscall_finish_blocked_recv(je_trap_frame *f, je_ep_channel *rec,
-                                           uint8_t side, uint64_t ubuf, uint64_t cap,
-                                           uint64_t hbuf, uint64_t hcap)
-{
-    je_vm *vm; uint32_t index;
-    if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return; }
-    je_ep_wait_cause cause = je_endpoint_wait_cause(rec, side);
-    uint32_t slot = 0u; (void)je_sched_current_slot(&slot);
-    switch (cause) {
-    case JE_EP_WAIT_TIMED_OUT:
-        je_endpoint_kern_wait_release(rec, side, slot);
-        f->rax=(uint64_t)JE_ABI_H_TIMED_OUT; f->rdx=0; return;
-    case JE_EP_WAIT_PEER_CLOSED:
-        je_endpoint_kern_wait_release(rec, side, slot);
-        f->rax=(uint64_t)JE_ABI_H_PEER_CLOSED; f->rdx=0; return;
-    case JE_EP_WAIT_CANCELLED:
-        je_endpoint_kern_wait_release(rec, side, slot);
-        f->rax=(uint64_t)JE_ABI_H_CANCELLED; f->rdx=0; return;
-    case JE_EP_WAIT_WOKEN: break;    /* deliver below */
-    default:
-        /* No terminal cause on a resumed thread = kernel-invariant break. */
-        je_arch_console_write("JeiOS fatal: recv resume without terminal cause\r\n");
-        je_arch_halt(); return;
-    }
-    /* WOKEN delivery from the owned reserved head. */
-    uint8_t staging[JE_EP_MSG_MAX];
-    je_ep_capdesc caps[JE_ABI_MSG_CAPS_MAX];
-    size_t mlen = 0u; uint8_t mcaps = 0u;
-    je_ep_recv_lease lease;
-    je_ep_status s = je_endpoint_kern_recv_peek_owned(rec, side, staging,
-                                                      je_syscall_recv_staging_cap(cap, sizeof staging),
-                                                      &mlen, (uint8_t)hcap, caps, &mcaps,
-                                                      &lease);
-    if (s == JE_EP_SHORT_BUFFER) {
-        /* Buffer too small: leave the message QUEUED but RELEASE the waiter (the
-         * head returns to deliverable), so a re-issued recv with a bigger buffer
-         * takes the normal path. NOT releasing here would wedge the end forever —
-         * the continuation only runs while wait_pending is set, which we clear on
-         * return. Report the required sizes. */
-        je_endpoint_kern_wait_release(rec, side, slot);
-        f->rax=(uint64_t)JE_ABI_H_SHORT_BUFFER;
-        f->rdx=(uint64_t)mlen | ((uint64_t)mcaps << 32); return;
-    }
-    if (s != JE_EP_OK) { je_endpoint_kern_wait_release(rec, side, slot);
-                         f->rax=(uint64_t)ep_status_to_abi(s); f->rdx=0; return; }
-    /* Stage mints (dead cap -> handle 0; roll back all on transient fault). */
-    je_handle minted[JE_ABI_MSG_CAPS_MAX]; bool was_live[JE_ABI_MSG_CAPS_MAX];
-    for (uint8_t c = 0; c < mcaps; ++c) { minted[c]=0u; was_live[c]=false; }
-    je_abi_status fail = JE_ABI_OK; uint8_t done = 0u;
-    for (uint8_t c = 0; c < mcaps; ++c) {
-        if (!je_endpoint_kern_capdesc_live(&caps[c])) { minted[c]=0u; continue; }
-        je_handle nh = 0u;
-        je_ep_status mc = je_endpoint_kern_mint_recv_cap(vm, index, &caps[c], &nh);
-        if (mc != JE_EP_OK) { fail = ep_status_to_abi(mc); break; }
-        minted[c]=nh; was_live[c]=true; done=(uint8_t)(c+1u);
-    }
-    if (fail != JE_ABI_OK) {
-        for (uint8_t c = 0; c < done; ++c)
-            if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
-        /* Message stays queued+reserved; A6-5 says a fault does NOT consume. But a
-         * transient mint fault must not wedge the waiter forever: release it so a
-         * re-issue can retry (the head returns to deliverable). */
-        je_endpoint_kern_wait_release(rec, side, slot);
-        f->rax=(uint64_t)fail; f->rdx=0; return;
-    }
-    if (mlen != 0u) {
-        je_abi_status cs = je_copy_to_user(ubuf, staging, (uint64_t)mlen);
-        if (cs != JE_ABI_OK) {
-            for (uint8_t c = 0; c < mcaps; ++c)
-                if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
-            je_endpoint_kern_wait_release(rec, side, slot);
-            f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return;
-        }
-    }
-    if (mcaps != 0u) {
-        uint32_t hout[JE_ABI_MSG_CAPS_MAX];
-        for (uint8_t c = 0; c < mcaps; ++c) hout[c]=(uint32_t)minted[c];
-        je_abi_status cs = je_copy_to_user(hbuf, hout, (uint64_t)mcaps*sizeof(uint32_t));
-        if (cs != JE_ABI_OK) {
-            for (uint8_t c = 0; c < mcaps; ++c)
-                if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
-            je_endpoint_kern_wait_release(rec, side, slot);
-            f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return;
-        }
-    }
-    /* Infallible commit (dequeue + release inflight), then free the waiter. */
-    je_ep_status cm = je_endpoint_kern_recv_commit(&lease);
-    if (cm != JE_EP_OK) { je_arch_console_write("JeiOS fatal: blocked recv commit mismatch\r\n"); je_arch_halt(); }
-#if JE_TEST_MODE == 13
-    for (uint8_t c = 0u; c < mcaps; ++c)
-        if (was_live[c] && minted[c])
-            je_m4g_record_cap_delivery(vm, index, &caps[c]);
-    je_m4g_record_control_receive(vm, index, &lease, staging, mlen, mcaps);
-#endif
-#if JE_TEST_MODE == 15
-    for (uint8_t c = 0u; c < mcaps; ++c)
-        if (was_live[c] && minted[c])
-            je_m4g_record_cap_delivery(vm, index, &caps[c]);
-#endif
-    je_endpoint_kern_wait_release(rec, side, slot);
-    f->rax=(uint64_t)JE_ABI_OK;
-    f->rdx=(uint64_t)mlen | ((uint64_t)mcaps << 32);
-}
-
 static je_trap_frame *dispatch_proc_status(je_trap_frame *f)
 {
     je_handle_table *t = current_htable();
@@ -744,6 +633,137 @@ static je_trap_frame *dispatch_device_ack(je_trap_frame *f)
     return je_sched_return_to_user(f);
 }
 
+#define JE_G_ARG_0 f->rdi
+#define JE_G_ARG_1 f->rsi
+#define JE_G_ARG_2 f->rdx
+#define JE_G_ARG_3 f->r10
+#define JE_G_ARG_4 f->r8
+#define JE_G_ARG_5 f->r9
+#define JE_G_ARG(i) JE_G_ARG_##i
+#define JE_G_SET_STATUS(v) f->rax = (uint64_t)(v)
+#define JE_G_SET_RESULT(v) f->rdx = (uint64_t)(v)
+#define JE_G_RETURN() return je_sched_return_to_user(f)
+#define JE_G_BLOCK(rec, side, deadline) \
+    return je_sched_block_current(f, (rec), (side), (deadline))
+#define JE_G_FINISH_FN je_syscall_finish_blocked_recv
+#define JE_G_FINISH_STORAGE static
+#define JE_G_FINISH_PARAMS \
+    je_trap_frame *f, je_ep_channel *rec, uint8_t side, \
+    uint64_t ubuf, uint64_t cap, uint64_t hbuf, uint64_t hcap
+#define JE_G_IPC_FATAL(text) \
+    je_arch_console_write("JeiOS fatal: " text "\r\n"); je_arch_halt()
+#define JE_G_NOTE_WAIT_TERMINAL(index, rec, side, cause)
+#define JE_G_NOTE_SHORT_BUFFER(index, rec, side, bytes, caps)
+#define JE_G_NOTE_RECV_CAPS(index, rec, side, count, caps, minted, was_live)
+#define JE_G_FAULT_RESUMED_COPY()
+#define JE_G_FAULT_RECV_COMMIT(lease)
+#define JE_G_CLOSE_EXTRA(t, h, type, rights, object) \
+        } else if (type == JE_ABI_OBJ_PROCESS) { \
+            je_proc_id id = JE_PROC_ID_NONE; \
+            if (!process_id_from_object(process_pool(), object, &id) \
+                || process_pool()->rec[id.index].handle_refs == 0u) \
+                syscall_invariant("JeiOS fatal: PROCESS close invariant\r\n"); \
+            if (je_handle_close(t, h) != JE_HANDLE_OK) \
+                syscall_invariant("JeiOS fatal: PROCESS close mismatch\r\n"); \
+            dispatch_release_process(object); \
+            JE_G_SET_STATUS(JE_ABI_OK); \
+            JE_G_SET_RESULT(0); \
+        } else if (type == JE_ABI_OBJ_DEVICE) { \
+            je_proc_id caller = JE_PROC_ID_NONE; \
+            if (je_sched_current_proc_id(&caller) != JE_OK) \
+                syscall_invariant("JeiOS fatal: DEVICE close caller invariant\r\n"); \
+            bool revoke = je_device_close_matches( \
+                je_kernel_device(), caller, vm, index, h); \
+            je_handle_status s = je_handle_close(t, h); \
+            if (s == JE_HANDLE_OK && revoke) \
+                (void)je_device_revoke_close(je_kernel_device()); \
+            JE_G_SET_STATUS(handle_status_to_abi(s)); \
+            JE_G_SET_RESULT(0); \
+        } else if (type == JE_ABI_OBJ_SELF || type == JE_ABI_OBJ_LAUNCHER) { \
+            je_handle_status s = je_handle_close(t, h); \
+            JE_G_SET_STATUS(handle_status_to_abi(s)); \
+            JE_G_SET_RESULT(0);
+#define JE_G_CLOSE_FALLBACK() JE_G_SET_STATUS(JE_ABI_H_WRONGTYPE)
+#define JE_G_QUERY_RESULT(s, type, rights, object) \
+    (void)rights; (void)object; \
+    if ((s) == JE_HANDLE_OK && dispatch_for_type(type) == (const je_type_dispatch *)0) \
+        (s) = JE_HANDLE_WRONGTYPE; \
+    JE_G_SET_STATUS(handle_status_to_abi(s)); \
+    JE_G_SET_RESULT(((s) == JE_HANDLE_OK) ? (uint64_t)(type) : 0u);
+#define JE_G_RIGHTS_RESULT(s, type, rights, object) \
+    (void)object; \
+    const je_type_dispatch *dispatch = ((s) == JE_HANDLE_OK) \
+                                      ? dispatch_for_type(type) \
+                                      : (const je_type_dispatch *)0; \
+    if ((s) == JE_HANDLE_OK && !dispatch) (s) = JE_HANDLE_WRONGTYPE; \
+    if ((s) == JE_HANDLE_OK && ((rights) & JE_ABI_RIGHT_INSPECT) == 0u) \
+        (s) = JE_HANDLE_DENIED; \
+    JE_G_SET_STATUS(handle_status_to_abi(s)); \
+    JE_G_SET_RESULT(((s) == JE_HANDLE_OK) \
+                        ? (uint64_t)((rights) & dispatch->known_rights) : 0u);
+#define JE_G_DUP_PREPARE(resolve, type) \
+    const je_type_dispatch *dispatch = ((resolve) == JE_HANDLE_OK) \
+                                      ? dispatch_for_type(type) \
+                                      : (const je_type_dispatch *)0;
+#define JE_G_DUP_RESOLVED(t, type, source_rights, object, new_rights, nh) \
+    if (!dispatch) { \
+        JE_G_SET_STATUS(JE_ABI_H_WRONGTYPE); \
+        JE_G_SET_RESULT(0); \
+        JE_G_RETURN(); \
+    } \
+    if ((new_rights) & ~(source_rights)) { \
+        JE_G_SET_STATUS(JE_ABI_H_DENIED); \
+        JE_G_SET_RESULT(0); \
+        JE_G_RETURN(); \
+    } \
+    if (dispatch->dup == JE_DUP_POLICY_DENIED) { \
+        JE_G_SET_STATUS(JE_ABI_H_DENIED); \
+        JE_G_SET_RESULT(0); \
+        JE_G_RETURN(); \
+    } \
+    if (dispatch->dup == JE_DUP_POLICY_SELF) { \
+        je_handle_status s = je_handle_dup_self( \
+            t, (je_handle)JE_G_ARG(0), JE_HANDLE_OBJ_SELF, \
+            (new_rights), &(nh)); \
+        JE_G_SET_STATUS(handle_status_to_abi(s)); \
+    } else if (dispatch->dup == JE_DUP_POLICY_ENDPOINT) { \
+        je_vm *vm; \
+        uint32_t index; \
+        if (!current_vm_index(&vm, &index)) { \
+            JE_G_SET_STATUS(JE_ABI_INVALID); \
+            JE_G_SET_RESULT(0); \
+            JE_G_RETURN(); \
+        } \
+        je_ep_status s = je_endpoint_kern_dup( \
+            vm, index, (je_handle)JE_G_ARG(0), (new_rights), &(nh)); \
+        JE_G_SET_STATUS(ep_status_to_abi(s)); \
+    } else { \
+        je_proc_pool *pool = process_pool(); \
+        je_proc_id id = JE_PROC_ID_NONE; \
+        if (!process_id_from_object(pool, object, &id)) \
+            syscall_invariant("JeiOS fatal: PROCESS dup invariant\r\n"); \
+        je_status retain = dispatch_retain_process(object); \
+        if (retain == JE_ERR_BUSY) { \
+            JE_G_SET_STATUS(JE_ABI_H_REFOVERFLOW); \
+            JE_G_SET_RESULT(0); \
+            JE_G_RETURN(); \
+        } \
+        if (retain != JE_OK) \
+            syscall_invariant("JeiOS fatal: PROCESS dup retain invariant\r\n"); \
+        je_handle_status a = je_handle_alloc( \
+            t, object, JE_PROCESS_TYPE, (new_rights), &(nh)); \
+        if (a != JE_HANDLE_OK) { \
+            dispatch_release_process(object); \
+            JE_G_SET_STATUS(handle_status_to_abi(a)); \
+            JE_G_SET_RESULT(0); \
+            JE_G_RETURN(); \
+        } \
+        JE_G_SET_STATUS(JE_ABI_OK); \
+    }
+#define JE_G_EMIT_FINISH
+#include "syscall_glue.inc"
+#undef JE_G_EMIT_FINISH
+
 /* Kernel glue. Returns the frame to iretq to (the caller for RETURN/invalid, a
  * live successor for YIELD/EXIT). Must only be called for a user-origin int 0x80
  * frame (je_trap_dispatch enforces cs&3==3; the scheduler helpers re-check the
@@ -815,178 +835,9 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         f->rdx = (uint64_t)h;                 /* 0 on failure (alloc clears out) */
         return je_sched_return_to_user(f);
     }
-    case JE_SYSCALL_HANDLE_CLOSE: {
-        /* Typed close dispatch (A3-3): peek the slot's object type, then branch
-         * EXACTLY — SELF -> raw table close; ENDPOINT -> endpoint-aware close
-         * (drops the handle_ref); any other/unknown type -> fail closed. The peek
-         * and the close are atomic because this int 0x80 path runs at IF=0 on one
-         * CPU (SMP revisit). A raw je_handle_close on an endpoint slot would leak
-         * a ref, which is exactly what this dispatch prevents. */
-        je_vm *vm; uint32_t index;
-        if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        je_handle_table *t = &vm->procs[index].htable;
-        je_handle h = (je_handle)f->rdi;
-        uint32_t type = 0u, rights = 0u; void *object = (void *)0;
-        je_handle_status resolve = je_handle_resolve_any(t, h, &type, &rights, &object);
-        if (resolve != JE_HANDLE_OK) {
-            f->rax=(uint64_t)handle_status_to_abi(resolve); f->rdx=0;
-        } else if (type == JE_ABI_OBJ_ENDPOINT) {
-            je_ep_status s = je_endpoint_kern_close(vm, index, h);
-            f->rax = (uint64_t)ep_status_to_abi(s); f->rdx = 0;
-        } else if (type == JE_ABI_OBJ_PROCESS) {
-            je_proc_id id = JE_PROC_ID_NONE;
-            if (!process_id_from_object(process_pool(), object, &id)
-                || process_pool()->rec[id.index].handle_refs == 0u)
-                syscall_invariant("JeiOS fatal: PROCESS close invariant\r\n");
-            if (je_handle_close(t, h) != JE_HANDLE_OK)
-                syscall_invariant("JeiOS fatal: PROCESS close mismatch\r\n");
-            dispatch_release_process(object);
-            f->rax=(uint64_t)JE_ABI_OK; f->rdx=0;
-        } else if (type == JE_ABI_OBJ_DEVICE) {
-            je_proc_id caller = JE_PROC_ID_NONE;
-            if (je_sched_current_proc_id(&caller) != JE_OK)
-                syscall_invariant("JeiOS fatal: DEVICE close caller invariant\r\n");
-            bool revoke = je_device_close_matches(
-                je_kernel_device(), caller, vm, index, h);
-            je_handle_status s = je_handle_close(t, h);
-            if (s == JE_HANDLE_OK && revoke)
-                (void)je_device_revoke_close(je_kernel_device());
-            f->rax = (uint64_t)handle_status_to_abi(s); f->rdx = 0u;
-        } else if (type == JE_ABI_OBJ_SELF || type == JE_ABI_OBJ_LAUNCHER) {
-            je_handle_status s = je_handle_close(t, h);
-            f->rax = (uint64_t)handle_status_to_abi(s); f->rdx = 0;
-        } else {
-            f->rax = (uint64_t)JE_ABI_H_WRONGTYPE; f->rdx = 0;
-        }
-        return je_sched_return_to_user(f);
-    }
-    case JE_SYSCALL_HANDLE_QUERY: {
-        /* Look up the handle for its object type. No expected-type/rights are
-         * required from ring 3 in M3b, so WRONGTYPE/DENIED are not user-reachable
-         * here (they are covered by the hosted table tests and the mapper). On OK,
-         * RDX = object type; otherwise RDX = 0. */
-        je_handle_table *t = current_htable();
-        if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        uint32_t type = 0u, rights = 0u; void *object = (void *)0;
-        je_handle_status s = je_handle_resolve_any(t, (je_handle)f->rdi,
-                                                   &type, &rights, &object);
-        (void)rights; (void)object;
-        if (s == JE_HANDLE_OK && dispatch_for_type(type) == (const je_type_dispatch *)0)
-            s = JE_HANDLE_WRONGTYPE;
-        f->rax = (uint64_t)handle_status_to_abi(s);
-        f->rdx = (s == JE_HANDLE_OK) ? (uint64_t)type : 0u;
-        return je_sched_return_to_user(f);
-    }
-    case JE_SYSCALL_HANDLE_RIGHTS: {
-        /* Look up the handle requiring the INSPECT right, and return its rights
-         * mask (masked to the known ABI bits, so an internal bit can never leak).
-         * DENIED here IS ring-3-observable: handle_dup can derive a handle that
-         * lacks INSPECT, and this op on that handle returns DENIED (proven by the
-         * M3b-s1 QEMU marker). */
-        je_handle_table *t = current_htable();
-        if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        uint32_t type = 0u, rights = 0u; void *object = (void *)0;
-        je_handle_status s = je_handle_resolve_any(t, (je_handle)f->rdi,
-                                                   &type, &rights, &object);
-        const je_type_dispatch *dispatch = (s == JE_HANDLE_OK)
-                                          ? dispatch_for_type(type)
-                                          : (const je_type_dispatch *)0;
-        if (s == JE_HANDLE_OK && !dispatch) s = JE_HANDLE_WRONGTYPE;
-        if (s == JE_HANDLE_OK && (rights & JE_ABI_RIGHT_INSPECT) == 0u)
-            s = JE_HANDLE_DENIED;
-        f->rax = (uint64_t)handle_status_to_abi(s);
-        f->rdx = (s == JE_HANDLE_OK) ? (uint64_t)(rights & dispatch->known_rights) : 0u;
-        return je_sched_return_to_user(f);
-    }
-    case JE_SYSCALL_HANDLE_DUP: {
-        /* Attenuate: derive a new SELF handle (RDI) with a rights SUBSET (RSI).
-         * The decoder already rejected unknown rights bits as INVALID; here a
-         * request for a known-but-unheld right returns DENIED (never escalates).
-         * The new handle is a fresh, independently-closable slot naming the same
-         * SELF object; it counts against quota. This is where DENIED becomes
-         * genuinely ring-3-observable: dup(self, 0) yields a rights-less handle on
-         * which handle_rights then returns DENIED. */
-        je_handle_table *t = current_htable();
-        if (!t) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        je_handle nh = 0u;
-        uint32_t type = 0u, source_rights = 0u; void *object = (void *)0;
-        je_handle_status resolve = je_handle_resolve_any(t, (je_handle)f->rdi,
-                                                          &type, &source_rights, &object);
-        const je_type_dispatch *dispatch = (resolve == JE_HANDLE_OK)
-                                          ? dispatch_for_type(type)
-                                          : (const je_type_dispatch *)0;
-        if (resolve != JE_HANDLE_OK) {
-            f->rax=(uint64_t)handle_status_to_abi(resolve); f->rdx=0;
-            return je_sched_return_to_user(f);
-        }
-        uint32_t new_rights = (uint32_t)f->rsi;
-        if (!dispatch) {
-            f->rax=(uint64_t)JE_ABI_H_WRONGTYPE; f->rdx=0;
-            return je_sched_return_to_user(f);
-        }
-        if ((new_rights & ~source_rights) != 0u) {
-            f->rax=(uint64_t)JE_ABI_H_DENIED; f->rdx=0;
-            return je_sched_return_to_user(f);
-        }
-        if (dispatch->dup == JE_DUP_POLICY_DENIED) {
-            f->rax=(uint64_t)JE_ABI_H_DENIED; f->rdx=0;
-            return je_sched_return_to_user(f);
-        }
-        if (dispatch->dup == JE_DUP_POLICY_SELF) {
-            je_handle_status s = je_handle_dup_self(t, (je_handle)f->rdi,
-                                                    JE_HANDLE_OBJ_SELF, new_rights, &nh);
-            f->rax = (uint64_t)handle_status_to_abi(s);
-        } else if (dispatch->dup == JE_DUP_POLICY_ENDPOINT) {
-            je_vm *vm; uint32_t index;
-            if (!current_vm_index(&vm, &index)) {
-                f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0;
-                return je_sched_return_to_user(f);
-            }
-            je_ep_status s = je_endpoint_kern_dup(vm, index, (je_handle)f->rdi,
-                                                  new_rights, &nh);
-            f->rax=(uint64_t)ep_status_to_abi(s);
-        } else {
-            je_proc_pool *pool = process_pool();
-            je_proc_id id = JE_PROC_ID_NONE;
-            if (!process_id_from_object(pool, object, &id)) {
-                syscall_invariant("JeiOS fatal: PROCESS dup invariant\r\n");
-            }
-            je_status retain = dispatch_retain_process(object);
-            if (retain == JE_ERR_BUSY) {
-                f->rax=(uint64_t)JE_ABI_H_REFOVERFLOW; f->rdx=0;
-                return je_sched_return_to_user(f);
-            }
-            if (retain != JE_OK) {
-                syscall_invariant("JeiOS fatal: PROCESS dup retain invariant\r\n");
-            }
-            je_handle_status a = je_handle_alloc(t, object, JE_PROCESS_TYPE,
-                                                  new_rights, &nh);
-            if (a != JE_HANDLE_OK) {
-                dispatch_release_process(object);
-                f->rax=(uint64_t)handle_status_to_abi(a); f->rdx=0;
-                return je_sched_return_to_user(f);
-            }
-            f->rax=(uint64_t)JE_ABI_OK;
-        }
-        f->rdx = (uint64_t)nh;                /* 0 on failure (dup clears out) */
-        return je_sched_return_to_user(f);
-    }
-    case JE_SYSCALL_ENDPOINT_CREATE: {
-        /* endpoint_create() (A3-2): mint both ends into the caller's own table
-         * via the kernel pool wrapper, which refuses unless this vm has the
-         * teardown hook installed (UNSUPPORTED) so a created endpoint is always
-         * on a death path that reclaims it. On OK, pack the two 32-bit handles:
-         * RDX[31:0]=h0, RDX[63:32]=h1. RDX is left 0 on failure (undefined by
-         * ABI, but we zero it rather than leak a stale value). */
-        je_vm *vm; uint32_t index;
-        if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        je_handle h0 = 0u, h1 = 0u;
-        je_ep_status s = je_endpoint_kern_create(vm, index, &h0, &h1);
-        f->rax = (uint64_t)ep_status_to_abi(s);
-        f->rdx = (s == JE_EP_OK)
-               ? ((uint64_t)h0 | ((uint64_t)h1 << 32)) : 0u;
-        return je_sched_return_to_user(f);
-    }
+#define JE_G_EMIT_CASES_EARLY
+#include "syscall_glue.inc"
+#undef JE_G_EMIT_CASES_EARLY
     case JE_SYSCALL_CLOCK_TICKS:
         f->rax = (uint64_t)JE_ABI_OK;
         f->rdx = je_sched_ticks();
@@ -1024,170 +875,9 @@ je_trap_frame *je_syscall_dispatch(je_trap_frame *f)
         f->rdx = (uint64_t)child;
         return je_sched_return_to_user(f);
     }
-    case JE_SYSCALL_TRY_SEND: {
-        /* A5-4 send: resolve caps (if any) in the sender's table FIRST (read-only
-         * -> TRANSFER + attenuation), preflight bytes+caps, copy bytes to stack
-         * staging, then pure all-or-nothing enqueue (bytes + cap descriptors +
-         * per-cap inflight retain). Cap-array copy fault ranks last (after a clean
-         * preflight), per the frozen precedence. */
-        je_vm *vm; uint32_t index;
-        if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        je_handle h = (je_handle)f->rdi;
-        uint64_t ubuf = f->rsi, len = f->rdx;
-        uint8_t ncaps = (uint8_t)(f->r10 & 0xffu);
-        uint64_t caparr = f->r8;
-        je_ep_capdesc caps[JE_ABI_MSG_CAPS_MAX];
-        /* Resolve each user cap entry {low32 handle, high32 rights} -> descriptor.
-         * Copy the array in first (a fault here is INVALID but only after the main
-         * handle is validated by the preflight below — so do the base preflight
-         * (len + main handle SEND/state/full) FIRST). */
-        je_ep_status bpf = je_endpoint_kern_send_preflight(vm, index, h, (size_t)len);
-        if (bpf != JE_EP_OK) { f->rax=(uint64_t)ep_status_to_abi(bpf); f->rdx=0; return je_sched_return_to_user(f); }
-        if (ncaps != 0u) {
-            uint64_t raw[JE_ABI_MSG_CAPS_MAX];
-            je_abi_status cs = je_copy_from_user(raw, caparr,
-                                                 (uint64_t)ncaps * sizeof(uint64_t));
-            if (cs != JE_ABI_OK) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-            for (uint8_t c = 0; c < ncaps; ++c) {
-                je_handle ch = (je_handle)(raw[c] & 0xffffffffu);
-                uint32_t crights = (uint32_t)(raw[c] >> 32);
-                if (crights & ~(uint32_t)JE_ABI_RIGHTS_KNOWN) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-                je_ep_status rc = je_endpoint_kern_resolve_send_cap(vm, index, ch, crights, &caps[c]);
-                if (rc != JE_EP_OK) { f->rax=(uint64_t)ep_status_to_abi(rc); f->rdx=0; return je_sched_return_to_user(f); }
-            }
-        }
-        uint8_t staging[JE_EP_MSG_MAX];
-        if (len != 0u) {
-            je_abi_status cs = je_copy_from_user(staging, ubuf, len);
-            if (cs != JE_ABI_OK) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        }
-        je_ep_status s = je_endpoint_kern_send_caps(vm, index, h, staging,
-                                                    (size_t)len, caps, ncaps);
-        f->rax = (uint64_t)ep_status_to_abi(s); f->rdx = 0;
-        return je_sched_return_to_user(f);
-    }
-    case JE_SYSCALL_TRY_RECV: {
-        /* A5-4 recv: PEEK (bytes + cap descriptors, no dequeue) -> stage all live
-         * mints in the receiver's table (dead caps -> handle 0, A5-2) -> copy bytes
-         * out -> copy handle array out -> INFALLIBLE commit (dequeue + release each
-         * cap's inflight). Any transient fault rolls back every staged mint and
-         * leaves the message queued. */
-        je_vm *vm; uint32_t index;
-        if (!current_vm_index(&vm, &index)) { f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f); }
-        je_handle h = (je_handle)f->rdi;
-        uint64_t ubuf = f->rsi, cap = f->rdx, hbuf = f->r8, hcap = f->r9;
-        uint64_t timeout = f->r10;   /* A6-ABI: relative tick duration; 0 = poll */
-        /* A6-3: bound + overflow-check a nonzero timeout BEFORE anything else, so
-         * the rejection does not depend on queue state (a huge R10 is INVALID
-         * whether or not a message happens to be queued). JE_IPC_MAX_WAIT keeps
-         * the absolute deadline well below the UINT64_MAX tick the ISR aborts on. */
-        uint64_t now = je_sched_ticks();
-        if (timeout != 0u && (timeout > JE_IPC_MAX_WAIT || timeout > (UINT64_MAX - now))) {
-            f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f);
-        }
-        /* A6-ABI entry snapshot: evaluate the end once via the plain try_recv path
-         * BEFORE registering any waiter. If it is EMPTY (would block) and a nonzero
-         * timeout was given, register a per-end waiter and PARK (constrained
-         * restartable syscall); on resume the continuation prologue delivers. A
-         * zero timeout, or a non-EMPTY probe, falls through to the normal recv. */
-        if (timeout != 0u) {
-            je_ep_status probe = je_endpoint_kern_recv_entry_probe(vm, index, h);
-            if (probe == JE_EP_EMPTY) {
-                uint32_t slot = 0u;
-                if (je_sched_current_slot(&slot) != JE_OK) {
-                    f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f);
-                }
-                je_ep_channel *wrec = (je_ep_channel *)0; uint8_t wside = 0u;
-                je_ep_status reg = je_endpoint_kern_wait_register(vm, index, h, slot, &wrec, &wside);
-                if (reg == JE_EP_WAITERS_BUSY) {   /* A6-4: slot occupied -> non-blocking EMPTY */
-                    f->rax=(uint64_t)JE_ABI_H_EMPTY; f->rdx=0; return je_sched_return_to_user(f);
-                }
-                if (reg != JE_EP_OK) {
-                    f->rax=(uint64_t)ep_status_to_abi(reg); f->rdx=0; return je_sched_return_to_user(f);
-                }
-                /* Park: saves args + owned rec/side, rewinds int 0x80, switches. */
-                return je_sched_block_current(f, wrec, wside, now + timeout);
-            }
-            /* probe != EMPTY: deliverable / SHORT_BUFFER / PEER_CLOSED / error ->
-             * fall through to the normal recv below (which re-derives the exact
-             * result and, for a deliverable message, does the full mint/copy). */
-        }
-        uint8_t staging[JE_EP_MSG_MAX];
-        je_ep_capdesc caps[JE_ABI_MSG_CAPS_MAX];
-        size_t mlen = 0u; uint8_t mcaps = 0u;
-        je_ep_recv_lease lease;
-        je_ep_status s = je_endpoint_kern_recv_peek_caps(vm, index, h, staging,
-                                                         je_syscall_recv_staging_cap(cap, sizeof staging),
-                                                         &mlen,
-                                                         (uint8_t)hcap, caps, &mcaps,
-                                                         &lease);
-        if (s == JE_EP_SHORT_BUFFER) {
-            f->rax=(uint64_t)JE_ABI_H_SHORT_BUFFER;
-            f->rdx=(uint64_t)mlen | ((uint64_t)mcaps << 32);
-            return je_sched_return_to_user(f);
-        }
-        if (s != JE_EP_OK) { f->rax=(uint64_t)ep_status_to_abi(s); f->rdx=0; return je_sched_return_to_user(f); }
-        /* Stage mints: a live cap mints a fresh handle; a dead cap stages 0 (A5-2).
-         * Roll back all minted-so-far on any transient failure (QUOTA/NOSLOTS/
-         * REFOVERFLOW). */
-        je_handle minted[JE_ABI_MSG_CAPS_MAX];
-        bool was_live[JE_ABI_MSG_CAPS_MAX];
-        for (uint8_t c = 0; c < mcaps; ++c) { minted[c] = 0u; was_live[c] = false; }
-        je_abi_status fail = JE_ABI_OK; uint8_t done = 0u;
-        for (uint8_t c = 0; c < mcaps; ++c) {
-            if (!je_endpoint_kern_capdesc_live(&caps[c])) { minted[c] = 0u; continue; }
-            je_handle nh = 0u;
-            je_ep_status mc = je_endpoint_kern_mint_recv_cap(vm, index, &caps[c], &nh);
-            if (mc != JE_EP_OK) { fail = ep_status_to_abi(mc); break; }
-            minted[c] = nh; was_live[c] = true; done = (uint8_t)(c + 1u);
-        }
-        if (fail != JE_ABI_OK) {
-            for (uint8_t c = 0; c < done; ++c)
-                if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
-            f->rax=(uint64_t)fail; f->rdx=0; return je_sched_return_to_user(f);
-        }
-        /* Copy bytes out. */
-        if (mlen != 0u) {
-            je_abi_status cs = je_copy_to_user(ubuf, staging, (uint64_t)mlen);
-            if (cs != JE_ABI_OK) {
-                for (uint8_t c = 0; c < mcaps; ++c)
-                    if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
-                f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f);
-            }
-        }
-        /* Copy minted handle array out (u32 each). */
-        if (mcaps != 0u) {
-            uint32_t hout[JE_ABI_MSG_CAPS_MAX];
-            for (uint8_t c = 0; c < mcaps; ++c) hout[c] = (uint32_t)minted[c];
-            je_abi_status cs = je_copy_to_user(hbuf, hout,
-                                               (uint64_t)mcaps * sizeof(uint32_t));
-            if (cs != JE_ABI_OK) {
-                for (uint8_t c = 0; c < mcaps; ++c)
-                    if (was_live[c] && minted[c]) (void)je_endpoint_kern_close(vm, index, minted[c]);
-                f->rax=(uint64_t)JE_ABI_INVALID; f->rdx=0; return je_sched_return_to_user(f);
-            }
-        }
-        /* Infallible commit: dequeue + release each cap's inflight ref. */
-        je_ep_status cm = je_endpoint_kern_recv_commit(&lease);
-        if (cm != JE_EP_OK) {
-            je_arch_console_write("JeiOS fatal: recv commit mismatch\r\n");
-            je_arch_halt();
-        }
-#if JE_TEST_MODE == 13
-        for (uint8_t c = 0u; c < mcaps; ++c)
-            if (was_live[c] && minted[c])
-                je_m4g_record_cap_delivery(vm, index, &caps[c]);
-        je_m4g_record_control_receive(vm, index, &lease, staging, mlen, mcaps);
-#endif
-#if JE_TEST_MODE == 15
-        for (uint8_t c = 0u; c < mcaps; ++c)
-            if (was_live[c] && minted[c])
-                je_m4g_record_cap_delivery(vm, index, &caps[c]);
-#endif
-        f->rax = (uint64_t)JE_ABI_OK;
-        f->rdx = (uint64_t)mlen | ((uint64_t)mcaps << 32);
-        return je_sched_return_to_user(f);
-    }
+#define JE_G_EMIT_CASES_LATE
+#include "syscall_glue.inc"
+#undef JE_G_EMIT_CASES_LATE
 #ifdef JE_DEV_COPY_INJECT
     case JE_SYSCALL_COPY_FIXUP_INJECT: {
         /* dev-only: raw-copy an unmapped arena page to prove the fixup recovers;

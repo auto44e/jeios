@@ -14,6 +14,7 @@
 
 #include <jeios/abi.h>
 #include <jeios/handle.h>
+#include <jeios/endpoint_kern.h>
 #include <jeios/lifecycle.h>
 #include <jeios/proc.h>
 #include <jeios/status.h>
@@ -23,6 +24,7 @@
 
 #include "paging.h"
 #include "trapframe.h"
+#include "gic.h"
 
 extern je_pages *je_arm_scheduler_pages(void);
 extern je_arm_mmu je_arm_mmu_context;
@@ -34,6 +36,12 @@ extern je_status je_arm_sched_create_user(je_vm *vm, uint32_t index,
 extern je_status je_arm_sched_current_user(je_vm **out_vm, uint32_t *out_index,
                                             uint32_t *out_slot);
 extern uint32_t je_arm_el0_test_mode_rejection(uint32_t slot);
+extern bool je_arm_sched_ipc_was_blocked(uint32_t slot);
+extern bool je_arm_sched_ipc_woken_restart(uint32_t slot);
+extern bool je_sched_wait_pending(je_ep_channel **rec, uint8_t *side,
+                                  uint64_t *rdi, uint64_t *rsi,
+                                  uint64_t *rdx, uint64_t *r8, uint64_t *r9,
+                                  uint64_t *post_svc_elr);
 extern _Noreturn void je_arm_sched_start_user(void);
 extern const je_vm_ops *je_arch_vm_ops(je_pages *pages, int nx_available);
 extern uint64_t je_arm_user_root[];
@@ -65,8 +73,25 @@ extern void je_arm_sched_install_ttbr0(uint64_t root_pa, uint16_t asid);
     (UINT32_C(0x54000000) | (((uint32_t)(imm19) & UINT32_C(0x7ffff)) << 5) | \
      ((uint32_t)(cond) & UINT32_C(0xf)))
 #define A64_BCOND_NE UINT32_C(1)
+#define A64_BCOND_EQ UINT32_C(0)
 #define A64_CMP(rn, rm) \
     (UINT32_C(0xeb00001f) | ((uint32_t)(rm) << 16) | ((uint32_t)(rn) << 5))
+#define A64_LDR(rt, rn, imm) \
+    (UINT32_C(0xf9400000) | (((uint32_t)(imm) / 8u) << 10) | \
+     ((uint32_t)(rn) << 5) | (uint32_t)(rt))
+#define A64_STR(rt, rn, imm) \
+    (UINT32_C(0xf9000000) | (((uint32_t)(imm) / 8u) << 10) | \
+     ((uint32_t)(rn) << 5) | (uint32_t)(rt))
+#define A64_LSR(rd, rn, shift) \
+    (UINT32_C(0xd340fc00) | (((uint32_t)(shift) & 0x3fu) << 16) | \
+     ((uint32_t)(rn) << 5) | (uint32_t)(rd))
+#define A64_UBFM(rd, rn, immr, imms) \
+    (UINT32_C(0xd3400000) | (((uint32_t)(immr) & 0x3fu) << 16) | \
+     (((uint32_t)(imms) & 0x3fu) << 10) | ((uint32_t)(rn) << 5) | \
+     (uint32_t)(rd))
+#define A64_ORR(rd, rn, rm) \
+    (UINT32_C(0xaa000000) | ((uint32_t)(rm) << 16) | \
+     ((uint32_t)(rn) << 5) | (uint32_t)(rd))
 #define A64_MRS_TPIDR_EL0(rt) (UINT32_C(0xd53bd040) | (uint32_t)(rt))
 #define A64_MRS_TPIDRRO_EL0(rt) (UINT32_C(0xd53bd060) | (uint32_t)(rt))
 #define A64_MRS_MDCCSR_EL0(rt) (UINT32_C(0xd5330100) | (uint32_t)(rt))
@@ -82,7 +107,8 @@ extern void je_arm_sched_install_ttbr0(uint64_t root_pa, uint16_t asid);
 #define JE_EL0_REGISTER_FAIL UINT64_C(0xbad0)
 #define JE_EL0_SP_FAIL UINT64_C(0xbad1)
 #define JE_EL0_EXIT_SIGNAL UINT64_C(0x455849545349474e)
-#define JE_EL0_SPIN_COUNT UINT16_C(0x0100)
+#define JE_EL0_SPIN_COUNT UINT16_C(0x1000)
+#define JE_EL0_SURVIVOR_SPIN_COUNT UINT16_C(0x4)
 #define JE_EL0_TPIDRRO_EXPECTED UINT64_C(0)
 #define JE_EL0_SP_POISON (JE_VM_ARENA_BASE + UINT64_C(0x100))
 #define JE_EL0_CNTP_CTL_ISS UINT64_C(0x000000000032f804)
@@ -111,9 +137,11 @@ typedef enum {
 
 static je_vm je_el0_vm;
 static je_proc_pool je_el0_pool;
-static uint8_t je_el0_good_blob[2][3u * JE_PAGE_SIZE]
+static uint8_t je_el0_good_blob[2][4u * JE_PAGE_SIZE]
     __attribute__((aligned(16)));
-static uint8_t je_el0_negative_blob[3u * JE_PAGE_SIZE]
+static uint8_t je_el0_negative_blob[4u * JE_PAGE_SIZE]
+    __attribute__((aligned(16)));
+static uint8_t je_el0_death_blob[4u * JE_PAGE_SIZE]
     __attribute__((aligned(16)));
 static je_vm_image je_el0_image;
 static je_proc_id je_el0_good_proc[2];
@@ -137,11 +165,50 @@ static bool je_el0_survivor_reaped;
 static bool je_el0_irq_marker_printed;
 static uint64_t je_el0_lone_yields;
 static bool je_el0_lone_irq_reselect;
+static bool je_el0_survivor_spin_armed;
+static unsigned je_el0_survivor_spin_start;
+static unsigned je_el0_survivor_spin_end;
 static unsigned je_el0_spin_start;
 static unsigned je_el0_spin_end;
 static uint32_t je_el0_copy_round[2];
 static uint32_t je_el0_handle_step[2];
 static bool je_el0_copy_fixup_proven;
+static bool je_el0_ipc_woken_seen;
+static bool je_el0_ipc_timeout_seen;
+static bool je_el0_ipc_timer_wake_seen;
+static bool je_el0_ipc_peer_closed_seen;
+static bool je_el0_ipc_deadcap_seen;
+static bool je_el0_ipc_deadcap_verified;
+static bool je_el0_ipc_deadcap_pending;
+#if defined(JE_ARM_IPC_FAULT) && JE_ARM_IPC_FAULT == 7
+static bool je_el0_short_buffer_marker_seen;
+#endif
+static uint32_t je_el0_ipc_deadcap_slot;
+static je_handle je_el0_deadcap_source;
+static bool je_el0_deadcap_source_closed;
+static bool je_el0_ipc_idle_seen;
+static bool je_el0_all_blocked_state_seen;
+static bool je_el0_idle_guard_seen;
+static bool je_el0_ipc_death_seen;
+static bool je_el0_death_live;
+#ifndef JE_ARM_EL0_DISABLE_WAKE_KILL
+static bool je_el0_death_kill_pending;
+static bool je_el0_death_killed;
+#endif
+static uint32_t je_el0_death_index;
+static uint32_t je_el0_death_slot;
+static je_proc_id je_el0_death_proc;
+static je_proc_id je_el0_reuse_proc;
+static uint32_t je_el0_reuse_index;
+static uint32_t je_el0_reuse_slot;
+static bool je_el0_reuse_live;
+static bool je_el0_reuse_proc_done;
+static bool je_el0_reuse_marker;
+static uint32_t je_el0_death_waiters_before;
+static je_ep_channel *je_el0_death_rec;
+static uint8_t je_el0_death_side;
+static uint32_t je_el0_death_waiter_id;
+static uint32_t je_el0_death_generation;
 extern volatile uint8_t je_arm_in_handler;
 #ifdef JE_ARM_COPY_FAULT_MUTANT_RESTORE_SELECTED
 extern volatile uint8_t je_arm_copy_restore_selected_seen;
@@ -201,7 +268,8 @@ static _Noreturn void proof_halt(void)
 
 static void emit(uint8_t *blob, unsigned *pc, uint32_t instruction)
 {
-    if (*pc > JE_PAGE_SIZE - sizeof(uint32_t)) proof_fatal("blob-overflow");
+    if (*pc > 2u * JE_PAGE_SIZE - sizeof(uint32_t))
+        proof_fatal("blob-overflow");
     blob[*pc + 0u] = (uint8_t)(instruction & 0xffu);
     blob[*pc + 1u] = (uint8_t)((instruction >> 8) & 0xffu);
     blob[*pc + 2u] = (uint8_t)((instruction >> 16) & 0xffu);
@@ -279,6 +347,370 @@ static void emit_syscall(uint8_t *blob, unsigned *pc, uint64_t op)
 {
     emit(blob, pc, A64_MOVZ(8u, (uint16_t)op, 0u));
     emit(blob, pc, A64_SVC(0u));
+}
+
+static void emit_ipc_yields(uint8_t *blob, unsigned *pc, unsigned count)
+{
+    for (unsigned i = 0u; i < count; ++i) emit_yield_args(blob, pc);
+}
+
+static void emit_ipc_seed_load(uint8_t *blob, unsigned *pc, unsigned reg)
+{
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_LDR(reg, 1u, 0x20u));
+}
+
+static void emit_ipc_create(uint8_t *blob, unsigned *pc,
+                            unsigned *fail_branches,
+                            unsigned *fail_branch_count)
+{
+    emit_zero_syscall_args(blob, pc);
+    emit_syscall(blob, pc, JE_SYSCALL_ENDPOINT_CREATE);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+    emit(blob, pc, A64_ADD(19u, 1u, 0u));
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_STR(19u, 1u, 0x28u)); /* packed c0/c1 */
+}
+
+static void emit_ipc_transfer(uint8_t *blob, unsigned *pc,
+                              unsigned *fail_branches,
+                              unsigned *fail_branch_count)
+{
+    /* x19 = a SEND|TRANSFER sibling of created c0; x20 = packed {c0,c1}.
+     * The real two-cap message carries live c0 first and a separate seeded
+     * source handle second. The seeded source is closed before the receiver
+     * mints, so the second entry is the A5-2 NULL marker while c0 remains
+     * usable end-to-end for B's reply over c1. */
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_LDR(20u, 1u, 0x28u));
+    emit(blob, pc, A64_UBFM(19u, 20u, 0u, 31u));
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit(blob, pc, A64_MOVZ(1u, JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_TRANSFER, 0u));
+    emit(blob, pc, A64_MOVZ(2u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(4u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(5u, 0u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_DUP);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+    emit(blob, pc, A64_ADD(19u, 1u, 0u));
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_LDR(20u, 1u, 0x28u));
+    /*
+     * First exercise the source-right attenuation guard through the real
+     * send-cap path: x19 has SEND|TRANSFER but not RECV, so SEND|RECV must
+     * be denied before anything is enqueued.
+     */
+    emit(blob, pc, A64_MOVZ(20u,
+                             JE_ABI_RIGHT_SEND | JE_ABI_RIGHT_RECV, 2u));
+    emit(blob, pc, A64_ORR(20u, 20u, 19u));
+    emit_load_data_pointer(blob, pc);
+    /*
+     * x4 points at the first cap descriptor in the transfer array. Keep the
+     * descriptor and the pointer at the same arena offset so the endpoint
+     * sees the intended sibling handle and rights.
+     */
+    emit(blob, pc, A64_STR(20u, 1u, 0x100u));
+    emit(blob, pc, A64_MOVZ(22u, UINT16_C(0x3633), 0u));
+    emit(blob, pc, A64_MOVK(22u, UINT16_C(0x4d50), 1u));
+    emit(blob, pc, A64_STR(22u, 1u, 0x180u));
+    emit(blob, pc, A64_MOVZ(2u, 4u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 1u, 0u));
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(4u, 1u, 0x100u));
+    emit_ipc_seed_load(blob, pc, 0u); /* send over A's bootstrap end */
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(1u, 1u, 0x80u));
+    emit_syscall(blob, pc, JE_SYSCALL_TRY_SEND);
+    emit_expect(blob, pc, 0u, JE_ABI_H_DENIED,
+                fail_branches, fail_branch_count);
+    /* The attenuation sibling is no longer needed. Closing it before the
+     * real enqueue leaves c0 with exactly one source handle to close below. */
+    emit_zero_syscall_args(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_CLOSE);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+
+    /* The attenuated SEND-only descriptors are the message actually delivered:
+     * cap[0] = live created c0, cap[1] = the soon-to-be-closed seeded end. */
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_LDR(20u, 1u, 0x28u));
+    emit(blob, pc, A64_UBFM(20u, 20u, 0u, 31u));
+    emit(blob, pc, A64_MOVZ(24u, JE_ABI_RIGHT_SEND, 2u));
+    emit(blob, pc, A64_ORR(20u, 20u, 24u));
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_STR(20u, 1u, 0x100u));
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_LDR(20u, 1u, 0x48u));
+    emit(blob, pc, A64_MOVZ(24u, JE_ABI_RIGHT_SEND, 2u));
+    emit(blob, pc, A64_ORR(20u, 20u, 24u));
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_STR(20u, 1u, 0x108u));
+    emit(blob, pc, A64_MOVZ(2u, 4u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 2u, 0u));
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(4u, 1u, 0x100u));
+    emit_ipc_seed_load(blob, pc, 0u);
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(1u, 1u, 0x80u));
+    emit(blob, pc, A64_MOVZ(5u, 0u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_TRY_SEND);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+
+    /* The kernel test hook closes the separate seeded source immediately
+     * after enqueue, before the awakened receiver can be scheduled. */
+}
+
+static void emit_ipc_blocking_recv(uint8_t *blob, unsigned *pc,
+                                   unsigned *fail_branches,
+                                   unsigned *fail_branch_count)
+{
+    emit_ipc_seed_load(blob, pc, 19u);
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(1u, 1u, 0x180u));
+#if defined(JE_ARM_IPC_FAULT) && JE_ARM_IPC_FAULT == 7
+    emit(blob, pc, A64_MOVZ(2u, 0u, 0u));
+#else
+    emit(blob, pc, A64_MOVZ(2u, 0x100u, 0u));
+#endif
+    emit(blob, pc, A64_MOVZ(3u, 0x1000u, 0u));
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(4u, 1u, 0x1c0u));
+    emit(blob, pc, A64_MOVZ(5u, 2u, 0u));
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(1u, 1u, 0x180u));
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_TRY_RECV);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+}
+
+static void emit_ipc_reply(uint8_t *blob, unsigned *pc,
+                           unsigned *fail_branches,
+                           unsigned *fail_branch_count)
+{
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_LDR(19u, 1u, 0x1c0u));
+    emit(blob, pc, A64_UBFM(19u, 19u, 0u, 31u));
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit(blob, pc, A64_MOVZ(1u, JE_ABI_RIGHT_RECV, 0u));
+    emit(blob, pc, A64_MOVZ(2u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(4u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(5u, 0u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_DUP);
+    emit_expect(blob, pc, 0u, JE_ABI_H_DENIED,
+                fail_branches, fail_branch_count);
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit(blob, pc, A64_MOVZ(1u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(2u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(4u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(5u, 0u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_TRY_SEND);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+    emit_zero_syscall_args(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_CLOSE);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+}
+
+static void emit_ipc_expect_empty(uint8_t *blob, unsigned *pc,
+                                  unsigned *fail_branches,
+                                  unsigned *fail_branch_count)
+{
+    emit_ipc_seed_load(blob, pc, 19u);
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(1u, 1u, 0x1a0u));
+    emit(blob, pc, A64_MOVZ(2u, 0x100u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(4u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(5u, 0u, 0u));
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_TRY_RECV);
+    emit_expect(blob, pc, 0u, JE_ABI_H_EMPTY, fail_branches,
+                fail_branch_count);
+    emit_expect(blob, pc, 1u, 0u, fail_branches, fail_branch_count);
+}
+
+static void emit_ipc_timed_out_recv(uint8_t *blob, unsigned *pc,
+                                    unsigned *fail_branches,
+                                    unsigned *fail_branch_count)
+{
+    emit_ipc_seed_load(blob, pc, 19u);
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(1u, 1u, 0x1a0u));
+    emit(blob, pc, A64_MOVZ(2u, 0x100u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 0x40u, 0u));
+    emit(blob, pc, A64_MOVZ(4u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(5u, 0u, 0u));
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_TRY_RECV);
+    emit_expect(blob, pc, 0u, JE_ABI_H_TIMED_OUT, fail_branches,
+                fail_branch_count);
+    emit_expect(blob, pc, 1u, 0u, fail_branches, fail_branch_count);
+}
+
+static void emit_ipc_all_blocked_recv(uint8_t *blob, unsigned *pc,
+                                      uint64_t expected_status,
+                                      bool send_after,
+                                      unsigned *fail_branches,
+                                      unsigned *fail_branch_count)
+{
+    emit_ipc_seed_load(blob, pc, 19u);
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(1u, 1u, 0x1a0u));
+    emit(blob, pc, A64_MOVZ(2u, 0x100u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 0x80u, 0u));
+    emit(blob, pc, A64_MOVZ(4u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(5u, 0u, 0u));
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_TRY_RECV);
+    emit_expect(blob, pc, 0u, expected_status, fail_branches,
+                fail_branch_count);
+    if (expected_status == JE_ABI_OK)
+        emit_expect(blob, pc, 1u, 1u, fail_branches, fail_branch_count);
+    else
+        emit_expect(blob, pc, 1u, 0u, fail_branches, fail_branch_count);
+    if (!send_after) return;
+
+    /* A's timeout is the control edge. The one-byte send is deliberately a
+     * normal user syscall after the peer waiter has been released. */
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(1u, 1u, 0x180u));
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit(blob, pc, A64_MOVZ(2u, 1u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(4u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(5u, 0u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_TRY_SEND);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+}
+
+static void emit_ipc_peer_closed_recv(uint8_t *blob, unsigned *pc,
+                                      unsigned *fail_branches,
+                                      unsigned *fail_branch_count)
+{
+    emit_ipc_seed_load(blob, pc, 19u);
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(1u, 1u, 0x1a0u));
+    emit(blob, pc, A64_MOVZ(2u, 0x100u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 0x1000u, 0u));
+    emit(blob, pc, A64_MOVZ(4u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(5u, 0u, 0u));
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_TRY_RECV);
+    emit_expect(blob, pc, 0u, JE_ABI_H_PEER_CLOSED,
+                fail_branches, fail_branch_count);
+    emit_expect(blob, pc, 1u, 0u, fail_branches, fail_branch_count);
+}
+
+static void emit_ipc_close_seed(uint8_t *blob, unsigned *pc,
+                                unsigned *fail_branches,
+                                unsigned *fail_branch_count)
+{
+    emit_ipc_seed_load(blob, pc, 19u);
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_zero_syscall_args(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_CLOSE);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+}
+
+static void emit_ipc_close_created(uint8_t *blob, unsigned *pc,
+                                   unsigned *fail_branches,
+                                   unsigned *fail_branch_count)
+{
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_LDR(20u, 1u, 0x28u));
+    emit(blob, pc, A64_UBFM(19u, 20u, 0u, 31u));
+    emit_zero_syscall_args(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_CLOSE);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+    emit(blob, pc, A64_UBFM(19u, 20u, 32u, 63u));
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_CLOSE);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+}
+
+static void emit_ipc_victim_send(uint8_t *blob, unsigned *pc,
+                                 unsigned *fail_branches,
+                                 unsigned *fail_branch_count)
+{
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_LDR(19u, 1u, 0x40u));
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(1u, 1u, 0x180u));
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit(blob, pc, A64_MOVZ(2u, 1u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(4u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(5u, 0u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_TRY_SEND);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+#ifdef JE_ARM_EL0_FORCE_DEATH_RELEASE_RACE
+    /*
+     * Test-only CPU work between the victim send and its own close. A timer
+     * interrupt can therefore reap the victim and run the replacement before
+     * this process closes its source end. The kernel release ordering is still
+     * checked by the oracle; this only makes the observation window repeatable.
+     */
+    emit_load_u64(blob, pc, 23u, UINT64_C(8000000));
+    const unsigned race_spin_start = *pc;
+    emit(blob, pc, A64_SUBS_IMM(23u, 23u, 1u));
+    const unsigned race_spin_branch = *pc;
+    emit(blob, pc, A64_BCOND(A64_BCOND_NE, 0));
+    patch_pc_relative(blob, race_spin_branch, race_spin_start, true,
+                      A64_BCOND_NE);
+#endif
+    emit_zero_syscall_args(blob, pc);
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_HANDLE_CLOSE);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
+}
+
+static void emit_ipc_reply_recv(uint8_t *blob, unsigned *pc,
+                                unsigned *fail_branches,
+                                unsigned *fail_branch_count)
+{
+    unsigned retry_start = *pc;
+    unsigned empty_branch;
+    unsigned exhausted_branch;
+    unsigned retry_branch;
+    unsigned after_retry;
+
+    /* The reply is produced by B after the wake/restart.  A bounded retry
+     * proves the message rather than relying on UART/timer timing. */
+    emit(blob, pc, A64_MOVZ(23u, 64u, 0u));
+    retry_start = *pc;
+    emit(blob, pc, A64_MOVZ(8u, JE_SYSCALL_TRY_RECV, 0u));
+    /* B uses the live c0 cap, whose peer is A's original c1. */
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_LDR(19u, 1u, 0x28u));
+    emit(blob, pc, A64_UBFM(19u, 19u, 32u, 63u));
+    emit_load_data_pointer(blob, pc);
+    emit(blob, pc, A64_ADD(1u, 1u, 0x1a0u));
+    emit(blob, pc, A64_MOVZ(2u, 0x100u, 0u));
+    emit(blob, pc, A64_MOVZ(3u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(4u, 0u, 0u));
+    emit(blob, pc, A64_MOVZ(5u, 0u, 0u));
+    emit(blob, pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, pc, JE_SYSCALL_TRY_RECV);
+    emit_load_u64(blob, pc, 22u, JE_ABI_H_EMPTY);
+    emit(blob, pc, A64_CMP(0u, 22u));
+    empty_branch = *pc;
+    emit(blob, pc, A64_BCOND(A64_BCOND_NE, 0));
+    emit(blob, pc, A64_SUBS_IMM(23u, 23u, 1u));
+    exhausted_branch = *pc;
+    emit(blob, pc, A64_BCOND(UINT32_C(0), 0));
+    emit_yield_args(blob, pc);
+    retry_branch = *pc;
+    emit(blob, pc, A64_B(0));
+    after_retry = *pc;
+    patch_pc_relative(blob, empty_branch, after_retry, true, A64_BCOND_NE);
+    patch_pc_relative(blob, exhausted_branch, after_retry, true, UINT32_C(0));
+    patch_pc_relative(blob, retry_branch, retry_start, false, 0u);
+    emit_expect(blob, pc, 0u, JE_ABI_OK, fail_branches, fail_branch_count);
 }
 
 static void emit_copy_probe(uint8_t *blob, unsigned *pc, uint64_t src,
@@ -364,7 +796,7 @@ static void make_good_blob(uint8_t *blob, uint16_t value,
                            uint64_t expected_sp, bool spin,
                            bool exits_after_signal)
 {
-    for (size_t i = 0u; i < 3u * JE_PAGE_SIZE; ++i) blob[i] = 0u;
+    for (size_t i = 0u; i < 4u * JE_PAGE_SIZE; ++i) blob[i] = 0u;
     unsigned pc = 0u;
     unsigned fail_branches[64];
     unsigned fail_branch_count = 0u;
@@ -376,6 +808,11 @@ static void make_good_blob(uint8_t *blob, uint16_t value,
     unsigned loop_branch = 0u;
     unsigned yield_target = 0u;
     unsigned sp_fail_target = 0u;
+    unsigned survivor_spin_start = 0u;
+    unsigned survivor_spin_branch = 0u;
+    unsigned survivor_spin_end = 0u;
+    unsigned survivor_spin_skip = 0u;
+    unsigned survivor_spin_entry = 0u;
 
     /*
      * Load a distinct non-zero value into every architectural GPR before the
@@ -449,6 +886,63 @@ static void make_good_blob(uint8_t *blob, uint16_t value,
     emit_user_sp_check(blob, &pc, expected_sp, sp_fail_branches,
                        &sp_fail_count);
 
+    /*
+     * ARM IPC proof fixture.  B enters the blocking recv first; A spends a
+     * bounded yield window letting the timer dispatch B into PARKED before it
+     * creates/sends the transferred endpoint cap.  The endpoint handles are
+     * kernel-seeded into each process's data page at offset 0x20.
+     */
+    emit_load_data_pointer(blob, &pc);
+    emit(blob, &pc, A64_MOVZ(3u, value, 0u));
+    emit(blob, &pc, A64_STR(3u, 1u, 0u));
+    emit(blob, &pc, A64_MOVZ(3u, (uint16_t)JE_EL0_REGISTER_PASS, 0u));
+    emit(blob, &pc, A64_STR(3u, 1u, 8u));
+    if (spin) {
+        emit_ipc_yields(blob, &pc, 64u);
+        emit_ipc_create(blob, &pc, fail_branches, &fail_branch_count);
+        emit_ipc_transfer(blob, &pc, fail_branches, &fail_branch_count);
+        emit_ipc_reply_recv(blob, &pc, fail_branches, &fail_branch_count);
+        emit_ipc_close_created(blob, &pc, fail_branches, &fail_branch_count);
+        emit_ipc_all_blocked_recv(
+            blob, &pc, JE_ABI_H_TIMED_OUT, true,
+            fail_branches, &fail_branch_count);
+        /* Let B register the second receive before the peer close. */
+        emit_ipc_yields(blob, &pc, 64u);
+        emit_ipc_close_seed(blob, &pc, fail_branches, &fail_branch_count);
+        emit_ipc_victim_send(blob, &pc, fail_branches, &fail_branch_count);
+    } else {
+        emit_ipc_blocking_recv(blob, &pc, fail_branches, &fail_branch_count);
+        emit_ipc_reply(blob, &pc, fail_branches, &fail_branch_count);
+        emit_ipc_expect_empty(blob, &pc, fail_branches, &fail_branch_count);
+        emit_ipc_timed_out_recv(blob, &pc, fail_branches, &fail_branch_count);
+        emit_ipc_all_blocked_recv(
+            blob, &pc, JE_ABI_OK,
+            false, fail_branches, &fail_branch_count);
+        emit_ipc_peer_closed_recv(blob, &pc, fail_branches, &fail_branch_count);
+        emit_ipc_close_seed(blob, &pc, fail_branches, &fail_branch_count);
+    }
+    /*
+     * Leave A in a bounded CPU-only window after all IPC sends/closes.  B can
+     * finish its final receive and exit while A is in this window; the next
+     * timer IRQ must then reselect A as the lone READY/RUNNING survivor.
+     * This is deliberately a real IRQ witness, not an SVC-yield substitute.
+     */
+    if (spin) {
+        survivor_spin_skip = pc;
+        emit(blob, &pc, A64_B(0));
+        survivor_spin_entry = pc;
+        emit(blob, &pc, A64_MOVZ(30u, JE_EL0_SURVIVOR_SPIN_COUNT, 1u));
+        survivor_spin_start = pc;
+        emit(blob, &pc, A64_SUBS_IMM(30u, 30u, 1u));
+        survivor_spin_branch = pc;
+        emit(blob, &pc, A64_BCOND(A64_BCOND_NE, 0));
+        survivor_spin_end = pc;
+        if (value == UINT16_C(0x1111)) {
+            je_el0_survivor_spin_start = survivor_spin_entry;
+            je_el0_survivor_spin_end = survivor_spin_end;
+        }
+    }
+
     emit_load_data_pointer(blob, &pc);
     emit(blob, &pc, A64_MOVZ(3u, value, 0u));
     emit(blob, &pc, UINT32_C(0xf9000023)); /* STR x3,[x1] */
@@ -486,6 +980,12 @@ static void make_good_blob(uint8_t *blob, uint16_t value,
 
     if (spin) patch_pc_relative(blob, spin_branch, spin_start, true,
                                 A64_BCOND_NE);
+    if (spin)
+        patch_pc_relative(blob, survivor_spin_branch, survivor_spin_start,
+                          true, A64_BCOND_NE);
+    if (spin)
+        patch_pc_relative(blob, survivor_spin_skip, survivor_spin_end,
+                          false, 0u);
     patch_pc_relative(blob, tpidr_branch + sizeof(uint32_t), fail_target,
                       true, A64_BCOND_NE);
     for (unsigned i = 0u; i < fail_branch_count; ++i)
@@ -510,10 +1010,51 @@ static void make_good_blob(uint8_t *blob, uint16_t value,
     for (unsigned i = 0u; i < 2u * JE_PAGE_SIZE; ++i) {
         uint8_t byte = (uint8_t)((value + (uint16_t)(i * 13u) + 1u) & 0xffu);
         if (byte == 0u) byte = 1u;
-        blob[JE_PAGE_SIZE + i] = byte;
+        blob[2u * JE_PAGE_SIZE + i] = byte;
     }
     for (unsigned i = 0u; i < sizeof(uint64_t); ++i)
-        blob[JE_PAGE_SIZE + i] = (uint8_t)((uint64_t)value >> (i * 8u));
+        blob[2u * JE_PAGE_SIZE + i] = (uint8_t)((uint64_t)value >> (i * 8u));
+}
+
+static void make_death_waiter_blob(uint8_t *blob)
+{
+    for (size_t i = 0u; i < 4u * JE_PAGE_SIZE; ++i) blob[i] = 0u;
+    unsigned pc = 0u;
+    emit_ipc_seed_load(blob, &pc, 19u);
+    emit_load_data_pointer(blob, &pc);
+    emit(blob, &pc, A64_ADD(1u, 1u, 0x1a0u));
+    emit(blob, &pc, A64_MOVZ(2u, 0x100u, 0u));
+    emit(blob, &pc, A64_MOVZ(3u, 0x1000u, 0u));
+    emit(blob, &pc, A64_MOVZ(4u, 0u, 0u));
+    emit(blob, &pc, A64_MOVZ(5u, 0u, 0u));
+    emit(blob, &pc, A64_ADD(0u, 19u, 0u));
+    emit_syscall(blob, &pc, JE_SYSCALL_TRY_RECV);
+    /*
+     * The receiver exits normally after the real WOKEN resume.  The proof
+     * must exercise lifecycle waiter release without the old test-only
+     * kill-at-wake shortcut.
+     */
+    emit_zero_syscall_args(blob, &pc);
+    emit_syscall(blob, &pc, JE_SYS_EXIT);
+    const unsigned loop = pc;
+    emit_yield_args(blob, &pc);
+    const unsigned back = pc;
+    emit(blob, &pc, A64_B(0u));
+    patch_pc_relative(blob, back, loop, false, 0u);
+}
+
+static void make_reuse_blob(uint8_t *blob)
+{
+    for (size_t i = 0u; i < 4u * JE_PAGE_SIZE; ++i) blob[i] = 0u;
+    unsigned pc = 0u;
+    emit_yield_args(blob, &pc);
+    emit_zero_syscall_args(blob, &pc);
+    emit_syscall(blob, &pc, JE_SYS_EXIT);
+    const unsigned loop = pc;
+    emit_yield_args(blob, &pc);
+    const unsigned back = pc;
+    emit(blob, &pc, A64_B(0u));
+    patch_pc_relative(blob, back, loop, false, 0u);
 }
 
 static void make_negative_blob(je_el0_negative kind)
@@ -571,8 +1112,9 @@ static void image_init(void)
         .entry_offset = 0u,
         .reserved = 0u,
         .segments = {
-            { 0u, JE_PAGE_SIZE, 0u, JE_PAGE_SIZE, JE_VM_R | JE_VM_X, 0u },
-            { JE_PAGE_SIZE, 2u * JE_PAGE_SIZE, 2u * JE_PAGE_SIZE,
+            { 0u, 2u * JE_PAGE_SIZE, 0u, 2u * JE_PAGE_SIZE,
+              JE_VM_R | JE_VM_X, 0u },
+            { 2u * JE_PAGE_SIZE, 2u * JE_PAGE_SIZE, 2u * JE_PAGE_SIZE,
               2u * JE_PAGE_SIZE,
               JE_VM_R | JE_VM_W, 0u },
         },
@@ -582,21 +1124,61 @@ static void image_init(void)
 static je_proc_id allocate_process(void)
 {
     je_proc_id id = JE_PROC_ID_NONE;
-    if (je_proc_alloc(&je_el0_pool, 0u, false, &id) != JE_OK)
+    /*
+     * The bootstrap channel is fixture-owned and uncharged.  A's proof then
+     * creates exactly one additional channel, so give each test identity one
+     * endpoint-creation credit and let the bridge enforce that charge.
+     */
+    if (je_proc_alloc(&je_el0_pool, 1u, false, &id) != JE_OK)
         proof_fatal("proc-alloc");
     return id;
+}
+
+static void build_user_vm(uint8_t *blob, uint32_t *out_index,
+                          je_proc_id *out_proc)
+{
+    je_proc_id id = allocate_process();
+    je_status status = je_vm_build(&je_el0_vm, &je_el0_image, blob,
+                                   4u * JE_PAGE_SIZE, 1, out_index);
+    if (status != JE_OK) proof_fatal("vm-build");
+    *out_proc = id;
 }
 
 static void build_user(uint8_t *blob, uint32_t *out_index,
                        je_proc_id *out_proc, uint32_t *out_slot)
 {
-    je_proc_id id = allocate_process();
-    je_status status = je_vm_build(&je_el0_vm, &je_el0_image, blob,
-                                   3u * JE_PAGE_SIZE, 1, out_index);
-    if (status != JE_OK) proof_fatal("vm-build");
-    status = je_arm_sched_create_user(&je_el0_vm, *out_index, id, out_slot);
+    build_user_vm(blob, out_index, out_proc);
+    const je_status status = je_arm_sched_create_user(
+        &je_el0_vm, *out_index, *out_proc, out_slot);
     if (status != JE_OK) proof_fatal("thread-create");
-    *out_proc = id;
+}
+
+static void seed_user_u64(uint32_t index, uint64_t arena_offset,
+                          uint64_t value)
+{
+    if (index >= JE_VM_MAX_PROCESSES ||
+        (arena_offset & (sizeof(uint64_t) - 1u)) != 0u ||
+        arena_offset >= JE_VM_ARENA_SIZE)
+        proof_fatal("fixture-seed-bounds");
+    je_vm_process *process = &je_el0_vm.procs[index];
+    for (size_t n = 0u; n < process->journal_count; ++n) {
+        const je_vm_journal_entry *entry = &process->journal[n];
+        if (entry->kind != JE_VM_J_PTE ||
+            arena_offset < entry->varena_off ||
+            arena_offset >= entry->varena_off + JE_PAGE_SIZE)
+            continue;
+        const je_vm_ref ref = { index, entry->extent, entry->page };
+        uint8_t *mapped = (uint8_t *)je_el0_vm.ops->map(
+            je_el0_vm.ops->context, ref);
+        if (!mapped) proof_fatal("fixture-seed-map");
+        for (unsigned byte = 0u; byte < sizeof(value); ++byte)
+            mapped[arena_offset - entry->varena_off + byte] =
+                (uint8_t)(value >> (byte * 8u));
+        je_el0_vm.ops->unmap(je_el0_vm.ops->context, ref);
+        je_el0_vm.ops->flush(je_el0_vm.ops->context);
+        return;
+    }
+    proof_fatal("fixture-seed-page");
 }
 
 static void spawn_negative(void)
@@ -782,6 +1364,213 @@ void je_arm_el0_test_note_kstack(uint32_t slot)
     }
 }
 
+void je_arm_el0_test_note_wait_terminal(uint32_t index,
+                                        je_ep_channel *rec,
+                                        uint8_t side,
+                                        je_ep_wait_cause cause)
+{
+    if (cause == JE_EP_WAIT_PEER_CLOSED) {
+        if (!je_el0_ipc_peer_closed_seen ||
+            index != je_el0_good_index[1] ||
+            je_endpoint_end_state(rec, side) != JE_EP_END_PEER_CLOSED ||
+            je_endpoint_inbound_count(rec, side) != 0u)
+            proof_fatal("peer-closed terminal");
+        je_el0_death_live = true;
+        return;
+    }
+    (void)index;
+}
+
+void je_arm_el0_test_note_short_buffer(uint32_t index,
+                                       je_ep_channel *rec,
+                                       uint8_t side,
+                                       size_t required_bytes,
+                                       uint8_t required_caps)
+{
+    (void)rec;
+    (void)side;
+#if defined(JE_ARM_IPC_FAULT) && JE_ARM_IPC_FAULT == 7
+    if (index != je_el0_good_index[1] || required_bytes == 0u)
+        proof_fatal("short-buffer marker");
+    je_el0_short_buffer_marker_seen = true;
+    proof_write("JeiOS/aarch64: EL0 IPC SHORT_BUFFER trusted-cause required=");
+    proof_dec(required_bytes);
+    proof_write(" caps=");
+    proof_dec(required_caps);
+    proof_write("\r\n");
+#else
+    (void)index;
+    (void)required_bytes;
+    (void)required_caps;
+#endif
+}
+
+uint32_t je_arm_el0_test_short_buffer_slot(void)
+{
+    return je_el0_good_slot[1];
+}
+
+void je_arm_el0_test_note_recv_caps(uint32_t index,
+                                    je_ep_channel *rec,
+                                    uint8_t side,
+                                    uint8_t count,
+                                    const je_ep_capdesc *caps,
+                                    const je_handle *minted,
+                                    const bool *was_live)
+{
+    (void)rec;
+    (void)side;
+    if (index != je_el0_good_index[1] || count == 0u) return;
+    if (count != 2u || caps == NULL || minted == NULL ||
+        was_live == NULL || !was_live[0] || was_live[1] ||
+        minted[0] == 0u || minted[1] != 0u ||
+        !je_endpoint_kern_capdesc_live(&caps[0]) ||
+        je_endpoint_kern_capdesc_live(&caps[1])) {
+        proof_fatal("deadcap state");
+    }
+    je_el0_ipc_deadcap_verified = true;
+    uint32_t handle_index = 0u;
+    je_handle_decode(minted[0], &handle_index, NULL);
+    je_el0_ipc_deadcap_slot = handle_index;
+    je_el0_ipc_deadcap_pending = true;
+}
+
+void je_arm_el0_test_note_ipc_send(je_ep_channel *rec, uint8_t side)
+{
+    if (!je_el0_deadcap_source_closed) {
+        je_vm *vm = NULL;
+        uint32_t index = UINT32_MAX;
+        uint32_t slot = UINT32_MAX;
+        if (je_arm_sched_current_user(&vm, &index, &slot) == JE_OK &&
+            index == je_el0_good_index[0]) {
+            if (je_endpoint_kern_close(vm, index, je_el0_deadcap_source)
+                    != JE_EP_OK)
+                proof_fatal("deadcap-source-close");
+            je_el0_deadcap_source_closed = true;
+        }
+    }
+    if (je_el0_ipc_deadcap_pending) {
+        je_vm *vm = NULL;
+        uint32_t index = UINT32_MAX;
+        uint32_t slot = UINT32_MAX;
+        if (je_arm_sched_current_user(&vm, &index, &slot) == JE_OK &&
+            index == je_el0_good_index[1]) {
+            je_el0_ipc_deadcap_pending = false;
+            je_el0_ipc_deadcap_seen = true;
+            proof_write("JeiOS/aarch64: EL0 IPC DEADCAP_NULL_MARKER slot=");
+            proof_dec(je_el0_ipc_deadcap_slot);
+            proof_write(" live_sibling=ok\r\n");
+        }
+    }
+    (void)rec;
+    (void)side;
+}
+
+void je_arm_el0_test_note_ipc_close(je_ep_channel *rec, uint8_t side,
+                                    je_handle h)
+{
+    if (h != je_el0_deadcap_source) return;
+    je_vm *vm = NULL;
+    uint32_t index = UINT32_MAX;
+    uint32_t slot = UINT32_MAX;
+    if (je_arm_sched_current_user(&vm, &index, &slot) != JE_OK ||
+        index != je_el0_good_index[0])
+        return;
+    if (!rec || side > 1u ||
+        je_endpoint_end_state(rec, side) != JE_EP_END_CLOSED)
+        proof_fatal("deadcap-source-close");
+    if (je_el0_good_slot[1] == UINT32_MAX)
+        proof_fatal("ipc-order-release");
+}
+
+void je_arm_el0_test_note_ipc_wake(je_ep_channel *rec, uint8_t side,
+                                   uint32_t waiter_id)
+{
+    if (!je_el0_death_live) return;
+    if (!je_arm_sched_ipc_was_blocked(waiter_id))
+        proof_fatal("death wake not blocked");
+    je_el0_death_rec = rec;
+    je_el0_death_side = side;
+    je_el0_death_waiter_id = waiter_id;
+    je_el0_death_generation = rec->generation;
+#ifndef JE_ARM_EL0_DISABLE_WAKE_KILL
+    je_el0_death_kill_pending = true;
+#endif
+}
+
+void je_arm_el0_test_note_peer_closed(je_ep_channel *rec, uint8_t side,
+                                      uint32_t waiter_id)
+{
+    if (!je_arm_sched_ipc_was_blocked(waiter_id) ||
+        je_endpoint_end_state(rec, side) != JE_EP_END_PEER_CLOSED ||
+        je_endpoint_inbound_count(rec, side) != 0u)
+        proof_fatal("peer-closed arbitration");
+    je_el0_ipc_peer_closed_seen = true;
+    je_el0_death_live = true;
+    proof_write("JeiOS/aarch64: EL0 IPC PEER_CLOSED "
+                "trusted-cause blocked-before-ready=1\r\n");
+}
+
+void je_arm_el0_test_note_all_blocked_state(void)
+{
+    if (je_el0_good_slot[0] == UINT32_MAX ||
+        je_el0_good_slot[1] == UINT32_MAX ||
+        !je_arm_sched_ipc_was_blocked(je_el0_good_slot[0]) ||
+        !je_arm_sched_ipc_was_blocked(je_el0_good_slot[1]))
+        return;
+    je_el0_all_blocked_state_seen = true;
+}
+
+void je_arm_el0_test_note_all_blocked_idle(uint32_t slot)
+{
+    if (je_el0_ipc_idle_seen) return;
+    if (!je_el0_all_blocked_state_seen ||
+        (slot != je_el0_good_slot[0] && slot != je_el0_good_slot[1]))
+        return;
+    je_el0_ipc_idle_seen = true;
+    proof_write("JeiOS/aarch64: EL0 IPC ALL_BLOCKED_IDLE woke=1\r\n");
+}
+
+void je_arm_el0_test_note_idle_guard(uint32_t slot)
+{
+    if (!je_el0_ipc_idle_seen || slot == 0u)
+        proof_fatal("idle guard witness");
+    if (je_el0_idle_guard_seen) return;
+    je_el0_idle_guard_seen = true;
+    proof_write("JeiOS/aarch64: EL0 IPC IDLE_STACK_GUARD "
+                "bss_overwrites=0 stack_guard=1 resumed=");
+    proof_dec(slot);
+    proof_write("\r\n");
+}
+
+void je_arm_el0_test_note_timer_wake(uint32_t slot)
+{
+    if (slot == je_el0_good_slot[1] && !je_el0_ipc_timer_wake_seen) {
+        je_el0_ipc_timer_wake_seen = true;
+        proof_write("JeiOS/aarch64: EL0 IPC TIMER_WAKE "
+                    "trusted-cause\r\n");
+    }
+}
+
+bool je_arm_el0_test_take_wake_death(uint32_t slot)
+{
+    /*
+     * The default proof kills the dedicated death waiter at the real WOKEN
+     * boundary. A separate no-kill profile leaves it to resume and exercise
+     * the same frame path without hiding a scheduler overwrite.
+     */
+#ifdef JE_ARM_EL0_DISABLE_WAKE_KILL
+    (void)slot;
+    return false;
+#else
+    if (!je_el0_death_kill_pending || slot != je_el0_death_slot)
+        return false;
+    je_el0_death_killed = true;
+    je_el0_death_kill_pending = false;
+    return true;
+#endif
+}
+
 void je_arm_el0_test_note_svc_proof(uint32_t slot,
                                     const je_arm_trapframe *tf)
 {
@@ -847,15 +1636,103 @@ void je_arm_el0_test_note_svc(uint32_t slot, uint64_t op,
             proof_fatal("svc-proof-status");
         return;
     }
+    bool woken_restart = false;
+    if (op == JE_SYSCALL_TRY_RECV)
+        woken_restart = je_arm_sched_ipc_woken_restart(slot);
+#if defined(JE_ARM_IPC_FAULT) && JE_ARM_IPC_FAULT == 7
+    if (op == JE_SYSCALL_TRY_RECV && woken_restart &&
+        tf->gpr[0] == JE_ABI_H_SHORT_BUFFER) {
+        if (!je_el0_short_buffer_marker_seen)
+            proof_fatal("short-buffer trusted marker missing");
+        proof_fatal("short-buffer resume");
+    }
+#endif
+    if (op == JE_SYSCALL_TRY_RECV &&
+        slot == je_el0_good_slot[1]) {
+        if (tf->gpr[0] == JE_ABI_OK &&
+            (tf->gpr[1] & UINT64_C(0xffffffff)) == 4u &&
+            (tf->gpr[1] >> 32) == 2u &&
+            !je_el0_ipc_woken_seen) {
+            if (!woken_restart)
+                proof_fatal("woken restart witness");
+            je_el0_ipc_woken_seen = true;
+            proof_write("JeiOS/aarch64: EL0 IPC WOKEN_RESTART "
+                        "trusted-cause\r\n");
+        }
+        if (tf->gpr[0] == JE_ABI_H_TIMED_OUT &&
+            tf->gpr[1] == 0u &&
+            !je_el0_ipc_timeout_seen) {
+            je_el0_ipc_timeout_seen = true;
+            proof_write("JeiOS/aarch64: EL0 IPC TIMED_OUT "
+                        "trusted-cause\r\n");
+        }
+        if (tf->gpr[0] == JE_ABI_H_PEER_CLOSED &&
+            slot == je_el0_good_slot[1]) {
+            je_el0_death_live = true;
+        }
+    }
     je_vm *vm = NULL;
     uint32_t index = UINT32_MAX;
     uint32_t current_slot = UINT32_MAX;
     const bool copy_op = op == JE_SYSCALL_COPY_PROBE;
     const bool handle_op = op >= JE_SYSCALL_HANDLE_SELF &&
                            op <= JE_SYSCALL_HANDLE_DUP;
-    if (copy_op || handle_op || op == JE_SYS_YIELD) {
+    const bool close_op = op == JE_SYSCALL_HANDLE_CLOSE;
+    const bool reuse_probe = je_el0_reuse_live &&
+                             (op == JE_SYSCALL_TRY_RECV ||
+                              op == JE_SYS_YIELD);
+    if (copy_op || handle_op || close_op || op == JE_SYS_YIELD ||
+        op == JE_SYS_EXIT || reuse_probe) {
         if (je_arm_sched_current_user(&vm, &index, &current_slot) != JE_OK)
             proof_fatal("current-user");
+    }
+    if (reuse_probe &&
+        index == je_el0_reuse_index &&
+        current_slot == je_el0_reuse_slot) {
+        uint32_t stale_waiter_id = 0u;
+        const bool rec_freed = je_el0_death_rec != NULL &&
+                               !je_el0_death_rec->allocated;
+        const je_ep_end_state death_state =
+            je_el0_death_rec == NULL
+                ? JE_EP_END_FREE
+                : je_endpoint_end_state(je_el0_death_rec,
+                                        je_el0_death_side);
+        const uint8_t survivor_side =
+            (uint8_t)(je_el0_death_side ^ 1u);
+        const bool victim_waiter_present =
+            je_el0_death_rec != NULL &&
+            je_el0_death_rec->end[je_el0_death_side].waiter.present;
+        const bool bad_release =
+            je_el0_death_rec == NULL ||
+            ((!rec_freed) &&
+             (death_state != JE_EP_END_CLOSED ||
+              je_el0_death_rec->generation != je_el0_death_generation ||
+              je_endpoint_end_state(je_el0_death_rec, survivor_side) !=
+                  JE_EP_END_PEER_CLOSED ||
+              victim_waiter_present ||
+              je_el0_death_rec->end[0].inflight_refs != 0u ||
+              je_el0_death_rec->end[1].inflight_refs != 0u)) ||
+            (rec_freed &&
+             je_el0_death_rec->generation == je_el0_death_generation) ||
+            (rec_freed && death_state != JE_EP_END_FREE) ||
+            je_endpoint_wait_id(je_el0_death_rec, je_el0_death_side,
+                                &stale_waiter_id) ||
+            je_endpoint_kern_waiters_released() <=
+                je_el0_death_waiters_before ||
+            je_sched_wait_pending(NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                                  NULL);
+        if (bad_release) {
+            proof_fatal("death-release");
+        }
+        je_el0_reuse_marker = true;
+        je_el0_ipc_death_seen = true;
+        je_el0_reuse_live = false;
+        je_el0_reuse_proc_done = true;
+        proof_write("JeiOS/aarch64: EL0 IPC DEATH_RELEASED_WAITER "
+                    "rec_freed=");
+        proof_dec(rec_freed ? 1u : 0u);
+        proof_write(" no_stale_id=1\r\n");
+        return;
     }
     if (copy_op) {
         if (index >= 2u) proof_fatal("copy-index");
@@ -867,6 +1744,8 @@ void je_arm_el0_test_note_svc(uint32_t slot, uint64_t op,
     }
     if (handle_op) {
         if (index >= 2u) proof_fatal("handle-index");
+        if (je_el0_handle_step[index] >= 7u)
+            return;
         verify_handle_step(index, current_slot, op, tf);
         return;
     }
@@ -892,6 +1771,17 @@ void je_arm_el0_test_note_svc(uint32_t slot, uint64_t op,
         }
         if (je_el0_irq_preempted && current_slot == je_el0_good_slot[1])
             je_el0_irq_peer_ran = true;
+        if (je_el0_irq_preempted && je_el0_irq_peer_ran &&
+            !je_el0_irq_marker_printed) {
+            je_el0_irq_marker_printed = true;
+            proof_write("JeiOS/aarch64: EL0 TIMER_PREEMPT from=");
+            proof_dec(je_el0_good_slot[0]);
+            proof_write(" to=");
+            proof_dec(je_el0_good_slot[1]);
+            proof_write(" switches=");
+            proof_dec(je_el0_irq_preemptions);
+            proof_write("\r\n");
+        }
         if (je_copy_from_user(&je_el0_good_value[index],
                               JE_VM_ARENA_BASE + 2u * JE_PAGE_SIZE,
                               sizeof(je_el0_good_value[index])) != JE_ABI_OK)
@@ -907,17 +1797,6 @@ void je_arm_el0_test_note_svc(uint32_t slot, uint64_t op,
         if (je_el0_good_yield_mask == 3u &&
             je_el0_good_value[0] != je_el0_good_value[1])
             spawn_negative();
-        if (je_el0_irq_preempted && je_el0_irq_peer_ran &&
-            !je_el0_irq_marker_printed) {
-            je_el0_irq_marker_printed = true;
-            proof_write("JeiOS/aarch64: EL0 TIMER_PREEMPT from=");
-            proof_dec(je_el0_good_slot[0]);
-            proof_write(" to=");
-            proof_dec(je_el0_good_slot[1]);
-            proof_write(" switches=");
-            proof_dec(je_el0_irq_preemptions);
-            proof_write("\r\n");
-        }
         if (je_el0_survivor_reaped && current_slot == je_el0_good_slot[0]) {
             ++je_el0_lone_yields;
             proof_write("JeiOS/aarch64: EL0 LONE_SURVIVOR_YIELD slot=");
@@ -930,8 +1809,17 @@ void je_arm_el0_test_note_svc(uint32_t slot, uint64_t op,
             je_el0_active == JE_EL0_NEG_COUNT &&
             !je_el0_negative_live && je_el0_survivor_reaped &&
             je_el0_register_roundtrip_mask == 3u &&
-            je_el0_irq_marker_printed && je_el0_mode_negative_passed &&
-            je_el0_lone_yields >= 2u && je_el0_lone_irq_reselect) {
+            je_el0_irq_marker_printed && je_el0_ipc_timer_wake_seen &&
+            je_el0_mode_negative_passed &&
+            je_el0_lone_yields >= 2u &&
+            je_el0_ipc_woken_seen && je_el0_ipc_timeout_seen &&
+            je_el0_ipc_peer_closed_seen && je_el0_ipc_deadcap_seen &&
+            je_el0_ipc_deadcap_verified &&
+            je_el0_ipc_idle_seen &&
+#ifndef JE_ARM_EL0_DISABLE_WAKE_KILL
+            je_el0_ipc_death_seen && je_el0_reuse_marker &&
+#endif
+            je_el0_lone_irq_reselect) {
             proof_write("JeiOS/aarch64: EL0 proof PASS "
                         "reviewed-cache-tlb=not-observed\r\n");
             proof_halt();
@@ -964,12 +1852,22 @@ void je_arm_el0_test_before_return(uint32_t slot, je_arm_trapframe *tf)
     if (index == je_el0_good_index[1] &&
         je_el0_active == JE_EL0_NEG_COUNT && !je_el0_survivor_reaped)
         tf->gpr[1] = JE_EL0_EXIT_SIGNAL;
+    if (index == je_el0_good_index[0] &&
+        je_el0_active == JE_EL0_NEG_COUNT &&
+        !je_el0_survivor_spin_armed &&
+        je_el0_survivor_spin_end > je_el0_survivor_spin_start) {
+        tf->elr = JE_VM_ARENA_BASE + je_el0_survivor_spin_start;
+        je_el0_survivor_spin_armed = true;
+    }
 }
 
 void je_arm_el0_test_note_fault(uint32_t slot, uint32_t reason,
                                 uint64_t ec, uint64_t far, uint64_t il,
                                 uint64_t iss, uint64_t fsc, uint64_t wnr)
 {
+    if (je_el0_reuse_proc_done && slot == je_el0_reuse_slot &&
+        reason == JE_ABI_DEATH_EXIT)
+        return;
     if (!je_el0_negative_live) return;
     if (je_el0_active == JE_EL0_NEG_CNTP_CTL) {
         if (ec != UINT64_C(0x18) || iss != JE_EL0_CNTP_CTL_ISS)
@@ -1008,6 +1906,51 @@ void je_arm_el0_test_note_fault(uint32_t slot, uint32_t reason,
 
 void je_arm_el0_test_note_reaped(uint32_t index, je_proc_id proc_id)
 {
+#ifdef JE_ARM_EL0_DISABLE_WAKE_KILL
+    /*
+     * This profile exists solely to prove that the wake-resumed context can
+     * return through the scheduler without the old kill-at-wake shortcut.
+     * Leave lifecycle reuse to the default profile, whose real death path
+     * proves waiter release at the teardown boundary.
+     */
+    if (je_el0_death_live &&
+        index == je_el0_death_index &&
+        proc_id.index == je_el0_death_proc.index &&
+        proc_id.gen == je_el0_death_proc.gen) {
+        je_el0_death_live = false;
+        return;
+    }
+#endif
+    if (je_el0_death_live &&
+        index == je_el0_death_index &&
+        proc_id.index == je_el0_death_proc.index &&
+        proc_id.gen == je_el0_death_proc.gen) {
+        if (je_el0_death_rec == NULL ||
+            je_el0_death_waiter_id != je_el0_death_slot ||
+            je_el0_death_side > 1u)
+            proof_fatal("death-record");
+        je_el0_death_live = false;
+        je_el0_reuse_live = false;
+        make_reuse_blob(je_el0_death_blob);
+        uint32_t reuse_slot = UINT32_MAX;
+        build_user(je_el0_death_blob, &je_el0_reuse_index,
+                   &je_el0_reuse_proc, &reuse_slot);
+        if (je_el0_reuse_index != je_el0_death_index ||
+            reuse_slot != je_el0_death_slot ||
+            je_el0_reuse_proc.index != je_el0_death_proc.index ||
+            je_el0_reuse_proc.gen == je_el0_death_proc.gen)
+            proof_fatal("death-slot-reuse");
+        je_el0_reuse_slot = reuse_slot;
+        je_el0_reuse_live = true;
+        return;
+    }
+    if (je_el0_reuse_proc_done &&
+        index == je_el0_reuse_index &&
+        proc_id.index == je_el0_reuse_proc.index &&
+        proc_id.gen == je_el0_reuse_proc.gen) {
+        je_el0_reuse_proc_done = false;
+        return;
+    }
     if (!je_el0_negative_live) {
         if (index != je_el0_good_index[1] ||
             proc_id.index != je_el0_good_proc[1].index ||
@@ -1053,6 +1996,8 @@ _Noreturn void je_arm_el0_test_run(void)
     const je_vm_ops *ops = je_arch_vm_ops(je_arm_scheduler_pages(), 1);
     if (je_vm_init(&je_el0_vm, ops, je_arm_scheduler_pages(), 0u) != JE_OK)
         proof_fatal("vm-init");
+    je_endpoint_kern_set_proc_pool(&je_el0_pool);
+    je_endpoint_kern_install(&je_el0_vm);
     make_good_blob(je_el0_good_blob[0], UINT16_C(0x1111),
                    JE_VM_ARENA_BASE + JE_VM_ARENA_SIZE, true, false);
     make_good_blob(je_el0_good_blob[1], UINT16_C(0x2222),
@@ -1065,6 +2010,54 @@ _Noreturn void je_arm_el0_test_run(void)
                &je_el0_good_proc[1], &slots[1]);
     je_el0_good_slot[0] = slots[0];
     je_el0_good_slot[1] = slots[1];
+    je_handle seed_a = 0u;
+    je_handle seed_b = 0u;
+    if (je_endpoint_kern_seed(&je_el0_vm, je_el0_good_index[0],
+                              je_el0_good_index[1], &seed_a, &seed_b)
+            != JE_EP_OK ||
+        seed_a == 0u || seed_b == 0u)
+        proof_fatal("ipc-seed");
+    seed_user_u64(je_el0_good_index[0], 2u * JE_PAGE_SIZE + 0x20u,
+                  seed_a);
+    seed_user_u64(je_el0_good_index[1], 2u * JE_PAGE_SIZE + 0x20u,
+                  seed_b);
+    const uint32_t cap_endpoint_baseline =
+        je_endpoint_kernel_allocated();
+    if (cap_endpoint_baseline != 1u)
+        proof_fatal("cap-baseline");
+    je_handle dead_source = 0u;
+    je_handle dead_peer = 0u;
+    if (je_endpoint_kern_seed(&je_el0_vm, je_el0_good_index[0],
+                              je_el0_good_index[1], &dead_source, &dead_peer)
+            != JE_EP_OK ||
+        dead_source == 0u || dead_peer == 0u)
+        proof_fatal("deadcap-seed");
+    je_el0_deadcap_source = dead_source;
+    seed_user_u64(je_el0_good_index[0], 2u * JE_PAGE_SIZE + 0x48u,
+                  dead_source);
+    seed_user_u64(je_el0_good_index[1], 2u * JE_PAGE_SIZE + 0x28u,
+                  dead_peer);
+    make_death_waiter_blob(je_el0_death_blob);
+    uint32_t death_slot = UINT32_MAX;
+    build_user(je_el0_death_blob, &je_el0_death_index,
+               &je_el0_death_proc, &death_slot);
+    je_el0_death_slot = death_slot;
+    je_handle death_a = 0u;
+    je_handle death_b = 0u;
+    if (je_endpoint_kern_seed(&je_el0_vm, je_el0_good_index[0],
+                              je_el0_death_index, &death_a, &death_b)
+            != JE_EP_OK ||
+        death_a == 0u || death_b == 0u)
+        proof_fatal("death-seed");
+    seed_user_u64(je_el0_good_index[0], 2u * JE_PAGE_SIZE + 0x40u,
+                  death_a);
+    seed_user_u64(je_el0_death_index, 2u * JE_PAGE_SIZE + 0x20u,
+                  death_b);
+    /* The bootstrap and dead-cap records are live at this point; G1 closes
+     * the first, B closes the second after minting, and the transferred
+     * endpoint is closed/released by the G2 commit. */
+    je_el0_death_waiters_before =
+        je_endpoint_kern_waiters_released();
     const uint32_t mode_negative =
         je_arm_el0_test_mode_rejection(slots[0]);
     if (mode_negative != UINT32_C(0xf))
@@ -1083,5 +2076,7 @@ _Noreturn void je_arm_el0_test_run(void)
     cpacr |= UINT64_C(3) << 20;
     __asm__ volatile("msr cpacr_el1, %0\n\tisb" : : "r"(cpacr) : "memory");
     proof_write("JeiOS/aarch64: EL0 setup two-processes real-code timer-live\r\n");
+    if (je_timer_arm(NULL, NULL) != JE_OK)
+        proof_fatal("timer-rearm");
     je_arm_sched_start_user();
 }

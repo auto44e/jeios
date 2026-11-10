@@ -235,6 +235,77 @@ static void test_zombie_exclusion(void)
     assert(je_rr_pick(&table) == b);
 }
 
+static void test_blocked_exclusion(void)
+{
+    uint32_t a;
+    uint32_t b;
+
+    reset_fake();
+    create_two(&a, &b);
+    switch_to(a);
+    je_rr_block(&table, a);
+    assert(je_rr_get_state(&table, a) == JE_RR_BLOCKED);
+    assert(je_rr_pick(&table) == b);
+    switch_to(b);
+    assert(je_rr_pick(&table) == 0u);
+}
+
+static void test_blocked_switch_rejected(void)
+{
+    uint32_t a;
+    void *resume = (void *)(uintptr_t)UINTPTR_MAX;
+
+    reset_fake();
+    a = create_one();
+    switch_to(a);
+    je_rr_block(&table, a);
+    assert(je_rr_switch(&table, a, &resume) == JE_ERR_INVALID);
+    assert(resume == NULL);
+    assert(je_rr_current(&table) == a);
+    assert(je_rr_get_state(&table, a) == JE_RR_BLOCKED);
+}
+
+static void test_blocked_wake_idempotent(void)
+{
+    uint32_t a;
+
+    reset_fake();
+    a = create_one();
+    switch_to(a);
+    je_rr_block(&table, a);
+    je_rr_wake(&table, a);
+    assert(je_rr_get_state(&table, a) == JE_RR_READY);
+    je_rr_wake(&table, a);
+    assert(je_rr_get_state(&table, a) == JE_RR_READY);
+}
+
+static void test_sleeping_wake_is_not_blocked_wake(void)
+{
+    uint32_t a;
+
+    reset_fake();
+    a = create_one();
+    switch_to(a);
+    je_rr_sleep(&table, a, UINT64_C(10), UINT64_C(1));
+    assert(je_rr_get_state(&table, a) == JE_RR_SLEEPING);
+    je_rr_wake(&table, a);
+    assert(je_rr_get_state(&table, a) == JE_RR_SLEEPING);
+}
+
+static void test_blocked_death(void)
+{
+    uint32_t a;
+
+    reset_fake();
+    a = create_one();
+    switch_to(a);
+    je_rr_block(&table, a);
+    je_rr_exit(&table, a);
+    assert(je_rr_get_state(&table, a) == JE_RR_ZOMBIE);
+    je_rr_wake(&table, a);
+    assert(je_rr_get_state(&table, a) == JE_RR_ZOMBIE);
+}
+
 static void test_counters(void)
 {
     const je_rr_counters *a_counts;
@@ -386,6 +457,11 @@ int main(void)
     test_idle_fallback();
     test_sleep_deadline();
     test_zombie_exclusion();
+    test_blocked_exclusion();
+    test_blocked_switch_rejected();
+    test_blocked_wake_idempotent();
+    test_sleeping_wake_is_not_blocked_wake();
+    test_blocked_death();
     test_counters();
     test_frame_init_rollback();
     test_dispatch_rollback();

@@ -125,6 +125,10 @@ bool je_endpoint_kern_waiter_release_by_id(uint32_t slot);
  * or be dropped. It is compiled into every build; the cost is a bounded pool scan with
  * IRQs off on each release. [Corrected after the PR-D verification review.] */
 uint32_t je_endpoint_kern_woken_reservations_released(void);
+/* Kernel-only count of waiter releases, including ordinary terminal cleanup.
+ * The ARM EL0 fixture uses the delta around its real death handoff to prove
+ * that the dying slot's waiter was released before slot reuse. */
+uint32_t je_endpoint_kern_waiters_released(void);
 /* Recv glue: entry probe (deliverable? empty? closed?) and waiter registration. */
 je_ep_status je_endpoint_kern_recv_entry_probe(je_vm *vm, uint32_t index, je_handle h);
 je_ep_status je_endpoint_kern_wait_register(je_vm *vm, uint32_t index, je_handle h,

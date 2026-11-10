@@ -1056,10 +1056,34 @@ EL0_REGISTER_RE = re.compile(
 EL0_TIMER_PREEMPT_RE = re.compile(
     rb"JeiOS/aarch64: EL0 TIMER_PREEMPT from=(\d+) to=(\d+)"
     rb" switches=(\d+)")
+EL0_IPC_TIMER_WAKE = b"JeiOS/aarch64: EL0 IPC TIMER_WAKE trusted-cause"
+EL0_IPC_WOKEN_RESTART = (
+    b"JeiOS/aarch64: EL0 IPC WOKEN_RESTART trusted-cause")
+EL0_IPC_TIMED_OUT = (
+    b"JeiOS/aarch64: EL0 IPC TIMED_OUT trusted-cause")
+EL0_IPC_PEER_CLOSED = (
+    b"JeiOS/aarch64: EL0 IPC PEER_CLOSED trusted-cause "
+    b"blocked-before-ready=1")
+EL0_IPC_DEADCAP = (
+    b"JeiOS/aarch64: EL0 IPC DEADCAP_NULL_MARKER slot=")
+EL0_IPC_ALL_BLOCKED_IDLE = (
+    b"JeiOS/aarch64: EL0 IPC ALL_BLOCKED_IDLE woke=1")
+EL0_IPC_IDLE_STACK_GUARD_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 IPC IDLE_STACK_GUARD "
+    rb"bss_overwrites=0 stack_guard=1 resumed=(\d+)")
+EL0_IPC_DEATH_RELEASED = (
+    b"JeiOS/aarch64: EL0 IPC DEATH_RELEASED_WAITER "
+    b"rec_freed=")
+EL0_IPC_DEATH_RELEASED_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 IPC DEATH_RELEASED_WAITER "
+    rb"rec_freed=([01]) no_stale_id=1")
+EL0_IPC_SHORT_BUFFER = b"JeiOS/aarch64: EL0 IPC SHORT_BUFFER trusted-cause"
 EL0_LONE_SURVIVOR_RE = re.compile(
     rb"JeiOS/aarch64: EL0 LONE_SURVIVOR_YIELD slot=(\d+) count=(\d+)")
 EL0_LONE_IRQ_RESELECT_RE = re.compile(
     rb"JeiOS/aarch64: EL0 LONE_IRQ_RESELECT slot=(\d+)")
+EL0_LONE_SVC_RESELECT_RE = re.compile(
+    rb"JeiOS/aarch64: EL0 LONE_SURVIVOR_SVC_RESELECT slot=(\d+)")
 EL0_CNTKCTL_TRAP_RE = re.compile(
     rb"JeiOS/aarch64: EL0 CNTKCTL_PREEMPT_WRITE_TRAP stage=(\d+)")
 EL0_DCC_TRAP_RE = re.compile(
@@ -1112,7 +1136,9 @@ COPY_FAULTS = {
     "guard-2": 12,
 }
 COPY_PAGE_SIZE = 0x1000
-COPY_FAULT_HOLE = EL0_ARENA_DATA - COPY_PAGE_SIZE
+# The EL0 fixture has two RX pages followed by two RW pages.  Its deliberate
+# not-present copy-fault hole is beyond that complete image, at +4 pages.
+COPY_FAULT_HOLE = EL0_ARENA_DATA + 2 * COPY_PAGE_SIZE
 COPY_FAULT_CODE = EL0_ARENA_DATA - 2 * COPY_PAGE_SIZE
 COPY_FAULT_KERNEL = 0x40080000
 COPY_LOAD_SITE_SYM = b"je_copy_user_load_site"
@@ -1253,7 +1279,7 @@ def check_copy_fault(lines, name, elf_path):
           f"ELR=0x{elr:x} FAR=0x{far:x}")
 
 
-def check_el0_test(lines):
+def check_el0_test(lines, no_wake_kill=False):
     """Re-derive the MP3a-2 proof claims from trusted serial observations.
 
     The harness does not trust a user-reported success bit: it checks the
@@ -1269,12 +1295,16 @@ def check_el0_test(lines):
             (EL0_MODE_AARCH32_RE, "AArch32 M[4] composite")):
         if not any(mode_re.fullmatch(ln) for ln in lines):
             fail(f"el0-test: {name} mode-negative was not exercised")
+    def proof_slots(markers):
+        slots = sorted(int(m.group(1)) for m in markers)
+        return slots in ([1, 2], [1, 3])
+
     kstacks = [m for m in (EL0_KSTACK_RE.fullmatch(ln) for ln in lines) if m]
-    if sorted(int(m.group(1)) for m in kstacks) != [1, 2]:
+    if not proof_slots(kstacks):
         fail("el0-test: SP_EL1 frame markers missing")
     proofs = [m for m in
               (EL0_SVC_PROOF_RE.fullmatch(ln) for ln in lines) if m]
-    if sorted(int(m.group(1)) for m in proofs) != [1, 2]:
+    if not proof_slots(proofs):
         fail(f"el0-test: expected two non-vacuous SVC proofs, found "
              f"{[m.group(1).decode() for m in proofs]}")
     for m in proofs:
@@ -1286,12 +1316,12 @@ def check_el0_test(lines):
             fail("el0-test: non-vacuous SVC status/result/register proof failed")
     tpidrro = [m for m in
                (EL0_TPIDRRO_RE.fullmatch(ln) for ln in lines) if m]
-    if sorted(int(m.group(1)) for m in tpidrro) != [1, 2] or \
+    if not proof_slots(tpidrro) or \
             any(int(m.group(2), 16) != 0 for m in tpidrro):
         fail("el0-test: TPIDRRO zero round-trip markers missing or non-zero")
     registers = [m for m in
                  (EL0_REGISTER_RE.fullmatch(ln) for ln in lines) if m]
-    if sorted(int(m.group(1)) for m in registers) != [1, 2] or \
+    if not proof_slots(registers) or \
             any(int(m.group(2), 16) != 0x5245 for m in registers):
         fail("el0-test: post-SVC register round-trip marker failed")
     preempts = [m for m in
@@ -1299,17 +1329,48 @@ def check_el0_test(lines):
     if len(preempts) != 1 or (int(preempts[0].group(1)),
                               int(preempts[0].group(2))) != (1, 2) or \
             int(preempts[0].group(3)) < 1:
-        fail("el0-test: timer-live EL0 preemption marker missing")
+        fail("el0-test: genuine timer-live EL0 preemption marker missing")
+    if lines.count(EL0_IPC_TIMER_WAKE) != 1:
+        fail("el0-test: timer-live IPC wake marker missing")
+    required_ipc_markers = (
+            (EL0_IPC_WOKEN_RESTART, "WOKEN_RESTART"),
+            (EL0_IPC_TIMED_OUT, "TIMED_OUT"),
+            (EL0_IPC_PEER_CLOSED, "PEER_CLOSED"),
+            (EL0_IPC_DEADCAP, "DEADCAP_NULL_MARKER"),
+            (EL0_IPC_ALL_BLOCKED_IDLE, "ALL_BLOCKED_IDLE"))
+    if not no_wake_kill:
+        required_ipc_markers += (
+            (EL0_IPC_DEATH_RELEASED, "DEATH_RELEASED_WAITER"),)
+    for marker, name in required_ipc_markers:
+        count = sum(marker in line for line in lines)
+        if count != 1:
+            fail(f"el0-test: expected one trusted IPC {name} marker, "
+                 f"found {count}")
+    if not no_wake_kill:
+        death_markers = [
+            m for m in
+            (EL0_IPC_DEATH_RELEASED_RE.fullmatch(ln) for ln in lines) if m]
+        if len(death_markers) != 1:
+            fail("el0-test: malformed death-release marker")
+    idle_guards = [m for m in
+                   (EL0_IPC_IDLE_STACK_GUARD_RE.fullmatch(ln)
+                    for ln in lines) if m]
+    if len(idle_guards) != 1 or int(idle_guards[0].group(1)) not in (1, 2):
+        fail("el0-test: idle stack/BSS guard proof missing")
     lone = [m for m in
             (EL0_LONE_SURVIVOR_RE.fullmatch(ln) for ln in lines) if m]
     lone_irq = [m for m in
                 (EL0_LONE_IRQ_RESELECT_RE.fullmatch(ln) for ln in lines)
                 if m]
+    lone_svc = [m for m in
+                (EL0_LONE_SVC_RESELECT_RE.fullmatch(ln) for ln in lines)
+                if m]
     if not any(EL0_REAP_LONE_RE.fullmatch(ln) for ln in lines) or \
-            len(lone) < 2 or len(lone_irq) != 1:
+            len(lone) < 2 or len(lone_irq) != 1 or lone_svc:
         fail("el0-test: lone-survivor reap/yield markers missing")
     lone_slots = {int(m.group(1)) for m in lone}
-    if len(lone_slots) != 1 or int(lone_irq[0].group(1)) not in lone_slots or \
+    reselect_slot = int(lone_irq[0].group(1))
+    if len(lone_slots) != 1 or reselect_slot not in lone_slots or \
             max(int(m.group(2)) for m in lone) < 2:
         fail("el0-test: lone-survivor self-yield/reselect evidence is weak")
 
@@ -1332,11 +1393,13 @@ def check_el0_test(lines):
         if arena != EL0_ARENA_DATA:
             fail(f"el0-test: arena VA=0x{arena:x} != 0x{EL0_ARENA_DATA:x}")
         values[slot] = value
-    if values.get(1) != 0x1111 or values.get(2) != 0x2222:
+    if values.get(1) != 0x1111 or 0x2222 not in values.values():
         fail(f"el0-test: expected distinct per-process arena values, got {values}")
 
     spawns = [m for m in (EL0_SPAWN_RE.fullmatch(ln) for ln in lines) if m]
     deaths = [m for m in (EL0_DEATH_RE.fullmatch(ln) for ln in lines) if m]
+    if no_wake_kill:
+        deaths = [m for m in deaths if int(m.group(3)) != 1]
     terminated = [m for m in
                   (EL0_TERMINATED_RE.fullmatch(ln) for ln in lines) if m]
     reaps = [m for m in (EL0_REAP_RE.fullmatch(ln) for ln in lines) if m]
@@ -1350,15 +1413,18 @@ def check_el0_test(lines):
     exits = [
         m for m in terminated if int(m.group(2)) == 1  # JE_ABI_DEATH_EXIT
     ]
-    if len(negative_terminated) != 10 or len(exits) != 1:
-        fail(f"el0-test: expected 10 negative and 1 exit termination markers, "
+    if len(negative_terminated) != 10 or len(exits) not in (2, 3):
+        fail(f"el0-test: expected 10 negative and 2/3 exit termination markers, "
              f"found {len(negative_terminated)} negative/{len(exits)} exit")
-    if (int(exits[0].group(1)) != 2 or int(exits[0].group(3), 16) != 0x15 or
-            int(exits[0].group(5)) != 1 or
-            int(exits[0].group(6), 16) != 0 or
-            int(exits[0].group(7), 16) != 0 or
-            int(exits[0].group(8)) != 0):
-        fail("el0-test: survivor exit syndrome was not the expected SVC return")
+    exit_slots = [int(m.group(1)) for m in exits]
+    if exit_slots.count(2) != 1 or exit_slots.count(3) != len(exits) - 1 or \
+            any(
+            int(m.group(3), 16) != 0x15 or
+            int(m.group(5)) != 1 or
+            int(m.group(6), 16) != 0 or
+            int(m.group(7), 16) != 0 or
+            int(m.group(8)) != 0 for m in exits):
+        fail("el0-test: exit syndromes were not the expected SVC returns")
     expected = {
         0: (0, 0x24, 0x40000000, 1, 0x0000000f),
         1: (0, 0x24, 0x40000000, 1, 0x0000004f),
@@ -2429,9 +2495,17 @@ def main():
     ap.add_argument("--el0-test", action="store_true",
                     help="expect the MP3a-2 real EL0/SVC/fault-death proof "
                          "(two processes, isolation, hardening, reap)")
+    ap.add_argument("--el0-no-wake-kill", action="store_true",
+                    help="validate EL0 wake/resume with the test-only death "
+                         "kill hook disabled")
     ap.add_argument("--copy-fault", choices=sorted(COPY_FAULTS), metavar="NAME",
                     help="expect one MP3b ARM copy-fault guard to reject: "
                          + ", ".join(sorted(COPY_FAULTS)))
+    ap.add_argument("--ipc-fault", choices=(
+        "drop-the-rewind", "wrong-resume-assertion",
+        "re-resolve-on-resume", "commit-mismatch", "copy-fault-resume",
+        "short-buffer-resume", "waiters-busy", "idle-no-panic"),
+                    help="expect one MP3c ARM IPC guard to FATAL")
     ap.add_argument("--sched-mutation",
                     choices=("drop-mov-sp", "pick-skips-b", "rebuild-fake-frame",
                              "unconditional-cur-ready", "wfi-i-masked",
@@ -2499,6 +2573,8 @@ def main():
                           or args.phys_alloc or args.user_test):
         fail("--el0-test is only valid alone (its build excludes the other "
              "toggles)")
+    if args.el0_no_wake_kill and not args.el0_test:
+        fail("--el0-no-wake-kill requires --el0-test")
     if args.copy_fault and (args.dtb_bad or args.vector_test or args.mmu_fault
                             or args.bss_verified or args.timer_poll
                             or args.timer_test or args.sched_test
@@ -2506,6 +2582,8 @@ def main():
         fail("--copy-fault is only valid with the EL0 proof build")
     if args.copy_fault and not args.el0_test:
         fail("--copy-fault requires --el0-test")
+    if args.ipc_fault and not args.el0_test:
+        fail("--ipc-fault requires --el0-test")
     if args.sched_mutation is not None and not args.sched_test:
         fail("--sched-mutation requires --sched-test")
     if (args.late_corruption is not None or args.stalled_timer) and not args.timer_test:
@@ -2613,7 +2691,7 @@ def main():
     # message; this only shortens the wait, it never makes a run PASS.
     early_stop = (VALIDATED if args.dtb_bad
                   else None if args.sched_mutation is not None or
-                  args.copy_fault else b"FATAL")
+                  args.copy_fault or args.ipc_fault else b"FATAL")
     if not args.dtb_bad:
         check_dtb_gic_timer(fx)   # static: pinned bases/INTID vs fixture DTB
 
@@ -2645,7 +2723,7 @@ def main():
         out, early, err = run_qemu(
             cmd, serial_path, final_line, early_stop, args.timeout,
             (lambda line: b"FATAL" in line)
-            if args.sched_mutation is not None else None)
+            if args.sched_mutation is not None or args.ipc_fault else None)
     finally:
         if boot_image != args.image:
             try:
@@ -2700,6 +2778,42 @@ def main():
             fail(f"scheduler mutation {args.sched_mutation} emitted a PASS")
         print(f"QEMU aarch64 mutation: FAIL as expected "
               f"{args.sched_mutation} -> {lines[-1].decode('ascii')}")
+        sys.exit(1)
+    if args.ipc_fault is not None:
+        lines, partial = split_lines(out)
+        if partial:
+            fail("--ipc-fault emitted an unterminated serial line")
+        fatal_lines = [line for line in lines if b"FATAL" in line]
+        if len(fatal_lines) != 1:
+            fail(f"--ipc-fault {args.ipc_fault}: expected one IPC FATAL, "
+                 f"got {fatal_lines!r}")
+        if any(b"EL0 proof PASS" in line for line in lines):
+            fail(f"--ipc-fault {args.ipc_fault}: proof PASS was emitted")
+        expected = {
+            "drop-the-rewind": b"JeiOS/aarch64: FATAL sched IPC rewind guard",
+            "wrong-resume-assertion":
+                b"JeiOS/aarch64: FATAL sched IPC resume assertion",
+            "re-resolve-on-resume":
+                b"JeiOS/aarch64: FATAL sched IPC re-resolve",
+            "commit-mismatch":
+                b"JeiOS/aarch64: FATAL IPC blocked recv commit mismatch",
+            "copy-fault-resume":
+                b"JeiOS/aarch64: FATAL IPC copy fault in resumed continuation",
+            "short-buffer-resume":
+                b"JeiOS/aarch64: FATAL el0-test short-buffer resume",
+            "waiters-busy":
+                b"JeiOS/aarch64: FATAL sched IPC WAITERS_BUSY guard",
+            "idle-no-panic":
+                b"JeiOS/aarch64: FATAL sched nothing can wake",
+        }[args.ipc_fault]
+        if fatal_lines[0] != expected:
+            fail(f"--ipc-fault {args.ipc_fault}: expected named detector "
+                 f"{expected!r}, got {fatal_lines[0]!r}")
+        if args.ipc_fault == "short-buffer-resume" and \
+                not any(EL0_IPC_SHORT_BUFFER in line for line in lines):
+            fail("--ipc-fault short-buffer-resume: trusted marker missing")
+        print(f"QEMU aarch64 IPC fault: FATAL as expected "
+              f"{args.ipc_fault} -> {fatal_lines[0].decode('ascii')}")
         sys.exit(1)
     if args.late_corruption is not None or args.stalled_timer:
         lines, partial = split_lines(out)
@@ -2803,7 +2917,7 @@ def main():
         elif args.copy_fault:
             check_copy_fault(lines, args.copy_fault, elf)
         elif args.el0_test:
-            check_el0_test(lines)
+            check_el0_test(lines, args.el0_no_wake_kill)
     if args.mmu_fault:
         check_mmu_fault(lines, args.mmu_fault, fault_exp, mmu_syms)
 

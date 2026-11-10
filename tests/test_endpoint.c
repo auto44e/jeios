@@ -1501,6 +1501,34 @@ int main(void)
         assert(rl==2u && rb[0]==1 && rb[1]==2);
     }
 
+    /* 30. A TIMED_OUT waiter is terminal: a later send may queue data, but its
+     * wake arbitration must not overwrite the timeout cause or reserve the head. */
+    fresh(QUOTA);
+    {
+        je_handle d0=0,d1=0;
+        assert(je_endpoint_channel_create(&g_pool,&g_t,JE_EP_RIGHTS_ALL,
+                                          &g_t,JE_EP_RIGHTS_ALL,&d0,&d1)==JE_EP_OK);
+        je_ep_channel *rr; uint8_t rs;
+        assert(je_endpoint_resolve(&g_pool,&g_t,d1,&rr,&rs)==JE_EP_OK);
+        je_ep_channel *wr; uint8_t ws;
+        assert(je_endpoint_wait_register(&g_pool,&g_t,d1,11u,&wr,&ws)==JE_EP_OK);
+        uint32_t timed=0u;
+        assert(je_endpoint_wait_arbitrate(rr,rs,JE_EP_WAIT_TIMED_OUT,&timed)
+               ==JE_EP_ARB_WON && timed==11u);
+        assert(je_endpoint_wait_cause(rr,rs)==JE_EP_WAIT_TIMED_OUT);
+        uint8_t msg[1]={99};
+        assert(je_endpoint_try_send(&g_pool,&g_t,d0,msg,1)==JE_EP_OK);
+        uint32_t late=0u;
+        assert(je_endpoint_wait_arbitrate(rr,rs,JE_EP_WAIT_WOKEN,&late)
+               ==JE_EP_ARB_LOST);
+        assert(je_endpoint_wait_cause(rr,rs)==JE_EP_WAIT_TIMED_OUT);
+        assert(je_endpoint_wait_release(&g_pool,rr,rs,11u)==true);
+        uint8_t rb[JE_EP_MSG_MAX]; size_t rl=0;
+        assert(je_endpoint_recv_peek(&g_pool,&g_t,d1,rb,sizeof rb,&rl,
+                                     (je_ep_recv_lease*)0)==JE_EP_OK);
+        assert(rl==1u && rb[0]==99u);
+    }
+
     test_ddev();
     test_f07_resolve_precedence();
 
@@ -1509,7 +1537,8 @@ int main(void)
            "alive, pool-exhaustion + create-unwind, release-walk, data IPC "
            "send/recv/FIFO/QUEUE_FULL/SHORT_BUFFER/PEER_CLOSED/rights/zero-len, "
            "cap-transfer mint/dead-cap/cycle-reclaim, "
-           "waits register/arbitrate-CAS/reserved-head/release/release-by-id/peer-close-EMPTY, "
+           "waits register/arbitrate-CAS/reserved-head/release/release-by-id/"
+           "peer-close-EMPTY/timed-out-late-send-terminal, "
            "D-DEV create_by charge/QUOTA/NOSLOTS-first/mint-unwind/transfer/dying/dead/"
            "freed/reused/NONE/procs-NULL/create==create_by(NONE)/no stale creator on reuse, "
            "F07 resolve precedence BADINDEX/STALE/WRONGTYPE-before-CORRUPT)\n");

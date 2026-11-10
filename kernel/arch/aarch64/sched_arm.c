@@ -23,6 +23,7 @@
 #include <jeios/status.h>
 #ifdef JE_ARM_EL0_TEST
 #include <jeios/abi.h>
+#include <jeios/endpoint_kern.h>
 #include <jeios/lifecycle.h>
 #include <jeios/proc.h>
 #include <jeios/syscall.h>
@@ -55,7 +56,13 @@ extern je_arm_mmu je_arm_mmu_context;
 #ifdef JE_ARM_EL0_TEST
 extern je_syscall_action je_arm_syscall_dispatch(
     uint64_t op, const uint64_t args[6], je_abi_status *out_status,
+    uint64_t *out_result, je_ep_channel **block_rec, uint8_t *block_side,
+    uint64_t *block_deadline);
+extern void je_arm_finish_blocked_recv(
+    je_ep_channel *rec, uint8_t side, uint64_t ubuf, uint64_t cap,
+    uint64_t hbuf, uint64_t hcap, je_abi_status *out_status,
     uint64_t *out_result);
+extern bool je_arm_sched_wait_identity(je_proc_id *out);
 #endif
 
 extern uint8_t _text[];
@@ -66,7 +73,6 @@ extern uint8_t __stack_top[];
 static je_rr_table je_arm_rr;
 static bool je_arm_rr_ready;
 static bool je_arm_stack_mapped[JE_RR_MAX];
-static uint32_t je_arm_frame_generation[JE_RR_MAX];
 
 #ifdef JE_ARM_EL0_TEST
 /* These arrays are the scheduler-owned binding. A slot is never allowed to
@@ -83,6 +89,27 @@ static bool je_arm_pending_user;
 static je_vm *je_arm_pending_vm;
 static uint32_t je_arm_pending_index;
 static je_proc_id je_arm_pending_proc;
+typedef struct {
+    bool pending;
+    je_ep_channel *rec;
+    uint8_t side;
+    uint64_t args[6];
+    uint64_t post_svc_elr;
+    uint64_t deadline;
+    je_proc_id proc_id;
+} je_arm_ipc_continuation;
+
+#define JE_ARM_EL0_BSS_GUARD_SIZE 64u
+typedef struct {
+    uint8_t below[JE_ARM_EL0_BSS_GUARD_SIZE];
+    uint32_t frame_generation[JE_RR_MAX];
+    je_arm_ipc_continuation ipc[JE_RR_MAX];
+    uint32_t identity_shadow;
+    uint8_t above[JE_ARM_EL0_BSS_GUARD_SIZE];
+} je_arm_el0_guarded_state;
+static je_arm_el0_guarded_state je_arm_el0_state;
+#define je_arm_frame_generation (je_arm_el0_state.frame_generation)
+#define je_arm_ipc (je_arm_el0_state.ipc)
 
 static uint64_t arm_user_expected_sp(uint32_t slot)
 {
@@ -110,6 +137,16 @@ extern void je_arm_el0_test_note_irq_switch(uint32_t from_slot,
                                             uint64_t elr);
 extern void je_arm_el0_test_note_svc_proof(uint32_t slot,
                                            const je_arm_trapframe *tf);
+extern void je_arm_el0_test_note_all_blocked_state(void);
+extern void je_arm_el0_test_note_all_blocked_idle(uint32_t slot);
+extern void je_arm_el0_test_note_idle_guard(uint32_t slot);
+extern void je_arm_el0_test_note_timer_wake(uint32_t slot);
+extern bool je_arm_el0_test_take_wake_death(uint32_t slot);
+extern uint32_t je_arm_el0_test_short_buffer_slot(void);
+#endif
+
+#ifndef JE_ARM_EL0_TEST
+static uint32_t je_arm_frame_generation[JE_RR_MAX];
 #endif
 
 /*
@@ -120,6 +157,16 @@ volatile uint32_t je_arm_sched_current_identity;
 volatile uint32_t je_arm_sched_exit_flags[JE_RR_MAX];
 volatile uint32_t je_arm_sched_nzcv_phase[JE_RR_MAX];
 volatile uint64_t je_arm_sched_canary_checks[JE_RR_MAX];
+
+#ifdef JE_ARM_EL0_TEST
+static uint64_t je_arm_idle_stack_run_base;
+static volatile uint8_t *je_arm_idle_stack_canary;
+static bool je_arm_idle_context_ran;
+static bool je_arm_idle_all_blocked;
+static bool je_arm_idle_wake_seen;
+static bool je_arm_ipc_parked[JE_RR_MAX];
+static bool je_arm_ipc_woken[JE_RR_MAX];
+#endif
 
 extern uint64_t je_arm_timer_ticks(void);
 
@@ -247,6 +294,15 @@ static inline void arm_wfi(void)
      */
     __asm__ volatile("wfi" ::: "memory");
 }
+
+#ifdef JE_ARM_EL0_TEST
+static _Noreturn void arm_idle_entry(void)
+{
+    je_arm_idle_context_ran = true;
+    arm_daif_clear_i();
+    for (;;) arm_wfi();
+}
+#endif
 
 static uint32_t next_frame_generation(uint32_t generation)
 {
@@ -404,8 +460,15 @@ static je_arm_frame_result frame_shape_class(const je_rr_ctx *ctx,
     if (kernel_sp != (uint64_t)frame_end ||
         (kernel_sp & UINT64_C(0xf)) != 0u || kernel_sp > (uint64_t)top)
         return JE_ARM_FRAME_BAD;
-    if ((frame->spsr & ~JE_ARM_SPSR_NZCV) != JE_ARM_SPSR_POLICY)
-        return JE_ARM_FRAME_BAD;
+    {
+        uint64_t expected_policy = JE_ARM_SPSR_POLICY;
+#ifdef JE_ARM_EL0_TEST
+        if (ctx->slot == 0u && phase != 0u)
+            expected_policy &= ~JE_ARM_DAIF_I;
+#endif
+        if ((frame->spsr & ~JE_ARM_SPSR_NZCV) != expected_policy)
+            return JE_ARM_FRAME_BAD;
+    }
     if ((frame->elr & UINT64_C(3)) != 0u ||
         frame->elr < (uint64_t)text_start ||
         frame->elr >= (uint64_t)text_end)
@@ -731,6 +794,45 @@ static const je_rr_hooks je_arm_hooks = {
     .idle_wait = arm_idle_wait
 };
 
+#ifdef JE_ARM_EL0_TEST
+static void arm_idle_guard_fill(void)
+{
+    for (unsigned i = 0u; i < JE_ARM_EL0_BSS_GUARD_SIZE; ++i) {
+        je_arm_el0_state.below[i] = UINT8_C(0xa5);
+        je_arm_el0_state.above[i] = UINT8_C(0xa5);
+    }
+}
+
+static bool arm_idle_guard_intact(uint32_t resumed_slot)
+{
+    if (je_arm_idle_stack_run_base == 0u ||
+        je_arm_idle_stack_canary == NULL ||
+        je_arm_sched_current_identity != resumed_slot ||
+        je_arm_el0_state.identity_shadow != resumed_slot ||
+        je_arm_frame_generation[0] == 0u)
+        return false;
+    for (unsigned i = 0u; i < JE_ARM_EL0_BSS_GUARD_SIZE; ++i)
+        if (je_arm_el0_state.below[i] != UINT8_C(0xa5) ||
+            je_arm_el0_state.above[i] != UINT8_C(0xa5) ||
+            je_arm_idle_stack_canary[i] != UINT8_C(0xa5))
+            return false;
+    for (uint32_t slot = 12u; slot < JE_RR_MAX; ++slot) {
+        if (je_arm_ipc[slot].pending ||
+            je_arm_ipc[slot].rec != NULL ||
+            je_arm_ipc[slot].deadline != 0u)
+            return false;
+    }
+    return true;
+}
+
+static void arm_idle_guard_check(uint32_t resumed_slot)
+{
+    if (!arm_idle_guard_intact(resumed_slot))
+        sched_fatal("idle stack guard");
+    je_arm_el0_test_note_idle_guard(resumed_slot);
+}
+#endif
+
 void je_arm_sched_init(void)
 {
     if (je_arm_rr_ready) return;
@@ -738,12 +840,60 @@ void je_arm_sched_init(void)
     je_arm_rr.slots[0].usable_base = (uintptr_t)__stack_bottom;
     je_arm_rr.slots[0].top = (uintptr_t)__stack_top;
     je_arm_stack_mapped[0] = true;
+#ifdef JE_ARM_EL0_TEST
+    {
+        je_pages *pages = je_arm_scheduler_pages();
+        uint64_t run_base = 0u;
+        uint64_t idle_top = 0u;
+        if (pages == NULL ||
+            je_pages_alloc(pages, JE_ARM_STACK_RUN_PAGES, &run_base) != JE_OK) {
+            sched_fatal("idle stack alloc");
+        }
+        if (je_arm_mmu_stack_map(&je_arm_mmu_context, run_base,
+                                 &idle_top) != JE_OK) {
+            (void)je_pages_free(pages, run_base, JE_ARM_STACK_RUN_PAGES);
+            sched_fatal("idle stack map");
+        }
+        je_arm_idle_stack_run_base = run_base;
+        je_arm_rr.slots[0].usable_base =
+            (uintptr_t)(run_base + JE_ARM_PAGE_SIZE);
+        je_arm_rr.slots[0].top = (uintptr_t)idle_top;
+        je_arm_idle_stack_canary =
+            (volatile uint8_t *)je_arm_rr.slots[0].usable_base;
+        for (unsigned i = 0u; i < JE_ARM_EL0_BSS_GUARD_SIZE; ++i)
+            je_arm_idle_stack_canary[i] = UINT8_C(0xa5);
+        arm_idle_guard_fill();
+    }
+    /*
+     * Slot zero is a real resumable context.  Its frame is at the top of a
+     * dedicated mapped stack, while the page immediately below that stack is
+     * left unmapped by je_arm_mmu_stack_map().
+     */
+    {
+        je_arm_trapframe *idle =
+            (je_arm_trapframe *)(je_arm_rr.slots[0].top -
+                                 (uintptr_t)JE_TF_SIZE);
+        for (unsigned i = 0u; i < JE_TF_SIZE / sizeof(uint64_t); ++i)
+            ((uint64_t *)idle)[i] = 0u;
+        idle->elr = (uint64_t)(uintptr_t)arm_idle_entry;
+        idle->spsr = JE_ARM_SPSR_POLICY & ~JE_ARM_DAIF_I;
+        *je_arm_tf_kernel_sp(idle) =
+            (uint64_t)(uintptr_t)idle + (uint64_t)JE_TF_SIZE;
+        idle->vector = JE_ARM_VECTOR_EL1_FIRST + 1u;
+        je_arm_frame_generation[0] = 1u;
+        idle->pad = 1u;
+        je_arm_rr.slots[0].frame = idle;
+    }
+#endif
 #ifdef JE_ARM_SCHED_TEST
     je_arm_sched_stack_base[0] = (uintptr_t)__stack_bottom;
     je_arm_sched_stack_top[0] = (uintptr_t)__stack_top;
 #endif
     je_arm_rr_ready = true;
     je_arm_sched_current_identity = 0u;
+#ifdef JE_ARM_EL0_TEST
+    je_arm_el0_state.identity_shadow = 0u;
+#endif
 }
 
 #ifdef JE_ARM_EL0_TEST
@@ -760,6 +910,13 @@ je_status je_arm_sched_create_user(je_vm *vm, uint32_t index,
         vm->procs[index].state != JE_VM_READY ||
         !je_proc_valid(je_arm_proc_pool, proc_id))
         return JE_ERR_INVALID;
+    {
+        uint32_t linked_slot = 0u;
+        uint32_t linked_index = 0u;
+        if (je_proc_run_link(je_arm_proc_pool, proc_id,
+                             &linked_slot, &linked_index) == JE_OK)
+            return JE_ERR_BUSY;
+    }
     if (je_arm_pending_user) return JE_ERR_BUSY;
     je_arm_pending_user = true;
     je_arm_pending_vm = vm;
@@ -795,6 +952,12 @@ je_status je_arm_sched_current_user(je_vm **out_vm, uint32_t *out_index,
     *out_index = je_arm_user_index[slot];
     *out_slot = slot;
     return JE_OK;
+}
+
+bool je_arm_sched_ipc_was_blocked(uint32_t slot)
+{
+    return slot > 0u && slot < JE_RR_MAX &&
+           je_arm_rr.slots[slot].state == JE_RR_BLOCKED;
 }
 
 /*
@@ -970,6 +1133,12 @@ static void arm_user_mark_dying(uint32_t slot, uint32_t reason,
     const je_status status = je_lc_on_dying(
         slot, je_arm_user_proc[slot], reason, code, vector);
     if (status != JE_OK) sched_fatal("lifecycle dying");
+    /*
+     * The lifecycle owner releases endpoint waiters; the architecture owns the
+     * continuation record. Clear it before the slot can be reaped and reused,
+     * so a replacement process cannot inherit a stale resume identity.
+     */
+    je_arm_ipc[slot] = (je_arm_ipc_continuation){0};
     je_rr_exit(&je_arm_rr, slot);
 }
 
@@ -1000,9 +1169,43 @@ static void *arm_switch_to_ready(void)
         je_arm_rr.slots[current].state == JE_RR_RUNNING)
         je_arm_rr.slots[current].state = JE_RR_READY;
     for (uint32_t attempt = 0u; attempt < JE_RR_MAX; ++attempt) {
-        const uint32_t next = je_rr_pick(&je_arm_rr);
+        uint32_t next = je_rr_pick(&je_arm_rr);
         if (next == 0u) {
-            sched_fatal("no live EL0 successor");
+            bool all_blocked = true;
+            bool can_wake = false;
+            bool have_user = false;
+            for (uint32_t slot = 1u; slot < JE_RR_MAX; ++slot) {
+                if (!arm_current_is_user(slot)) continue;
+                have_user = true;
+                if (je_arm_rr.slots[slot].state != JE_RR_BLOCKED) {
+                    all_blocked = false;
+                    continue;
+                }
+                if (je_arm_ipc[slot].pending &&
+                    je_arm_ipc[slot].deadline != 0u)
+                    can_wake = true;
+            }
+#if !defined(JE_ARM_IPC_FAULT) || JE_ARM_IPC_FAULT != 11
+            (void)all_blocked;
+            (void)have_user;
+#endif
+#if defined(JE_ARM_IPC_FAULT) && JE_ARM_IPC_FAULT == 11
+            if (have_user && all_blocked) {
+                for (uint32_t slot = 1u; slot < JE_RR_MAX; ++slot)
+                    if (je_arm_ipc[slot].pending)
+                        je_arm_ipc[slot].deadline = 0u;
+                can_wake = false;
+            }
+#endif
+            if (!can_wake && current != 0u)
+                sched_fatal("nothing can wake");
+#ifdef JE_ARM_EL0_TEST
+            if (have_user && all_blocked) {
+                je_arm_idle_all_blocked = true;
+                je_arm_el0_test_note_all_blocked_state();
+            }
+#endif
+            next = 0u;
         }
         void *resume = NULL;
         const je_status status = je_rr_switch(&je_arm_rr, next, &resume);
@@ -1011,8 +1214,21 @@ static void *arm_switch_to_ready(void)
             je_arm_frame_generation[next] =
                 next_frame_generation(je_arm_frame_generation[next]);
             je_arm_sched_current_identity = next;
+#ifdef JE_ARM_EL0_TEST
+            je_arm_el0_state.identity_shadow = next;
+#endif
             if (arm_current_is_user(next))
                 je_arm_el0_test_poison_tpidr();
+#ifdef JE_ARM_EL0_TEST
+            if (current == 0u && next != 0u &&
+                je_arm_idle_context_ran && je_arm_idle_all_blocked &&
+                je_arm_idle_wake_seen) {
+                je_arm_el0_test_note_all_blocked_idle(next);
+                arm_idle_guard_check(next);
+                je_arm_idle_all_blocked = false;
+                je_arm_idle_wake_seen = false;
+            }
+#endif
             return resume;
         }
         if (arm_current_is_user(next) &&
@@ -1039,6 +1255,156 @@ static void *arm_switch_to_ready(void)
     }
     sched_fatal("successor bound");
 }
+
+#ifdef JE_ARM_EL0_TEST
+static void *arm_user_death(je_arm_trapframe *tf, uint32_t reason,
+                            uint64_t code);
+
+void je_arm_sched_wake_ipc(uint32_t slot)
+{
+    if (slot == 0u || slot >= JE_RR_MAX) return;
+    if (je_arm_ipc[slot].pending &&
+        je_arm_rr.slots[slot].state == JE_RR_BLOCKED) {
+        je_arm_ipc_woken[slot] = true;
+        je_arm_idle_wake_seen = true;
+    }
+    je_rr_wake(&je_arm_rr, slot);
+#ifdef JE_ARM_EL0_TEST
+    /*
+     * The ARM EL0 proof has no PROC_KILL syscall.  Its victim is therefore
+     * marked through the real lifecycle owner at the WOKEN boundary, before
+     * the scheduler can resume it.  Reaping remains IRQ-authoritative below.
+     */
+    if (je_arm_el0_test_take_wake_death(slot))
+        arm_user_mark_dying(slot, JE_ABI_DEATH_KILLED, 0u, 0u);
+#endif
+}
+
+je_status je_sched_current_proc_id(je_proc_id *out)
+{
+    const uint32_t slot = je_rr_current(&je_arm_rr);
+    if (!out || slot == 0u || slot >= JE_RR_MAX ||
+        !je_arm_user_slot[slot])
+        return JE_ERR_INVALID;
+    *out = je_arm_user_proc[slot];
+    return JE_OK;
+}
+
+bool je_sched_wait_pending(je_ep_channel **rec, uint8_t *side,
+                           uint64_t *rdi, uint64_t *rsi, uint64_t *rdx,
+                           uint64_t *r8, uint64_t *r9,
+                           uint64_t *post_svc_elr)
+{
+    const uint32_t slot = je_rr_current(&je_arm_rr);
+    if (slot == 0u || slot >= JE_RR_MAX || !je_arm_ipc[slot].pending)
+        return false;
+    const je_arm_ipc_continuation *p = &je_arm_ipc[slot];
+    if (rec) *rec = p->rec;
+    if (side) *side = p->side;
+    if (rdi) *rdi = p->args[0];
+    if (rsi) *rsi = p->args[1];
+    if (rdx) *rdx = p->args[2];
+    if (r8) *r8 = p->args[4];
+    if (r9) *r9 = p->args[5];
+    if (post_svc_elr) *post_svc_elr = p->post_svc_elr;
+    return true;
+}
+
+bool je_arm_sched_wait_identity(je_proc_id *out)
+{
+    const uint32_t slot = je_rr_current(&je_arm_rr);
+    if (!out || slot == 0u || slot >= JE_RR_MAX ||
+        !je_arm_ipc[slot].pending)
+        return false;
+    *out = je_arm_ipc[slot].proc_id;
+    return true;
+}
+
+static void arm_ipc_deadline_sweep(uint64_t now)
+{
+    for (uint32_t slot = 1u; slot < JE_RR_MAX; ++slot) {
+        je_arm_ipc_continuation *p = &je_arm_ipc[slot];
+        if (!p->pending || p->deadline == 0u ||
+            p->deadline > now ||
+            je_arm_rr.slots[slot].state != JE_RR_BLOCKED)
+            continue;
+        uint32_t waiter = 0u;
+        (void)je_endpoint_wait_arbitrate(
+            p->rec, p->side, JE_EP_WAIT_TIMED_OUT, &waiter);
+        if (je_endpoint_wait_cause(p->rec, p->side) ==
+            JE_EP_WAIT_WAITING)
+            sched_fatal("IPC deadline arbitration");
+        je_rr_wake(&je_arm_rr, slot);
+        je_arm_idle_wake_seen = true;
+        je_arm_el0_test_note_timer_wake(slot);
+    }
+}
+
+bool je_arm_sched_ipc_woken_restart(uint32_t slot)
+{
+    if (slot == 0u || slot >= JE_RR_MAX) return false;
+    const bool witnessed = je_arm_ipc_parked[slot] &&
+                           je_arm_ipc_woken[slot];
+    je_arm_ipc_parked[slot] = false;
+    je_arm_ipc_woken[slot] = false;
+    return witnessed;
+}
+
+void je_sched_wait_finish(void)
+{
+    const uint32_t slot = je_rr_current(&je_arm_rr);
+    if (slot == 0u || slot >= JE_RR_MAX) return;
+    je_arm_ipc[slot] = (je_arm_ipc_continuation){0};
+}
+
+void *je_arm_block_current(je_arm_trapframe *tf, je_ep_channel *rec,
+                           uint8_t side, uint64_t deadline)
+{
+    const uint32_t slot = je_rr_current(&je_arm_rr);
+    je_arm_ipc_continuation *p;
+    if (!tf || slot == 0u || slot >= JE_RR_MAX ||
+        !arm_current_is_user(slot) || !rec || side > 1u || deadline == 0u)
+        sched_fatal("IPC park arguments");
+    if (tf->elr < JE_VM_ARENA_BASE + 4u ||
+        (tf->elr & UINT64_C(3)) != 0u)
+        return arm_user_death(tf, JE_ABI_DEATH_BAD_RETURN, 0u);
+    p = &je_arm_ipc[slot];
+    if (p->pending) sched_fatal("IPC park duplicate");
+    if (record_current_frame(&je_arm_rr.slots[slot], tf) != JE_ARM_FRAME_OK)
+        sched_fatal("IPC park frame");
+    p->pending = true;
+    p->rec = rec;
+    p->side = side;
+    for (unsigned i = 0u; i < 6u; ++i) p->args[i] = tf->gpr[i];
+    p->post_svc_elr = tf->elr;
+    p->deadline = deadline;
+    p->proc_id = je_arm_user_proc[slot];
+    je_arm_ipc_parked[slot] = true;
+    je_arm_ipc_woken[slot] = false;
+#if defined(JE_ARM_IPC_FAULT) && JE_ARM_IPC_FAULT == 10
+    {
+        je_vm *busy_vm = NULL;
+        uint32_t busy_index = UINT32_MAX;
+        je_ep_channel *busy_rec = NULL;
+        uint8_t busy_side = 0u;
+        if (je_sched_current_user(&busy_vm, &busy_index) != JE_OK)
+            sched_fatal("IPC WAITERS_BUSY setup");
+        if (je_endpoint_kern_wait_register(
+                busy_vm, busy_index, (je_handle)tf->gpr[0], slot,
+                &busy_rec, &busy_side) != JE_EP_WAITERS_BUSY)
+            sched_fatal("IPC WAITERS_BUSY guard missing");
+        sched_fatal("IPC WAITERS_BUSY guard");
+    }
+#endif
+#if !defined(JE_ARM_IPC_FAULT) || JE_ARM_IPC_FAULT != 1
+    tf->elr -= 4u;
+#endif
+    if (tf->elr != p->post_svc_elr - UINT64_C(4))
+        sched_fatal("IPC rewind guard");
+    je_rr_block(&je_arm_rr, slot);
+    return (je_arm_trapframe *)arm_switch_to_ready();
+}
+#endif
 
 static void *arm_user_death(je_arm_trapframe *tf, uint32_t reason,
                             uint64_t code)
@@ -1093,12 +1459,6 @@ void *je_arm_el0_svc(je_arm_trapframe *tf)
 {
     if (tf == NULL || !arm_current_is_user(je_rr_current(&je_arm_rr)))
         sched_fatal("SVC from non-user");
-    /*
-     * Reap only after the restore seam has put execution on the successor's
-     * SP_EL1. Reaping from arm_switch_to_ready() would unmap the old current
-     * kernel stack while this C call is still using it.
-     */
-    arm_reap_zombies();
     const je_arm_frame_result shape =
         frame_shape_class(&je_arm_rr.slots[je_rr_current(&je_arm_rr)],
                           tf, 1u, false, false);
@@ -1115,12 +1475,82 @@ void *je_arm_el0_svc(je_arm_trapframe *tf)
         (esr & UINT64_C(0xffff)) != 0u)
         return arm_user_death(tf, JE_ABI_DEATH_FAULT, 0u);
 
+    /*
+     * A parked recv re-enters through the same SVC instruction.  The saved
+     * owned endpoint record is authoritative; decode is deliberately skipped
+     * so the user cannot turn a wake into a second syscall.  ELR at this point
+     * is the post-SVC address because the re-executed SVC trapped with ELR=site
+     * + 4, not the rewound address stored while parked.
+     */
+    {
+        je_ep_channel *wrec = NULL;
+        uint8_t wside = 0u;
+        uint64_t wrdi = 0u;
+        uint64_t wrsi = 0u;
+        uint64_t wrdx = 0u;
+        uint64_t wr8 = 0u;
+        uint64_t wr9 = 0u;
+        uint64_t wpost = 0u;
+        if (je_sched_wait_pending(&wrec, &wside, &wrdi, &wrsi, &wrdx,
+                                  &wr8, &wr9, &wpost)) {
+            je_proc_id expected = JE_PROC_ID_NONE;
+            je_proc_id actual = JE_PROC_ID_NONE;
+            (void)wrdi;
+#if defined(JE_ARM_IPC_FAULT) && JE_ARM_IPC_FAULT == 2
+            if (tf->elr != (wpost - 4u) ||
+#else
+            if (tf->elr != wpost ||
+#endif
+                !je_arm_sched_wait_identity(&expected) ||
+                je_sched_current_proc_id(&actual) != JE_OK ||
+                expected.index != actual.index || expected.gen != actual.gen)
+                sched_fatal("IPC resume assertion");
+            je_abi_status resumed_status = JE_ABI_INVALID;
+            uint64_t resumed_result = 0u;
+#if defined(JE_ARM_IPC_FAULT) && JE_ARM_IPC_FAULT == 7
+            if (svc_slot == je_arm_el0_test_short_buffer_slot()) {
+                wrdx = 0u;
+            }
+#endif
+#if defined(JE_ARM_IPC_FAULT) && JE_ARM_IPC_FAULT == 6
+            wrsi = JE_VM_ARENA_BASE;
+#endif
+#if defined(JE_ARM_IPC_FAULT) && JE_ARM_IPC_FAULT == 4
+            {
+                je_vm *resume_vm = NULL;
+                uint32_t resume_index = UINT32_MAX;
+                je_ep_status resolve_status = JE_EP_CORRUPT;
+                if (je_sched_current_user(&resume_vm, &resume_index) == JE_OK)
+                    resolve_status = je_endpoint_kern_recv_entry_probe(
+                        resume_vm, resume_index, (je_handle)wrdi);
+                if (resolve_status != JE_EP_EMPTY &&
+                    resolve_status != JE_EP_OK)
+                    sched_fatal("IPC re-resolve");
+            }
+#endif
+            je_arm_finish_blocked_recv(wrec, wside, wrsi, wrdx, wr8, wr9,
+                                       &resumed_status, &resumed_result);
+            je_sched_wait_finish();
+            tf->gpr[0] = (uint64_t)resumed_status;
+            tf->gpr[1] = resumed_result;
+            je_arm_el0_test_note_svc(svc_slot, tf->gpr[8], tf);
+            je_rr_ctx *resumed = &je_arm_rr.slots[svc_slot];
+            if (record_current_frame(resumed, tf) != JE_ARM_FRAME_OK)
+                sched_fatal("resume frame classification");
+            no_switch_frame(resumed, tf);
+            return tf;
+        }
+    }
+
     uint64_t args[6];
     for (unsigned i = 0u; i < 6u; ++i) args[i] = tf->gpr[i];
     const uint64_t op = tf->gpr[8];
     je_abi_status abi_status = JE_ABI_UNSUPPORTED;
     uint64_t result = 0u;
     je_syscall_action action;
+    je_ep_channel *block_rec = NULL;
+    uint8_t block_side = 0u;
+    uint64_t block_deadline = 0u;
 #ifdef JE_ARM_EL0_TEST
     if (op == JE_ARM_EL0_PROOF_OP) {
         action = JE_SYSCALL_RETURN;
@@ -1133,7 +1563,14 @@ void *je_arm_el0_svc(je_arm_trapframe *tf)
         }
     } else
 #endif
-        action = je_arm_syscall_dispatch(op, args, &abi_status, &result);
+        action = je_arm_syscall_dispatch(op, args, &abi_status, &result,
+                                          &block_rec, &block_side,
+                                          &block_deadline);
+    if (action == JE_SYSCALL_BLOCK) {
+        if (block_rec == NULL || block_deadline == 0u)
+            sched_fatal("IPC block result");
+        return je_arm_block_current(tf, block_rec, block_side, block_deadline);
+    }
     tf->gpr[0] = (uint64_t)abi_status;
     tf->gpr[1] = result;
     if (op == JE_ARM_EL0_PROOF_OP)
@@ -1223,8 +1660,19 @@ void *je_arm_sched_irq(je_arm_trapframe *tf)
     return je_arm_sched_test_irq(tf, current_slot);
 #else
 #ifdef JE_ARM_EL0_TEST
-    if (arm_current_is_user(current_slot)) {
-        je_rr_tick(&je_arm_rr, je_arm_timer_ticks());
+    {
+        const uint64_t now = je_arm_timer_ticks();
+        je_rr_tick(&je_arm_rr, now);
+        /*
+         * Reap first: endpoint teardown may close a peer and win the
+         * PEER_CLOSED arbitration.  The deadline sweep then arbitrates only
+         * still-WAITING receivers, so a peer death cannot be misreported as a
+         * timeout.
+         */
+        arm_reap_zombies();
+        arm_ipc_deadline_sweep(now);
+    }
+    if (arm_current_is_user(current_slot) || current_slot == 0u) {
         void *resume = arm_switch_to_ready();
         je_arm_el0_test_note_irq_switch(current_slot,
                                         je_rr_current(&je_arm_rr),
