@@ -1,0 +1,10 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<Scheme LastUpgradeVersion="1500" version="1.3">
+  <BuildAction parallelizeBuildables="NO" buildImplicitDependencies="NO">
+    <BuildActionEntries>
+      <BuildActionEntry buildForTesting="NO" buildForRunning="YES" buildForProfiling="NO" buildForArchiving="NO" buildForAnalyzing="NO">
+        <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="BEE6EF3ACA405B2CFA80D6BB" BuildableName="check" BlueprintName="check" ReferencedContainer="container:JeiOS.xcodeproj" />
+      </BuildActionEntry>
+    </BuildActionEntries>
+  </BuildAction>
+</Scheme>
