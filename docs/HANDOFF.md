@@ -1,5 +1,10 @@
 # Agent handoff: MP3c ARM capability IPC
 
+## Xcode projects — 2026-11-13T21:10:17-05:00
+
+Base `10c5b8c9b9e2c45eba2fc32b8564b82ac5aa7f16`, branch tooling/xcode-project. Added source navigator, shared external-build schemes, task wrapper, deterministic generator and docs/XCODE.md. Runtime unchanged. Plist/XML references, regeneration, bash syntax and invalid-task rejection passed. make check: exit 2 at test_boot, LeakSanitizer ptrace/environment failure; no full suite pass claimed. Xcode/xcodebuild unavailable on Linux; Mac open/list/build and Docker-on-Mac execution remain unverified. No signing, flashing or device qualification. Next: validate on a Mac using docs/XCODE.md.
+
+
 ## Current status — MP3c G1/G2/G3 tightening fix — observed 2026-11-10T12:58:14Z
 
 Repository `/tmp/wt-mp3c`, branch `wip/mp3c`, exact inspected base commit

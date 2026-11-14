@@ -2,3 +2,8 @@ build/
 *.iso
 *.o
 __pycache__/
+
+# Xcode per-user state
+xcuserdata/
+*.xcuserstate
+DerivedData/

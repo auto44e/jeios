@@ -1,5 +1,7 @@
 # JeiOS
 
+Mac/Xcode development: [project setup and shared schemes](docs/XCODE.md).
+
 Future [JTerminal native terminal and session roadmap](docs/JTERMINAL.md): persistent local/remote sessions, ecosystem device connections and enterprise/cluster management. Planned after stabilization and prerequisite gates; no runtime support added.
 
 **Current work order — 2026-11-06T02:10:28-05:00:** [Current-code stabilization gate](docs/audit/2026-11-fix-gate.md). Complete the existing-code repairs and acceptance ledger before new implementations; this supersedes older next-task wording. Repairs are planned, not completed by this documentation PR.
