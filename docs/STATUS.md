@@ -1,3 +1,17 @@
+# Current ecosystem status — 2026-11-14
+
+Inspected core main `b2b209f3863a27cf25d746547038f4985bf7e984`.
+Audit repair gate closed with accepted residual dispositions; MP2 scheduler #101,
+lifecycle extraction #102, ARM EL0 #103/#104, handles #105 and IPC #106 are merged.
+Xcode tooling #107 is merged; Mac validation remains distinct from Linux checks.
+
+Next: [audit continuation A0–A8](audit/2026-11-continuation.md), tracked by #87,
+#18/#19 and mobile #2. ARM service parity and mobile/physical qualification remain
+pending. Current main CI 43607930996 was running at observation, not yet passed.
+This documentation adds no runtime fixes or new hardware support.
+
+## Historical checkpoints (superseded where inconsistent)
+
 # Current ecosystem status
 
 Observed 2026-11-08T12:40Z (MP2 ADR 0013 scheduler). Branch `feat/mp2-sched` atop
