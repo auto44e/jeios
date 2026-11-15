@@ -2,7 +2,7 @@
 
 Future [JTerminal native terminal and session roadmap](JTERMINAL.md): persistent local/remote sessions, ecosystem device connections and enterprise/cluster management. Planned after stabilization and prerequisite gates; no runtime support added.
 
-**Current work order — 2026-11-06T02:10:28-05:00:** [Current-code stabilization gate](audit/2026-11-fix-gate.md). Complete the existing-code repairs and acceptance ledger before new implementations; this supersedes older next-task wording. Repairs are planned, not completed by this documentation PR.
+**Current work order — 2026-11-14:** [Audit continuation for working agents](audit/2026-11-continuation.md). Original fix gate closed; MP2/lifecycle/ARM EL0/handles/IPC are merged. Complete residual assurance and dependent platform qualification with exact-revision evidence.
 
 Current checkpoint and work order: [STATUS.md](STATUS.md). Dated status and next-task statements below are historical when superseded by that checkpoint.
 

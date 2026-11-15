@@ -1,5 +1,22 @@
 # Agent handoff: MP3c ARM capability IPC
 
+## Audit continuation — 2026-11-14T10:06:03-05:00
+
+Baseline `b2b209f3863a27cf25d746547038f4985bf7e984`, branch docs/audit-continuation.
+Added [A0–A8 agent work packages](audit/2026-11-continuation.md), corrected stale
+entrypoint priority and current status. Planning only; no runtime changes.
+Original repair gate remains closed; residual work needs evidence, not duplicate
+MP2/lifecycle/MP3 implementation. Read the new work packages before historical notes.
+
+Validation: relative links and git diff --check passed. make check exit 2 due to
+LeakSanitizer host limitation (see PR); no full hosted/native/hardware pass claimed.
+No boot-affecting changes or emulator rerun. Main CI 43607930996 was running when
+observed, not evidence for this documentation commit. Single-agent AI-assisted
+handoff, not independent human qualification. Next: A0 exact-revision evidence,
+then A1–A3 regression/receive work; A4 cleanup and A5–A8 parity/design/qualification
+remain separately bounded and subject to existing owner gates.
+
+
 ## Xcode projects — 2026-11-13T21:10:17-05:00
 
 Base `10c5b8c9b9e2c45eba2fc32b8564b82ac5aa7f16`, branch tooling/xcode-project. Added source navigator, shared external-build schemes, task wrapper, deterministic generator and docs/XCODE.md. Runtime unchanged. Plist/XML references, regeneration, bash syntax and invalid-task rejection passed. make check: exit 2 at test_boot, LeakSanitizer ptrace/environment failure; no full suite pass claimed. Xcode/xcodebuild unavailable on Linux; Mac open/list/build and Docker-on-Mac execution remain unverified. No signing, flashing or device qualification. Next: validate on a Mac using docs/XCODE.md.
